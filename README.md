@@ -17,7 +17,13 @@ photos -> identify -> price -> draft -> [you review] -> eBay draft -> publish
 
 1. **Capture.** You send photos to the bot. They are batched (it waits a few
    seconds for more photos), saved to `data/inbox/<id>/`, and recorded as a new
-   item with status `captured`.
+   item with status `captured`. Photo order matters:
+   - the **1st** photo is the overview (used as the eBay gallery cover),
+   - the **2nd** photo is the tag close-up (fed to Gemini to identify the item;
+     on the eBay listing it is moved to appear as the *last* product image),
+   - the **last** photo is always the Ross receipt/check. It is OCR'd for the
+     price you paid and the 12-digit code (`receipt.py`), stored as cost data,
+     and **never posted to eBay**.
 
 2. **Identify** (`identify.py`). Two Gemini calls:
    - *Research* (model `gemini-2.5-pro`, with Google Search) reads the tag —
@@ -34,8 +40,9 @@ photos -> identify -> price -> draft -> [you review] -> eBay draft -> publish
    sold listings and active listings. The bot filters to brand-relevant comps,
    takes the median of sold prices, undercuts it (and the cheapest active
    competitor), and rounds to a `.99` price. If there are too few sold comps, it
-   falls back to the resale estimate found during identification. Status becomes
-   `priced`.
+   falls back to the resale estimate found during identification. The eBay URL of
+   the best-match comp the price is anchored to is saved on the item
+   (`price_source_url`). Status becomes `priced`.
 
 4. **Draft** (`pipeline/draft.py`). Gemini (`gemini-2.5-flash`) writes the
    listing — title, description, item specifics, category, and price — using the
@@ -65,6 +72,7 @@ photos -> identify -> price -> draft -> [you review] -> eBay draft -> publish
 | `identify.py` | Step 2: two-stage Gemini product identification |
 | `pipeline/price.py` | Step 3: eBay comps (Apify) and pricing logic |
 | `pipeline/draft.py` | Step 4: listing copy generation |
+| `receipt.py` | OCR the Ross receipt (last photo) for paid price + 12-digit code |
 | `ebay/auth.py` | eBay OAuth: user token (seller) and app token (catalog) |
 | `ebay/inventory.py` | Step 6/7: build, create, and publish eBay offers |
 | `ebay/taxonomy.py` | eBay category validation and item-aspect metadata (cached) |
@@ -85,9 +93,12 @@ are overridable via `GEMINI_MODEL` and `GEMINI_FAST_MODEL`.
 Everything lives in one SQLite file, `data/ross.db`:
 
 - `items` — one row per item, with JSON columns for `photos`, `identification`,
-  `pricing`, `listing`, and `ebay`, plus a `status` that tracks pipeline
-  progress (`captured`, `identified`, `priced`, `drafted`, `review`, `approved`,
-  `ebay_draft`, `published`, `rejected`).
+  `pricing`, `listing`, `ebay`, and `receipt` (the OCR'd Ross receipt: paid
+  price, original price, and 12-digit code), a `price_source_url` (the comp the
+  price is anchored to), plus a `status` that tracks pipeline progress
+  (`captured`, `identified`, `priced`, `drafted`, `review`, `approved`,
+  `ebay_draft`, `published`, `rejected`). New columns are added by an automatic
+  `ALTER TABLE` migration on startup.
 - `ebay_tokens` — the seller's OAuth access and refresh tokens.
 - `taxonomy_cache` — eBay category and aspect lookups, cached for 30 days.
 
@@ -98,6 +109,10 @@ Photos are stored on disk under `data/inbox/`.
 - Python 3.11+
 - Accounts and API keys for: Google Gemini, Telegram, Apify, eBay Developer,
   and Cloudinary
+- The **Tesseract OCR** binary (for reading the Ross receipt). On Windows,
+  install the UB-Mannheim build and either add it to `PATH` or set
+  `TESSERACT_CMD` in `.env` to the full path of `tesseract.exe`. The Python
+  wrappers (`pytesseract`, `Pillow`) come from `requirements.txt`.
 
 ## Setup
 

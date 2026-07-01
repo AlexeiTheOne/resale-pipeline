@@ -11,7 +11,17 @@ VALID_STATUSES = [
     "review", "approved", "ebay_draft", "published", "rejected"
 ]
 
-VALID_FIELDS = ["identification", "pricing", "listing", "ebay", "photos", "processed"]
+VALID_FIELDS = [
+    "identification", "pricing", "listing", "ebay", "photos", "processed",
+    "price_source_url", "receipt",
+]
+
+# Columns added after the initial schema shipped. Each is created with an
+# ALTER TABLE on startup if the existing table doesn't already have it.
+_MIGRATIONS = {
+    "price_source_url": "TEXT",  # link to the comp the suggested price is anchored to
+    "receipt": "TEXT",           # OCR'd Ross receipt: cost, original price, 12-digit code
+}
 
 
 def _conn():
@@ -26,7 +36,8 @@ def _now():
 def _row_to_dict(row, cursor):
     keys = [d[0] for d in cursor.description]
     d = dict(zip(keys, row))
-    for field in ("photos", "processed", "identification", "pricing", "listing", "ebay"):
+    for field in ("photos", "processed", "identification", "pricing", "listing",
+                  "ebay", "price_source_url", "receipt"):
         if d.get(field) is not None:
             d[field] = json.loads(d[field])
     return d
@@ -48,6 +59,10 @@ def create_tables() -> None:
                 updated_at  TEXT NOT NULL
             )
         """)
+        existing = {row[1] for row in con.execute("PRAGMA table_info(items)")}
+        for column, coltype in _MIGRATIONS.items():
+            if column not in existing:
+                con.execute(f"ALTER TABLE items ADD COLUMN {column} {coltype}")
 
 
 def create_item(photos: list[str]) -> str:

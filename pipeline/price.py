@@ -121,6 +121,7 @@ def get_pricing(search_query: str, research: dict | None = None) -> dict:
                 "title": item.get("title", ""),
                 "condition": item.get("condition", ""),
                 "image": item.get("thumbnailUrl", ""),
+                "url": item.get("url", ""),
             })
     sold_comps = _brand_relevant(sold_comps)[:comps_count]
     sold_prices = sorted(c["price"] for c in sold_comps)
@@ -136,6 +137,7 @@ def get_pricing(search_query: str, research: dict | None = None) -> dict:
                 "title": item.get("title", ""),
                 "condition": item.get("condition", ""),
                 "image": (imgs[0] if imgs else item.get("thumbnail", "")),
+                "url": item.get("url", ""),
             })
     active_listings = _brand_relevant(active_listings)[:active_count]
     active_prices = [a["price"] for a in active_listings]
@@ -153,6 +155,7 @@ def get_pricing(search_query: str, research: dict | None = None) -> dict:
     # --- Best-match reference listing (prefer SOLD = proven sales) ---
     reference = None
     stock_image_url = None
+    price_source_url = None
     pool = [{**c, "source": "sold"} for c in sold_comps] + \
            [{**a, "source": "active"} for a in active_listings]
     if pool:
@@ -163,8 +166,10 @@ def get_pricing(search_query: str, research: dict | None = None) -> dict:
                 "price": best["price"],
                 "condition": best["condition"],
                 "source": best["source"],
+                "url": best.get("url") or None,
             }
             stock_image_url = _upgrade_image(best.get("image"))
+            price_source_url = best.get("url") or None
 
     # The researched resale figure is a firm signal about THIS exact item, so it
     # acts as a price floor (undercut applied, but NOT subject to the active-floor
@@ -183,6 +188,7 @@ def get_pricing(search_query: str, research: dict | None = None) -> dict:
             "sold_comps": sold_comps,
             "reference": reference,
             "stock_image_url": stock_image_url,
+            "price_source_url": price_source_url,
             **research_fields,
         }
         if research_floor:
@@ -224,6 +230,7 @@ def get_pricing(search_query: str, research: dict | None = None) -> dict:
         "sold_comps": sold_comps,
         "reference": reference,
         "stock_image_url": stock_image_url,
+        "price_source_url": price_source_url,
         "confidence": confidence,
         **research_fields,
     }
