@@ -2,8 +2,15 @@ import os, sys, uuid, asyncio, shutil, time, traceback
 from pathlib import Path
 from dotenv import load_dotenv
 import httpx
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 from telegram.request import HTTPXRequest
 
 load_dotenv()
@@ -12,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import GEMINI_PHOTO_LIMIT
 from db import create_item, delete_item, get_item, list_items, update_field, update_status
 from identify import identify_item
+from receipt import extract_receipt
 from pipeline.price import get_pricing
 from pipeline.draft import generate_draft, revise_draft
 from ebay.auth import get_access_token
@@ -29,12 +37,14 @@ INBOX.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_CAPTURE_WINDOW = 5    # seconds to wait for more photos before processing
 EXTENDED_CAPTURE_WINDOW = 30  # after the user types "wait" — for forwarding big batches
+WAIT_EXTENSION = 15           # seconds the inline "Wait" button waits for more photos
 
 pending = {}        # user_id -> {"files": [bytearray,...], "task": asyncio.Task}
 review = {}         # user_id -> item_id  (item currently awaiting this user's reply)
 locks = {}          # user_id -> asyncio.Lock guarding pending[user_id]
 last_item = {}      # user_id -> item_id  (last-touched item, survives past the review window)
 capture_window = {} # user_id -> seconds to batch photos (default DEFAULT_CAPTURE_WINDOW)
+staging = {}        # user_id -> {item_id, folder, paths, chat_id, task} awaiting Start/Wait/Cancel
 
 
 def _lock_for(user_id):
@@ -80,17 +90,33 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     data = await f.download_as_bytearray()
 
     async with _lock_for(user_id):
-        if user_id not in pending:
-            pending[user_id] = {"files": [], "task": None}
-        pending[user_id]["files"].append(data)
-        count = len(pending[user_id]["files"])
+        st = staging.get(user_id)
+        if st is not None:
+            # Item is already awaiting confirmation — this photo belongs to it.
+            # Append it, then re-arm the confirmation once photos stop arriving.
+            idx = len(st["paths"])
+            p = st["folder"] / f"{st['folder'].name}_{idx}.jpg"
+            p.write_bytes(data)
+            st["paths"].append(str(p))
+            update_field(st["item_id"], "photos", st["paths"])
+            if st["task"] is not None:
+                st["task"].cancel()
+            st["task"] = context.application.create_task(
+                _await_more_photos(user_id, st["item_id"], context, WAIT_EXTENSION)
+            )
+            count = len(st["paths"])
+        else:
+            if user_id not in pending:
+                pending[user_id] = {"files": [], "task": None}
+            pending[user_id]["files"].append(data)
+            count = len(pending[user_id]["files"])
 
-        if pending[user_id]["task"] is not None:
-            pending[user_id]["task"].cancel()
+            if pending[user_id]["task"] is not None:
+                pending[user_id]["task"].cancel()
 
-        pending[user_id]["task"] = context.application.create_task(
-            finalize_capture(user_id, update, context)
-        )
+            pending[user_id]["task"] = context.application.create_task(
+                finalize_capture(user_id, update, context)
+            )
     print(f"📷 Capture: photo appended, {count} buffered for user {user_id}")
 
 
@@ -116,36 +142,149 @@ async def finalize_capture(user_id, update, context):
     item_id = create_item(paths)
     print(f"📷 Capture: item {item_id} created with {len(paths)} photo path(s) in DB")
 
-    await _safe_reply(update.message, f"📸 {len(paths)} photos received. Processing...")
+    # Don't auto-run. Hold the item and ask the user what to do with it.
+    chat_id = update.effective_chat.id
+    async with _lock_for(user_id):
+        staging[user_id] = {
+            "item_id": item_id, "folder": folder, "paths": paths,
+            "chat_id": chat_id, "task": None,
+        }
+    await _send_confirmation(context, chat_id, item_id, len(paths))
 
+
+def _confirmation_markup(item_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Start", callback_data=f"confirm:start:{item_id}"),
+        InlineKeyboardButton("Wait", callback_data=f"confirm:wait:{item_id}"),
+        InlineKeyboardButton("Cancel", callback_data=f"confirm:cancel:{item_id}"),
+    ]])
+
+
+async def _send_confirmation(context, chat_id, item_id, count) -> None:
+    text = f"{count} photo(s) buffered. Start the listing, wait for more photos, or cancel?"
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id, text=text, reply_markup=_confirmation_markup(item_id)
+        )
+    except Exception as e:
+        print(f"WARNING: send confirmation failed: {type(e).__name__}: {e}")
+
+
+async def _await_more_photos(user_id, item_id, context, delay) -> None:
+    """After the Wait window, re-show the confirmation if the item is still staged
+    and no newer photo restarted the timer."""
+    await asyncio.sleep(delay)
+    async with _lock_for(user_id):
+        st = staging.get(user_id)
+        if st is None or st["item_id"] != item_id:
+            return
+        st["task"] = None
+        count, chat_id = len(st["paths"]), st["chat_id"]
+    await _send_confirmation(context, chat_id, item_id, count)
+
+
+async def _run_and_review(user_id, item_id, paths, message, context) -> None:
     # run_pipeline runs in a worker thread; this schedules each progress ping back
     # onto the bot's event loop so the user sees which step is running (some steps
     # — identification, Apify pricing — take a minute or more).
     loop = asyncio.get_running_loop()
 
     def notify(text: str) -> None:
-        asyncio.run_coroutine_threadsafe(_safe_reply(update.message, text), loop)
+        asyncio.run_coroutine_threadsafe(_safe_reply(message, text), loop)
 
     try:
         result = await asyncio.to_thread(run_pipeline, item_id, paths, notify)
     except Exception as e:
         error_details = traceback.format_exc()
         print("PIPELINE ERROR:", error_details)
-        await _safe_reply(update.message, f"⚠️ Pipeline error at step: {type(e).__name__}: {str(e)[:200]}")
+        await _safe_reply(message, f"⚠️ Pipeline error at step: {type(e).__name__}: {str(e)[:200]}")
         return
 
     review[user_id] = item_id
     last_item[user_id] = item_id
-    await _safe_reply(update.message, format_draft(result), parse_mode=None)
+    await _safe_reply(message, format_draft(result), parse_mode=None)
+
+
+async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    try:
+        _, action, item_id = query.data.split(":", 2)
+    except ValueError:
+        return
+
+    if action == "start":
+        async with _lock_for(user_id):
+            st = staging.pop(user_id, None)
+            if st and st["task"] is not None:
+                st["task"].cancel()
+        if st is None or st["item_id"] != item_id:
+            await query.edit_message_text("This item is no longer waiting.")
+            return
+        paths = st["paths"]
+        await query.edit_message_text(f"Starting. {len(paths)} photo(s). Processing...")
+        await _run_and_review(user_id, item_id, paths, query.message, context)
+
+    elif action == "wait":
+        async with _lock_for(user_id):
+            st = staging.get(user_id)
+            if st is None or st["item_id"] != item_id:
+                await query.edit_message_text("This item is no longer waiting.")
+                return
+            if st["task"] is not None:
+                st["task"].cancel()
+            st["task"] = context.application.create_task(
+                _await_more_photos(user_id, item_id, context, WAIT_EXTENSION)
+            )
+        await query.edit_message_text(f"Waiting {WAIT_EXTENSION}s for more photos. Send them now.")
+
+    elif action == "cancel":
+        async with _lock_for(user_id):
+            st = staging.pop(user_id, None)
+            if st and st["task"] is not None:
+                st["task"].cancel()
+        item = get_item(item_id)
+        if item is not None:
+            photos = item.get("photos") or []
+            if photos:
+                shutil.rmtree(Path(photos[0]).parent, ignore_errors=True)
+            delete_item(item_id)
+        await query.edit_message_text("Cancelled. Photos discarded.")
+
+
+def _split_receipt(item_id, paths, notify=lambda _t: None) -> list[str]:
+    """Peel the last photo — always the Ross receipt — off the listing photos,
+    OCR it for the paid price + 12-digit code, and persist both. The receipt is
+    dropped from `photos` so it never reaches eBay. Idempotent: if the receipt
+    was already processed for this item, returns the stored listing photos."""
+    item = get_item(item_id)
+    if item and item.get("receipt"):
+        return item.get("photos") or []
+    if len(paths) < 2:
+        return list(paths)  # nothing to peel — no receipt to separate
+
+    listing_photos = list(paths[:-1])
+    data = extract_receipt(paths[-1])
+    update_field(item_id, "photos", listing_photos)
+    update_field(item_id, "receipt", data)
+    if data.get("error"):
+        notify(f"🧾 Receipt saved, but OCR failed: {data['error']}")
+    else:
+        notify(f"🧾 Receipt: paid ${data.get('reduced_price')} · code {data.get('code')}")
+    return listing_photos
 
 
 def run_pipeline(item_id, paths, notify=lambda _t: None) -> dict:
     try:
-        # Only the first N photos (overview + tag) go to the paid API; all photos
-        # remain on the item for the eBay listing.
-        id_photos = paths[:GEMINI_PHOTO_LIMIT]
+        # The last photo is always the Ross receipt: OCR it for cost + code and
+        # remove it from the listing photos (it must not be posted to eBay).
+        listing_photos = _split_receipt(item_id, paths, notify)
+        # Only the first N photos (overview + tag) go to the paid API; all listing
+        # photos remain on the item for the eBay listing.
+        id_photos = listing_photos[:GEMINI_PHOTO_LIMIT]
         notify("🔬 Identifying the item...")
-        print(f"🔬 Identifying from {len(id_photos)} of {len(paths)} photo(s)")
+        print(f"🔬 Identifying from {len(id_photos)} of {len(listing_photos)} listing photo(s)")
         t = time.perf_counter()
         ident = identify_item(id_photos)
         id_secs = time.perf_counter() - t
@@ -159,6 +298,8 @@ def run_pipeline(item_id, paths, notify=lambda _t: None) -> dict:
         pricing = get_pricing(ident["search_query"], research=ident)
         price_secs = time.perf_counter() - t
         update_field(item_id, "pricing", pricing)
+        if pricing.get("price_source_url"):
+            update_field(item_id, "price_source_url", pricing["price_source_url"])
         update_status(item_id, "priced")
         print(f"✓ Priced in {price_secs:.0f}s:", pricing.get("suggested_price"), f"({pricing.get('confidence')})")
 
@@ -201,6 +342,12 @@ def format_draft(result) -> str:
         "",
         f"PRICE: ${listing['price']}",
         f"  sold median: ${pricing.get('sold_median')} | active floor: ${pricing.get('active_floor')} | {pricing.get('confidence')}",
+    ]
+
+    if pricing.get("price_source_url"):
+        lines.append(f"  price source: {pricing['price_source_url']}")
+
+    lines += [
         "",
         "DESCRIPTION:",
         short_desc,
@@ -431,7 +578,8 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         if status == "captured":
-            ident = await asyncio.to_thread(identify_item, item["photos"][:GEMINI_PHOTO_LIMIT])
+            listing_photos = await asyncio.to_thread(_split_receipt, item_id, item["photos"])
+            ident = await asyncio.to_thread(identify_item, listing_photos[:GEMINI_PHOTO_LIMIT])
             update_field(item_id, "identification", ident)
             update_status(item_id, "identified")
             await _safe_reply(update.message, f"✓ Identified: {ident.get('brand')} {ident.get('product_name') or ident.get('item_type')}")
@@ -441,6 +589,8 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 get_pricing, item["identification"]["search_query"], research=item["identification"]
             )
             update_field(item_id, "pricing", pricing)
+            if pricing.get("price_source_url"):
+                update_field(item_id, "price_source_url", pricing["price_source_url"])
             update_status(item_id, "priced")
             await _safe_reply(update.message, f"✓ Priced: ${pricing.get('suggested_price')} ({pricing.get('confidence')})")
 
@@ -548,6 +698,7 @@ def main() -> None:
     )
     app.add_error_handler(error_handler)
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm:"))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("listing", listing_command))
     app.add_handler(CommandHandler("delete", delete_command))
