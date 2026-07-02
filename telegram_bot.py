@@ -269,9 +269,10 @@ def _split_receipt(item_id, paths, notify=lambda _t: None) -> list[str]:
     update_field(item_id, "photos", listing_photos)
     update_field(item_id, "receipt", data)
     if data.get("error"):
-        notify(f"🧾 Receipt saved, but OCR failed: {data['error']}")
+        notify(f"🧾 Receipt saved, but couldn't be read: {data['error']}")
     else:
-        notify(f"🧾 Receipt: paid ${data.get('reduced_price')} · code {data.get('code')}")
+        orig = f" (orig ${data['original_price']})" if data.get("original_price") else ""
+        notify(f"🧾 Receipt: paid ${data.get('reduced_price')}{orig} · code {data.get('code')}")
     return listing_photos
 
 
