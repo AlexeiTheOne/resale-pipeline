@@ -21,9 +21,13 @@ photos -> identify -> price -> draft -> [you review] -> eBay draft -> publish
    - the **1st** photo is the overview (used as the eBay gallery cover),
    - the **2nd** photo is the tag close-up (fed to Gemini to identify the item;
      on the eBay listing it is moved to appear as the *last* product image),
-   - the **last** photo is always the Ross receipt/check. It is OCR'd for the
-     price you paid and the 12-digit code (`receipt.py`), stored as cost data,
-     and **never posted to eBay**.
+   - the **last** photo is always the Ross price tag/check. Its CODE128 barcode
+     is decoded (`receipt.py`) for the 12-digit item code and the price you paid
+     — Ross barcodes are `<12-digit code><6-digit price in cents>`, e.g.
+     `400286461425000999` → code `400286461425`, paid `$9.99`. OCR reads the
+     printed "Original $XX.XX" line (not in the barcode) and backs up the barcode
+     if it can't be decoded. The result is stored as cost data and **never
+     posted to eBay**.
 
 2. **Identify** (`identify.py`). Two Gemini calls:
    - *Research* (model `gemini-2.5-pro`, with Google Search) reads the tag —
@@ -72,7 +76,7 @@ photos -> identify -> price -> draft -> [you review] -> eBay draft -> publish
 | `identify.py` | Step 2: two-stage Gemini product identification |
 | `pipeline/price.py` | Step 3: eBay comps (Apify) and pricing logic |
 | `pipeline/draft.py` | Step 4: listing copy generation |
-| `receipt.py` | OCR the Ross receipt (last photo) for paid price + 12-digit code |
+| `receipt.py` | Decode the Ross tag (last photo): barcode → paid price + 12-digit code, OCR → original price |
 | `ebay/auth.py` | eBay OAuth: user token (seller) and app token (catalog) |
 | `ebay/inventory.py` | Step 6/7: build, create, and publish eBay offers |
 | `ebay/taxonomy.py` | eBay category validation and item-aspect metadata (cached) |
@@ -109,10 +113,12 @@ Photos are stored on disk under `data/inbox/`.
 - Python 3.11+
 - Accounts and API keys for: Google Gemini, Telegram, Apify, eBay Developer,
   and Cloudinary
-- The **Tesseract OCR** binary (for reading the Ross receipt). On Windows,
-  install the UB-Mannheim build and either add it to `PATH` or set
-  `TESSERACT_CMD` in `.env` to the full path of `tesseract.exe`. The Python
-  wrappers (`pytesseract`, `Pillow`) come from `requirements.txt`.
+- The **Tesseract OCR** binary (for the printed "Original" price on the Ross
+  tag). On Windows, install the UB-Mannheim build and either add it to `PATH` or
+  set `TESSERACT_CMD` in `.env` to the full path of `tesseract.exe`. The Python
+  wrappers (`pytesseract`, `Pillow`, `pyzbar`) come from `requirements.txt`;
+  `pyzbar` bundles the zbar barcode library on Windows, so no extra system
+  install is needed for barcode decoding.
 
 ## Setup
 

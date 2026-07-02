@@ -4,3 +4,4 @@ python-dotenv
 python-telegram-bot>=20.0
 pytesseract
 Pillow
+pyzbar
