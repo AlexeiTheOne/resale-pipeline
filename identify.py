@@ -5,6 +5,7 @@ into our JSON schema) and is the function the rest of the app imports. Run this
 module directly to identify a set of photos from the command line.
 """
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -13,10 +14,15 @@ from google.genai import types
 
 from llm import generate_with_retry, make_client, response_text
 from config import GEMINI_MODEL, GEMINI_FAST_MODEL
+from receipt import read_product_upcs, ocr_text
 
 load_dotenv()
 
 client = make_client()
+
+# The grounded research call occasionally returns an empty response; retry a few
+# times before giving up rather than falling through to a hallucinated guess.
+RESEARCH_ATTEMPTS = 3
 
 
 def _repair_json(raw: str) -> str:
@@ -79,7 +85,12 @@ RESEARCH_SYSTEM = (
     "brand, and the visible features on eBay (both sold and active listings), on the "
     "brand's own website, and on resale sites. Run several searches, read the "
     "results, and reason step by step before you conclude. Do NOT answer in JSON — "
-    "write a short plain-text findings report."
+    "write a short plain-text findings report.\n"
+    "CRITICAL: if the UPC and style-number searches do not actually confirm a "
+    "specific product, say so plainly and report the item as UNCONFIRMED. Do NOT "
+    "fall back to naming a generic popular product (e.g. a common Coach or Michael "
+    "Kors bag) just because it's plausible — an unconfirmed honest answer is far "
+    "more useful than a confident wrong one."
 )
 
 RESEARCH_PROMPT = (
@@ -181,6 +192,10 @@ FORMAT_INSTRUCTIONS = (
     "- product_image_url: only an official brand/retailer image URL from the report; "
     "null if the report has none or only cites marketplace-seller photos.\n"
     "- confidence 0.0-1.0; lower it if the report could not pin the product or price.\n"
+    "- If the report says the item is UNCONFIRMED / could not be verified, do NOT "
+    "invent a specific brand or product_name: set product_name (and brand, if the "
+    "tag brand wasn't legible) to null, keep item_type generic, and set confidence "
+    "below 0.3. Never output a confident specific product the report didn't confirm.\n"
     "- Return raw JSON only, no markdown fences.\n"
     "\n"
     "RESEARCH REPORT:\n"
@@ -207,37 +222,135 @@ def _parse_json_object(raw: str) -> dict:
         return json.loads(_repair_json(raw))
 
 
-def identify_item(image_paths: list[str]) -> dict:
+# A style/SKU-looking token: 5–14 chars, letters+digits mixed (e.g. 'XW08963',
+# '87F2LEVB9U'). Pure-digit runs are excluded — they're covered by the UPC and a
+# bare number is too noise-prone to trust from OCR.
+_STYLE_CODE_RE = re.compile(r"\b(?=[A-Z0-9-]{5,14}\b)(?=[A-Z0-9-]*[A-Z])(?=[A-Z0-9-]*\d)[A-Z0-9-]+\b")
+
+
+def _extract_style_codes(text: str) -> list[str]:
+    """Pull style/SKU-looking tokens out of noisy tag OCR. Raw OCR of a tag is
+    mostly garbage, so we forward only these high-signal codes, not the prose."""
+    seen = []
+    for m in _STYLE_CODE_RE.finditer(text.upper()):
+        tok = m.group(0)
+        if tok not in seen:
+            seen.append(tok)
+    return seen[:5]
+
+
+def _tag_signals(scan_paths: list[str], fallback_ocr_path: str | None) -> tuple[list[str], list[str]]:
+    """Read hard identifiers off the tag WITHOUT the vision model: decode any
+    product UPC/EAN barcodes across all photos, and OCR the tag for printed
+    style/SKU codes the barcode doesn't carry. The vision model reads long barcode
+    digits unreliably and, when it can't, confidently hallucinates a generic
+    popular product — feeding it the decoded UPC removes that failure mode."""
+    upcs: list[str] = []
+    upc_photo: str | None = None
+    for p in scan_paths:
+        for u in read_product_upcs(p):
+            if u not in upcs:
+                upcs.append(u)
+                if upc_photo is None:
+                    upc_photo = p
+
+    # OCR the photo the UPC came from (almost always the tag); otherwise the
+    # caller's best guess at the tag photo. One OCR call keeps latency down, and
+    # we keep only style-code tokens — never the noisy raw text.
+    style_codes: list[str] = []
+    ocr_path = upc_photo or fallback_ocr_path
+    if ocr_path:
+        try:
+            style_codes = _extract_style_codes(ocr_text(ocr_path) or "")
+        except Exception as e:
+            print(f"Tag OCR skipped: {type(e).__name__}: {e}")
+    return upcs, style_codes
+
+
+def _tag_data_block(upcs: list[str], style_codes: list[str]) -> str:
+    """Prepended to the research prompt as authoritative, decoded tag facts."""
+    if not upcs and not style_codes:
+        return ""
+    lines = []
+    if upcs:
+        lines.append("- Product UPC/EAN (decoded from the barcode): " + ", ".join(upcs))
+    if style_codes:
+        lines.append("- Possible style/SKU codes (OCR — may contain errors): "
+                     + ", ".join(style_codes))
+    return (
+        "AUTHORITATIVE TAG DATA — decoded directly from the item's barcode/tag, so "
+        "the UPC below is ground truth and beats anything you think you see in the photo:\n"
+        + "\n".join(lines) + "\n"
+        "Search the UPC digits FIRST (try them as-is, without a leading zero, and "
+        "as a 12-digit UPC-A) to pull up the exact product. Only conclude the item "
+        "is unconfirmed if these searches genuinely fail.\n\n"
+    )
+
+
+def identify_item(image_paths: list[str], scan_paths: list[str] | None = None) -> dict:
     image_parts = [
         types.Part.from_bytes(data=Path(p).read_bytes(), mime_type="image/jpeg")
         for p in image_paths
     ]
 
+    # Decode the tag barcode / OCR the tag across ALL photos (barcode reading is
+    # free and local), even though only these first few images go to the model.
+    scan_paths = scan_paths or image_paths
+    fallback_ocr = image_paths[1] if len(image_paths) >= 2 else (image_paths[0] if image_paths else None)
+    upcs, style_codes = _tag_signals(scan_paths, fallback_ocr)
+    if upcs:
+        print(f"Tag barcode decoded UPC(s): {', '.join(upcs)}")
+    research_prompt = _tag_data_block(upcs, style_codes) + RESEARCH_PROMPT
+
     # Stage 1 — free-form grounded research (think + search the web/eBay).
-    research = generate_with_retry(
-        client,
-        model=GEMINI_MODEL,
-        contents=[*image_parts, types.Part.from_text(text=RESEARCH_PROMPT)],
-        config=types.GenerateContentConfig(
-            system_instruction=RESEARCH_SYSTEM,
-            temperature=0,
-            # flash is a thinking model with dynamic thinking on by default, and
-            # those tokens count against this budget — give the findings report
-            # enough headroom that thinking can't truncate it.
-            max_output_tokens=8000,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-        ),
-    )
-    report = (research.text or "").strip()
+    # The grounded call intermittently returns an empty response (finish_reason
+    # STOP, zero output tokens, zero searches) — a transient flake, not a token
+    # limit. Left unhandled it silently yields no findings, and the format stage
+    # then hallucinates a generic popular product from the photos (the recurring
+    # "Coach Signature PVC Zip Tote" every time). So retry on an empty report.
+    report = ""
+    research = None
+    for attempt in range(1, RESEARCH_ATTEMPTS + 1):
+        research = generate_with_retry(
+            client,
+            model=GEMINI_MODEL,
+            contents=[*image_parts, types.Part.from_text(text=research_prompt)],
+            config=types.GenerateContentConfig(
+                system_instruction=RESEARCH_SYSTEM,
+                temperature=0,
+                # flash is a thinking model with dynamic thinking on by default, and
+                # those tokens count against this budget — give the findings report
+                # enough headroom that thinking can't truncate it.
+                max_output_tokens=8000,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+            ),
+        )
+        report = (research.text or "").strip()
+        if report:
+            break
+        fr = research.candidates[0].finish_reason if research.candidates else None
+        print(f"Research returned empty text (finish_reason={fr}); "
+              f"retry {attempt}/{RESEARCH_ATTEMPTS}")
+
     queries = []
-    if research.candidates:
+    if research and research.candidates:
         gm = getattr(research.candidates[0], "grounding_metadata", None)
         queries = list(getattr(gm, "web_search_queries", None) or [])
     if queries:
         print(f"Research ran {len(queries)} search(es): {', '.join(queries[:6])}"
               + (" ..." if len(queries) > 6 else ""))
     if not report:
-        report = "(No research text was returned; identify from the photos alone.)"
+        # Still empty after retries. Do NOT invite the model to guess from the
+        # photos — hand it the decoded tag data (if any) and an explicit
+        # "unconfirmed" so it records the UPC and returns nulls, not a fake match.
+        known = []
+        if upcs:
+            known.append("UPC " + ", ".join(upcs))
+        if style_codes:
+            known.append("style code(s) " + ", ".join(style_codes))
+        detail = ("Decoded tag data: " + "; ".join(known) + ". ") if known else ""
+        report = (f"(No research findings could be produced. {detail}"
+                  "The item is UNCONFIRMED — do not guess a specific product.)")
 
     # Stage 2 — structure the findings into our schema on the fast model (no tools,
     # no photos: everything visual was already captured into the report in stage 1,
@@ -261,11 +374,19 @@ def identify_item(image_paths: list[str]) -> dict:
     except (json.JSONDecodeError, ValueError):
         raise ValueError(raw_text)
 
+    # The decoded barcode is exact — trust it over whatever digits the model read.
+    if upcs:
+        result["upc"] = upcs[0]
+
     # Safety net: downstream pricing requires a search_query.
     if not result.get("search_query"):
         bits = [result.get("brand"), result.get("product_name") or result.get("item_type"),
                 result.get("color")]
         result["search_query"] = " ".join(b for b in bits if b).strip()
+    # Last resort (unconfirmed item): search the exact UPC so pricing still has
+    # something concrete to look up rather than an empty query.
+    if not result.get("search_query") and result.get("upc"):
+        result["search_query"] = result["upc"]
     return result
 
 
