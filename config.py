@@ -31,6 +31,14 @@ EBAY_RETURN_POLICY_ID = os.getenv("EBAY_RETURN_POLICY_ID")
 
 EBAY_MARKETPLACE_ID = "EBAY_US"
 EBAY_CURRENCY = "USD"
+
+# Promoted Listings (ads). The ad rate is a percentage of the final sale price
+# eBay charges only when the item sells via a promoted placement.
+EBAY_PROMOTED_CAMPAIGN_NAME = os.getenv("EBAY_PROMOTED_CAMPAIGN_NAME", "ross-auto-promoted")
+# Ad rate applied automatically when a listing is published (/activate). Every
+# listing is promoted at this floor rate by default; bump an individual one with
+# /promote <id> <pct>. Set to 0 to disable auto-promotion. eBay accepts 2–100%.
+EBAY_DEFAULT_AD_RATE_PCT = float(os.getenv("EBAY_DEFAULT_AD_RATE_PCT", "4"))
 EBAY_MERCHANT_LOCATION_KEY = "ross-resale-warehouse"
 EBAY_SHIP_FROM_ADDRESS = {
     "city": "Doral",

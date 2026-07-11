@@ -16,7 +16,7 @@ from telegram.request import HTTPXRequest
 load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import GEMINI_PHOTO_LIMIT, MAX_CONCURRENT_LISTINGS
+from config import GEMINI_PHOTO_LIMIT, MAX_CONCURRENT_LISTINGS, EBAY_DEFAULT_AD_RATE_PCT
 from db import create_item, delete_item, get_item, list_items, update_field, update_status
 from identify import identify_item
 from receipt import extract_receipt
@@ -30,6 +30,7 @@ from ebay.inventory import (
     publish_offer,
     MissingRequiredAspectsError,
 )
+from ebay.marketing import promote_listing, marketing_status
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 INBOX = Path("data/inbox")
@@ -45,6 +46,8 @@ locks = {}          # user_id -> asyncio.Lock guarding pending[user_id]
 last_item = {}      # user_id -> item_id  (last-touched item, survives past the review window)
 capture_window = {} # user_id -> seconds to batch photos (default DEFAULT_CAPTURE_WINDOW)
 staging = {}        # user_id -> {item_id, folder, paths, chat_id, task} awaiting Start/Wait/Cancel
+awaiting_photos = {}# user_id -> item_id  (photos should attach to this existing item, set by /addphotos)
+appending = {}      # user_id -> {item_id, folder, base, new, chat_id, task} while an append batch is collected
 
 
 def _lock_for(user_id):
@@ -96,6 +99,37 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     data = await f.download_as_bytearray()
 
     async with _lock_for(user_id):
+        target = awaiting_photos.get(user_id)
+        if target is not None:
+            # /addphotos mode — this photo attaches to an existing item rather than
+            # starting a new one. Buffer it and (re)arm the finalize timer that
+            # writes the new photos onto the item and re-syncs the eBay offer.
+            ap = appending.get(user_id)
+            if ap is None or ap["item_id"] != target:
+                existing = get_item(target)
+                if existing is None:
+                    awaiting_photos.pop(user_id, None)
+                    appending.pop(user_id, None)
+                    await _safe_reply(update.message, "That item no longer exists — nothing to add photos to.")
+                    return
+                photos = existing.get("photos") or []
+                folder = Path(photos[0]).parent if photos else (INBOX / target)
+                folder.mkdir(parents=True, exist_ok=True)
+                ap = appending[user_id] = {
+                    "item_id": target, "folder": folder, "base": list(photos),
+                    "new": [], "chat_id": update.effective_chat.id, "task": None,
+                }
+            p = ap["folder"] / f"{ap['folder'].name}_{mid}.jpg"
+            p.write_bytes(data)
+            ap["new"].append((mid, str(p)))
+            if ap["task"] is not None:
+                ap["task"].cancel()
+            ap["task"] = context.application.create_task(
+                _finalize_append(user_id, target, update, context)
+            )
+            count = len(ap["new"])
+            print(f"📷 Append: {count} new photo(s) buffered for item {target[:8]}")
+            return
         st = staging.get(user_id)
         if st is not None:
             # Item is already awaiting confirmation — this photo belongs to it.
@@ -193,6 +227,97 @@ async def _await_more_photos(user_id, item_id, context, delay) -> None:
         st["task"] = None
         count, chat_id = len(st["paths"]), st["chat_id"]
     await _send_confirmation(context, chat_id, item_id, count)
+
+
+async def _finalize_append(user_id, item_id, update, context) -> None:
+    """After photos stop arriving in /addphotos mode, commit the new photos onto
+    the item (existing photos first, new ones appended in send order) and, if the
+    item already has an eBay offer, push the updated photo set to eBay."""
+    window = capture_window.get(user_id, DEFAULT_CAPTURE_WINDOW)
+    await asyncio.sleep(window)
+    async with _lock_for(user_id):
+        ap = appending.get(user_id)
+        if ap is None or ap["item_id"] != item_id:
+            return  # a newer batch or a cancel superseded this one
+        appending.pop(user_id, None)
+        awaiting_photos.pop(user_id, None)
+        capture_window.pop(user_id, None)
+        # Order the newly-added photos by message_id (send order), then append them
+        # after the item's original photos so the gallery cover/tag order is kept.
+        new_sorted = [path for _, path in sorted(ap["new"], key=lambda mp: mp[0])]
+        photos = ap["base"] + new_sorted
+
+    update_field(item_id, "photos", photos)
+    last_item[user_id] = item_id
+    added = len(new_sorted)
+    print(f"📷 Append: committed {added} photo(s) to item {item_id}, {len(photos)} total")
+    await _safe_reply(update.message, f"➕ Added {added} photo(s) to {item_id[:8]} ({len(photos)} total).")
+    await _resync_photos(item_id, update.message)
+
+
+async def _resync_photos(item_id: str, message) -> None:
+    """Push the item's current photo set to eBay. No-op for items that haven't
+    been drafted on eBay yet — the new photos are simply picked up when the draft
+    is first created. For drafted/published items, rebuild the inventory item and
+    re-publish so the change reaches the live listing."""
+    item = get_item(item_id)
+    if item is None:
+        return
+    status = item["status"]
+    if status not in ("ebay_draft", "published"):
+        await _safe_reply(message, "They'll be included when you create the eBay draft (/retry or approve).")
+        return
+
+    await _safe_reply(message, "🔄 Updating the eBay listing with the new photos...")
+    try:
+        result = await asyncio.to_thread(create_draft_offer, item_id)
+    except Exception as e:
+        traceback.print_exc()
+        await _safe_reply(message,
+            f"⚠️ Photos saved, but updating the eBay offer failed: {type(e).__name__}: {str(e)[:250]}\n"
+            "Use /retry to try again."
+        )
+        return
+
+    # create_draft_offer returns fresh sku/offer_id/image_urls; merge so we keep
+    # any listing_id / view_item_url already stored for a published item.
+    merged = {**(item.get("ebay") or {}), **result}
+    update_field(item_id, "ebay", merged)
+
+    if status == "published":
+        offer_id = merged.get("offer_id")
+        try:
+            await asyncio.to_thread(publish_offer, offer_id)
+        except Exception as e:
+            traceback.print_exc()
+            await _safe_reply(message,
+                f"⚠️ Offer updated, but re-publishing the live listing failed: {type(e).__name__}: {str(e)[:250]}\n"
+                "Use /activate to push it live."
+            )
+            return
+        await _safe_reply(message, f"✅ Live listing updated. {merged.get('view_item_url', '')}".strip())
+    else:
+        await _safe_reply(message, "✅ eBay draft updated with the new photos. /activate when ready.")
+
+
+async def addphotos_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Attach more photos to an existing item. Usage: /addphotos <id> then send the
+    photos. Applies to the most recent item when no id is given."""
+    user_id = update.effective_user.id
+    item_id, err = _resolve_item_id(user_id, context.args)
+    if err:
+        await _safe_reply(update.message, f"⚠️ {err}")
+        return
+
+    async with _lock_for(user_id):
+        awaiting_photos[user_id] = item_id
+        appending.pop(user_id, None)  # drop any half-collected batch for a different item
+    last_item[user_id] = item_id
+    window = capture_window.get(user_id, DEFAULT_CAPTURE_WINDOW)
+    await _safe_reply(update.message,
+        f"📎 Send the photos to add to {item_id[:8]} now. "
+        f"I'll attach them once they stop arriving (~{window}s). /cancel to abort."
+    )
 
 
 _pipeline_sem = None
@@ -706,6 +831,47 @@ async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await _safe_reply(update.message, f"🎉 Published! {ebay_data['view_item_url']}")
 
+    # Auto-promote on publish when a default ad rate is configured (0 = off).
+    if EBAY_DEFAULT_AD_RATE_PCT and EBAY_DEFAULT_AD_RATE_PCT > 0:
+        await _promote_item(item_id, EBAY_DEFAULT_AD_RATE_PCT, update.message)
+
+
+async def _promote_item(item_id: str, pct, message) -> None:
+    """Add/adjust the Promoted Listings ad rate for an item's SKU."""
+    item = get_item(item_id)
+    sku = (item.get("ebay") or {}).get("sku") if item else None
+    if not sku:
+        await _safe_reply(message, "No eBay SKU for this item yet — create the draft first.")
+        return
+    try:
+        result = await asyncio.to_thread(promote_listing, sku, pct)
+    except Exception as e:
+        traceback.print_exc()
+        await _safe_reply(message, f"⚠️ Could not set the ad rate: {type(e).__name__}: {str(e)[:250]}")
+        return
+    verb = "Updated" if result["action"] == "updated" else "Set"
+    await _safe_reply(message, f"📣 {verb} ad rate to {result['bid_percentage']}% for {item_id[:8]} (Promoted Listings).")
+
+
+async def promote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Promote a listing (or change its ad rate). Usage: /promote <id> <pct>
+    or /promote <pct> to apply to the most recent item. eBay accepts 2–100%."""
+    user_id = update.effective_user.id
+    args = list(context.args)
+
+    # Trailing arg is the percentage; the rest (if any) identifies the item.
+    if not args:
+        await _safe_reply(update.message, "Usage: /promote <id> <pct>  (e.g. /promote 3f2a 10)")
+        return
+    pct = args[-1]
+    id_args = args[:-1]
+    item_id, err = _resolve_item_id(user_id, id_args)
+    if err:
+        await _safe_reply(update.message, f"⚠️ {err}")
+        return
+    last_item[user_id] = item_id
+    await _promote_item(item_id, pct, update.message)
+
 
 async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -793,6 +959,15 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as e:
             lines.append(f"❌ {policy_type.capitalize()} policy: {e}")
 
+    try:
+        status = await asyncio.to_thread(marketing_status)
+        lines.append(f"✅ Promoted Listings (sell.marketing): {status}")
+    except Exception as e:
+        lines.append(
+            f"❌ Promoted Listings (sell.marketing): {str(e)[:150]}\n"
+            "   → if this is a scope/403 error, re-run `python -m ebay.auth` to re-consent."
+        )
+
     for name in ("CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"):
         lines.append(f"✅ {name}: set" if os.getenv(name) else f"❌ {name}: missing")
 
@@ -805,9 +980,15 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         data = pending.pop(user_id, None)
         if data and data.get("task") is not None:
             data["task"].cancel()
+        ap = appending.pop(user_id, None)
+        if ap and ap.get("task") is not None:
+            ap["task"].cancel()
+        was_appending = awaiting_photos.pop(user_id, None) is not None
 
     if data:
         await _safe_reply(update.message, f"🛑 Cancelled capture ({len(data['files'])} photo(s) discarded).")
+    elif was_appending:
+        await _safe_reply(update.message, "🛑 Cancelled — stopped waiting for photos to add.")
     else:
         await _safe_reply(update.message, "No capture in progress.")
 
@@ -853,8 +1034,10 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("listing", listing_command))
     app.add_handler(CommandHandler("receipt", receipt_command))
+    app.add_handler(CommandHandler("addphotos", addphotos_command))
     app.add_handler(CommandHandler("delete", delete_command))
     app.add_handler(CommandHandler("activate", activate_command))
+    app.add_handler(CommandHandler("promote", promote_command))
     app.add_handler(CommandHandler("retry", retry_command))
     app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
