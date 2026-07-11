@@ -76,6 +76,39 @@ def decode_barcode(image_path: str) -> str | None:
     return None
 
 
+# Symbologies that carry a globally-unique product UPC/EAN (so they identify the
+# product). A Ross tag's CODE128 is the store's own 18-digit price code — not the
+# product — so it's deliberately excluded here.
+_PRODUCT_SYMBOLS = {"EAN13", "EAN8", "UPCA", "UPCE"}
+
+
+def read_product_upcs(image_path: str) -> list[str]:
+    """Decode product UPC/EAN barcodes from a photo, returning the digit strings
+    (deduped, in decode order). Best-effort: [] if none decode or pyzbar/Pillow
+    aren't installed. Excludes the Ross CODE128 store code and empty QR codes so
+    only real product identifiers come back."""
+    if _zbar_decode is None or Image is None:
+        return []
+    try:
+        img = ImageOps.exif_transpose(Image.open(image_path))
+    except Exception:
+        return []
+    found = []
+    for im in (img, ImageOps.grayscale(img),
+               img.resize((img.size[0] * 2, img.size[1] * 2))):
+        try:
+            results = _zbar_decode(im)
+        except Exception:
+            continue
+        for res in results:
+            if res.type not in _PRODUCT_SYMBOLS:
+                continue
+            digits = re.sub(r"\D", "", res.data.decode("utf-8", "ignore"))
+            if len(digits) >= 8 and digits not in found:
+                found.append(digits)
+    return found
+
+
 def parse_barcode(digits: str | None) -> dict:
     """Split a Ross barcode into code + paid price. The 18-digit form is
     <12-digit code><6-digit price in cents>; a bare 12-digit form is code only."""

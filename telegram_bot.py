@@ -543,7 +543,9 @@ def run_pipeline(item_id, paths, notify=lambda _t: None) -> dict:
         notify("🔬 Identifying the item...")
         print(f"🔬 Identifying from {len(id_photos)} of {len(listing_photos)} listing photo(s)")
         t = time.perf_counter()
-        ident = identify_item(id_photos)
+        # Send the first few photos to the model, but scan ALL of them for the tag
+        # barcode (decoding is free and the tag isn't always in the first few).
+        ident = identify_item(id_photos, scan_paths=listing_photos)
         id_secs = time.perf_counter() - t
         update_field(item_id, "identification", ident)
         update_status(item_id, "identified")
@@ -892,7 +894,9 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         if status == "captured":
             listing_photos = await asyncio.to_thread(_split_receipt, item_id, item["photos"])
-            ident = await asyncio.to_thread(identify_item, listing_photos[:GEMINI_PHOTO_LIMIT])
+            ident = await asyncio.to_thread(
+                identify_item, listing_photos[:GEMINI_PHOTO_LIMIT], listing_photos
+            )
             update_field(item_id, "identification", ident)
             update_status(item_id, "identified")
             await _safe_reply(update.message, f"✓ Identified: {ident.get('brand')} {ident.get('product_name') or ident.get('item_type')}")
