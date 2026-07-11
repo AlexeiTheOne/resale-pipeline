@@ -103,10 +103,13 @@ def get_pricing(search_query: str, research: dict | None = None) -> dict:
     # scrape that can take a minute or more; running them in parallel rather than
     # back-to-back roughly halves the pricing wait.
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        sold_future = pool.submit(_call, SOLD_URL, {"keyword": search_query, "count": comps_count})
+        sold_future = pool.submit(
+            _call, SOLD_URL,
+            {"keyword": search_query, "count": comps_count, "itemCondition": "new"},
+        )
         active_future = pool.submit(
             _call, ACTIVE_URL,
-            {"searchQueries": [search_query], "maxProductsPerSearch": active_count},
+            {"searchQueries": [search_query], "maxProductsPerSearch": active_count, "condition": ["new"]},
         )
         raw_sold = sold_future.result()
         raw_active = active_future.result()

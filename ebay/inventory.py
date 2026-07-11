@@ -15,8 +15,10 @@ from dotenv import load_dotenv
 
 from config import (
     EBAY_CURRENCY,
+    EBAY_FULFILLMENT_POLICY_ID,
     EBAY_MARKETPLACE_ID,
     EBAY_MERCHANT_LOCATION_KEY,
+    EBAY_RETURN_POLICY_ID,
     EBAY_SHIP_FROM_ADDRESS,
 )
 from db import get_item, update_field
@@ -514,23 +516,24 @@ def create_draft_offer(item_id: str) -> dict:
     aspects = _resolve_required_aspects(category_id, aspects, item_type_hint)
     aspects = _enforce_single_cardinality(category_id, aspects)
 
-    # Reorder so the tag close-up (2nd photo) becomes the last listing image.
-    # For New-with-tags items, append the official brand product photo as a
-    # secondary image (after the seller's real photos), re-hosted via Cloudinary.
+    # Reorder so the tag close-up (2nd photo) becomes the last listing image, then
+    # append the official brand/retailer product photo (if the identify step found
+    # one) as a secondary image after the seller's real photos, re-hosted via
+    # Cloudinary. Kept secondary — never the gallery cover — so the buyer always
+    # leads with photos of the actual item, regardless of condition.
     image_paths = _reorder_for_listing(list(photos))
-    if str(listing.get("condition_id")) == "1000":
-        stock_url = (item.get("identification") or {}).get("product_image_url")
-        stock_path = _download_brand_image(stock_url, item_id)
-        if stock_path:
-            image_paths.append(stock_path)
-            print("🖼️ Draft: added official brand product photo as a secondary image (NWT)")
+    stock_url = (item.get("identification") or {}).get("product_image_url")
+    stock_path = _download_brand_image(stock_url, item_id)
+    if stock_path:
+        image_paths.append(stock_path)
+        print("🖼️ Draft: added official brand product photo as a secondary image")
 
     image_urls = upload_photos(image_paths)
     print(f"📤 Draft: {len(image_urls)} Cloudinary URL(s) returned from upload_photos")
 
     _ensure_location()
-    fulfillment_policy_id = get_policy_id("fulfillment")
-    return_policy_id = get_policy_id("return")
+    fulfillment_policy_id = EBAY_FULFILLMENT_POLICY_ID or get_policy_id("fulfillment")
+    return_policy_id = EBAY_RETURN_POLICY_ID or get_policy_id("return")
 
     sku = item_id
     condition = CONDITION_MAP.get(str(listing.get("condition_id")), "USED_GOOD")

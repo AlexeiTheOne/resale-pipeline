@@ -1,4 +1,4 @@
-import os, sys, uuid, asyncio, shutil, time, traceback
+import os, sys, re, uuid, asyncio, shutil, time, traceback
 from pathlib import Path
 from dotenv import load_dotenv
 import httpx
@@ -16,7 +16,7 @@ from telegram.request import HTTPXRequest
 load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import GEMINI_PHOTO_LIMIT
+from config import GEMINI_PHOTO_LIMIT, MAX_CONCURRENT_LISTINGS
 from db import create_item, delete_item, get_item, list_items, update_field, update_status
 from identify import identify_item
 from receipt import extract_receipt
@@ -85,6 +85,12 @@ def _resolve_item_id(user_id: int, args: list[str]) -> tuple[str | None, str | N
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+    # message_id increases in the order you send messages. The downloads below are
+    # awaited before we take the lock, and with concurrent update processing on,
+    # these handlers run in parallel — so lock/append order reflects which download
+    # finished first, NOT your send order. We tag each photo with its message_id
+    # and sort by it so photo position (cover / tag / receipt) is deterministic.
+    mid = update.message.message_id
     photo = update.message.photo[-1]
     f = await context.bot.get_file(photo.file_id)
     data = await f.download_as_bytearray()
@@ -93,11 +99,13 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         st = staging.get(user_id)
         if st is not None:
             # Item is already awaiting confirmation — this photo belongs to it.
-            # Append it, then re-arm the confirmation once photos stop arriving.
-            idx = len(st["paths"])
-            p = st["folder"] / f"{st['folder'].name}_{idx}.jpg"
+            # Append it (kept sorted by message_id), then re-arm the confirmation
+            # once photos stop arriving.
+            p = st["folder"] / f"{st['folder'].name}_{mid}.jpg"
             p.write_bytes(data)
-            st["paths"].append(str(p))
+            st["photos"].append((mid, str(p)))
+            st["photos"].sort(key=lambda mp: mp[0])
+            st["paths"] = [path for _, path in st["photos"]]
             update_field(st["item_id"], "photos", st["paths"])
             if st["task"] is not None:
                 st["task"].cancel()
@@ -108,7 +116,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         else:
             if user_id not in pending:
                 pending[user_id] = {"files": [], "task": None}
-            pending[user_id]["files"].append(data)
+            pending[user_id]["files"].append((mid, data))
             count = len(pending[user_id]["files"])
 
             if pending[user_id]["task"] is not None:
@@ -126,6 +134,8 @@ async def finalize_capture(user_id, update, context):
     async with _lock_for(user_id):
         files = pending.pop(user_id)["files"]
         capture_window.pop(user_id, None)  # reset to default for the next batch
+    # Order by message_id (your send order), not the order downloads finished.
+    files.sort(key=lambda md: md[0])
     print(f"📷 Capture: {len(files)} photo(s) collected from buffer (window {window}s)")
 
     staging_id = str(uuid.uuid4())
@@ -133,10 +143,12 @@ async def finalize_capture(user_id, update, context):
     folder.mkdir(parents=True, exist_ok=True)
 
     paths = []
-    for i, b in enumerate(files):
-        p = folder / f"{staging_id}_{i}.jpg"
+    photos = []  # (message_id, path) kept so later-added photos stay ordered
+    for mid, b in files:
+        p = folder / f"{staging_id}_{mid}.jpg"
         p.write_bytes(b)
         paths.append(str(p))
+        photos.append((mid, str(p)))
     print(f"📷 Capture: {len(paths)} photo(s) written to disk in {folder}")
 
     item_id = create_item(paths)
@@ -146,7 +158,7 @@ async def finalize_capture(user_id, update, context):
     chat_id = update.effective_chat.id
     async with _lock_for(user_id):
         staging[user_id] = {
-            "item_id": item_id, "folder": folder, "paths": paths,
+            "item_id": item_id, "folder": folder, "paths": paths, "photos": photos,
             "chat_id": chat_id, "task": None,
         }
     await _send_confirmation(context, chat_id, item_id, len(paths))
@@ -183,26 +195,54 @@ async def _await_more_photos(user_id, item_id, context, delay) -> None:
     await _send_confirmation(context, chat_id, item_id, count)
 
 
+_pipeline_sem = None
+
+
+def _pipeline_semaphore() -> asyncio.Semaphore:
+    """Cap how many item pipelines run concurrently (MAX_CONCURRENT_LISTINGS).
+    Created lazily so it binds to the running event loop; extra Starts queue on
+    it rather than firing a swarm of parallel Gemini/Apify calls."""
+    global _pipeline_sem
+    if _pipeline_sem is None:
+        _pipeline_sem = asyncio.Semaphore(MAX_CONCURRENT_LISTINGS)
+    return _pipeline_sem
+
+
+def _review_markup(item_id: str) -> InlineKeyboardMarkup:
+    """Approve/Reject buttons carrying the item id, so a finished draft can be
+    acted on unambiguously even when several are pending at once."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"review:approve:{item_id}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"review:reject:{item_id}"),
+    ]])
+
+
 async def _run_and_review(user_id, item_id, paths, message, context) -> None:
     # run_pipeline runs in a worker thread; this schedules each progress ping back
     # onto the bot's event loop so the user sees which step is running (some steps
-    # — identification, Apify pricing — take a minute or more).
+    # — identification, Apify pricing — take a minute or more). Guarded by the
+    # concurrency semaphore so multiple items can be in flight but not unbounded.
     loop = asyncio.get_running_loop()
 
     def notify(text: str) -> None:
         asyncio.run_coroutine_threadsafe(_safe_reply(message, text), loop)
 
     try:
-        result = await asyncio.to_thread(run_pipeline, item_id, paths, notify)
+        async with _pipeline_semaphore():
+            result = await asyncio.to_thread(run_pipeline, item_id, paths, notify)
     except Exception as e:
         error_details = traceback.format_exc()
         print("PIPELINE ERROR:", error_details)
         await _safe_reply(message, f"⚠️ Pipeline error at step: {type(e).__name__}: {str(e)[:200]}")
         return
 
+    # review[user_id] tracks the most-recent draft, which is what a typed
+    # correction / approve applies to. The per-draft buttons below carry the
+    # item id explicitly, so approving is unambiguous regardless of order.
     review[user_id] = item_id
     last_item[user_id] = item_id
-    await _safe_reply(message, format_draft(result), parse_mode=None)
+    await _safe_reply(message, format_draft(result), parse_mode=None,
+                      reply_markup=_review_markup(item_id))
 
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -224,7 +264,11 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         paths = st["paths"]
         await query.edit_message_text(f"Starting. {len(paths)} photo(s). Processing...")
-        await _run_and_review(user_id, item_id, paths, query.message, context)
+        # Launch as a background task so this handler returns immediately and
+        # another item can be started while this one is still processing.
+        context.application.create_task(
+            _run_and_review(user_id, item_id, paths, query.message, context)
+        )
 
     elif action == "wait":
         async with _lock_for(user_id):
@@ -253,6 +297,84 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text("Cancelled. Photos discarded.")
 
 
+async def _approve_item(item_id: str, message, context) -> None:
+    """Mark an item approved and push it to eBay as a draft offer. Shared by the
+    typed 'approve' and the per-draft Approve button. Reports progress/errors to
+    `message`; leaves the item at 'approved' (retryable) on any eBay failure."""
+    update_status(item_id, "approved")
+    await _safe_reply(message, "✅ Approved. Creating eBay draft...")
+
+    try:
+        ebay_result = await asyncio.to_thread(create_draft_offer, item_id)
+    except MissingRequiredAspectsError as e:
+        lines = [
+            f"⚠️ Can't create the draft yet — eBay category {e.category_id} requires these "
+            "item specifics and I couldn't safely infer a value:"
+        ]
+        for m in e.missing:
+            opts = f" (allowed: {', '.join(m['allowed_values'])})" if m["allowed_values"] else ""
+            lines.append(f"  • {m['name']}{opts}")
+        lines.append("The item is saved as 'approved' — fix the listing and retry manually.")
+        await _safe_reply(message, "\n".join(lines))
+        return
+    except Exception as e:
+        traceback.print_exc()
+        await _safe_reply(message,
+            f"⚠️ Approved, but eBay draft creation failed: {type(e).__name__}: {str(e)[:300]}\n"
+            "The item is saved as 'approved' — fix the issue and retry manually."
+        )
+        return
+
+    update_field(item_id, "ebay", ebay_result)
+    update_status(item_id, "ebay_draft")
+
+    msg = f"📝 Draft created on eBay (SKU {ebay_result['sku']}, offer {ebay_result['offer_id']})."
+    msg += "\nUse /listing to review it and /activate to publish it when ready — it may not show up in Seller Hub's Drafts UI (API-created offers often don't)."
+    if ebay_result.get("reselected_from"):
+        def _label(name, cid):
+            return f"{name} ({cid})" if name else str(cid)
+        new_label = _label(ebay_result.get("category_name"), ebay_result["category_id"])
+        old_label = _label(ebay_result.get("reselected_from_name"), ebay_result["reselected_from"])
+        msg += f"\n⚠️ Listed under category {new_label} (auto-corrected from {old_label})"
+    await _safe_reply(message, msg)
+
+
+async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the per-draft Approve/Reject buttons. The item id rides in the
+    callback data, so this works no matter how many drafts are pending."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    try:
+        _, action, item_id = query.data.split(":", 2)
+    except ValueError:
+        return
+
+    item = get_item(item_id)
+    if item is None:
+        await query.edit_message_text("This item no longer exists.")
+        return
+    if item["status"] not in ("review", "drafted"):
+        await query.edit_message_text(f"Item {item_id[:8]} is '{item['status']}' — nothing to review.")
+        return
+
+    # Drop the buttons so the draft can't be double-actioned.
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if review.get(user_id) == item_id:
+        review.pop(user_id, None)
+    last_item[user_id] = item_id
+
+    if action == "approve":
+        await _approve_item(item_id, query.message, context)
+    elif action == "reject":
+        update_status(item_id, "rejected")
+        await _safe_reply(query.message, f"❌ Rejected {item_id[:8]}.")
+
+
 def _split_receipt(item_id, paths, notify=lambda _t: None) -> list[str]:
     """Peel the last photo — always the Ross receipt — off the listing photos,
     OCR it for the paid price + 12-digit code, and persist both. The receipt is
@@ -268,11 +390,20 @@ def _split_receipt(item_id, paths, notify=lambda _t: None) -> list[str]:
     data = extract_receipt(paths[-1])
     update_field(item_id, "photos", listing_photos)
     update_field(item_id, "receipt", data)
-    if data.get("error"):
-        notify(f"🧾 Receipt saved, but couldn't be read: {data['error']}")
-    else:
+    if data.get("code") and data.get("reduced_price") is not None:
         orig = f" (orig ${data['original_price']})" if data.get("original_price") else ""
-        notify(f"🧾 Receipt: paid ${data.get('reduced_price')}{orig} · code {data.get('code')}")
+        notify(f"🧾 Receipt: paid ${data['reduced_price']}{orig} · code {data['code']}")
+    else:
+        # No barcode and OCR couldn't recover both fields — tell the user exactly
+        # what's missing and how to fill it in manually for this item.
+        got = []
+        if data.get("reduced_price") is not None:
+            got.append(f"paid ${data['reduced_price']}")
+        if data.get("code"):
+            got.append(f"code {data['code']}")
+        detail = ": got " + ", ".join(got) if got else (f" ({data['error']})" if data.get("error") else "")
+        notify(f"🧾 Couldn't fully read the tag{detail}. "
+               f"Add it manually: /receipt {item_id[:8]} <price> <code>")
     return listing_photos
 
 
@@ -353,7 +484,7 @@ def format_draft(result) -> str:
         "DESCRIPTION:",
         short_desc,
         "",
-        "Reply: 'approve', 'reject', or type a correction (e.g. 'color is yellow not orange')",
+        "Tap Approve / Reject below, or type a correction (e.g. 'color is yellow not orange').",
     ]
 
     return "\n".join(lines)
@@ -386,46 +517,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _safe_reply(update.message, "Send me photos of an item to start.")
         return
 
+    # Typed approve/reject/correction target the most-recent draft (the buttons
+    # on each draft handle any-order approval unambiguously).
     item_id = review[user_id]
 
     if low in ("approve", "✅", "yes", "ok"):
-        update_status(item_id, "approved")
         review.pop(user_id, None)
-        await _safe_reply(update.message, "✅ Approved. Creating eBay draft...")
-
-        try:
-            ebay_result = await asyncio.to_thread(create_draft_offer, item_id)
-        except MissingRequiredAspectsError as e:
-            lines = [
-                f"⚠️ Can't create the draft yet — eBay category {e.category_id} requires these "
-                "item specifics and I couldn't safely infer a value:"
-            ]
-            for m in e.missing:
-                opts = f" (allowed: {', '.join(m['allowed_values'])})" if m["allowed_values"] else ""
-                lines.append(f"  • {m['name']}{opts}")
-            lines.append("The item is saved as 'approved' — fix the listing and retry manually.")
-            await _safe_reply(update.message, "\n".join(lines))
-            return
-        except Exception as e:
-            traceback.print_exc()
-            await _safe_reply(update.message, 
-                f"⚠️ Approved, but eBay draft creation failed: {type(e).__name__}: {str(e)[:300]}\n"
-                "The item is saved as 'approved' — fix the issue and retry manually."
-            )
-            return
-
-        update_field(item_id, "ebay", ebay_result)
-        update_status(item_id, "ebay_draft")
-
-        msg = f"📝 Draft created on eBay (SKU {ebay_result['sku']}, offer {ebay_result['offer_id']})."
-        msg += "\nUse /listing to review it and /activate to publish it when ready — it may not show up in Seller Hub's Drafts UI (API-created offers often don't)."
-        if ebay_result.get("reselected_from"):
-            def _label(name, cid):
-                return f"{name} ({cid})" if name else str(cid)
-            new_label = _label(ebay_result.get("category_name"), ebay_result["category_id"])
-            old_label = _label(ebay_result.get("reselected_from_name"), ebay_result["reselected_from"])
-            msg += f"\n⚠️ Listed under category {new_label} (auto-corrected from {old_label})"
-        await _safe_reply(update.message, msg)
+        await _approve_item(item_id, update.message, context)
         return
 
     if low in ("reject", "❌", "no"):
@@ -449,7 +547,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "pricing": item["pricing"],
         "listing": revised,
     }
-    await _safe_reply(update.message, format_draft(result))
+    await _safe_reply(update.message, format_draft(result), reply_markup=_review_markup(item_id))
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -484,7 +582,55 @@ async def listing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "pricing": item.get("pricing") or {},
         "listing": item["listing"],
     }
-    await _safe_reply(update.message, format_draft(result))
+    # Offer Approve/Reject only while the item is still awaiting review.
+    markup = _review_markup(item_id) if item["status"] in ("review", "drafted") else None
+    if markup is not None:
+        review[user_id] = item_id
+    await _safe_reply(update.message, format_draft(result), reply_markup=markup)
+
+
+async def receipt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually set the Ross cost (paid price) + 12-digit code on an item — for
+    when the tag's barcode couldn't be decoded. Does not affect the eBay price.
+
+    Usage: /receipt <price> <code>            (applies to the most recent item)
+           /receipt <item_id> <price> <code>  (explicit item)"""
+    user_id = update.effective_user.id
+    args = context.args
+    if len(args) < 2:
+        await _safe_reply(update.message,
+            "Usage: /receipt [item_id] <price> <code>\n"
+            "e.g. /receipt 9.99 400286461425")
+        return
+
+    *id_args, price_str, code_str = args
+    item_id, err = _resolve_item_id(user_id, id_args)
+    if err:
+        await _safe_reply(update.message, f"⚠️ {err}")
+        return
+
+    try:
+        price = float(price_str.replace("$", "").replace(",", ""))
+    except ValueError:
+        await _safe_reply(update.message, f"⚠️ '{price_str}' isn't a valid price.")
+        return
+
+    code = re.sub(r"\D", "", code_str)
+    if len(code) != 12:
+        await _safe_reply(update.message,
+            f"⚠️ The ID must be 12 digits (got {len(code)} from '{code_str}').")
+        return
+
+    item = get_item(item_id)
+    if item is None:
+        await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
+        return
+
+    receipt = dict(item.get("receipt") or {})
+    receipt.update({"reduced_price": price, "code": code, "source": "manual"})
+    update_field(item_id, "receipt", receipt)
+    last_item[user_id] = item_id
+    await _safe_reply(update.message, f"🧾 Saved for {item_id[:8]}: paid ${price:.2f} · code {code}")
 
 
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -605,7 +751,7 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "identification": item["identification"],
                 "pricing": item["pricing"],
                 "listing": draft,
-            }))
+            }), reply_markup=_review_markup(item_id))
 
         elif status == "approved":
             result = await asyncio.to_thread(create_draft_offer, item_id)
@@ -695,13 +841,18 @@ def main() -> None:
         .token(TOKEN)
         .request(_ipv4_request(256))
         .get_updates_request(_ipv4_request(1))
+        # Process updates concurrently so a running pipeline / eBay call doesn't
+        # stall other actions (e.g. reviewing item B while item A is pricing).
+        .concurrent_updates(True)
         .build()
     )
     app.add_error_handler(error_handler)
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm:"))
+    app.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("listing", listing_command))
+    app.add_handler(CommandHandler("receipt", receipt_command))
     app.add_handler(CommandHandler("delete", delete_command))
     app.add_handler(CommandHandler("activate", activate_command))
     app.add_handler(CommandHandler("retry", retry_command))

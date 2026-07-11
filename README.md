@@ -27,7 +27,8 @@ photos -> identify -> price -> draft -> [you review] -> eBay draft -> publish
      `400286461425000999` → code `400286461425`, paid `$9.99`. OCR reads the
      printed "Original $XX.XX" line (not in the barcode) and backs up the barcode
      if it can't be decoded. The result is stored as cost data and **never
-     posted to eBay**.
+     posted to eBay**. If neither the barcode nor OCR yields the price and code,
+     the bot asks you to set them with `/receipt <price> <code>`.
 
 2. **Identify** (`identify.py`). Two Gemini calls:
    - *Research* (model `gemini-2.5-pro`, with Google Search) reads the tag —
@@ -63,7 +64,10 @@ photos -> identify -> price -> draft -> [you review] -> eBay draft -> publish
 6. **Create eBay draft** (`ebay/inventory.py`). On approval, the bot validates
    the category, fills any required item specifics, uploads the photos to
    Cloudinary (eBay needs hosted image URLs), and creates an unpublished offer.
-   Status becomes `ebay_draft`. Nothing is live yet.
+   If the identify step found an official brand/retailer product image, it is
+   re-hosted and appended as a secondary image (after your real photos, so it's
+   never the gallery cover) for items of any condition. Status becomes
+   `ebay_draft`. Nothing is live yet.
 
 7. **Publish.** `/activate` publishes the offer; the item goes live and status
    becomes `published`. The bot replies with the listing URL.
@@ -159,6 +163,7 @@ Photos are stored on disk under `data/inbox/`.
 | `wait`           | Extend the photo-batching window for a large batch    |
 | `/status`        | List all items and their pipeline status              |
 | `/listing [id]`  | Show the current draft for an item                    |
+| `/receipt [id] <price> <code>` | Manually set the Ross cost + 12-digit code (when the tag barcode couldn't be read) |
 | `/activate [id]` | Publish an eBay draft, making it a live listing       |
 | `/retry [id]`    | Re-run the failed pipeline step for an item           |
 | `/delete [id]`   | Delete an item, its photos, and its eBay offer        |

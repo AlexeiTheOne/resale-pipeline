@@ -5,19 +5,29 @@ ACTIVE_COUNT = 5
 DEBUG_MODE = True
 UNDERCUT_PCT = 0.15
 
-# Pro handles the grounded research step (identify stage 1), where reasoning over
-# web/eBay results pays off.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+# The grounded research step (identify stage 1). We default to flash rather than
+# pro: pro reasons deeper over search results but is far more prone to 503
+# (overloaded) errors, so flash trades a little identification depth on hard
+# items for much better reliability. Override with GEMINI_MODEL=gemini-2.5-pro
+# in .env if you want pro back for research.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Faster, cheaper model for steps that only structure data we already have: the
-# identify format stage and the draft writer. These don't need pro's grounded
-# reasoning, and flash avoids pro's slow, thinking-heavy responses.
+# identify format stage and the draft writer.
 GEMINI_FAST_MODEL = os.getenv("GEMINI_FAST_MODEL", "gemini-2.5-flash")
 
 # How many of the uploaded photos to send to Gemini for identification. All
 # photos are still kept for the eBay listing; only the first N (the overview +
 # tag close-up the user sends first) go through the paid API to save tokens.
 GEMINI_PHOTO_LIMIT = int(os.getenv("GEMINI_PHOTO_LIMIT", "3"))
+
+# How many listings may run through the identify→price→draft pipeline at once.
+# Each item makes several Gemini + Apify calls; too many in parallel raises the
+# odds of 429/503 rate-limit and overload errors, so keep this modest.
+MAX_CONCURRENT_LISTINGS = int(os.getenv("MAX_CONCURRENT_LISTINGS", "3"))
+
+EBAY_FULFILLMENT_POLICY_ID = os.getenv("EBAY_FULFILLMENT_POLICY_ID")
+EBAY_RETURN_POLICY_ID = os.getenv("EBAY_RETURN_POLICY_ID")
 
 EBAY_MARKETPLACE_ID = "EBAY_US"
 EBAY_CURRENCY = "USD"

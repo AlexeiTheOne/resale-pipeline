@@ -221,7 +221,10 @@ def identify_item(image_paths: list[str]) -> dict:
         config=types.GenerateContentConfig(
             system_instruction=RESEARCH_SYSTEM,
             temperature=0,
-            max_output_tokens=4000,
+            # flash is a thinking model with dynamic thinking on by default, and
+            # those tokens count against this budget — give the findings report
+            # enough headroom that thinking can't truncate it.
+            max_output_tokens=8000,
             tools=[types.Tool(google_search=types.GoogleSearch())],
         ),
     )
