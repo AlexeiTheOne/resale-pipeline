@@ -21,6 +21,10 @@ TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 SCOPES = [
     "https://api.ebay.com/oauth/api_scope/sell.inventory",
     "https://api.ebay.com/oauth/api_scope/sell.account",
+    # Promoted Listings (ebay/marketing.py). Adding a scope does NOT extend an
+    # already-issued token — after this change the seller must re-run
+    # `python -m ebay.auth` and re-consent, or Marketing API calls will 403.
+    "https://api.ebay.com/oauth/api_scope/sell.marketing",
 ]
 
 DB_PATH = "data/ross.db"
