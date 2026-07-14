@@ -288,6 +288,51 @@ def revise_draft(current_draft: dict, correction: str) -> dict:
         raise ValueError(raw)
 
 
+def revise_identification(current: dict, correction: str) -> dict:
+    """Apply a user's free-text correction to an identification dict (e.g. 'brand
+    is Tommy Jeans, color navy'). Returns the FULL updated identification. Keeps
+    search_query consistent with any brand/product/color change so the follow-on
+    pricing step searches the corrected item."""
+    system = (
+        "You correct a product identification JSON based on a user's note. "
+        "Return the FULL updated object as valid JSON only, no markdown. Apply the "
+        "correction, keep every other field the same, and use null for unknowns. "
+        "If the correction changes the brand, product_name, color, or item_type, "
+        "update search_query to match (search_query includes the brand)."
+    )
+    user_message = (
+        "CURRENT IDENTIFICATION:\n" + json.dumps(current, indent=2) +
+        "\n\nCORRECTION FROM THE USER:\n" + correction +
+        "\n\nReturn the full updated identification as JSON with the same fields."
+    )
+    response = generate_with_retry(
+        client,
+        model=MODEL,
+        contents=user_message,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            temperature=0,
+            max_output_tokens=8000,
+            thinking_config=types.ThinkingConfig(thinking_budget=1024),
+        ),
+    )
+    raw = response_text(response, "identification revision")
+    if "```" in raw:
+        for part in raw.split("```"):
+            cleaned = part.lstrip("json").strip()
+            if cleaned.startswith("{"):
+                raw = cleaned
+                break
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
+    if start != -1 and end > start:
+        raw = raw[start:end]
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raise ValueError(raw)
+
+
 if __name__ == "__main__":
     test_identification = {
         "brand": "The North Face",
