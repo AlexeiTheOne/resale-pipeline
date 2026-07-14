@@ -26,7 +26,15 @@ _MIGRATIONS = {
 
 def _conn():
     Path("data").mkdir(exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH)
+    # WAL lets readers and a writer coexist; busy_timeout makes a contended write
+    # wait for the lock instead of raising "database is locked" immediately. Both
+    # matter because concurrent_updates + to_thread workers hit this file from
+    # several threads at once. (WAL is a persistent DB property; busy_timeout is
+    # per-connection, so it's set on every connect.)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
+    return con
 
 
 def _now():

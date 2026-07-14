@@ -116,8 +116,11 @@ def get_pricing(search_query: str, research: dict | None = None) -> dict:
 
     # --- SOLD comps ---
     sold_comps = []
+    sold_parseable = 0  # rows that yielded a price at all (before the range filter)
     for item in raw_sold:
         price = _to_float(item.get("totalPrice")) or _to_float(item.get("soldPrice"))
+        if price is not None:
+            sold_parseable += 1
         if price is not None and 5 <= price <= 500:
             sold_comps.append({
                 "price": round(price, 2),
@@ -131,8 +134,11 @@ def get_pricing(search_query: str, research: dict | None = None) -> dict:
 
     # --- ACTIVE listings ---
     active_listings = []
+    active_parseable = 0
     for item in raw_active:
         price = _to_float(item.get("price")) or _to_float(item.get("priceString"))
+        if price is not None:
+            active_parseable += 1
         if price is not None and 5 <= price <= 500:
             imgs = item.get("images") or []
             active_listings.append({
@@ -145,6 +151,23 @@ def get_pricing(search_query: str, research: dict | None = None) -> dict:
     active_listings = _brand_relevant(active_listings)[:active_count]
     active_prices = [a["price"] for a in active_listings]
     active_floor = min(active_prices) if active_prices else None
+
+    # Canary for scraper schema drift: the Apify actors are third-party and mapped
+    # "by ACTUAL behavior" (see the module header) — if an actor changes its output
+    # field names, every row parses to no price, the comp lists go empty, and we
+    # silently fall back to the research estimate. Rows returned but none parseable
+    # is the tell. Surfaced at the price gate rather than swallowed. (Zero rows is
+    # NOT flagged — that's often just a genuinely rare item with no comps.)
+    comp_warnings = []
+    if len(raw_sold) >= 3 and sold_parseable == 0:
+        comp_warnings.append(
+            f"sold-comp scraper returned {len(raw_sold)} rows but none had a parseable "
+            "price — the Apify actor's output schema may have changed")
+    if len(raw_active) >= 3 and active_parseable == 0:
+        comp_warnings.append(
+            f"active-listing scraper returned {len(raw_active)} rows but none had a "
+            "parseable price — the Apify actor's output schema may have changed")
+    comp_warning = "; ".join(comp_warnings) or None
 
     # Price evidence the identify step gathered, surfaced for the draft step.
     research_resale = _research_resale(research)
@@ -192,6 +215,7 @@ def get_pricing(search_query: str, research: dict | None = None) -> dict:
             "reference": reference,
             "stock_image_url": stock_image_url,
             "price_source_url": price_source_url,
+            "comp_warning": comp_warning,
             **research_fields,
         }
         if research_floor:
@@ -234,6 +258,7 @@ def get_pricing(search_query: str, research: dict | None = None) -> dict:
         "reference": reference,
         "stock_image_url": stock_image_url,
         "price_source_url": price_source_url,
+        "comp_warning": comp_warning,
         "confidence": confidence,
         **research_fields,
     }

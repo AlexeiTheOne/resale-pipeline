@@ -32,7 +32,10 @@ DB_PATH = "data/ross.db"
 
 def _conn():
     Path("data").mkdir(exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
+    return con
 
 
 def _create_table() -> None:
