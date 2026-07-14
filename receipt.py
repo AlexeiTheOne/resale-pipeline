@@ -31,9 +31,23 @@ except ImportError:  # deps not installed yet — extract_receipt degrades grace
     ImageOps = None
 
 try:
+    from pyzbar.pyzbar import ZBarSymbol as _ZBarSymbol
     from pyzbar.pyzbar import decode as _zbar_decode
 except ImportError:
     _zbar_decode = None
+    _ZBarSymbol = None
+
+# Restrict zbar to only the symbologies we actually read. Left unrestricted it
+# runs every decoder — including the 2D PDF417/QR ones, whose C library spews
+# "Assertion failed" warnings to stderr on ordinary product/tag photos and floods
+# the console. These allowlists keep those decoders from ever running.
+#   • product photos: globally-unique product barcodes (EAN/UPC)
+#   • Ross tag: the store's CODE128 price/code barcode
+_PRODUCT_ZBAR_SYMBOLS = (
+    [_ZBarSymbol.EAN13, _ZBarSymbol.EAN8, _ZBarSymbol.UPCA, _ZBarSymbol.UPCE]
+    if _ZBarSymbol else None
+)
+_TAG_ZBAR_SYMBOLS = [_ZBarSymbol.CODE128] if _ZBarSymbol else None
 
 load_dotenv()
 
@@ -67,7 +81,7 @@ def decode_barcode(image_path: str) -> str | None:
                   img.resize((img.size[0] * 2, img.size[1] * 2))]
     for im in renderings:
         try:
-            for res in _zbar_decode(im):
+            for res in _zbar_decode(im, symbols=_TAG_ZBAR_SYMBOLS):
                 digits = re.sub(r"\D", "", res.data.decode("utf-8", "ignore"))
                 if len(digits) >= 12:
                     return digits
@@ -97,7 +111,7 @@ def read_product_upcs(image_path: str) -> list[str]:
     for im in (img, ImageOps.grayscale(img),
                img.resize((img.size[0] * 2, img.size[1] * 2))):
         try:
-            results = _zbar_decode(im)
+            results = _zbar_decode(im, symbols=_PRODUCT_ZBAR_SYMBOLS)
         except Exception:
             continue
         for res in results:
