@@ -3,16 +3,18 @@
 A Telegram bot that turns photos of an item into a ready-to-publish eBay
 listing. You send photos; it identifies the product, prices it against real eBay
 comps, writes the listing, pushes it to eBay as a draft, and publishes it on your
-command. You review and approve every item before anything goes live.
+command. You confirm the identification and the price along the way, and review
+and approve every item before anything goes live.
 
 ## How it works
 
 Each item moves through a pipeline. Every step saves its result to a local
 SQLite database and advances the item's status, so a failure can be retried from
-where it stopped instead of starting over.
+where it stopped instead of starting over. The pipeline pauses for your OK after
+identification and after pricing, so you can correct either before it continues.
 
 ```
-photos -> identify -> price -> draft -> [you review] -> eBay draft -> publish
+photos -> identify -> [confirm] -> price -> [confirm] -> draft -> [approve] -> eBay draft -> publish
 ```
 
 1. **Capture.** You send photos to the bot. They are batched (it waits a few
@@ -30,16 +32,24 @@ photos -> identify -> price -> draft -> [you review] -> eBay draft -> publish
      posted to eBay**. If neither the barcode nor OCR yields the price and code,
      the bot asks you to set them with `/receipt <price> <code>`.
 
-2. **Identify** (`identify.py`). Two Gemini calls:
-   - *Research* (model `gemini-2.5-pro`, with Google Search) reads the tag —
-     UPC, style number, color code — and searches the web and eBay to determine
-     the exact product, its real specifications, and its market price. It writes
-     a plain-text findings report.
+2. **Identify** (`identify.py`). Before calling the model, the product's
+   UPC/EAN barcode is decoded directly off the photos with `pyzbar` (scanning
+   every photo, since the tag isn't always in the first few) — the exact digits,
+   not the model's unreliable read of a tiny barcode. That UPC, plus any
+   style/SKU codes read off the tag, are handed to the model as authoritative
+   input. Then two Gemini calls run:
+   - *Research* (model `gemini-2.5-flash`, with Google Search) searches the UPC
+     first, then the style number and visual details, to determine the exact
+     product, its real specifications, and its market price, and writes a
+     plain-text findings report. This call is retried if it comes back empty, and
+     if it still can't confirm the item it says so rather than guessing.
    - *Format* (model `gemini-2.5-flash`) turns that report into a structured
      JSON object: brand, product name, color, condition, specifications, price
      evidence, and an eBay search query.
 
-   Result is saved to the item; status becomes `identified`.
+   Result is saved; status becomes `identified`. The bot shows you what it found
+   and waits: reply `confirm` to price it, or type a correction (e.g. "brand is
+   Tommy Jeans, color navy") that the model applies before re-showing it.
 
 3. **Price** (`pipeline/price.py`). Two eBay scrapers run in parallel via Apify:
    sold listings and active listings. The bot filters to brand-relevant comps,
@@ -47,7 +57,9 @@ photos -> identify -> price -> draft -> [you review] -> eBay draft -> publish
    competitor), and rounds to a `.99` price. If there are too few sold comps, it
    falls back to the resale estimate found during identification. The eBay URL of
    the best-match comp the price is anchored to is saved on the item
-   (`price_source_url`). Status becomes `priced`.
+   (`price_source_url`). Status becomes `priced`. The bot shows the suggested
+   price and waits: reply `confirm` to continue, or type a price to override it
+   (a whole number is charm-priced, e.g. `35` → `$34.99`).
 
 4. **Draft** (`pipeline/draft.py`). Gemini (`gemini-2.5-flash`) writes the
    listing — title, description, item specifics, category, and price — using the
@@ -70,7 +82,14 @@ photos -> identify -> price -> draft -> [you review] -> eBay draft -> publish
    `ebay_draft`. Nothing is live yet.
 
 7. **Publish.** `/activate` publishes the offer; the item goes live and status
-   becomes `published`. The bot replies with the listing URL.
+   becomes `published`. The bot replies with the listing URL. If a default ad
+   rate is set (`EBAY_DEFAULT_AD_RATE_PCT`, 4% by default), the listing is
+   automatically enrolled in Promoted Listings at that rate on publish; adjust
+   any individual listing with `/promote <id> <pct>`.
+
+You can also attach more photos to an existing item at any time with
+`/addphotos <id>` — new photos are appended, and if the item is already an eBay
+draft or live listing, the offer is rebuilt so the photos reach eBay.
 
 ## Architecture
 
@@ -83,6 +102,7 @@ photos -> identify -> price -> draft -> [you review] -> eBay draft -> publish
 | `receipt.py` | Decode the Ross tag (last photo): barcode → paid price + 12-digit code, OCR → original price |
 | `ebay/auth.py` | eBay OAuth: user token (seller) and app token (catalog) |
 | `ebay/inventory.py` | Step 6/7: build, create, and publish eBay offers |
+| `ebay/marketing.py` | Promoted Listings: campaign + per-listing ad rate |
 | `ebay/taxonomy.py` | eBay category validation and item-aspect metadata (cached) |
 | `db.py` | SQLite item store |
 | `llm.py` | Shared Gemini client factory and retry wrapper |
@@ -91,10 +111,12 @@ photos -> identify -> price -> draft -> [you review] -> eBay draft -> publish
 
 ### Models
 
-The research step uses `gemini-2.5-pro` because grounded reasoning over search
-results pays off there. The format and draft steps only structure data the
-pipeline already has, so they use the faster, cheaper `gemini-2.5-flash`. Both
-are overridable via `GEMINI_MODEL` and `GEMINI_FAST_MODEL`.
+The research step defaults to `gemini-2.5-flash`. `gemini-2.5-pro` reasons more
+deeply over search results but is far more prone to 503 (overloaded) errors, so
+flash trades a little depth on hard items for much better reliability — set
+`GEMINI_MODEL=gemini-2.5-pro` in `.env` if you want pro back. The format and
+draft steps only structure data the pipeline already has, so they use the fast
+`gemini-2.5-flash` (overridable via `GEMINI_FAST_MODEL`).
 
 ### Data
 
@@ -147,7 +169,9 @@ Photos are stored on disk under `data/inbox/`.
    ```
 
    You need Business Policies (shipping and returns) set up in eBay Seller Hub
-   first.
+   first. The requested scopes include `sell.marketing` (for Promoted Listings) —
+   if you authorized before that was added, re-run these two commands to
+   re-consent, or ad-rate calls will 403.
 
 4. Run the bot:
 
@@ -159,16 +183,20 @@ Photos are stored on disk under `data/inbox/`.
 
 | Command          | What it does                                          |
 | ---------------- | ----------------------------------------------------- |
-| _(send photos)_  | Start a new item. Reply `approve` / `reject` / a note |
+| _(send photos)_  | Start a new item, then step through the confirm gates |
+| `confirm`        | At a gate: accept the identification / price and continue |
+| _(free text)_    | At a gate: correct the identification, or set the price; at review, correct the draft or `approve`/`reject` |
 | `wait`           | Extend the photo-batching window for a large batch    |
 | `/status`        | List all items and their pipeline status              |
 | `/listing [id]`  | Show the current draft for an item                    |
+| `/addphotos [id]`| Attach more photos to an existing item                |
 | `/receipt [id] <price> <code>` | Manually set the Ross cost + 12-digit code (when the tag barcode couldn't be read) |
 | `/activate [id]` | Publish an eBay draft, making it a live listing       |
+| `/promote [id] <pct>` | Set/adjust a listing's Promoted Listings ad rate (2–100%) |
 | `/retry [id]`    | Re-run the failed pipeline step for an item           |
 | `/delete [id]`   | Delete an item, its photos, and its eBay offer        |
-| `/health`        | Check eBay token, business policies, and Cloudinary    |
-| `/cancel`        | Discard photos currently being captured               |
+| `/health`        | Check eBay token, business policies, ad scope, and Cloudinary |
+| `/cancel`        | Discard photos being captured, or drop out of a confirm gate |
 
 `[id]` accepts a full item id or a unique prefix (as shown by `/status`). If
 omitted, it defaults to the most recently touched item.
@@ -179,9 +207,14 @@ Defaults are in `config.py`; the marked ones can be overridden in `.env`:
 
 - `GEMINI_MODEL` / `GEMINI_FAST_MODEL` — research vs. format/draft models
 - `GEMINI_PHOTO_LIMIT` — how many photos are sent to the paid API per item
+- `MAX_CONCURRENT_LISTINGS` — how many items may run the pipeline at once
 - `COMPS_COUNT` / `ACTIVE_COUNT` — how many comps to pull when pricing
 - `UNDERCUT_PCT` — how far below the comp median to price
 - `DEBUG_MODE` — when true, pulls fewer comps to save time and cost
+- `EBAY_FULFILLMENT_POLICY_ID` / `EBAY_RETURN_POLICY_ID` — pin specific Business
+  Policies (otherwise the first policy on the account is used)
+- `EBAY_DEFAULT_AD_RATE_PCT` — Promoted Listings ad rate auto-applied on publish
+  (default `4`; set `0` to disable), and `EBAY_PROMOTED_CAMPAIGN_NAME`
 - eBay marketplace, currency, merchant location, and ship-from address
 
 ## Notes
