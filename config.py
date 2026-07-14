@@ -2,8 +2,23 @@ import os
 
 COMPS_COUNT = 10
 ACTIVE_COUNT = 5
-DEBUG_MODE = True
 UNDERCUT_PCT = 0.15
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# When true, pricing pulls only 3 sold + 3 active comps to save time/cost — fine
+# for local testing, WRONG for production: it can't clear the >=3 sold-comp bar
+# that pricing needs to trust comps, so items silently fall back to the research
+# estimate. Defaults to False (full comps); set DEBUG_MODE=true in .env to speed
+# up local runs. This was hardcoded True and is the reason real pricing has been
+# running on debug-sized samples.
+DEBUG_MODE = _env_bool("DEBUG_MODE", False)
 
 # The grounded research step (identify stage 1). We default to flash rather than
 # pro: pro reasons deeper over search results but is far more prone to 503

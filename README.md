@@ -108,6 +108,7 @@ draft or live listing, the offer is rebuilt so the photos reach eBay.
 | `llm.py` | Shared Gemini client factory and retry wrapper |
 | `config.py` | Settings and defaults |
 | `retry_publish.py` | Helper script to rebuild an eBay draft for one item |
+| `backup.py` | Standalone backup of `data/ross.db` (online snapshot) + `data/inbox/` |
 
 ### Models
 
@@ -196,6 +197,7 @@ Photos are stored on disk under `data/inbox/`.
 | `/retry [id]`    | Re-run the failed pipeline step for an item           |
 | `/delete [id]`   | Delete an item, its photos, and its eBay offer        |
 | `/health`        | Check eBay token, business policies, ad scope, and Cloudinary |
+| `/whoami`        | Show your Telegram user id (to fill `TELEGRAM_ALLOWED_USER_IDS`) |
 | `/cancel`        | Discard photos being captured, or drop out of a confirm gate |
 
 `[id]` accepts a full item id or a unique prefix (as shown by `/status`). If
@@ -210,7 +212,13 @@ Defaults are in `config.py`; the marked ones can be overridden in `.env`:
 - `MAX_CONCURRENT_LISTINGS` — how many items may run the pipeline at once
 - `COMPS_COUNT` / `ACTIVE_COUNT` — how many comps to pull when pricing
 - `UNDERCUT_PCT` — how far below the comp median to price
-- `DEBUG_MODE` — when true, pulls fewer comps to save time and cost
+- `DEBUG_MODE` — pulls fewer comps (3 sold / 3 active) to save time and cost when
+  set. **Defaults to `false`.** Leave it off in production: with only 3 sold comps
+  the pipeline can't clear the ≥3 threshold it needs to trust comps and silently
+  falls back to the research estimate. Set `DEBUG_MODE=true` only for local testing.
+- `TELEGRAM_ALLOWED_USER_IDS` — comma-separated Telegram user ids allowed to use
+  the bot. **Unset means the bot is open to anyone** (a loud warning prints on
+  startup). Send `/whoami` to the bot to get your id, then set this and restart.
 - `EBAY_FULFILLMENT_POLICY_ID` / `EBAY_RETURN_POLICY_ID` — pin specific Business
   Policies (otherwise the first policy on the account is used)
 - `EBAY_DEFAULT_AD_RATE_PCT` — Promoted Listings ad rate auto-applied on publish
@@ -226,6 +234,28 @@ Defaults are in `config.py`; the marked ones can be overridden in `.env`:
   could not be (rather than publishing something wrong).
 - The eBay description is rendered to HTML before sending, because eBay collapses
   plain-text line breaks.
+- The price gate flags **comp starvation**: if the Apify scrapers return rows but
+  none have a parseable price (a sign the third-party actor changed its output
+  schema), the suggested price shows a ⚠️ warning instead of quietly falling back
+  to the research estimate.
+
+## Backups
+
+`data/` is not in git, yet `data/ross.db` holds the items, receipt/cost history,
+and the eBay OAuth tokens, and `data/inbox/` holds the only copy of item photos
+until they reach Cloudinary. `backup.py` snapshots both:
+
+```
+python backup.py
+```
+
+It uses SQLite's online-backup API, so it's safe to run while the bot is live.
+Point it at a synced folder to get the data off the machine, and schedule it
+(Windows Task Scheduler / cron):
+
+- `BACKUP_DIR` — where snapshots go (default `data/backups`; set to a OneDrive/
+  Dropbox path for offsite copies)
+- `BACKUP_KEEP` — how many snapshots of each kind to retain (default 14)
 
 ## License
 

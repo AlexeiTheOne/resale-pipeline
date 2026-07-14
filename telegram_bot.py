@@ -5,9 +5,11 @@ import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
+    TypeHandler,
     filters,
     ContextTypes,
 )
@@ -35,6 +37,23 @@ from ebay.marketing import promote_listing, marketing_status
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 INBOX = Path("data/inbox")
 INBOX.mkdir(parents=True, exist_ok=True)
+
+
+def _parse_allowed_ids(raw: str | None) -> set[int]:
+    ids = set()
+    for tok in (raw or "").replace(";", ",").split(","):
+        tok = tok.strip()
+        if tok.isdigit():
+            ids.add(int(tok))
+    return ids
+
+
+# Whitelist of Telegram user IDs allowed to drive the bot. This gates a LIVE eBay
+# seller account (publish / delete / ad-rate), so an open bot means anyone who
+# finds the username can act on the account. When unset the bot stays open (so an
+# existing install isn't bricked on upgrade) but prints a loud startup warning;
+# use /whoami to get your id, then set TELEGRAM_ALLOWED_USER_IDS in .env.
+ALLOWED_USER_IDS = _parse_allowed_ids(os.getenv("TELEGRAM_ALLOWED_USER_IDS"))
 
 DEFAULT_CAPTURE_WINDOW = 5    # seconds to wait for more photos before processing
 EXTENDED_CAPTURE_WINDOW = 30  # after the user types "wait" — for forwarding big batches
@@ -64,6 +83,40 @@ async def _safe_reply(message, text: str, **kwargs) -> None:
         await message.reply_text(text, **kwargs)
     except Exception as e:
         print(f"WARNING: reply_text failed (continuing anyway): {type(e).__name__}: {e}")
+
+
+async def _auth_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global gate, registered in handler group -1 so it runs before everything
+    else. If TELEGRAM_ALLOWED_USER_IDS is set, only those users get through;
+    anyone else is refused and ApplicationHandlerStop halts the rest of the
+    handler chain. An unset allowlist leaves the bot open (legacy behavior)."""
+    if not ALLOWED_USER_IDS:
+        return
+    user = update.effective_user
+    if user is None or user.id not in ALLOWED_USER_IDS:
+        uid = user.id if user else "unknown"
+        print(f"⛔ Blocked update from unauthorized user {uid}")
+        if update.callback_query is not None:
+            await update.callback_query.answer("Not authorized.", show_alert=True)
+        elif update.effective_message is not None:
+            await _safe_reply(update.effective_message, "⛔ Not authorized to use this bot.")
+        raise ApplicationHandlerStop
+
+
+async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Report the caller's numeric Telegram id — the value to put in
+    TELEGRAM_ALLOWED_USER_IDS. Works from the phone before the allowlist is set."""
+    user = update.effective_user
+    if user is None:
+        return
+    if not ALLOWED_USER_IDS:
+        state = ("⚠️ open to everyone — add "
+                 f"TELEGRAM_ALLOWED_USER_IDS={user.id} to .env and restart to lock it to you.")
+    elif user.id in ALLOWED_USER_IDS:
+        state = "restricted; you are on the allowlist."
+    else:
+        state = "restricted; you are NOT on the allowlist."
+    await _safe_reply(update.message, f"Your Telegram user id: {user.id}\nBot access: {state}")
 
 
 def _resolve_item_id(user_id: int, args: list[str]) -> tuple[str | None, str | None]:
@@ -672,6 +725,8 @@ def format_pricing(pricing: dict) -> str:
     ]
     if pricing.get("price_source_url"):
         lines.append(f"  source: {pricing['price_source_url']}")
+    if pricing.get("comp_warning"):
+        lines.append(f"  ⚠️ {pricing['comp_warning']}")
     return "\n".join(lines)
 
 
@@ -1208,7 +1263,14 @@ def main() -> None:
         .concurrent_updates(True)
         .build()
     )
+    if not ALLOWED_USER_IDS:
+        print("⚠️ SECURITY: TELEGRAM_ALLOWED_USER_IDS is unset — the bot accepts "
+              "commands from ANY Telegram user, on a live eBay account. Send /whoami "
+              "to get your id, then set TELEGRAM_ALLOWED_USER_IDS=<id> in .env and restart.")
+
     app.add_error_handler(error_handler)
+    # Auth gate first (group -1): blocks unauthorized users before any handler below.
+    app.add_handler(TypeHandler(Update, _auth_guard), group=-1)
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm:"))
     app.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
@@ -1221,6 +1283,7 @@ def main() -> None:
     app.add_handler(CommandHandler("promote", promote_command))
     app.add_handler(CommandHandler("retry", retry_command))
     app.add_handler(CommandHandler("health", health_command))
+    app.add_handler(CommandHandler("whoami", whoami_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.run_polling()
