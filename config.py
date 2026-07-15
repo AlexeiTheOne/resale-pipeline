@@ -27,9 +27,12 @@ DEBUG_MODE = _env_bool("DEBUG_MODE", False)
 # Override GEMINI_MODEL in .env to pin a different model.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
-# Faster model for steps that only structure data we already have (no search): the
-# identify format stage and the draft writer.
-GEMINI_FAST_MODEL = os.getenv("GEMINI_FAST_MODEL", "gemini-3.5-flash")
+# Cheaper model for steps that only STRUCTURE data we already have (no search):
+# the identify format stage and the draft writer. These never had the grounding
+# flakiness that pushed research to 3.5, and 3.5-flash costs several times more
+# per token — so keep these on 2.5-flash. The draft call in particular carries a
+# lot of input (aspect hints), where the price gap matters most.
+GEMINI_FAST_MODEL = os.getenv("GEMINI_FAST_MODEL", "gemini-2.5-flash")
 
 # How many of the uploaded photos to send to Gemini for identification. All
 # photos are still kept for the eBay listing; only the first N (the overview +
