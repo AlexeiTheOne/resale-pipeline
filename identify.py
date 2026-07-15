@@ -7,6 +7,7 @@ module directly to identify a set of photos from the command line.
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -21,8 +22,9 @@ load_dotenv()
 client = make_client()
 
 # The grounded research call occasionally returns an empty response; retry a few
-# times before giving up rather than falling through to a hallucinated guess.
-RESEARCH_ATTEMPTS = 3
+# times (with backoff between attempts) before giving up rather than falling
+# through to a hallucinated guess.
+RESEARCH_ATTEMPTS = 4
 
 
 def _repair_json(raw: str) -> str:
@@ -331,6 +333,11 @@ def identify_item(image_paths: list[str], scan_paths: list[str] | None = None) -
         fr = research.candidates[0].finish_reason if research.candidates else None
         print(f"Research returned empty text (finish_reason={fr}); "
               f"retry {attempt}/{RESEARCH_ATTEMPTS}")
+        # Back off between attempts so retries land in DIFFERENT time windows —
+        # firing them back-to-back just re-hits the same bad moment on the
+        # grounding service, so all of them come back empty together.
+        if attempt < RESEARCH_ATTEMPTS:
+            time.sleep(min(3 * attempt, 12))
 
     queries = []
     if research and research.candidates:
