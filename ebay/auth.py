@@ -133,10 +133,19 @@ def _refresh(refresh_token: str) -> dict:
         "Content-Type": "application/x-www-form-urlencoded",
         "Authorization": f"Basic {_basic_auth_header()}",
     }
+    # Deliberately omit `scope`: on a refresh_token grant eBay requires the
+    # requested scope to be a SUBSET of what the refresh token was granted, and
+    # our SCOPES list has grown over time (sell.marketing was added later). A
+    # token consented before that addition doesn't carry the new scope, so
+    # requesting the full current list fails the whole refresh with
+    # invalid_scope — knocking out inventory/account too, not just marketing.
+    # Omitting scope returns a token with exactly the scopes actually granted,
+    # so refresh always succeeds and only the ungranted features degrade (they
+    # 403 with a re-consent hint via /health). Re-run `python -m ebay.auth` to
+    # actually grant the newer scopes.
     data = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
-        "scope": " ".join(SCOPES),
     }
     r = httpx.post(TOKEN_URL, headers=headers, data=data, timeout=30)
     if r.status_code >= 400:
