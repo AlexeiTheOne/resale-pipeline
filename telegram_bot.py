@@ -1,4 +1,4 @@
-import os, sys, re, uuid, asyncio, shutil, time, traceback
+import os, sys, re, uuid, asyncio, shutil, tempfile, time, traceback
 from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1171,6 +1171,39 @@ async def profit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _send_chunked(update.message, lines)
 
 
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Build an Excel profit report — cover photo, title, price, shipping, Ross
+    cost, and profit net of eBay fees + the ad rate — and send it as a file. It
+    reflects the current database each time, and the fee/shipping assumptions are
+    editable cells in the sheet that recalc every row."""
+    await _safe_reply(update.message, "📊 Building the profit report...")
+    import report as report_mod
+
+    out = Path(tempfile.gettempdir()) / f"ross_report_{int(time.time())}.xlsx"
+    try:
+        await asyncio.to_thread(report_mod.build_report, str(out))
+    except Exception as e:
+        traceback.print_exc()
+        _record_error("report build", e)
+        await _safe_reply(update.message, f"⚠️ Report failed: {type(e).__name__}: {str(e)[:200]}")
+        return
+
+    try:
+        with open(out, "rb") as f:
+            await update.message.reply_document(
+                document=f, filename="ross_profit_report.xlsx",
+                caption="Profit report — edit the yellow fee/shipping cells to recalc.")
+    except Exception as e:
+        traceback.print_exc()
+        _record_error("report send", e)
+        await _safe_reply(update.message, f"⚠️ Built the report but couldn't send it: {type(e).__name__}: {str(e)[:200]}")
+    finally:
+        try:
+            out.unlink()
+        except OSError:
+            pass
+
+
 async def listing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     item_id, err = _resolve_item_id(user_id, context.args)
@@ -1560,6 +1593,7 @@ def main() -> None:
     app.add_handler(CommandHandler("comps", comps_command))
     app.add_handler(CommandHandler("sold", sold_command))
     app.add_handler(CommandHandler("profit", profit_command))
+    app.add_handler(CommandHandler("report", report_command))
     app.add_handler(CommandHandler("listing", listing_command))
     app.add_handler(CommandHandler("receipt", receipt_command))
     app.add_handler(CommandHandler("addphotos", addphotos_command))
