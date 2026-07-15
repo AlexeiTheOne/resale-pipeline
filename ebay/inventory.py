@@ -206,6 +206,47 @@ def publish_offer(offer_id: str) -> str:
     return _request("POST", f"/sell/inventory/v1/offer/{offer_id}/publish").json()["listingId"]
 
 
+def withdraw_offer(offer_id: str) -> None:
+    """End a live listing (withdraw the published offer). The offer itself remains
+    as a draft, so it can be re-published later with publish_offer. A 404 (already
+    gone) or an 'offer not published' error is treated as success so /end is safe
+    to retry."""
+    r = httpx.post(
+        f"{EBAY_API_BASE}/sell/inventory/v1/offer/{offer_id}/withdraw",
+        headers=_headers(), timeout=30,
+    )
+    if r.status_code in (200, 204, 404):
+        return
+    # Not published (25710) means it's already not live — nothing to end.
+    if "25710" in r.text or "not published" in r.text.lower():
+        return
+    raise RuntimeError(
+        f"eBay API POST /sell/inventory/v1/offer/{offer_id}/withdraw failed [{r.status_code}]: {r.text}"
+    )
+
+
+# Offer fields that carry over when we re-send an offer to change its price. eBay's
+# updateOffer is a full replace, so we read the current offer and resend these.
+# Deliberately excludes listingStartDate — a published offer's start date is in the
+# past and eBay rejects re-sending a past date.
+_OFFER_UPDATABLE_FIELDS = (
+    "availableQuantity", "categoryId", "listingDescription", "listingPolicies",
+    "merchantLocationKey", "tax", "storeCategoryNames",
+    "quantityLimitPerBuyer", "lotSize", "hideBuyerDetails",
+)
+
+
+def update_offer_price(offer_id: str, price) -> None:
+    """Change an offer's price. eBay's updateOffer is a full PUT replace, so read
+    the current offer, swap in the new price, and send the carried-over fields
+    back. Works for both an unpublished draft and a live listing (a published
+    offer's update takes effect on the live listing immediately)."""
+    current = _request("GET", f"/sell/inventory/v1/offer/{offer_id}").json()
+    body = {k: current[k] for k in _OFFER_UPDATABLE_FIELDS if current.get(k) is not None}
+    body["pricingSummary"] = {"price": {"value": str(price), "currency": EBAY_CURRENCY}}
+    _request("PUT", f"/sell/inventory/v1/offer/{offer_id}", json=body)
+
+
 def get_policy_id(policy_type: str) -> str:
     resp = _request(
         "GET",
