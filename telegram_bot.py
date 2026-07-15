@@ -421,32 +421,74 @@ async def _run_stage(item_id, message, stage_fn, *args):
         return None, e
 
 
-async def _run_identify_and_gate(user_id, item_id, paths, message, context) -> None:
-    _, err = await _run_stage(item_id, message, _stage_identify, paths)
-    if err is None:
-        await _show_identify_gate(user_id, item_id, message)
-
-
-async def _run_price_and_gate(user_id, item_id, message, context) -> None:
-    _, err = await _run_stage(item_id, message, _stage_price)
-    if err is None:
-        await _show_price_gate(user_id, item_id, message)
-
-
-async def _run_draft_and_review(user_id, item_id, message, context) -> None:
-    _, err = await _run_stage(item_id, message, _stage_draft)
-    if err is not None:
-        return
+async def _show_review(user_id, item_id, message) -> None:
+    """Show a finished draft with Approve/Reject and mark it this user's active
+    review target, so a typed correction / approve applies to it. The per-draft
+    buttons carry the item id explicitly, so approving is unambiguous regardless
+    of how many drafts are pending."""
     item = get_item(item_id)
-    # review[user_id] tracks the most-recent draft, which is what a typed
-    # correction / approve applies to. The per-draft buttons carry the item id
-    # explicitly, so approving is unambiguous regardless of order.
     review[user_id] = item_id
     last_item[user_id] = item_id
     result = {"identification": item["identification"], "pricing": item["pricing"],
               "listing": item["listing"]}
     await _safe_reply(message, format_draft(result), parse_mode=None,
                       reply_markup=_review_markup(item_id))
+
+
+async def _publish_and_report(item_id, message) -> None:
+    """Publish an ebay_draft offer, report the live URL, then auto-promote at the
+    default ad rate if one is configured. Shared by /activate and advance()."""
+    try:
+        ebay_data = await asyncio.to_thread(_activate_item, item_id)
+    except Exception as e:
+        traceback.print_exc()
+        await _safe_reply(message, f"⚠️ Activate failed: {type(e).__name__}: {str(e)[:300]}")
+        return
+    await _safe_reply(message, f"🎉 Published! {ebay_data['view_item_url']}")
+    if EBAY_DEFAULT_AD_RATE_PCT and EBAY_DEFAULT_AD_RATE_PCT > 0:
+        await _promote_item(item_id, EBAY_DEFAULT_AD_RATE_PCT, message)
+
+
+async def advance(user_id, item_id, message, context) -> None:
+    """Run the single next automatic step for an item based on its status, then
+    pause at the matching confirm gate / review. This is the one place that knows
+    'what comes next' in the pipeline, shared by the capture Start button, the
+    confirm gates, and /retry — so every path honors the same identify/price
+    confirm gates instead of silently blowing past them. Advances exactly one
+    step; the compute stages report their own progress/errors via _run_stage."""
+    item = get_item(item_id)
+    if item is None:
+        await _safe_reply(message, "That item no longer exists.")
+        return
+    status = item["status"]
+
+    if status == "captured":
+        _, err = await _run_stage(item_id, message, _stage_identify, item.get("photos") or [])
+        if err is None:
+            await _show_identify_gate(user_id, item_id, message)
+
+    elif status == "identified":
+        _, err = await _run_stage(item_id, message, _stage_price)
+        if err is None:
+            await _show_price_gate(user_id, item_id, message)
+
+    elif status == "priced":
+        _, err = await _run_stage(item_id, message, _stage_draft)
+        if err is None:
+            await _show_review(user_id, item_id, message)
+
+    elif status in ("drafted", "review"):
+        # Waiting on your Approve/Reject — re-show the draft to act on.
+        await _show_review(user_id, item_id, message)
+
+    elif status == "approved":
+        await _approve_item(item_id, message, context)
+
+    elif status == "ebay_draft":
+        await _publish_and_report(item_id, message)
+
+    else:  # published, rejected
+        await _safe_reply(message, f"Nothing to advance — {item_id[:8]} is '{status}'.")
 
 
 async def _show_identify_gate(user_id, item_id, message) -> None:
@@ -499,9 +541,10 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         paths = st["paths"]
         await query.edit_message_text(f"Starting. {len(paths)} photo(s). Processing...")
         # Launch as a background task so this handler returns immediately and
-        # another item can be started while this one is still processing.
+        # another item can be started while this one is still processing. The item
+        # is 'captured', so advance() runs identify and pauses at its confirm gate.
         context.application.create_task(
-            _run_identify_and_gate(user_id, item_id, paths, query.message, context)
+            advance(user_id, item_id, query.message, context)
         )
 
     elif action == "wait":
@@ -805,14 +848,11 @@ async def _handle_gate(user_id, text, update, context) -> None:
             await _safe_reply(update.message, "No price set yet — type a price first (e.g. 35 -> $34.99).")
             return
         gate.pop(user_id, None)
-        if stage == "identify":
-            await _safe_reply(update.message, "✅ Confirmed. Pricing...")
-            context.application.create_task(
-                _run_price_and_gate(user_id, item_id, update.message, context))
-        else:  # price
-            await _safe_reply(update.message, "✅ Confirmed. Writing the listing...")
-            context.application.create_task(
-                _run_draft_and_review(user_id, item_id, update.message, context))
+        # Confirming identify leaves the item 'identified' (advance -> price gate);
+        # confirming price leaves it 'priced' (advance -> draft + review).
+        note = "✅ Confirmed. Pricing..." if stage == "identify" else "✅ Confirmed. Writing the listing..."
+        await _safe_reply(update.message, note)
+        context.application.create_task(advance(user_id, item_id, update.message, context))
         return
 
     # Not a confirm → treat as a change to this stage.
@@ -1048,23 +1088,13 @@ async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
         return
     if item["status"] != "ebay_draft":
-        await _safe_reply(update.message, 
+        await _safe_reply(update.message,
             f"Item {item_id[:8]} is at status '{item['status']}', not 'ebay_draft'. Nothing to activate."
         )
         return
 
-    try:
-        ebay_data = await asyncio.to_thread(_activate_item, item_id)
-    except Exception as e:
-        traceback.print_exc()
-        await _safe_reply(update.message, f"⚠️ Activate failed: {type(e).__name__}: {str(e)[:300]}")
-        return
-
-    await _safe_reply(update.message, f"🎉 Published! {ebay_data['view_item_url']}")
-
-    # Auto-promote on publish when a default ad rate is configured (0 = off).
-    if EBAY_DEFAULT_AD_RATE_PCT and EBAY_DEFAULT_AD_RATE_PCT > 0:
-        await _promote_item(item_id, EBAY_DEFAULT_AD_RATE_PCT, update.message)
+    # Publish + auto-promote, shared with advance() so both paths behave identically.
+    await _publish_and_report(item_id, update.message)
 
 
 async def _promote_item(item_id: str, pct, message) -> None:
@@ -1117,63 +1147,10 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
         return
 
-    status = item["status"]
-    await _safe_reply(update.message, f"🔄 Retrying {item_id[:8]} (status: {status})...")
-
-    try:
-        if status == "captured":
-            listing_photos = await asyncio.to_thread(_split_receipt, item_id, item["photos"])
-            ident = await asyncio.to_thread(
-                identify_item, listing_photos[:GEMINI_PHOTO_LIMIT], listing_photos
-            )
-            update_field(item_id, "identification", ident)
-            update_status(item_id, "identified")
-            await _safe_reply(update.message, f"✓ Identified: {ident.get('brand')} {ident.get('product_name') or ident.get('item_type')}")
-
-        elif status == "identified":
-            pricing = await asyncio.to_thread(
-                get_pricing, item["identification"]["search_query"], research=item["identification"]
-            )
-            update_field(item_id, "pricing", pricing)
-            if pricing.get("price_source_url"):
-                update_field(item_id, "price_source_url", pricing["price_source_url"])
-            update_status(item_id, "priced")
-            await _safe_reply(update.message, f"✓ Priced: ${pricing.get('suggested_price')} ({pricing.get('confidence')})")
-
-        elif status == "priced":
-            draft = await asyncio.to_thread(generate_draft, item["identification"], item["pricing"])
-            update_field(item_id, "listing", draft)
-            update_status(item_id, "drafted")
-            update_status(item_id, "review")
-            review[user_id] = item_id
-            await _safe_reply(update.message, format_draft({
-                "identification": item["identification"],
-                "pricing": item["pricing"],
-                "listing": draft,
-            }), reply_markup=_review_markup(item_id))
-
-        elif status == "approved":
-            result = await asyncio.to_thread(create_draft_offer, item_id)
-            update_field(item_id, "ebay", result)
-            update_status(item_id, "ebay_draft")
-            await _safe_reply(update.message, f"📝 Draft created: SKU {result['sku']}, offer {result['offer_id']}")
-
-        elif status == "ebay_draft":
-            ebay_data = await asyncio.to_thread(_activate_item, item_id)
-            await _safe_reply(update.message, f"🎉 Published! {ebay_data['view_item_url']}")
-
-        else:
-            await _safe_reply(update.message, f"Nothing to retry — status is '{status}'.")
-
-    except MissingRequiredAspectsError as e:
-        lines = [f"⚠️ Category {e.category_id} requires these item specifics:"]
-        for m in e.missing:
-            opts = f" (allowed: {', '.join(m['allowed_values'])})" if m["allowed_values"] else ""
-            lines.append(f"  • {m['name']}{opts}")
-        await _safe_reply(update.message, "\n".join(lines))
-    except Exception as e:
-        traceback.print_exc()
-        await _safe_reply(update.message, f"⚠️ Retry failed: {type(e).__name__}: {str(e)[:300]}")
+    await _safe_reply(update.message, f"🔄 Retrying {item_id[:8]} (status: {item['status']})...")
+    # Route through the same dispatcher the happy path uses, so a retried item
+    # stops at the identify/price confirm gates instead of blowing past them.
+    await advance(user_id, item_id, update.message, context)
 
 
 async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
