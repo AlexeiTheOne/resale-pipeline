@@ -59,12 +59,20 @@ def _basic_auth_header() -> str:
 
 
 def get_consent_url() -> str:
-    """URL to send the seller to so they can grant this app a user token."""
+    """URL to send the seller to so they can grant this app a user token.
+
+    prompt=login forces eBay to show the sign-in + consent screen even when the
+    browser already has an eBay session and a prior consent. Without it, a seller
+    who consented before a scope was added (e.g. sell.marketing) gets a SILENT
+    re-authorization that re-issues only the previously-granted scopes — so the
+    new scope never gets presented for approval and never lands on the token.
+    """
     params = {
         "client_id": CLIENT_ID,
         "redirect_uri": REDIRECT_URI,
         "response_type": "code",
         "scope": " ".join(SCOPES),
+        "prompt": "login",
     }
     return f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
 
