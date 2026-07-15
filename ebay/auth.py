@@ -108,9 +108,25 @@ def _load_token() -> dict | None:
         return {"access_token": row[0], "refresh_token": row[1], "expires_at": row[2]}
 
 
+def _extract_code(code_or_url: str) -> str:
+    """Accept either a bare authorization code or the whole redirect URL eBay
+    landed on. eBay's post-consent page shows a generic 'Authorization
+    successfully completed' message and keeps the code only in the address-bar
+    URL (?code=...&expires_in=...), so let the user paste that entire URL and pull
+    the code out here. Returns a fully URL-decoded code either way."""
+    s = code_or_url.strip().strip('"').strip("'")
+    if "code=" in s:
+        query = urllib.parse.urlparse(s).query or s
+        params = urllib.parse.parse_qs(query)
+        if params.get("code"):
+            return params["code"][0]  # parse_qs already URL-decodes
+    return urllib.parse.unquote(s)
+
+
 def exchange_code(code: str) -> dict:
-    """First-time setup: trade the authorization code from the consent redirect for tokens."""
-    code = urllib.parse.unquote(code)
+    """First-time setup: trade the authorization code from the consent redirect for
+    tokens. Accepts a bare code or the full redirect URL."""
+    code = _extract_code(code)
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Authorization": f"Basic {_basic_auth_header()}",
@@ -207,13 +223,14 @@ def get_access_token() -> str:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "exchange":
         if len(sys.argv) < 3:
-            print("Usage: python -m ebay.auth exchange <code>")
+            print('Usage: python -m ebay.auth exchange "<code or full redirect URL>"')
             sys.exit(1)
         token = exchange_code(sys.argv[2])
         print(f"Token stored. Expires in {token.get('expires_in')} seconds.")
     else:
         print("1. Open this URL, log in as the seller, and approve access:\n")
         print(get_consent_url())
-        print("\n2. eBay will redirect to your RuName's configured URL with a `code` query param.")
-        print("   Copy that code value, then run:\n")
-        print("   python -m ebay.auth exchange <code>")
+        print("\n2. eBay shows an 'Authorization successfully completed' page. The code")
+        print("   is NOT on the page — it's in the browser address bar as ?code=...")
+        print("   Copy the WHOLE URL from the address bar, then run (keep the quotes):\n")
+        print('   python -m ebay.auth exchange "<paste the whole URL>"')
