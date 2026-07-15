@@ -32,6 +32,8 @@ from ebay.inventory import (
     delete_offer,
     get_policy_id,
     publish_offer,
+    update_offer_price,
+    withdraw_offer,
     MissingRequiredAspectsError,
 )
 from ebay.marketing import promote_listing, marketing_status
@@ -1222,6 +1224,9 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     offer_id = (item.get("ebay") or {}).get("offer_id")
     if offer_id:
         try:
+            # A published offer can't be deleted while live — end it first.
+            if item["status"] == "published":
+                await asyncio.to_thread(withdraw_offer, offer_id)
             await asyncio.to_thread(delete_offer, offer_id)
         except Exception as e:
             await _safe_reply(update.message, f"⚠️ Could not delete eBay offer {offer_id}: {e}")
@@ -1236,6 +1241,94 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     last_item.pop(user_id, None)
     review.pop(user_id, None)
     await _safe_reply(update.message, f"🗑️ Deleted {item_id[:8]} (offer {offer_id or 'none'} removed).")
+
+
+async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """End a live listing (withdraw it from eBay) without deleting the item. The
+    offer drops back to a draft, so you can /activate it again later. Use this when
+    an item sold elsewhere or a live listing needs pulling."""
+    user_id = update.effective_user.id
+    item_id, err = _resolve_item_id(user_id, context.args)
+    if err:
+        await _safe_reply(update.message, f"⚠️ {err}")
+        return
+    last_item[user_id] = item_id
+
+    item = get_item(item_id)
+    if item is None:
+        await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
+        return
+    if item["status"] != "published":
+        await _safe_reply(update.message,
+            f"{item_id[:8]} is '{item['status']}', not a live listing — nothing to end.")
+        return
+    offer_id = (item.get("ebay") or {}).get("offer_id")
+    if not offer_id:
+        await _safe_reply(update.message, "No eBay offer id stored for this item.")
+        return
+
+    try:
+        await asyncio.to_thread(withdraw_offer, offer_id)
+    except Exception as e:
+        traceback.print_exc()
+        _record_error(f"end ({item_id[:8]})", e)
+        await _safe_reply(update.message, f"⚠️ Could not end the listing: {type(e).__name__}: {str(e)[:250]}")
+        return
+
+    update_status(item_id, "ebay_draft")
+    await _safe_reply(update.message,
+        f"🛑 Ended the live listing for {item_id[:8]} — it's back to a draft. /activate to relist.")
+
+
+async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set an item's price. Usage: /setprice [id] <price> (a whole number is
+    charm-priced, 35 -> $34.99). Updates the stored price, and if the item already
+    has an eBay offer (draft or live), pushes the new price to eBay too."""
+    user_id = update.effective_user.id
+    args = list(context.args)
+    if not args:
+        await _safe_reply(update.message, "Usage: /setprice [id] <price>  (e.g. /setprice 35 -> $34.99)")
+        return
+    price = _parse_price_override(args[-1])
+    if price is None:
+        await _safe_reply(update.message, f"'{args[-1]}' isn't a valid price.")
+        return
+    item_id, err = _resolve_item_id(user_id, args[:-1])
+    if err:
+        await _safe_reply(update.message, f"⚠️ {err}")
+        return
+    item = get_item(item_id)
+    if item is None:
+        await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
+        return
+    last_item[user_id] = item_id
+
+    # Update the stored price on both the listing and the pricing record.
+    listing = dict(item.get("listing") or {})
+    if listing:
+        listing["price"] = price
+        update_field(item_id, "listing", listing)
+    pricing = dict(item.get("pricing") or {})
+    pricing["suggested_price"] = price
+    pricing["confidence"] = "manual"
+    pricing["price_basis"] = "manual"
+    update_field(item_id, "pricing", pricing)
+
+    offer_id = (item.get("ebay") or {}).get("offer_id")
+    if offer_id and item["status"] in ("ebay_draft", "published"):
+        try:
+            await asyncio.to_thread(update_offer_price, offer_id, price)
+        except Exception as e:
+            traceback.print_exc()
+            _record_error(f"setprice ({item_id[:8]})", e)
+            await _safe_reply(update.message,
+                f"💲 Saved ${price} locally, but updating eBay failed: {type(e).__name__}: {str(e)[:200]}\n"
+                "The stored price is updated; use /retry or /addphotos to rebuild the offer.")
+            return
+        where = "live listing" if item["status"] == "published" else "eBay draft"
+        await _safe_reply(update.message, f"💲 Price set to ${price} for {item_id[:8]} (updated the {where}).")
+    else:
+        await _safe_reply(update.message, f"💲 Price set to ${price} for {item_id[:8]}.")
 
 
 def _activate_item(item_id: str) -> dict:
@@ -1440,6 +1533,8 @@ def main() -> None:
     app.add_handler(CommandHandler("receipt", receipt_command))
     app.add_handler(CommandHandler("addphotos", addphotos_command))
     app.add_handler(CommandHandler("delete", delete_command))
+    app.add_handler(CommandHandler("end", end_command))
+    app.add_handler(CommandHandler("setprice", setprice_command))
     app.add_handler(CommandHandler("activate", activate_command))
     app.add_handler(CommandHandler("promote", promote_command))
     app.add_handler(CommandHandler("retry", retry_command))
