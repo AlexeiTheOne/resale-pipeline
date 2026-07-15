@@ -128,8 +128,9 @@ Everything lives in one SQLite file, `data/ross.db`:
   price, original price, and 12-digit code), a `price_source_url` (the comp the
   price is anchored to), plus a `status` that tracks pipeline progress
   (`captured`, `identified`, `priced`, `drafted`, `review`, `approved`,
-  `ebay_draft`, `published`, `rejected`). New columns are added by an automatic
-  `ALTER TABLE` migration on startup.
+  `ebay_draft`, `published`, `sold`, `rejected`). A sold item also stores its
+  `sale_price` in the `ebay` JSON column, used by `/profit`. New columns are added
+  by an automatic `ALTER TABLE` migration on startup.
 - `ebay_tokens` — the seller's OAuth access and refresh tokens.
 - `taxonomy_cache` — eBay category and aspect lookups, cached for 30 days.
 
@@ -188,16 +189,23 @@ Photos are stored on disk under `data/inbox/`.
 | `confirm`        | At a gate: accept the identification / price and continue |
 | _(free text)_    | At a gate: correct the identification, or set the price; at review, correct the draft or `approve`/`reject` |
 | `wait`           | Extend the photo-batching window for a large batch    |
-| `/status`        | List all items and their pipeline status              |
+| `/status [status]` | List items and their pipeline status; optional filter (e.g. `/status published`), with a count-per-status header |
 | `/listing [id]`  | Show the current draft for an item                    |
+| `/comps [id]`    | Show the sold/active comps the price was built from   |
 | `/addphotos [id]`| Attach more photos to an existing item                |
 | `/receipt [id] <price> <code>` | Manually set the Ross cost + 12-digit code (when the tag barcode couldn't be read) |
+| `/setprice [id] <price>` | Set the price (charm-priced); pushes to eBay if the item has an offer |
 | `/activate [id]` | Publish an eBay draft, making it a live listing       |
+| `/end [id]`      | End a live listing (withdraw it); drops back to a draft to relist |
+| `/sold [id] [price]` | Mark an item sold and record the sale price; replies with profit vs. Ross cost |
+| `/profit`        | Summarize profit across all sold items (before eBay fees/shipping) |
 | `/promote [id] <pct>` | Set/adjust a listing's Promoted Listings ad rate (2–100%) |
-| `/retry [id]`    | Re-run the failed pipeline step for an item           |
-| `/delete [id]`   | Delete an item, its photos, and its eBay offer        |
+| `/retry [id]`    | Re-run the failed pipeline step for an item (honors the confirm gates) |
+| `/delete [id]`   | Delete an item, its photos, and its eBay offer (ends it first if live) |
 | `/health`        | Check eBay token, business policies, ad scope, and Cloudinary |
+| `/auth [url]`    | Re-consent the eBay account: no arg prints the consent URL; pass the redirect URL to finish |
 | `/whoami`        | Show your Telegram user id (to fill `TELEGRAM_ALLOWED_USER_IDS`) |
+| `/errors`        | Show recent errors (the server console isn't visible from the phone) |
 | `/cancel`        | Discard photos being captured, or drop out of a confirm gate |
 
 `[id]` accepts a full item id or a unique prefix (as shown by `/status`). If
