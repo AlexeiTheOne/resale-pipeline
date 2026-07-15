@@ -112,13 +112,14 @@ draft or live listing, the offer is rebuilt so the photos reach eBay.
 
 ### Models
 
-The research step defaults to `gemini-3.5-flash`. The 2.5 generation's
+The grounded research step defaults to `gemini-3.5-flash`. The 2.5 generation's
 search-grounding path frequently returned empty responses (`finish_reason=STOP`
 with zero searches) and 503s, which stalled identification; the newer 3.5
-grounding stack is markedly more reliable on the same grounded calls. Override
-`GEMINI_MODEL` in `.env` to pin a different model. The format and draft steps
-only structure data the pipeline already has (no search), so they use the same
-fast model via `GEMINI_FAST_MODEL`.
+grounding stack is markedly more reliable on the same grounded calls. The format
+and draft steps only structure data the pipeline already has (no search) and were
+never affected, so they stay on the cheaper `gemini-2.5-flash` — 3.5-flash costs
+several times more per token, and there's no reason to pay it where grounding
+isn't involved. Both are overridable via `GEMINI_MODEL` / `GEMINI_FAST_MODEL`.
 
 ### Data
 
