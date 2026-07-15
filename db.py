@@ -8,7 +8,7 @@ DB_PATH = "data/ross.db"
 
 VALID_STATUSES = [
     "captured", "identified", "priced", "drafted",
-    "review", "approved", "ebay_draft", "published", "rejected"
+    "review", "approved", "ebay_draft", "published", "sold", "rejected"
 ]
 
 VALID_FIELDS = [
