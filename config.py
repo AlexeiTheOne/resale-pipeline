@@ -20,16 +20,16 @@ def _env_bool(name: str, default: bool) -> bool:
 # running on debug-sized samples.
 DEBUG_MODE = _env_bool("DEBUG_MODE", False)
 
-# The grounded research step (identify stage 1). We default to flash rather than
-# pro: pro reasons deeper over search results but is far more prone to 503
-# (overloaded) errors, so flash trades a little identification depth on hard
-# items for much better reliability. Override with GEMINI_MODEL=gemini-2.5-pro
-# in .env if you want pro back for research.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# The grounded research step (identify stage 1). Defaults to gemini-3.5-flash:
+# the 2.5 generation's search-grounding path frequently returned empty responses
+# (finish_reason=STOP, zero searches) and 503s, which stalled identification; the
+# newer 3.5 grounding stack is markedly more reliable on the same grounded calls.
+# Override GEMINI_MODEL in .env to pin a different model.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
-# Faster, cheaper model for steps that only structure data we already have: the
+# Faster model for steps that only structure data we already have (no search): the
 # identify format stage and the draft writer.
-GEMINI_FAST_MODEL = os.getenv("GEMINI_FAST_MODEL", "gemini-2.5-flash")
+GEMINI_FAST_MODEL = os.getenv("GEMINI_FAST_MODEL", "gemini-3.5-flash")
 
 # How many of the uploaded photos to send to Gemini for identification. All
 # photos are still kept for the eBay listing; only the first N (the overview +
