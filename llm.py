@@ -14,7 +14,10 @@ from google import genai
 from google.genai import errors, types
 
 RETRYABLE_CODES = {429, 500, 503}
-MAX_RETRIES = 3
+# 503 "overloaded" is Google-side capacity exhaustion — it hits paid keys too
+# during peak load and can persist for a while. 3 retries (~2/4/8s) often isn't
+# enough to ride out a sustained overload, so give it more shots with backoff.
+MAX_RETRIES = 5
 MAX_DELAY = 60.0
 
 REQUEST_TIMEOUT_MS = 180_000
