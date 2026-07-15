@@ -135,6 +135,37 @@ async def _auth_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         raise ApplicationHandlerStop
 
 
+async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-consent the eBay seller account from the phone. /auth with no argument
+    replies with the consent URL to open; /auth <pasted redirect URL or code>
+    completes the exchange. Handy when the token loses a scope (e.g. sell.marketing
+    was added) and needs re-granting without a laptop."""
+    from ebay.auth import exchange_code, get_consent_url
+
+    args = context.args
+    if not args:
+        await _safe_reply(update.message,
+            "🔑 eBay re-consent:\n"
+            "1) Open this URL and approve (sign in as the seller):\n\n"
+            f"{get_consent_url()}\n\n"
+            "2) On the 'Authorization successfully completed' page, copy the WHOLE "
+            "address-bar URL (it contains code=) and send it back as:\n"
+            "/auth <paste the URL>")
+        return
+
+    await _safe_reply(update.message, "🔑 Exchanging with eBay...")
+    try:
+        token = await asyncio.to_thread(exchange_code, " ".join(args))
+    except Exception as e:
+        traceback.print_exc()
+        _record_error("auth exchange", e)
+        await _safe_reply(update.message, f"⚠️ Exchange failed: {type(e).__name__}: {str(e)[:250]}")
+        return
+    await _safe_reply(update.message,
+        f"✅ eBay authorized — token stored (expires in {token.get('expires_in')}s). "
+        "Run /health to confirm the scopes.")
+
+
 async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Report the caller's numeric Telegram id — the value to put in
     TELEGRAM_ALLOWED_USER_IDS. Works from the phone before the allowlist is set."""
@@ -1539,6 +1570,7 @@ def main() -> None:
     app.add_handler(CommandHandler("promote", promote_command))
     app.add_handler(CommandHandler("retry", retry_command))
     app.add_handler(CommandHandler("health", health_command))
+    app.add_handler(CommandHandler("auth", auth_command))
     app.add_handler(CommandHandler("whoami", whoami_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
