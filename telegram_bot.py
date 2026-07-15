@@ -1058,6 +1058,86 @@ async def comps_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _send_chunked(update.message, lines)
 
 
+def _sale_profit(item: dict):
+    """(paid, sale, profit) for an item, or Nones where unknown. Cost is what you
+    paid Ross (the receipt); sale is the recorded sale price, falling back to the
+    listed price. Profit is gross — before eBay fees, shipping, and ad rate."""
+    paid = (item.get("receipt") or {}).get("reduced_price")
+    ebay = item.get("ebay") or {}
+    sale = ebay.get("sale_price")
+    if sale is None:
+        sale = (item.get("listing") or {}).get("price")
+    profit = round(sale - paid, 2) if (paid is not None and sale is not None) else None
+    return paid, sale, profit
+
+
+async def sold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mark an item sold and record the sale price, replying with the profit vs.
+    what you paid Ross. Usage: /sold [id] [price]. The price is optional (defaults
+    to the listed price); a trailing number is taken as the sale price."""
+    user_id = update.effective_user.id
+    args = list(context.args)
+
+    sale_price = None
+    id_args = args
+    if args:
+        maybe = args[-1].replace("$", "").replace(",", "")
+        try:
+            sale_price = round(float(maybe), 2)
+            id_args = args[:-1]
+        except ValueError:
+            sale_price = None  # trailing arg wasn't a number — treat it all as the id
+
+    item_id, err = _resolve_item_id(user_id, id_args)
+    if err:
+        await _safe_reply(update.message, f"⚠️ {err}")
+        return
+    item = get_item(item_id)
+    if item is None:
+        await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
+        return
+
+    ebay = dict(item.get("ebay") or {})
+    if sale_price is not None:
+        ebay["sale_price"] = sale_price
+        update_field(item_id, "ebay", ebay)
+    update_status(item_id, "sold")
+    last_item[user_id] = item_id
+
+    # Re-read so _sale_profit sees the just-saved sale price.
+    paid, sale, profit = _sale_profit(get_item(item_id))
+    msg = f"✅ Marked {item_id[:8]} sold"
+    if sale is not None:
+        msg += f" for ${sale}"
+    if paid is not None:
+        msg += f" · paid ${paid}"
+    if profit is not None:
+        msg += f" · profit ${profit} (before fees)"
+    await _safe_reply(update.message, msg)
+
+
+async def profit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Summarize profit across all items marked sold: per-item paid/sold/margin
+    and the totals. Gross of eBay fees, shipping, and ad rate."""
+    sold = [i for i in list_items() if i["status"] == "sold"]
+    if not sold:
+        await _safe_reply(update.message, "No sold items yet. Mark one with /sold <id> <price>.")
+        return
+
+    total_cost = total_rev = 0.0
+    lines = ["💵 Profit — sold items (before eBay fees/shipping):", ""]
+    for item in sorted(sold, key=lambda x: x["created_at"]):
+        paid, sale, profit = _sale_profit(item)
+        total_cost += paid or 0
+        total_rev += sale or 0
+        title = (item.get("listing") or {}).get("title") or "(untitled)"
+        lines.append(f"{item['item_id'][:8]} · paid ${paid} · sold ${sale} · "
+                     f"+${profit} · {title[:32]}")
+    lines += ["", f"TOTAL: revenue ${round(total_rev, 2)} − cost ${round(total_cost, 2)} "
+                  f"= ${round(total_rev - total_cost, 2)} across {len(sold)} item(s)"]
+    await _send_chunked(update.message, lines)
+
+
 async def listing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     item_id, err = _resolve_item_id(user_id, context.args)
@@ -1354,6 +1434,8 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("errors", errors_command))
     app.add_handler(CommandHandler("comps", comps_command))
+    app.add_handler(CommandHandler("sold", sold_command))
+    app.add_handler(CommandHandler("profit", profit_command))
     app.add_handler(CommandHandler("listing", listing_command))
     app.add_handler(CommandHandler("receipt", receipt_command))
     app.add_handler(CommandHandler("addphotos", addphotos_command))
