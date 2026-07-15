@@ -1,4 +1,6 @@
 import os, sys, re, uuid, asyncio, shutil, time, traceback
+from collections import Counter, deque
+from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 import httpx
@@ -19,7 +21,7 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import GEMINI_PHOTO_LIMIT, MAX_CONCURRENT_LISTINGS, EBAY_DEFAULT_AD_RATE_PCT
-from db import create_item, delete_item, get_item, list_items, update_field, update_status
+from db import create_item, delete_item, get_item, list_items, update_field, update_status, VALID_STATUSES
 from identify import identify_item
 from receipt import extract_receipt
 from pipeline.price import get_pricing
@@ -83,6 +85,34 @@ async def _safe_reply(message, text: str, **kwargs) -> None:
         await message.reply_text(text, **kwargs)
     except Exception as e:
         print(f"WARNING: reply_text failed (continuing anyway): {type(e).__name__}: {e}")
+
+
+TELEGRAM_MAX_CHARS = 3900  # under the 4096 hard limit, leaving headroom
+
+
+async def _send_chunked(message, lines: list[str]) -> None:
+    """Send a list of lines as one or more messages, each under Telegram's 4096-char
+    cap. /status and /comps can outgrow a single message as the item count grows."""
+    buf, size = [], 0
+    for line in lines:
+        if buf and size + len(line) + 1 > TELEGRAM_MAX_CHARS:
+            await _safe_reply(message, "\n".join(buf))
+            buf, size = [], 0
+        buf.append(line)
+        size += len(line) + 1
+    if buf:
+        await _safe_reply(message, "\n".join(buf))
+
+
+# Ring buffer of recent errors, dumped by /errors. The console isn't visible from
+# the phone, so failures that only print a traceback there are otherwise invisible.
+_recent_errors: deque = deque(maxlen=10)
+
+
+def _record_error(where: str, exc: BaseException) -> None:
+    ts = datetime.now(timezone.utc).strftime("%m-%d %H:%M:%SZ")
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    _recent_errors.append((ts, where, tb.strip()))
 
 
 async def _auth_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -417,6 +447,7 @@ async def _run_stage(item_id, message, stage_fn, *args):
         return result, None
     except Exception as e:
         print("PIPELINE ERROR:", traceback.format_exc())
+        _record_error(f"{stage_fn.__name__} ({item_id[:8]})", e)
         await _safe_reply(message, f"⚠️ {stage_fn.__name__} failed: {type(e).__name__}: {str(e)[:200]}")
         return None, e
 
@@ -947,17 +978,84 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    items = list_items()
-    if not items:
+    """List items and their pipeline status. Optional status filter: /status
+    published. Paginated so it never exceeds Telegram's message-size limit."""
+    all_items = list_items()
+    if not all_items:
         await _safe_reply(update.message, "No items yet.")
         return
 
-    lines = []
+    # Header: a count per status across everything, so you see the funnel at a glance.
+    counts = Counter(i["status"] for i in all_items)
+    ordered = VALID_STATUSES + sorted(s for s in counts if s not in VALID_STATUSES)
+    header = "📊 " + " · ".join(f"{s}:{counts[s]}" for s in ordered if counts[s])
+
+    status_filter = context.args[0].lower() if context.args else None
+    if status_filter:
+        items = [i for i in all_items if i["status"] == status_filter]
+        if not items:
+            await _safe_reply(update.message, f"{header}\n\nNo items with status '{status_filter}'.")
+            return
+    else:
+        items = all_items
+
+    lines = [header, ""]
     for item in sorted(items, key=lambda i: i["created_at"]):
         listing = item.get("listing") or {}
         title = listing.get("title") or "(no listing yet)"
-        lines.append(f"{item['item_id'][:8]} | {item['status']:10} | {title}")
-    await _safe_reply(update.message, "\n".join(lines))
+        lines.append(f"{item['item_id'][:8]} | {item['status']:10} | {title[:48]}")
+    await _send_chunked(update.message, lines)
+
+
+async def errors_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show recent errors (the console isn't visible from the phone). Each entry is
+    the time, where it happened, and the exception's final line; the full traceback
+    still prints to the server console."""
+    if not _recent_errors:
+        await _safe_reply(update.message, "✅ No errors recorded since startup.")
+        return
+    lines = ["🐞 Recent errors (newest first):", ""]
+    for ts, where, tb in reversed(_recent_errors):
+        last = tb.splitlines()[-1] if tb else ""
+        lines.append(f"🕐 {ts} · {where}")
+        lines.append(f"   {last[:250]}")
+    await _send_chunked(update.message, lines)
+
+
+async def comps_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the sold/active comps the price was built from — the evidence behind a
+    suggested price, so you can sanity-check it before overriding."""
+    user_id = update.effective_user.id
+    item_id, err = _resolve_item_id(user_id, context.args)
+    if err:
+        await _safe_reply(update.message, f"⚠️ {err}")
+        return
+    last_item[user_id] = item_id
+
+    item = get_item(item_id)
+    pricing = (item or {}).get("pricing") or {}
+    if not pricing:
+        await _safe_reply(update.message, f"No pricing data for {item_id[:8]} yet.")
+        return
+
+    lines = [f"💰 Comps for {item_id[:8]} — suggested ${pricing.get('suggested_price')} "
+             f"({pricing.get('confidence')})"]
+    if pricing.get("comp_warning"):
+        lines.append(f"⚠️ {pricing['comp_warning']}")
+
+    sold = pricing.get("sold_comps") or []
+    lines += ["", f"SOLD ({len(sold)}, median ${pricing.get('sold_median')}):"]
+    lines += [f"  ${c.get('price')} · {(c.get('title') or '')[:48]}" for c in sold] or ["  (none)"]
+
+    active = pricing.get("active_listings") or []
+    lines += ["", f"ACTIVE ({len(active)}, floor ${pricing.get('active_floor')}):"]
+    lines += [f"  ${a.get('price')} · {(a.get('title') or '')[:48]}" for a in active] or ["  (none)"]
+
+    if pricing.get("research_resale"):
+        lines += ["", f"Research resale estimate: ${pricing['research_resale']}"]
+    if pricing.get("price_source_url"):
+        lines.append(f"Anchor: {pricing['price_source_url']}")
+    await _send_chunked(update.message, lines)
 
 
 async def listing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1209,6 +1307,8 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     print(f"UNHANDLED ERROR: {type(context.error).__name__}: {context.error}")
     traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
+    if context.error is not None:
+        _record_error("unhandled", context.error)
 
 
 def _ipv4_request(connection_pool_size: int) -> HTTPXRequest:
@@ -1252,6 +1352,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm:"))
     app.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("errors", errors_command))
+    app.add_handler(CommandHandler("comps", comps_command))
     app.add_handler(CommandHandler("listing", listing_command))
     app.add_handler(CommandHandler("receipt", receipt_command))
     app.add_handler(CommandHandler("addphotos", addphotos_command))
