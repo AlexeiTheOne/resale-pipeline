@@ -198,6 +198,8 @@ Photos are stored on disk under `data/inbox/`.
 | `/addphotos [id]`| Attach more photos to an existing item                |
 | `/receipt [id] <price> <code>` | Manually set the Ross cost + 12-digit code (when the tag barcode couldn't be read) |
 | `/setprice [id] <price>` | Set the price (charm-priced); pushes to eBay if the item has an offer |
+| `/setqty [id] <n>` | Set the available quantity on eBay (once the item has an offer); listings default to 1 |
+| `/sync`          | Pull each item's live price/quantity from eBay into the DB (e.g. after a manual Seller-Hub edit); flags ended/out-of-stock listings that likely sold |
 | `/activate [id]` | Publish an eBay draft, making it a live listing       |
 | `/end [id]`      | End a live listing (withdraw it); drops back to a draft to relist |
 | `/sold [id] [price]` | Mark an item sold and record the sale price; replies with profit vs. Ross cost |
