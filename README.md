@@ -210,6 +210,7 @@ Photos are stored on disk under `data/inbox/`.
 | `/auth [url]`    | Re-consent the eBay account: no arg prints the consent URL; pass the redirect URL to finish |
 | `/whoami`        | Show your Telegram user id (to fill `TELEGRAM_ALLOWED_USER_IDS`) |
 | `/errors`        | Show recent errors (the server console isn't visible from the phone) |
+| `/help`          | List every command and what it does                    |
 | `/cancel`        | Discard photos being captured, or drop out of a confirm gate |
 
 `[id]` accepts a full item id or a unique prefix (as shown by `/status`). If
