@@ -11,9 +11,9 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from google.genai import types
+from google.genai import errors, types
 
-from llm import generate_with_retry, make_client, response_text
+from llm import error_code, generate_with_retry, make_client, response_text
 from config import GEMINI_MODEL, GEMINI_FAST_MODEL
 from receipt import read_product_upcs, ocr_text
 
@@ -25,6 +25,12 @@ client = make_client()
 # times (with backoff between attempts) before giving up rather than falling
 # through to a hallucinated guess.
 RESEARCH_ATTEMPTS = 4
+
+# Wall-clock ceiling for the grounded research call's retrying. A single attempt
+# can sit ~180s at Google's deadline before 504'ing; without a cap, a bad window
+# burns 6+ minutes of the seller's time before we fall back. This gives it room
+# for a couple of quick 503 retries plus one full-deadline attempt, then bails.
+RESEARCH_TIME_BUDGET = 240.0
 
 
 def _repair_json(raw: str) -> str:
@@ -313,20 +319,35 @@ def identify_item(image_paths: list[str], scan_paths: list[str] | None = None) -
     report = ""
     research = None
     for attempt in range(1, RESEARCH_ATTEMPTS + 1):
-        research = generate_with_retry(
-            client,
-            model=GEMINI_MODEL,
-            contents=[*image_parts, types.Part.from_text(text=research_prompt)],
-            config=types.GenerateContentConfig(
-                system_instruction=RESEARCH_SYSTEM,
-                temperature=0,
-                # flash is a thinking model with dynamic thinking on by default, and
-                # those tokens count against this budget — give the findings report
-                # enough headroom that thinking can't truncate it.
-                max_output_tokens=8000,
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-            ),
-        )
+        try:
+            research = generate_with_retry(
+                client,
+                model=GEMINI_MODEL,
+                contents=[*image_parts, types.Part.from_text(text=research_prompt)],
+                config=types.GenerateContentConfig(
+                    system_instruction=RESEARCH_SYSTEM,
+                    temperature=0,
+                    # flash is a thinking model with dynamic thinking on by default, and
+                    # those tokens count against this budget — give the findings report
+                    # enough headroom that thinking can't truncate it.
+                    max_output_tokens=8000,
+                    tools=[types.Tool(google_search=types.GoogleSearch())],
+                ),
+                # This grounded call (search + thinking) is the slow one and can sit
+                # at Google's ~180s deadline and 504. Bound the retrying so a bad
+                # grounding window can't stretch identify to 6+ minutes before we
+                # give up and use the decoded-tag fallback below.
+                max_total_seconds=RESEARCH_TIME_BUDGET,
+            )
+        except errors.APIError as exc:
+            # Research couldn't complete even after retries (503 overload / repeated
+            # 504 deadline). Don't fail the whole item — break to the tag-data
+            # fallback below, which records the decoded UPC and returns an honest
+            # "unconfirmed" so the seller can correct it, instead of losing the item.
+            print(f"Research call failed ({error_code(exc) or type(exc).__name__}) — "
+                  "falling back to decoded tag data.")
+            research, report = None, ""
+            break
         report = (research.text or "").strip()
         if report:
             break
