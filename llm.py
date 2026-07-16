@@ -96,9 +96,22 @@ def _delay_for(exc: "errors.APIError", attempt: int) -> float:
     return min(2 ** attempt + 0.5, MAX_DELAY)
 
 
-def generate_with_retry(client, **kwargs):
+def error_code(exc: "errors.APIError"):
+    """Public accessor for an API error's HTTP/status code (or None)."""
+    return _code_of(exc)
+
+
+def generate_with_retry(client, *, max_total_seconds: float | None = None, **kwargs):
     """client.models.generate_content(**kwargs) with backoff on rate limits and
-    transient server errors."""
+    transient server errors.
+
+    max_total_seconds caps the wall-clock spent retrying. It exists for the slow
+    grounded research call, which can sit at Google's ~180s deadline before 504'ing:
+    once we've already spent this long across attempts, stop retrying and re-raise
+    so the caller can fall back gracefully instead of burning several more
+    multi-minute attempts on a request that clearly can't finish in time. Left
+    None (the default) for the fast calls, whose retries are cheap.
+    """
     attempt = 0
     started = time.monotonic()
     while True:
@@ -107,7 +120,12 @@ def generate_with_retry(client, **kwargs):
             return client.models.generate_content(**kwargs)
         except errors.APIError as exc:
             took = time.monotonic() - call_start
-            if not _is_retryable(exc) or attempt >= MAX_RETRIES:
+            elapsed = time.monotonic() - started
+            over_budget = max_total_seconds is not None and elapsed >= max_total_seconds
+            if not _is_retryable(exc) or attempt >= MAX_RETRIES or over_budget:
+                if over_budget:
+                    print(f"Gemini {_code_of(exc) or '?'} after {took:.0f}s: time budget "
+                          f"spent ({elapsed:.0f}s >= {max_total_seconds:.0f}s), giving up.")
                 raise
             attempt += 1
             delay = _delay_for(exc, attempt)
@@ -117,7 +135,7 @@ def generate_with_retry(client, **kwargs):
             # backoff look mysteriously slow.
             print(f"Gemini {_code_of(exc) or '?'} after {took:.0f}s: retrying in "
                   f"{delay:.0f}s (attempt {attempt}/{MAX_RETRIES}, "
-                  f"{time.monotonic() - started:.0f}s elapsed)")
+                  f"{elapsed:.0f}s elapsed)")
             time.sleep(delay)
 
 
