@@ -47,8 +47,12 @@ def make_client(api_key: str | None = None) -> "genai.Client":
     )
 
 
+def _code_of(exc: "errors.APIError"):
+    return getattr(exc, "code", None) or getattr(exc, "status_code", None)
+
+
 def _is_retryable(exc: "errors.APIError") -> bool:
-    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    code = _code_of(exc)
     if code in RETRYABLE_CODES:
         return True
     # Fallback for errors whose code attribute isn't populated — match on the
@@ -70,23 +74,50 @@ def _suggested_delay(exc: "errors.APIError") -> float | None:
     return None
 
 
+# Transient glitches and timeouts. Waiting doesn't help these — the request just
+# died or took too long — so retry quickly instead of serving a long backoff.
+FAST_RETRY_CODES = {500, 502, 504}
+FAST_RETRY_MAX = 6.0
+
+
+def _delay_for(exc: "errors.APIError", attempt: int) -> float:
+    """How long to wait before the next attempt, matched to WHY it failed.
+
+    A server-suggested delay always wins (429s carry one). Otherwise: 429/503
+    mean "you're rate-limited / we're out of capacity", which genuinely needs an
+    escalating wait; 500/502/504 are one-off glitches or a deadline overrun,
+    where sleeping 30s accomplishes nothing but making the user wait.
+    """
+    suggested = _suggested_delay(exc)
+    if suggested is not None:
+        return min(suggested + 0.5, MAX_DELAY)
+    if _code_of(exc) in FAST_RETRY_CODES:
+        return min(1.5 * attempt, FAST_RETRY_MAX)
+    return min(2 ** attempt + 0.5, MAX_DELAY)
+
+
 def generate_with_retry(client, **kwargs):
     """client.models.generate_content(**kwargs) with backoff on rate limits and
     transient server errors."""
     attempt = 0
+    started = time.monotonic()
     while True:
+        call_start = time.monotonic()
         try:
             return client.models.generate_content(**kwargs)
         except errors.APIError as exc:
+            took = time.monotonic() - call_start
             if not _is_retryable(exc) or attempt >= MAX_RETRIES:
                 raise
             attempt += 1
-            delay = _suggested_delay(exc)
-            if delay is None:
-                delay = min(2 ** attempt, MAX_DELAY)
-            delay = min(delay + 0.5, MAX_DELAY)
-            code = getattr(exc, "code", None) or getattr(exc, "status_code", "?")
-            print(f"Gemini {code}: retrying in {delay:.0f}s (attempt {attempt}/{MAX_RETRIES})")
+            delay = _delay_for(exc, attempt)
+            # Report the failed call's duration too: most of the wall-clock time
+            # between retries is the request dying (a 504 sits for ages before
+            # Google gives up), not our sleep — logging only the sleep made the
+            # backoff look mysteriously slow.
+            print(f"Gemini {_code_of(exc) or '?'} after {took:.0f}s: retrying in "
+                  f"{delay:.0f}s (attempt {attempt}/{MAX_RETRIES}, "
+                  f"{time.monotonic() - started:.0f}s elapsed)")
             time.sleep(delay)
 
 
