@@ -30,9 +30,11 @@ from ebay.auth import get_access_token
 from ebay.inventory import (
     create_draft_offer,
     delete_offer,
+    get_offer,
     get_policy_id,
     publish_offer,
     update_offer_price,
+    update_offer_quantity,
     withdraw_offer,
     MissingRequiredAspectsError,
 )
@@ -744,7 +746,8 @@ def _split_receipt(item_id, paths, notify=lambda _t: None) -> list[str]:
             got.append(f"code {data['code']}")
         detail = ": got " + ", ".join(got) if got else (f" ({data['error']})" if data.get("error") else "")
         notify(f"🧾 Couldn't fully read the tag{detail}. "
-               f"Add it manually: /receipt {item_id[:8]} <price> <code>")
+               f"Add it manually: /receipt {item_id[:8]} <price> [code]  "
+               "(code optional — leave it off to auto-fill)")
     return listing_photos
 
 
@@ -1171,6 +1174,102 @@ async def profit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _send_chunked(update.message, lines)
 
 
+def _sync_one(item: dict) -> dict | None:
+    """Pull one item's live eBay state (price, quantity, listing status) and write
+    any changes into the local DB. Runs in a worker thread (blocking eBay call).
+    Returns a summary dict for the report, or None if the offer couldn't be read."""
+    item_id = item["item_id"]
+    ebay = dict(item.get("ebay") or {})
+    offer_id = ebay.get("offer_id")
+
+    offer = get_offer(offer_id)
+
+    changes = []
+
+    # Price: eBay is the source of truth for a manual Seller-Hub edit.
+    ebay_price = (offer.get("pricingSummary") or {}).get("price") or {}
+    ebay_price_val = ebay_price.get("value")
+    if ebay_price_val is not None:
+        new_price = round(float(ebay_price_val), 2)
+        old_price = (item.get("listing") or {}).get("price")
+        if old_price is None or round(float(old_price), 2) != new_price:
+            listing = dict(item.get("listing") or {})
+            if listing:
+                listing["price"] = new_price
+                update_field(item_id, "listing", listing)
+            pricing = dict(item.get("pricing") or {})
+            pricing["suggested_price"] = new_price
+            pricing["price_basis"] = "ebay_sync"
+            update_field(item_id, "pricing", pricing)
+            changes.append(f"price ${old_price}→${new_price}")
+
+    # Quantity: default assumption is 1 (what every listing is created with).
+    ebay_qty = offer.get("availableQuantity")
+    if ebay_qty is not None:
+        old_qty = ebay.get("quantity", 1)
+        if int(old_qty) != int(ebay_qty):
+            ebay["quantity"] = int(ebay_qty)
+            update_field(item_id, "ebay", ebay)
+            changes.append(f"qty {old_qty}→{ebay_qty}")
+
+    listing_status = (offer.get("listing") or {}).get("listingStatus")
+    # A published listing eBay reports as ended or out of stock has almost
+    # certainly sold (or was ended in Seller Hub). We flag it rather than mark it
+    # sold, because getOffer doesn't carry the actual sale price — recording that
+    # is /sold's job. availableQuantity dropping to 0 is the same signal.
+    likely_sold = (
+        item["status"] == "published"
+        and (listing_status in ("ENDED", "OUT_OF_STOCK") or ebay_qty == 0)
+    )
+    return {"item_id": item_id, "changes": changes,
+            "likely_sold": likely_sold, "listing_status": listing_status}
+
+
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reconcile the local DB with eBay: walk every item that has an eBay offer,
+    pull its current price and quantity from eBay, and write back anything that
+    changed (e.g. a price or quantity you edited by hand in Seller Hub). Also flags
+    live listings eBay reports as ended/out-of-stock — those have likely sold, so
+    run /sold on them to record the sale price. Usage: /sync."""
+    items = [
+        i for i in list_items()
+        if (i.get("ebay") or {}).get("offer_id")
+        and i["status"] in ("ebay_draft", "published", "sold")
+    ]
+    if not items:
+        await _safe_reply(update.message, "Nothing to sync — no items have an eBay offer yet.")
+        return
+
+    await _safe_reply(update.message, f"🔄 Syncing {len(items)} item(s) from eBay...")
+
+    updated, sold_flags, errors = [], [], []
+    for item in items:
+        try:
+            result = await asyncio.to_thread(_sync_one, item)
+        except Exception as e:
+            traceback.print_exc()
+            _record_error(f"sync ({item['item_id'][:8]})", e)
+            errors.append(f"{item['item_id'][:8]}: {type(e).__name__}: {str(e)[:120]}")
+            continue
+        if result["changes"]:
+            updated.append(f"{result['item_id'][:8]}: {', '.join(result['changes'])}")
+        if result["likely_sold"]:
+            sold_flags.append(result["item_id"])
+
+    lines = [f"✅ Sync done — checked {len(items)} item(s)."]
+    if updated:
+        lines += ["", f"📝 Updated ({len(updated)}):"] + [f"  {u}" for u in updated]
+    else:
+        lines.append("No price/quantity changes found.")
+    if sold_flags:
+        lines += ["", "🛒 Likely sold (ended or out of stock on eBay) — record with "
+                  "/sold <id> <price>:"]
+        lines += [f"  {sid[:8]}" for sid in sold_flags]
+    if errors:
+        lines += ["", f"⚠️ Couldn't read ({len(errors)}):"] + [f"  {e}" for e in errors]
+    await _send_chunked(update.message, lines)
+
+
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Build an Excel profit report — cover photo, title, price, shipping, Ross
     cost, and profit net of eBay fees + the ad rate — and send it as a file. It
@@ -1229,22 +1328,65 @@ async def listing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _safe_reply(update.message, format_draft(result), reply_markup=markup)
 
 
-async def receipt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manually set the Ross cost (paid price) + 12-digit code on an item — for
-    when the tag's barcode couldn't be decoded. Does not affect the eBay price.
+_NO_CODE_WORDS = {"none", "n", "-", "x", "skip", "na", "n/a"}
 
-    Usage: /receipt <price> <code>            (applies to the most recent item)
-           /receipt <item_id> <price> <code>  (explicit item)"""
+
+def _next_receipt_code() -> str:
+    """Next synthetic 12-digit Ross code, for an item you paid for but have no tag
+    code on hand. Continues the sequence from the highest code already on file
+    (+1), so a generated code sorts right in row with the real ones. Zero-padded
+    to 12 digits; starts at 1 when nothing's been recorded yet."""
+    highest = 0
+    for it in list_items():
+        c = (it.get("receipt") or {}).get("code")
+        digits = re.sub(r"\D", "", str(c)) if c else ""
+        if digits:
+            highest = max(highest, int(digits))
+    return str(highest + 1).zfill(12)
+
+
+async def receipt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually set the Ross cost (paid price) — and optionally the 12-digit tag
+    code — on an item, for when the barcode couldn't be decoded. Does not affect
+    the eBay price. The code is optional: leave it off (or type 'none') and the
+    bot fills in the next sequential code so the row lines up with the others.
+
+    Usage: /receipt <price>                     (auto-generate the code)
+           /receipt <price> none                (same — explicit)
+           /receipt <price> <code>              (real 12-digit tag code)
+           /receipt <item_id> <price> [code]    (explicit item)"""
     user_id = update.effective_user.id
-    args = context.args
-    if len(args) < 2:
+    args = list(context.args)
+    if not args:
         await _safe_reply(update.message,
-            "Usage: /receipt [item_id] <price> <code>\n"
-            "e.g. /receipt 9.99 400286461425")
+            "Usage: /receipt [item_id] <price> [code]\n"
+            "e.g. /receipt 9.99 400286461425   ·   /receipt 9.99   (auto code)")
         return
 
-    *id_args, price_str, code_str = args
-    item_id, err = _resolve_item_id(user_id, id_args)
+    # Peel an optional trailing code off the end. A bare 'none' means "generate
+    # one"; a run of ≥8 digits is a real tag-code attempt (prices are far shorter,
+    # so this can't swallow the price); anything else is the price → auto-generate.
+    code = None
+    auto = True
+    tail = args[-1]
+    tail_digits = re.sub(r"\D", "", tail)
+    if tail.lower() in _NO_CODE_WORDS:
+        args = args[:-1]
+    elif tail_digits and len(tail_digits) >= 8 and "." not in tail:
+        if len(tail_digits) != 12:
+            await _safe_reply(update.message,
+                f"⚠️ A tag code must be 12 digits (got {len(tail_digits)} from '{tail}'). "
+                "Fix it, or type 'none' to auto-generate one.")
+            return
+        code, auto = tail_digits, False
+        args = args[:-1]
+
+    if not args:
+        await _safe_reply(update.message, "Usage: /receipt [item_id] <price> [code]  (e.g. /receipt 9.99)")
+        return
+
+    price_str = args[-1]
+    item_id, err = _resolve_item_id(user_id, args[:-1])
     if err:
         await _safe_reply(update.message, f"⚠️ {err}")
         return
@@ -1255,22 +1397,21 @@ async def receipt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _safe_reply(update.message, f"⚠️ '{price_str}' isn't a valid price.")
         return
 
-    code = re.sub(r"\D", "", code_str)
-    if len(code) != 12:
-        await _safe_reply(update.message,
-            f"⚠️ The ID must be 12 digits (got {len(code)} from '{code_str}').")
-        return
-
     item = get_item(item_id)
     if item is None:
         await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
         return
 
+    if auto:
+        code = _next_receipt_code()
+
     receipt = dict(item.get("receipt") or {})
-    receipt.update({"reduced_price": price, "code": code, "source": "manual"})
+    receipt.update({"reduced_price": price, "code": code,
+                    "source": "manual", "code_generated": auto})
     update_field(item_id, "receipt", receipt)
     last_item[user_id] = item_id
-    await _safe_reply(update.message, f"🧾 Saved for {item_id[:8]}: paid ${price:.2f} · code {code}")
+    tag = " (auto)" if auto else ""
+    await _safe_reply(update.message, f"🧾 Saved for {item_id[:8]}: paid ${price:.2f} · code {code}{tag}")
 
 
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1393,6 +1534,57 @@ async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _safe_reply(update.message, f"💲 Price set to ${price} for {item_id[:8]} (updated the {where}).")
     else:
         await _safe_reply(update.message, f"💲 Price set to ${price} for {item_id[:8]}.")
+
+
+async def setqty_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set an item's available quantity on eBay. Usage: /setqty [id] <n>.
+    Quantity isn't asked during posting (every item defaults to 1); use this after
+    the item is on eBay to stock more than one. Requires an eBay offer (a draft or
+    a live listing), and pushes the new quantity to eBay."""
+    user_id = update.effective_user.id
+    args = list(context.args)
+    if not args:
+        await _safe_reply(update.message, "Usage: /setqty [id] <quantity>  (e.g. /setqty 3)")
+        return
+    try:
+        qty = int(args[-1])
+    except ValueError:
+        await _safe_reply(update.message, f"'{args[-1]}' isn't a whole number.")
+        return
+    if qty < 0:
+        await _safe_reply(update.message, "Quantity can't be negative.")
+        return
+    item_id, err = _resolve_item_id(user_id, args[:-1])
+    if err:
+        await _safe_reply(update.message, f"⚠️ {err}")
+        return
+    item = get_item(item_id)
+    if item is None:
+        await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
+        return
+    last_item[user_id] = item_id
+
+    ebay = dict(item.get("ebay") or {})
+    offer_id, sku = ebay.get("offer_id"), ebay.get("sku")
+    if not offer_id or not sku or item["status"] not in ("ebay_draft", "published"):
+        await _safe_reply(update.message,
+            f"{item_id[:8]} isn't on eBay yet (status '{item['status']}') — it needs an eBay "
+            "offer first. Approve/activate it, then set the quantity.")
+        return
+
+    try:
+        await asyncio.to_thread(update_offer_quantity, sku, offer_id, qty)
+    except Exception as e:
+        traceback.print_exc()
+        _record_error(f"setqty ({item_id[:8]})", e)
+        await _safe_reply(update.message,
+            f"⚠️ Could not set the quantity: {type(e).__name__}: {str(e)[:250]}")
+        return
+
+    ebay["quantity"] = qty
+    update_field(item_id, "ebay", ebay)
+    where = "live listing" if item["status"] == "published" else "eBay draft"
+    await _safe_reply(update.message, f"📦 Quantity set to {qty} for {item_id[:8]} (updated the {where}).")
 
 
 def _activate_item(item_id: str) -> dict:
@@ -1556,10 +1748,12 @@ HELP_SECTIONS = [
         ("/listing [id]", "Show the current draft for an item"),
         ("/comps [id]", "Show the sold/active comps the price was built from"),
         ("/addphotos [id]", "Attach more photos to an existing item"),
-        ("/receipt [id] <price> <code>", "Set the Ross cost + 12-digit code by hand"),
+        ("/receipt [id] <price> [code]", "Set the Ross cost by hand; code is optional (omit or 'none' to auto-fill)"),
     ]),
     ("Selling", [
         ("/setprice [id] <price>", "Set the price (35 -> $34.99); pushes to eBay if it already has an offer"),
+        ("/setqty [id] <n>", "Set the quantity on eBay (once the item has an offer); default is 1"),
+        ("/sync", "Pull live price/quantity from eBay into the DB; flag ended/sold listings"),
         ("/activate [id]", "Publish an eBay draft — makes it live"),
         ("/end [id]", "End a live listing (drops to a draft; /activate to relist)"),
         ("/promote [id] <pct>", "Set the Promoted Listings ad rate (2-100%)"),
@@ -1672,6 +1866,8 @@ def main() -> None:
     app.add_handler(CommandHandler("delete", delete_command))
     app.add_handler(CommandHandler("end", end_command))
     app.add_handler(CommandHandler("setprice", setprice_command))
+    app.add_handler(CommandHandler("setqty", setqty_command))
+    app.add_handler(CommandHandler("sync", sync_command))
     app.add_handler(CommandHandler("activate", activate_command))
     app.add_handler(CommandHandler("promote", promote_command))
     app.add_handler(CommandHandler("retry", retry_command))

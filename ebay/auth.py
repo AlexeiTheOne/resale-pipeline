@@ -61,11 +61,19 @@ def _basic_auth_header() -> str:
 def get_consent_url() -> str:
     """URL to send the seller to so they can grant this app a user token.
 
-    prompt=login forces eBay to show the sign-in + consent screen even when the
-    browser already has an eBay session and a prior consent. Without it, a seller
-    who consented before a scope was added (e.g. sell.marketing) gets a SILENT
-    re-authorization that re-issues only the previously-granted scopes — so the
-    new scope never gets presented for approval and never lands on the token.
+    prompt=login forces eBay to show the sign-in screen even when the browser
+    already has an eBay session. NOTE: it forces re-LOGIN, not re-CONSENT — eBay
+    does not document a prompt=consent. If the seller has ALREADY granted this app
+    once, eBay reuses that stored grant and silently re-issues a code for only the
+    previously-consented scopes; a scope added afterward (e.g. sell.marketing) is
+    never shown on the Grant Access page and never lands on the new token — so the
+    Marketing calls keep 403'ing even after a fresh "log in and approve".
+
+    To actually add a new scope you must first REVOKE this app's existing grant on
+    the eBay account (Account settings → Sign In and Security → Third-Party App
+    Access → View → Revoke Access), THEN run this consent flow again. With no prior
+    grant, eBay presents the full scope list — including the new one — and the
+    exchanged token carries it.
     """
     params = {
         "client_id": CLIENT_ID,
@@ -235,7 +243,37 @@ if __name__ == "__main__":
             sys.exit(1)
         token = exchange_code(sys.argv[2])
         print(f"Token stored. Expires in {token.get('expires_in')} seconds.")
+        # eBay's token response doesn't itemize granted scopes, so verify the one
+        # that keeps going missing (sell.marketing) by actually calling it. A 403
+        # here means the consent came back WITHOUT marketing — see get_consent_url.
+        print("\nVerifying scopes on the new token...")
+        access = token["access_token"]
+        headers = {"Authorization": f"Bearer {access}", "Accept": "application/json"}
+        for label, url in (
+            ("sell.inventory", "https://api.ebay.com/sell/inventory/v1/inventory_item?limit=1"),
+            ("sell.account", "https://api.ebay.com/sell/account/v1/privilege"),
+            ("sell.marketing", "https://api.ebay.com/sell/marketing/v1/ad_campaign?marketplace_id=EBAY_US"),
+        ):
+            try:
+                code = httpx.get(url, headers=headers, timeout=30).status_code
+            except Exception as e:
+                print(f"  {label:15} ERROR {type(e).__name__}: {e}")
+                continue
+            ok = code < 400
+            print(f"  {label:15} {'[OK] granted' if ok else '[!!] NOT granted'} (HTTP {code})")
+        print("\nIf sell.marketing is ❌, the consent page reused your old grant and did "
+              "NOT add it.\nSee the note in get_consent_url(): the app doesn't appear in "
+              "your account's\nThird-Party App Access list, so it can't be revoked there — "
+              "you'll need to\nre-run consent from a fresh eBay session, or contact eBay if "
+              "it persists.")
     else:
+        print("⚠️ ADDING A NEW SCOPE (e.g. Promoted Listings / sell.marketing)?")
+        print("   eBay reuses a prior consent and will NOT re-show the permission list")
+        print("   just because you log in again — so the new scope silently never gets")
+        print("   granted. FIRST revoke this app on the eBay ACCOUNT you sell from:")
+        print("     Account settings → Sign In and Security → Third-Party App Access")
+        print("     → View → (this app) → Revoke Access")
+        print("   Then continue below to re-grant from scratch.\n")
         print("1. Open this URL, log in as the seller, and approve access:\n")
         print(get_consent_url())
         print("\n2. eBay shows an 'Authorization successfully completed' page. The code")

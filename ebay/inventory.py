@@ -247,6 +247,38 @@ def update_offer_price(offer_id: str, price) -> None:
     _request("PUT", f"/sell/inventory/v1/offer/{offer_id}", json=body)
 
 
+def get_offer(offer_id: str) -> dict:
+    """Read an offer's current state from eBay: price, availableQuantity, and the
+    nested `listing` container (listingId + listingStatus). Used by /sync to pull
+    manual Seller-Hub edits back into the local DB."""
+    return _request("GET", f"/sell/inventory/v1/offer/{offer_id}").json()
+
+
+def update_offer_quantity(sku: str, offer_id: str, quantity: int) -> None:
+    """Change how many units are available for a SKU's offer. eBay keeps two
+    quantities that must agree — the inventory item's shipToLocationAvailability
+    and the offer's availableQuantity — so this updates both atomically via
+    bulkUpdatePriceQuantity (setting only one leaves them inconsistent and the
+    offer rejects a higher availableQuantity than the item stocks). Works for a
+    draft or a live offer. The bulk call returns HTTP 200 even when an individual
+    SKU fails, so the per-SKU status in the body is checked."""
+    body = {
+        "requests": [{
+            "sku": sku,
+            "shipToLocationAvailability": {"quantity": quantity},
+            "offers": [{"offerId": offer_id, "availableQuantity": quantity}],
+        }]
+    }
+    resp = _request("POST", "/sell/inventory/v1/bulk_update_price_quantity", json=body).json()
+    for res in resp.get("responses", []):
+        status = res.get("statusCode", 200)
+        if status >= 400:
+            raise RuntimeError(
+                f"eBay bulk_update_price_quantity failed for SKU {res.get('sku')} "
+                f"[{status}]: {res.get('errors')}"
+            )
+
+
 def get_policy_id(policy_type: str) -> str:
     resp = _request(
         "GET",
