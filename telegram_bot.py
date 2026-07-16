@@ -5,6 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import httpx
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -1814,10 +1815,20 @@ async def _post_init(app: Application) -> None:
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    print(f"UNHANDLED ERROR: {type(context.error).__name__}: {context.error}")
-    traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
-    if context.error is not None:
-        _record_error("unhandled", context.error)
+    err = context.error
+    # Transient Telegram-side transport blips (502 Bad Gateway, request timeouts)
+    # while long-polling are retried automatically by PTB's polling loop — the bot
+    # keeps running, so they're not real failures. Log a one-liner instead of a
+    # scary traceback and keep them OUT of /errors, so that ring buffer stays full
+    # of things you can actually act on. BadRequest subclasses NetworkError but is a
+    # genuine API error (e.g. message too long), so it's deliberately excluded here.
+    if isinstance(err, (NetworkError, TimedOut)) and not isinstance(err, BadRequest):
+        print(f"⚠️ Transient Telegram network error (auto-retried): {type(err).__name__}: {err}")
+        return
+    print(f"UNHANDLED ERROR: {type(err).__name__}: {err}")
+    traceback.print_exception(type(err), err, err.__traceback__)
+    if err is not None:
+        _record_error("unhandled", err)
 
 
 def _ipv4_request(connection_pool_size: int) -> HTTPXRequest:
