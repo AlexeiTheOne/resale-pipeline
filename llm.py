@@ -13,7 +13,12 @@ import httpx
 from google import genai
 from google.genai import errors, types
 
-RETRYABLE_CODES = {429, 500, 503}
+# All transient server-side failures. 502/504 matter as much as 503: a grounded
+# research call (images + search + thinking) is slow enough to hit Google's
+# deadline, and 504 DEADLINE_EXCEEDED was previously treated as fatal — it failed
+# the whole identify stage on the first try instead of retrying a timeout that
+# usually succeeds on a second attempt.
+RETRYABLE_CODES = {429, 500, 502, 503, 504}
 # 503 "overloaded" is Google-side capacity exhaustion — it hits paid keys too
 # during peak load and can persist for a while. 3 retries (~2/4/8s) often isn't
 # enough to ride out a sustained overload, so give it more shots with backoff.
@@ -46,8 +51,12 @@ def _is_retryable(exc: "errors.APIError") -> bool:
     code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
     if code in RETRYABLE_CODES:
         return True
+    # Fallback for errors whose code attribute isn't populated — match on the
+    # status names, which are unambiguous (a bare "504" could appear in unrelated
+    # numbers, but DEADLINE_EXCEEDED can't).
     text = str(exc)
-    return any(s in text for s in ("RESOURCE_EXHAUSTED", "429", "503", "UNAVAILABLE"))
+    return any(s in text for s in (
+        "RESOURCE_EXHAUSTED", "429", "503", "UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL"))
 
 
 def _suggested_delay(exc: "errors.APIError") -> float | None:
