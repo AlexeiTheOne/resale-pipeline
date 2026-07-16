@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -1541,6 +1541,76 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _safe_reply(update.message, "No capture in progress.")
 
 
+# Single source of truth for /help and for Telegram's "/" autocomplete menu, so
+# the two can't drift apart from each other or from the handlers registered below.
+HELP_SECTIONS = [
+    ("Getting started", [
+        ("(send photos)", "Start a new item. 1st photo = cover, 2nd = tag close-up, last = the Ross price tag"),
+        ("wait", "Hold the photo-batching window open longer for a big batch"),
+        ("confirm", "At a gate: accept the identification / price and continue"),
+        ("(free text)", "At a gate: correct it (e.g. 'brand is Tommy Jeans, color navy'). At review: approve, reject, or a correction"),
+        ("/cancel", "Discard photos being captured, or drop out of a gate"),
+    ]),
+    ("Items", [
+        ("/status [status]", "List items and their stage. Filter, e.g. /status published"),
+        ("/listing [id]", "Show the current draft for an item"),
+        ("/comps [id]", "Show the sold/active comps the price was built from"),
+        ("/addphotos [id]", "Attach more photos to an existing item"),
+        ("/receipt [id] <price> <code>", "Set the Ross cost + 12-digit code by hand"),
+    ]),
+    ("Selling", [
+        ("/setprice [id] <price>", "Set the price (35 -> $34.99); pushes to eBay if it already has an offer"),
+        ("/activate [id]", "Publish an eBay draft — makes it live"),
+        ("/end [id]", "End a live listing (drops to a draft; /activate to relist)"),
+        ("/promote [id] <pct>", "Set the Promoted Listings ad rate (2-100%)"),
+        ("/retry [id]", "Re-run the current pipeline step for an item"),
+        ("/delete [id]", "Delete the item, its photos, and its eBay offer"),
+    ]),
+    ("Money", [
+        ("/sold [id] [price]", "Mark an item sold and record the sale price; replies with profit"),
+        ("/profit", "Profit summary across all sold items"),
+        ("/report", "Excel report: photos, prices, fees, and profit"),
+    ]),
+    ("Admin", [
+        ("/health", "Check eBay token, business policies, ad scope, Cloudinary"),
+        ("/auth [url]", "Re-consent eBay: no argument prints the consent URL; paste the redirect URL to finish"),
+        ("/whoami", "Your Telegram user id (for TELEGRAM_ALLOWED_USER_IDS)"),
+        ("/errors", "Recent errors (the server console isn't visible from the phone)"),
+        ("/help", "This list"),
+    ]),
+]
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List every command and what it does."""
+    lines = ["🤖 Ross Resale Bot — commands", ""]
+    for title, entries in HELP_SECTIONS:
+        lines.append(f"—— {title} ——")
+        for cmd, desc in entries:
+            lines.append(f"{cmd}")
+            lines.append(f"    {desc}")
+        lines.append("")
+    lines.append("[id] = a full item id or a unique prefix (as shown by /status). "
+                 "Leave it out to act on the most recent item.")
+    await _send_chunked(update.message, lines)
+
+
+async def _post_init(app: Application) -> None:
+    """Register the command list with Telegram so typing '/' on the phone offers
+    autocomplete. Built from HELP_SECTIONS so it stays in sync with /help."""
+    commands = [
+        BotCommand(cmd.lstrip("/").split()[0], desc[:256])
+        for _, entries in HELP_SECTIONS
+        for cmd, desc in entries
+        if cmd.startswith("/")
+    ]
+    try:
+        await app.bot.set_my_commands(commands)
+        print(f"Registered {len(commands)} commands with Telegram's autocomplete menu.")
+    except Exception as e:
+        print(f"WARNING: set_my_commands failed (non-fatal): {type(e).__name__}: {e}")
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     print(f"UNHANDLED ERROR: {type(context.error).__name__}: {context.error}")
     traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
@@ -1575,6 +1645,8 @@ def main() -> None:
         # Process updates concurrently so a running pipeline / eBay call doesn't
         # stall other actions (e.g. reviewing item B while item A is pricing).
         .concurrent_updates(True)
+        # Publishes the command list to Telegram so "/" offers autocomplete.
+        .post_init(_post_init)
         .build()
     )
     if not ALLOWED_USER_IDS:
@@ -1606,6 +1678,7 @@ def main() -> None:
     app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("auth", auth_command))
     app.add_handler(CommandHandler("whoami", whoami_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.run_polling()
