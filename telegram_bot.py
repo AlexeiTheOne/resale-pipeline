@@ -1330,18 +1330,26 @@ async def listing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 _NO_CODE_WORDS = {"none", "n", "-", "x", "skip", "na", "n/a"}
 
+# Real Ross tag codes are full 12-digit numbers (≥ 1e11). Generated placeholder
+# codes count up from 0 and stay far below that ceiling, so a generated code can
+# never collide with a real barcode no matter how many we mint.
+_REAL_CODE_FLOOR = 100_000_000_000  # smallest true 12-digit code (1e11)
+
 
 def _next_receipt_code() -> str:
     """Next synthetic 12-digit Ross code, for an item you paid for but have no tag
-    code on hand. Continues the sequence from the highest code already on file
-    (+1), so a generated code sorts right in row with the real ones. Zero-padded
-    to 12 digits; starts at 1 when nothing's been recorded yet."""
-    highest = 0
+    code on hand. Continues the PLACEHOLDER sequence from the highest placeholder
+    on file (+1) — deliberately ignoring real barcodes, so it counts up 0, 1, 2…
+    in its own low range and can't ever match a real code. Zero-padded to 12
+    digits; starts at 0 when no placeholder has been recorded yet."""
+    highest = -1
     for it in list_items():
         c = (it.get("receipt") or {}).get("code")
         digits = re.sub(r"\D", "", str(c)) if c else ""
         if digits:
-            highest = max(highest, int(digits))
+            value = int(digits)
+            if value < _REAL_CODE_FLOOR:
+                highest = max(highest, value)
     return str(highest + 1).zfill(12)
 
 
