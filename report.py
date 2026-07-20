@@ -45,6 +45,25 @@ def _price_for(item):
     return (item.get("listing") or {}).get("price")
 
 
+def _report_qty(item) -> int:
+    """How many units this row represents.
+
+    For a still-listed item it's the offer's available quantity (what /setqty
+    pushed to eBay) — a listing of 5 should project 5× the per-unit profit. For a
+    SOLD item it's 1: `sale_price` is already the realized amount for what sold,
+    and the live offer quantity has usually dropped to 0, so multiplying would
+    either double-count or zero the row out. (Ross items are near-always unique
+    single units, so a multi-unit sold order is the rare exception, not the norm.)
+    """
+    if item["status"] == "sold":
+        return 1
+    try:
+        q = int((item.get("ebay") or {}).get("quantity", 1))
+    except (TypeError, ValueError):
+        q = 1
+    return q if q > 0 else 1
+
+
 def _thumbnail(cover_path, dest_dir):
     if Image is None or not cover_path:
         return None
@@ -103,8 +122,14 @@ def build_report(path: str) -> str:
         cell.border = border
 
     # --- Table header (row 10) ---
-    headers = ["Photo", "ID", "Title", "Status", "Price", "Ship chg", "eBay fee",
-               "Ad fee", "Ship cost", "Cost (Ross)", "Net profit", "Margin"]
+    # Every money column is a LINE TOTAL (per-unit × qty), so a multi-quantity
+    # listing projects its full profit, not one unit's. "Unit price" stays
+    # per-unit for reference; "Revenue" = unit price × qty is what the fee/profit
+    # math builds on. Qty comes from _report_qty (offer quantity for live items;
+    # 1 for sold, whose sale_price is already the realized amount).
+    headers = ["Photo", "ID", "Title", "Status", "Qty", "Unit price", "Revenue",
+               "Ship chg", "eBay fee", "Ad fee", "Ship cost", "Cost (Ross)",
+               "Net profit", "Margin"]
     HR = 10
     for col, h in enumerate(headers, start=1):
         cell = ws.cell(row=HR, column=col, value=h)
@@ -118,7 +143,8 @@ def build_report(path: str) -> str:
     r = first
     for item in items:
         L = item.get("listing") or {}
-        price = round(float(_price_for(item)), 2)
+        unit_price = round(float(_price_for(item)), 2)
+        qty = _report_qty(item)
         paid = (item.get("receipt") or {}).get("reduced_price")
 
         ws.row_dimensions[r].height = 72
@@ -127,23 +153,32 @@ def build_report(path: str) -> str:
         if thumb:
             ws.add_image(XLImage(thumb), f"A{r}")
 
+        # Columns: A Photo B ID C Title D Status E Qty F Unit price G Revenue
+        # H Ship chg I eBay fee J Ad fee K Ship cost L Cost M Net profit N Margin
         ws.cell(row=r, column=2, value=item["item_id"][:8])
         ws.cell(row=r, column=3, value=L.get("title") or "(no title)")
         ws.cell(row=r, column=4, value=item["status"])
-        ws.cell(row=r, column=5, value=price).number_format = MONEY
-        ws.cell(row=r, column=6, value=f"={A_SHIP_CHG}").number_format = MONEY
-        ws.cell(row=r, column=7, value=f"={A_FVF}*(E{r}+F{r})+{A_FIXED}").number_format = MONEY
-        ws.cell(row=r, column=8, value=f"={A_AD}*E{r}").number_format = MONEY
-        ws.cell(row=r, column=9, value=f"={A_SHIP_COST}").number_format = MONEY
-        cost_cell = ws.cell(row=r, column=10)
+        ws.cell(row=r, column=5, value=qty).alignment = center
+        ws.cell(row=r, column=6, value=unit_price).number_format = MONEY
+        ws.cell(row=r, column=7, value=f"=F{r}*E{r}").number_format = MONEY           # revenue
+        ws.cell(row=r, column=8, value=f"={A_SHIP_CHG}*E{r}").number_format = MONEY    # ship charged
+        # FVF% applies to (item revenue + shipping charged); the fixed per-order fee
+        # is charged per unit sold.
+        ws.cell(row=r, column=9,
+                value=f"={A_FVF}*(G{r}+H{r})+{A_FIXED}*E{r}").number_format = MONEY    # eBay fee
+        ws.cell(row=r, column=10, value=f"={A_AD}*G{r}").number_format = MONEY         # ad fee
+        ws.cell(row=r, column=11, value=f"={A_SHIP_COST}*E{r}").number_format = MONEY  # ship cost
+        cost_cell = ws.cell(row=r, column=12)
         cost_cell.number_format = MONEY
         if paid is not None:
-            cost_cell.value = round(float(paid), 2)
+            cost_cell.value = f"={round(float(paid), 2)}*E{r}"  # unit cost × qty
         else:
             cost_cell.fill = missing_fill  # unknown — treated as 0 until you fill it
-        ws.cell(row=r, column=11, value=f"=E{r}+F{r}-G{r}-H{r}-I{r}-J{r}").number_format = MONEY
-        ws.cell(row=r, column=12, value=f'=IF((E{r}+F{r})=0,"",K{r}/(E{r}+F{r}))').number_format = "0.0%"
-        for col in range(2, 13):
+        ws.cell(row=r, column=13,
+                value=f"=G{r}+H{r}-I{r}-J{r}-K{r}-L{r}").number_format = MONEY         # net profit
+        ws.cell(row=r, column=14,
+                value=f'=IF((G{r}+H{r})=0,"",M{r}/(G{r}+H{r}))').number_format = "0.0%"  # margin
+        for col in range(2, 15):
             ws.cell(row=r, column=col).border = border
         r += 1
 
@@ -151,19 +186,25 @@ def build_report(path: str) -> str:
     last = r - 1
     if last >= first:
         ws.cell(row=r, column=2, value="TOTAL").font = bold
-        for col_letter in ("E", "G", "H", "I", "J", "K"):
+        # Sum units and every money column (skip unit price F and margin N — a sum
+        # of per-unit prices or percentages is meaningless).
+        for col_letter in ("E", "G", "H", "I", "J", "K", "L", "M"):
             c = ws.cell(row=r, column=ord(col_letter) - 64,
                         value=f"=SUM({col_letter}{first}:{col_letter}{last})")
-            c.number_format = MONEY
+            c.number_format = "0" if col_letter == "E" else MONEY
             c.font = bold
-        for col in range(2, 13):
+        # Blended margin on the totals: total net / total revenue.
+        ws.cell(row=r, column=14,
+                value=f'=IF(G{r}=0,"",M{r}/G{r})').number_format = "0.0%"
+        ws.cell(row=r, column=14).font = bold
+        for col in range(2, 15):
             cell = ws.cell(row=r, column=col)
             cell.fill = total_fill
             cell.border = border
 
     # --- Widths + note ---
-    widths = {"A": 14, "B": 10, "C": 46, "D": 11, "E": 10, "F": 10, "G": 10,
-              "H": 9, "I": 10, "J": 12, "K": 12, "L": 9}
+    widths = {"A": 14, "B": 10, "C": 40, "D": 11, "E": 6, "F": 10, "G": 10,
+              "H": 9, "I": 10, "J": 9, "K": 10, "L": 12, "M": 12, "N": 9}
     for col, w in widths.items():
         ws.column_dimensions[col].width = w
     ws.freeze_panes = "A11"

@@ -6,6 +6,7 @@ pipeline mid-item. generate_with_retry retries those, honoring the server's
 suggested retryDelay when present, and re-raises anything non-retryable or once
 the retry budget is spent so the caller can fail the item gracefully.
 """
+import random
 import re
 import time
 
@@ -80,25 +81,56 @@ FAST_RETRY_CODES = {500, 502, 504}
 FAST_RETRY_MAX = 6.0
 
 
+def _jitter(base: float) -> float:
+    """Equal jitter: keep half the computed backoff as a floor, randomize the
+    other half. This de-correlates retries across items running concurrently
+    (MAX_CONCURRENT_LISTINGS) — without it, a batch that all 503'd together backs
+    off in lockstep and re-hits the same overloaded capacity window as a batch,
+    so every attempt fails at once. Spreading them lets some land in a freer
+    window."""
+    half = base / 2
+    return half + random.uniform(0, half)
+
+
 def _delay_for(exc: "errors.APIError", attempt: int) -> float:
     """How long to wait before the next attempt, matched to WHY it failed.
 
     A server-suggested delay always wins (429s carry one). Otherwise: 429/503
     mean "you're rate-limited / we're out of capacity", which genuinely needs an
     escalating wait; 500/502/504 are one-off glitches or a deadline overrun,
-    where sleeping 30s accomplishes nothing but making the user wait.
+    where sleeping 30s accomplishes nothing but making the user wait. All paths
+    are jittered so concurrent items don't retry in lockstep.
     """
     suggested = _suggested_delay(exc)
     if suggested is not None:
-        return min(suggested + 0.5, MAX_DELAY)
+        # Honor the server's ask as a floor, then add a little jitter ON TOP
+        # (never below it) so clients handed the same retryDelay don't resume
+        # simultaneously.
+        return min(suggested + random.uniform(0.5, 2.5), MAX_DELAY)
     if _code_of(exc) in FAST_RETRY_CODES:
-        return min(1.5 * attempt, FAST_RETRY_MAX)
-    return min(2 ** attempt + 0.5, MAX_DELAY)
+        return _jitter(min(1.5 * attempt, FAST_RETRY_MAX))
+    return _jitter(min(2 ** attempt + 0.5, MAX_DELAY))
 
 
 def error_code(exc: "errors.APIError"):
     """Public accessor for an API error's HTTP/status code (or None)."""
     return _code_of(exc)
+
+
+def describe_error(exc: "errors.APIError") -> str:
+    """Compact, INFORMATIVE one-liner for an API error: code + status +
+    Google's own message (e.g. '503 UNAVAILABLE: The model is overloaded' vs
+    '504 DEADLINE_EXCEEDED: ...'). We were previously logging only the numeric
+    code, which threw away the one field that says WHY it failed — overload vs a
+    deadline overrun vs a bad request all look identical as a bare '503'."""
+    code = _code_of(exc) or "?"
+    status = getattr(exc, "status", None) or ""
+    message = getattr(exc, "message", None)
+    head = f"{code} {status}".strip()
+    if message:
+        return f"{head}: {message}"[:400]
+    # message not populated (some transport errors) — fall back to the full repr.
+    return f"{head} {exc}".strip()[:400]
 
 
 def generate_with_retry(client, *, max_total_seconds: float | None = None, **kwargs):
@@ -123,19 +155,22 @@ def generate_with_retry(client, *, max_total_seconds: float | None = None, **kwa
             elapsed = time.monotonic() - started
             over_budget = max_total_seconds is not None and elapsed >= max_total_seconds
             if not _is_retryable(exc) or attempt >= MAX_RETRIES or over_budget:
-                if over_budget:
-                    print(f"Gemini {_code_of(exc) or '?'} after {took:.0f}s: time budget "
-                          f"spent ({elapsed:.0f}s >= {max_total_seconds:.0f}s), giving up.")
+                # Always log the REAL reason on the final failure — this is the
+                # line that tells us overload vs deadline vs bad-request.
+                reason = ("time budget spent" if over_budget
+                          else "not retryable" if not _is_retryable(exc)
+                          else "retries exhausted")
+                print(f"Gemini giving up ({reason}) after {took:.0f}s this call / "
+                      f"{elapsed:.0f}s total: {describe_error(exc)}")
                 raise
             attempt += 1
             delay = _delay_for(exc, attempt)
-            # Report the failed call's duration too: most of the wall-clock time
-            # between retries is the request dying (a 504 sits for ages before
-            # Google gives up), not our sleep — logging only the sleep made the
-            # backoff look mysteriously slow.
-            print(f"Gemini {_code_of(exc) or '?'} after {took:.0f}s: retrying in "
-                  f"{delay:.0f}s (attempt {attempt}/{MAX_RETRIES}, "
-                  f"{elapsed:.0f}s elapsed)")
+            # Report the failed call's duration AND Google's message: most of the
+            # wall-clock between retries is the request dying (a 504 sits for ages
+            # before Google gives up), not our sleep — and the message distinguishes
+            # a genuine overload from a self-inflicted deadline overrun.
+            print(f"Gemini {describe_error(exc)} — after {took:.0f}s, retrying in "
+                  f"{delay:.0f}s (attempt {attempt}/{MAX_RETRIES}, {elapsed:.0f}s elapsed)")
             time.sleep(delay)
 
 

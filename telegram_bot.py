@@ -1,6 +1,6 @@
 import os, sys, re, uuid, asyncio, shutil, tempfile, time, traceback
 from collections import Counter, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 import httpx
@@ -21,13 +21,22 @@ from telegram.request import HTTPXRequest
 load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import GEMINI_PHOTO_LIMIT, MAX_CONCURRENT_LISTINGS, EBAY_DEFAULT_AD_RATE_PCT
-from db import create_item, delete_item, get_item, list_items, update_field, update_status, VALID_STATUSES
+from config import (
+    GEMINI_PHOTO_LIMIT, MAX_CONCURRENT_LISTINGS, EBAY_DEFAULT_AD_RATE_PCT,
+    REPRICE_WEEKDAY, REPRICE_HOUR_UTC,
+)
+from db import (
+    create_item, delete_item, get_item, latest_stats, list_items,
+    update_field, update_status, VALID_STATUSES,
+)
 from identify import identify_item
 from receipt import extract_receipt
 from pipeline.price import get_pricing
 from pipeline.draft import generate_draft, revise_draft, revise_identification
+from pipeline.reprice import run_weekly_check
 from ebay.auth import get_access_token
+from ebay.analytics import traffic_status
+from ebay.orders import finances_status, orders_status, sales_by_item
 from ebay.inventory import (
     create_draft_offer,
     delete_offer,
@@ -1044,6 +1053,78 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _send_chunked(update.message, lines)
 
 
+def _ross_title(item: dict) -> str:
+    """Best short label for an item in an audit list: its listing title, else the
+    identified brand+model, else a placeholder."""
+    title = (item.get("listing") or {}).get("title")
+    if title:
+        return title
+    ident = item.get("identification") or {}
+    guess = " ".join(x for x in (ident.get("brand"), ident.get("model") or ident.get("product_name")) if x)
+    return guess or "(no listing yet)"
+
+
+def _ross_fields(item: dict):
+    """(code_digits, code_kind, price) for an item's Ross tag. code_kind is
+    'real' (a genuine 12-digit barcode), 'auto' (a placeholder we minted, see
+    _next_receipt_code), or 'missing'. price is the reduced/paid Ross price."""
+    receipt = item.get("receipt") or {}
+    raw = receipt.get("code")
+    digits = re.sub(r"\D", "", str(raw)) if raw else ""
+    if not digits:
+        kind = "missing"
+    elif int(digits) < _REAL_CODE_FLOOR:
+        kind = "auto"
+    else:
+        kind = "real"
+    return (digits or None), kind, receipt.get("reduced_price")
+
+
+async def ross_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Audit Ross tag data — the code and the paid price — across items, so you can
+    see at a glance what's filled in and what still needs a /receipt. Groups items
+    into those missing the Ross price and those that have it; the code column shows
+    a real barcode, an 'auto:' placeholder, or — for none. Rejected items are
+    skipped. Usage: /ross (everything) · /ross missing (only unpriced items)."""
+    items = [i for i in list_items() if i["status"] != "rejected"]
+    if not items:
+        await _safe_reply(update.message, "No items yet.")
+        return
+
+    missing_only = bool(context.args) and context.args[0].lower() in ("missing", "todo", "unpriced")
+
+    def line(item: dict) -> str:
+        digits, kind, price = _ross_fields(item)
+        code_str = digits if kind == "real" else f"auto:{digits}" if kind == "auto" else "—"
+        price_str = f"${price}" if price is not None else "❌ none"
+        return (f"{item['item_id'][:8]} | {price_str:>8} | {code_str:16} | "
+                f"{item['status']:10} | {_ross_title(item)[:32]}")
+
+    priced, unpriced, no_real_code = [], [], 0
+    for item in sorted(items, key=lambda i: i["created_at"]):
+        _, kind, price = _ross_fields(item)
+        if kind != "real":
+            no_real_code += 1
+        (priced if price is not None else unpriced).append(item)
+
+    header = (f"📋 Ross audit — {len(items)} item(s) · {len(unpriced)} missing price · "
+              f"{no_real_code} without a real code")
+    lines = [header, ""]
+
+    if unpriced:
+        lines.append(f"❌ Missing Ross price ({len(unpriced)}) — set with /receipt <id> <price>:")
+        lines += [line(i) for i in unpriced]
+    if not missing_only and priced:
+        if unpriced:
+            lines.append("")
+        lines.append(f"✅ Priced ({len(priced)}):")
+        lines += [line(i) for i in priced]
+    if missing_only and not unpriced:
+        lines.append("🎉 Every item has a Ross price recorded.")
+
+    await _send_chunked(update.message, lines)
+
+
 async def errors_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show recent errors (the console isn't visible from the phone). Each entry is
     the time, where it happened, and the exception's final line; the full traceback
@@ -1098,7 +1179,9 @@ async def comps_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def _sale_profit(item: dict):
     """(paid, sale, profit) for an item, or Nones where unknown. Cost is what you
     paid Ross (the receipt); sale is the recorded sale price, falling back to the
-    listed price. Profit is gross — before eBay fees, shipping, and ad rate."""
+    listed price. Profit is gross — before eBay fees, shipping, and ad rate. Kept
+    for /sold's immediate reply (fees usually aren't known yet at sale time);
+    /profit uses the richer _sale_economics below once /sync has pulled fees."""
     paid = (item.get("receipt") or {}).get("reduced_price")
     ebay = item.get("ebay") or {}
     sale = ebay.get("sale_price")
@@ -1106,6 +1189,33 @@ def _sale_profit(item: dict):
         sale = (item.get("listing") or {}).get("price")
     profit = round(sale - paid, 2) if (paid is not None and sale is not None) else None
     return paid, sale, profit
+
+
+def _sale_economics(item: dict) -> dict:
+    """Full profit picture for a sold item. When /sync has pulled the real eBay
+    order (net_proceeds set), profit is exact — net of actual fees; otherwise it
+    falls back to a gross estimate (recorded/listed sale price, fees unknown).
+
+    Returns paid, sale, fees, net (proceeds after fees), profit (net − paid),
+    margin (profit / sale), and fees_known."""
+    paid = (item.get("receipt") or {}).get("reduced_price")
+    ebay = item.get("ebay") or {}
+    sale = ebay.get("sale_price")
+    if sale is None:
+        sale = (item.get("listing") or {}).get("price")
+
+    net = ebay.get("net_proceeds")
+    fees_known = net is not None and ebay.get("fees_known", True)
+    # Real net when we have it; otherwise the gross sale stands in (fees unknown).
+    proceeds = net if fees_known else sale
+
+    profit = round(proceeds - paid, 2) if (paid is not None and proceeds is not None) else None
+    margin = round(profit / sale, 4) if (profit is not None and sale) else None
+    return {
+        "paid": paid, "sale": sale, "fees": ebay.get("ebay_fees"),
+        "net": net, "proceeds": proceeds, "profit": profit,
+        "margin": margin, "fees_known": fees_known,
+    }
 
 
 async def sold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1154,31 +1264,56 @@ async def sold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def profit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Summarize profit across all items marked sold: per-item paid/sold/margin
-    and the totals. Gross of eBay fees, shipping, and ad rate."""
+    """Summarize profit across all items marked sold: per-item paid → sold → fees
+    → net → margin, and the totals. Uses REAL eBay fees for items /sync has pulled
+    an order for; items without one fall back to a gross number (fees unknown).
+    Run /sync first to fill in real fees."""
     sold = [i for i in list_items() if i["status"] == "sold"]
     if not sold:
-        await _safe_reply(update.message, "No sold items yet. Mark one with /sold <id> <price>.")
+        await _safe_reply(update.message, "No sold items yet. Run /sync to pull sold orders, "
+                          "or mark one by hand with /sold <id> <price>.")
         return
 
-    total_cost = total_rev = 0.0
-    lines = ["💵 Profit — sold items (before eBay fees/shipping):", ""]
+    total_cost = total_sale = total_net = 0.0
+    total_fees = 0.0
+    any_gross = False  # at least one item still on a fees-unknown estimate
+    lines = ["💵 Profit — sold items:", ""]
     for item in sorted(sold, key=lambda x: x["created_at"]):
-        paid, sale, profit = _sale_profit(item)
+        e = _sale_economics(item)
+        paid, sale, profit = e["paid"], e["sale"], e["profit"]
+        title = ((item.get("listing") or {}).get("title") or "(untitled)")[:32]
         total_cost += paid or 0
-        total_rev += sale or 0
-        title = (item.get("listing") or {}).get("title") or "(untitled)"
-        lines.append(f"{item['item_id'][:8]} · paid ${paid} · sold ${sale} · "
-                     f"+${profit} · {title[:32]}")
-    lines += ["", f"TOTAL: revenue ${round(total_rev, 2)} − cost ${round(total_cost, 2)} "
-                  f"= ${round(total_rev - total_cost, 2)} across {len(sold)} item(s)"]
+        total_sale += sale or 0
+        total_net += e["proceeds"] or 0
+
+        margin = f"{e['margin'] * 100:.0f}%" if e["margin"] is not None else "—"
+        if e["fees_known"]:
+            total_fees += e["fees"] or 0
+            lines.append(f"{item['item_id'][:8]} · paid ${paid} · sold ${sale} · "
+                         f"fees ${e['fees']} · net ${e['net']} · +${profit} ({margin}) · {title}")
+        else:
+            any_gross = True
+            lines.append(f"{item['item_id'][:8]} · paid ${paid} · sold ${sale} · "
+                         f"+${profit} ({margin}, gross — fees unknown) · {title}")
+
+    total_profit = round(total_net - total_cost, 2)
+    lines += ["", f"TOTAL: sold ${round(total_sale, 2)} − eBay fees ${round(total_fees, 2)} "
+                  f"− cost ${round(total_cost, 2)} = ${total_profit} across {len(sold)} item(s)"]
+    if any_gross:
+        lines.append("Some items show a gross estimate (no eBay order pulled yet) — run /sync "
+                     "to fill in real fees and net.")
     await _send_chunked(update.message, lines)
 
 
-def _sync_one(item: dict) -> dict | None:
+def _sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
     """Pull one item's live eBay state (price, quantity, listing status) and write
     any changes into the local DB. Runs in a worker thread (blocking eBay call).
-    Returns a summary dict for the report, or None if the offer couldn't be read."""
+    Returns a summary dict for the report, or None if the offer couldn't be read.
+
+    `sold_map` is ebay.orders.sales_by_item()'s result (keyed by sku==item_id and
+    by listing_id): when this item appears in it, the real sale price and eBay
+    fees are recorded and the item is marked sold automatically — no manual
+    /sold needed."""
     item_id = item["item_id"]
     ebay = dict(item.get("ebay") or {})
     offer_id = ebay.get("offer_id")
@@ -1213,25 +1348,54 @@ def _sync_one(item: dict) -> dict | None:
             update_field(item_id, "ebay", ebay)
             changes.append(f"qty {old_qty}→{ebay_qty}")
 
+    # Real sale from the Fulfillment/Finances APIs: if this item shows up in the
+    # sold_map, record the actual sale price + eBay fees + net and mark it sold
+    # outright — no manual /sold guess. Matched by sku (== item_id) first, then by
+    # the stored listing_id. Skipped if already sold so re-runs are idempotent.
+    auto_sold = False
+    sale = None
+    if sold_map and item["status"] != "sold":
+        sale = sold_map.get(item_id)
+        if sale is None and ebay.get("listing_id"):
+            sale = sold_map.get(str(ebay["listing_id"]))
+    if sale is not None:
+        ebay["sale_price"] = sale["sale_price"]
+        ebay["shipping_collected"] = sale["shipping_collected"]
+        ebay["ebay_fees"] = sale["ebay_fees"]
+        ebay["shipping_label_cost"] = sale["shipping_label_cost"]
+        ebay["net_proceeds"] = sale["net_proceeds"]
+        ebay["order_id"] = sale["order_id"]
+        ebay["sold_at"] = sale["sold_at"]
+        ebay["fees_known"] = sale["fees_known"]
+        update_field(item_id, "ebay", ebay)
+        update_status(item_id, "sold")
+        auto_sold = True
+        net = sale["net_proceeds"] if sale["fees_known"] else None
+        changes.append(f"SOLD ${sale['sale_price']}" + (f" · net ${net}" if net is not None else ""))
+
     listing_status = (offer.get("listing") or {}).get("listingStatus")
-    # A published listing eBay reports as ended or out of stock has almost
-    # certainly sold (or was ended in Seller Hub). We flag it rather than mark it
-    # sold, because getOffer doesn't carry the actual sale price — recording that
-    # is /sold's job. availableQuantity dropping to 0 is the same signal.
+    # A published listing eBay reports as ended or out of stock, that we DIDN'T
+    # just match to a real order above, has probably sold (or was ended in Seller
+    # Hub) — flag it so /sold can record a price the orders feed didn't carry
+    # (e.g. an order older than the sold_map window). availableQuantity dropping
+    # to 0 is the same signal.
     likely_sold = (
-        item["status"] == "published"
+        not auto_sold
+        and item["status"] == "published"
         and (listing_status in ("ENDED", "OUT_OF_STOCK") or ebay_qty == 0)
     )
-    return {"item_id": item_id, "changes": changes,
+    return {"item_id": item_id, "changes": changes, "auto_sold": auto_sold,
             "likely_sold": likely_sold, "listing_status": listing_status}
 
 
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Reconcile the local DB with eBay: walk every item that has an eBay offer,
     pull its current price and quantity from eBay, and write back anything that
-    changed (e.g. a price or quantity you edited by hand in Seller Hub). Also flags
-    live listings eBay reports as ended/out-of-stock — those have likely sold, so
-    run /sold on them to record the sale price. Usage: /sync."""
+    changed (e.g. a price or quantity you edited by hand in Seller Hub). Also pulls
+    real sold orders — an item eBay has an order for is marked sold automatically
+    with the actual sale price and eBay fees (so /profit shows real net/margin).
+    Listings that ended without a matching order are flagged for a manual /sold.
+    Usage: /sync [days] (order look-back window, default 90)."""
     items = [
         i for i in list_items()
         if (i.get("ebay") or {}).get("offer_id")
@@ -1241,31 +1405,57 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _safe_reply(update.message, "Nothing to sync — no items have an eBay offer yet.")
         return
 
+    days = 90
+    if context.args:
+        try:
+            days = max(1, int(context.args[0]))
+        except ValueError:
+            pass
+
     await _safe_reply(update.message, f"🔄 Syncing {len(items)} item(s) from eBay...")
 
-    updated, sold_flags, errors = [], [], []
+    # Pull real sold orders once (keyed by sku==item_id and listing_id) and hand
+    # the map to every _sync_one. A missing fulfillment/finances scope shouldn't
+    # break price/qty sync, so degrade to an empty map and note it in the report.
+    sold_map, sold_map_err = {}, None
+    try:
+        sold_map = await asyncio.to_thread(sales_by_item, days)
+    except Exception as e:
+        traceback.print_exc()
+        _record_error("sync (orders)", e)
+        sold_map_err = f"{type(e).__name__}: {str(e)[:150]}"
+
+    updated, auto_sold, sold_flags, errors = [], [], [], []
     for item in items:
         try:
-            result = await asyncio.to_thread(_sync_one, item)
+            result = await asyncio.to_thread(_sync_one, item, sold_map)
         except Exception as e:
             traceback.print_exc()
             _record_error(f"sync ({item['item_id'][:8]})", e)
             errors.append(f"{item['item_id'][:8]}: {type(e).__name__}: {str(e)[:120]}")
             continue
-        if result["changes"]:
+        if result["auto_sold"]:
+            auto_sold.append(f"{result['item_id'][:8]}: {', '.join(result['changes'])}")
+        elif result["changes"]:
             updated.append(f"{result['item_id'][:8]}: {', '.join(result['changes'])}")
         if result["likely_sold"]:
             sold_flags.append(result["item_id"])
 
-    lines = [f"✅ Sync done — checked {len(items)} item(s)."]
+    lines = [f"✅ Sync done — checked {len(items)} item(s) (orders: last {days}d)."]
+    if auto_sold:
+        lines += ["", f"🟢 Recorded sold from eBay orders ({len(auto_sold)}):"] + [f"  {a}" for a in auto_sold]
     if updated:
         lines += ["", f"📝 Updated ({len(updated)}):"] + [f"  {u}" for u in updated]
-    else:
+    elif not auto_sold:
         lines.append("No price/quantity changes found.")
     if sold_flags:
-        lines += ["", "🛒 Likely sold (ended or out of stock on eBay) — record with "
+        lines += ["", "🛒 Likely sold (ended/out of stock, no order matched) — record with "
                   "/sold <id> <price>:"]
         lines += [f"  {sid[:8]}" for sid in sold_flags]
+    if sold_map_err:
+        lines += ["", f"⚠️ Couldn't read eBay orders ({sold_map_err})",
+                  "   → if this is a scope/403 error, re-run `python -m ebay.auth` to grant "
+                  "sell.fulfillment.readonly + sell.finances."]
     if errors:
         lines += ["", f"⚠️ Couldn't read ({len(errors)}):"] + [f"  {e}" for e in errors]
     await _send_chunked(update.message, lines)
@@ -1606,6 +1796,10 @@ def _activate_item(item_id: str) -> dict:
     ebay_data = dict(item.get("ebay") or {})
     ebay_data["listing_id"] = listing_id
     ebay_data["view_item_url"] = f"https://www.ebay.com/itm/{listing_id}"
+    # A relist (end -> activate again) gets a new eBay listingId and starts
+    # accumulating fresh traffic, so always stamp "now" rather than keeping an
+    # old value — pipeline/reprice.py uses this to compute weeks-live.
+    ebay_data["published_at"] = datetime.now(timezone.utc).isoformat()
     update_field(item_id, "ebay", ebay_data)
     update_status(item_id, "published")
     return ebay_data
@@ -1670,6 +1864,162 @@ async def promote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _promote_item(item_id, pct, update.message)
 
 
+def _reprice_markup(item_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Apply", callback_data=f"reprice:apply:{item_id}"),
+        InlineKeyboardButton("Skip", callback_data=f"reprice:skip:{item_id}"),
+    ]])
+
+
+_VERDICT_LABEL = {
+    "INVISIBLE": "🙈 Not being found in search",
+    "LOW_CTR": "😐 Seen but not clicked",
+    "OVERPRICED": "💸 Views but no watchers — likely overpriced",
+    "SEND_OFFERS": "👀 Watchers building — consider a private offer before cutting",
+    "STALE": "🕸️ Stale — unsold a while",
+    "TOO_NEW": "🌱 Too new to judge yet",
+    "HEALTHY": "✅ Healthy",
+    "ERROR": "⚠️ Couldn't check",
+}
+
+
+def _format_reprice_line(r: dict) -> str:
+    item = get_item(r["item_id"])
+    title = ((item or {}).get("listing") or {}).get("title") or "(untitled)"
+    label = _VERDICT_LABEL.get(r["verdict"], r["verdict"])
+    line = f"{r['item_id'][:8]} · {label}\n  {title[:48]}"
+    if r["verdict"] == "ERROR":
+        line += f"\n  {r.get('error', '')[:150]}"
+        return line
+    watchers = r.get("watchers")
+    line += (f"\n  {r.get('impressions', 0)} impr · {r.get('views', 0)} views · "
+             f"{watchers if watchers is not None else '?'} watchers · ${r.get('current_price')}")
+    if r.get("suggested_price"):
+        line += f" → suggest ${r['suggested_price']}"
+    return line
+
+
+async def _send_reprice_digest(bot, chat_id, results: list[dict]) -> None:
+    """Post a weekly price-check digest: one summary header, then one message per
+    flagged item (with an Apply/Skip button when a suggested price exists) so
+    each can be actioned independently. Healthy/too-new items are just counted in
+    the header, not spelled out individually."""
+    flagged = [r for r in results if r["verdict"] not in ("HEALTHY", "TOO_NEW")]
+    healthy = [r for r in results if r["verdict"] == "HEALTHY"]
+    too_new = [r for r in results if r["verdict"] == "TOO_NEW"]
+
+    header = (f"📈 Weekly price check — {len(results)} live listing(s): "
+              f"{len(flagged)} flagged, {len(healthy)} healthy, {len(too_new)} too new to judge.")
+    try:
+        await bot.send_message(chat_id=chat_id, text=header)
+    except Exception as e:
+        print(f"WARNING: reprice digest header failed: {type(e).__name__}: {e}")
+        return
+
+    for r in flagged:
+        text = _format_reprice_line(r)
+        markup = _reprice_markup(r["item_id"]) if r.get("suggested_price") else None
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+        except Exception as e:
+            print(f"WARNING: reprice digest item failed: {type(e).__name__}: {e}")
+
+
+async def pricecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually run the weekly price-health check now (it also runs automatically
+    once a week). Pulls eBay traffic + watch count for every live listing,
+    diagnoses why an unsold item isn't moving, and offers a one-tap price cut
+    where the evidence supports one and the receipt cost is on file."""
+    await _safe_reply(update.message, "📈 Checking live listings against eBay traffic...")
+    try:
+        results = await asyncio.to_thread(run_weekly_check)
+    except Exception as e:
+        traceback.print_exc()
+        _record_error("pricecheck", e)
+        await _safe_reply(update.message, f"⚠️ Price check failed: {type(e).__name__}: {str(e)[:250]}")
+        return
+    if not results:
+        await _safe_reply(update.message, "No published listings to check.")
+        return
+    await _send_reprice_digest(context.bot, update.effective_chat.id, results)
+
+
+async def reprice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the per-item Apply/Skip buttons on a weekly price-check digest."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, action, item_id = query.data.split(":", 2)
+    except ValueError:
+        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if action == "skip":
+        return
+
+    item = get_item(item_id)
+    if item is None:
+        await _safe_reply(query.message, "That item no longer exists.")
+        return
+    stats = latest_stats(item_id)
+    price = stats.get("suggested_price") if stats else None
+    if price is None:
+        await _safe_reply(query.message, "No suggested price on file anymore — run /pricecheck again.")
+        return
+
+    listing = dict(item.get("listing") or {})
+    if listing:
+        listing["price"] = price
+        update_field(item_id, "listing", listing)
+    pricing = dict(item.get("pricing") or {})
+    pricing["suggested_price"] = price
+    pricing["confidence"] = "reprice"
+    pricing["price_basis"] = "reprice"
+    update_field(item_id, "pricing", pricing)
+
+    offer_id = (item.get("ebay") or {}).get("offer_id")
+    if offer_id:
+        try:
+            await asyncio.to_thread(update_offer_price, offer_id, price)
+        except Exception as e:
+            traceback.print_exc()
+            _record_error(f"reprice apply ({item_id[:8]})", e)
+            await _safe_reply(query.message,
+                f"⚠️ Saved ${price} locally, but updating eBay failed: {type(e).__name__}: {str(e)[:200]}\n"
+                "Use /setprice to retry pushing it to eBay.")
+            return
+    await _safe_reply(query.message, f"💲 Repriced {item_id[:8]} to ${price}.")
+
+
+async def _weekly_reprice_loop(app: Application) -> None:
+    """Runs for the lifetime of the bot: sleeps until the next configured weekly
+    slot (REPRICE_WEEKDAY/REPRICE_HOUR_UTC), runs the price check, and posts the
+    digest to every allowed user. A manual /pricecheck doesn't reset this clock."""
+    while True:
+        now = datetime.now(timezone.utc)
+        days_ahead = (REPRICE_WEEKDAY - now.weekday()) % 7
+        target = (now + timedelta(days=days_ahead)).replace(
+            hour=REPRICE_HOUR_UTC, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=7)
+        await asyncio.sleep((target - now).total_seconds())
+
+        print("📈 Running scheduled weekly price check...")
+        try:
+            results = await asyncio.to_thread(run_weekly_check)
+        except Exception as e:
+            traceback.print_exc()
+            _record_error("weekly reprice", e)
+            continue
+        if not results:
+            continue
+        for uid in ALLOWED_USER_IDS:
+            await _send_reprice_digest(app.bot, uid, results)
+
+
 async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     item_id, err = _resolve_item_id(user_id, context.args)
@@ -1714,6 +2064,33 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "   → if this is a scope/403 error, re-run `python -m ebay.auth` to re-consent."
         )
 
+    try:
+        status = await asyncio.to_thread(traffic_status)
+        lines.append(f"✅ Traffic analytics (sell.analytics.readonly): {status}")
+    except Exception as e:
+        lines.append(
+            f"❌ Traffic analytics (sell.analytics.readonly): {str(e)[:150]}\n"
+            "   → if this is a scope/403 error, re-run `python -m ebay.auth` to re-consent."
+        )
+
+    try:
+        status = await asyncio.to_thread(orders_status)
+        lines.append(f"✅ Sold orders (sell.fulfillment.readonly): {status}")
+    except Exception as e:
+        lines.append(
+            f"❌ Sold orders (sell.fulfillment.readonly): {str(e)[:150]}\n"
+            "   → if this is a scope/403 error, re-run `python -m ebay.auth` to re-consent."
+        )
+
+    try:
+        status = await asyncio.to_thread(finances_status)
+        lines.append(f"✅ Order fees (sell.finances): {status}")
+    except Exception as e:
+        lines.append(
+            f"❌ Order fees (sell.finances): {str(e)[:150]}\n"
+            "   → if this is a scope/403 error, re-run `python -m ebay.auth` to re-consent."
+        )
+
     for name in ("CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"):
         lines.append(f"✅ {name}: set" if os.getenv(name) else f"❌ {name}: missing")
 
@@ -1754,6 +2131,7 @@ HELP_SECTIONS = [
     ]),
     ("Items", [
         ("/status [status]", "List items and their stage. Filter, e.g. /status published"),
+        ("/ross [missing]", "Audit Ross code + paid price per item; /ross missing shows only unpriced ones"),
         ("/listing [id]", "Show the current draft for an item"),
         ("/comps [id]", "Show the sold/active comps the price was built from"),
         ("/addphotos [id]", "Attach more photos to an existing item"),
@@ -1762,16 +2140,17 @@ HELP_SECTIONS = [
     ("Selling", [
         ("/setprice [id] <price>", "Set the price (35 -> $34.99); pushes to eBay if it already has an offer"),
         ("/setqty [id] <n>", "Set the quantity on eBay (once the item has an offer); default is 1"),
-        ("/sync", "Pull live price/quantity from eBay into the DB; flag ended/sold listings"),
+        ("/sync [days]", "Pull live price/quantity + real sold orders from eBay; auto-marks sold items with actual fees"),
         ("/activate [id]", "Publish an eBay draft — makes it live"),
         ("/end [id]", "End a live listing (drops to a draft; /activate to relist)"),
         ("/promote [id] <pct>", "Set the Promoted Listings ad rate (2-100%)"),
+        ("/pricecheck", "Check live listings against eBay traffic/watchers; suggests price cuts (also runs weekly)"),
         ("/retry [id]", "Re-run the current pipeline step for an item"),
         ("/delete [id]", "Delete the item, its photos, and its eBay offer"),
     ]),
     ("Money", [
         ("/sold [id] [price]", "Mark an item sold and record the sale price; replies with profit"),
-        ("/profit", "Profit summary across all sold items"),
+        ("/profit", "Profit per sold item: paid → sold → fees → net → margin (real fees after /sync)"),
         ("/report", "Excel report: photos, prices, fees, and profit"),
     ]),
     ("Admin", [
@@ -1812,6 +2191,13 @@ async def _post_init(app: Application) -> None:
         print(f"Registered {len(commands)} commands with Telegram's autocomplete menu.")
     except Exception as e:
         print(f"WARNING: set_my_commands failed (non-fatal): {type(e).__name__}: {e}")
+
+    if ALLOWED_USER_IDS:
+        app.create_task(_weekly_reprice_loop(app))
+        print(f"Weekly price check scheduled: weekday={REPRICE_WEEKDAY} hour={REPRICE_HOUR_UTC} UTC.")
+    else:
+        print("⚠️ Weekly price check NOT scheduled — no TELEGRAM_ALLOWED_USER_IDS to notify. "
+              "Use /pricecheck manually, or set the allowlist to enable it.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1873,7 +2259,9 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm:"))
     app.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
+    app.add_handler(CallbackQueryHandler(reprice_callback, pattern=r"^reprice:"))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("ross", ross_command))
     app.add_handler(CommandHandler("errors", errors_command))
     app.add_handler(CommandHandler("comps", comps_command))
     app.add_handler(CommandHandler("sold", sold_command))
@@ -1889,6 +2277,7 @@ def main() -> None:
     app.add_handler(CommandHandler("sync", sync_command))
     app.add_handler(CommandHandler("activate", activate_command))
     app.add_handler(CommandHandler("promote", promote_command))
+    app.add_handler(CommandHandler("pricecheck", pricecheck_command))
     app.add_handler(CommandHandler("retry", retry_command))
     app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("auth", auth_command))

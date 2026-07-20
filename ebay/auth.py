@@ -25,6 +25,18 @@ SCOPES = [
     # already-issued token — after this change the seller must re-run
     # `python -m ebay.auth` and re-consent, or Marketing API calls will 403.
     "https://api.ebay.com/oauth/api_scope/sell.marketing",
+    # Weekly repricing (pipeline/reprice.py) reads per-listing traffic stats via
+    # the Sell Analytics API (ebay/analytics.py). Same re-consent caveat as
+    # sell.marketing above — a token issued before this line won't carry it.
+    "https://api.ebay.com/oauth/api_scope/sell.analytics.readonly",
+    # Real sold-order economics (ebay/orders.py): getOrders needs
+    # sell.fulfillment.readonly (the sale price, buyer-paid shipping, item map);
+    # getTransactions needs sell.finances (the exact eBay fee per order). Powers
+    # /sync's auto-sold detection and /profit's real net/margin. Same re-consent
+    # caveat as the scopes above — a token issued before these lines won't carry
+    # them, so re-run `python -m ebay.auth` after adding them.
+    "https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly",
+    "https://api.ebay.com/oauth/api_scope/sell.finances",
 ]
 
 DB_PATH = "data/ross.db"
@@ -253,17 +265,34 @@ if __name__ == "__main__":
             ("sell.inventory", "https://api.ebay.com/sell/inventory/v1/inventory_item?limit=1"),
             ("sell.account", "https://api.ebay.com/sell/account/v1/privilege"),
             ("sell.marketing", "https://api.ebay.com/sell/marketing/v1/ad_campaign?marketplace_id=EBAY_US"),
+            # Analytics wants dates as yyyyMMdd, not ISO — see ebay/analytics.py.
+            # A missing scope 403s; a malformed query (e.g. the throwaway listing
+            # id below) 400s but still proves the scope is present, so only a 403
+            # counts as "not granted" for this one.
+            ("sell.analytics.readonly",
+             "https://api.ebay.com/sell/analytics/v1/traffic_report?dimension=LISTING"
+             "&filter=marketplace_ids:%7BEBAY_US%7D,listing_ids:%7B000000000000%7D,"
+             "date_range:%5B20240101..20240102%5D&metric=LISTING_IMPRESSION_TOTAL"),
+            # A limit=1 read on each returns 2xx when scoped and 403 when not.
+            # Finances lives on a DIFFERENT host (apiz.ebay.com) — see ebay/orders.py.
+            ("sell.fulfillment.readonly",
+             "https://api.ebay.com/sell/fulfillment/v1/order?limit=1"),
+            ("sell.finances",
+             "https://apiz.ebay.com/sell/finances/v1/transaction?limit=1"),
         ):
             try:
                 code = httpx.get(url, headers=headers, timeout=30).status_code
             except Exception as e:
                 print(f"  {label:15} ERROR {type(e).__name__}: {e}")
                 continue
-            ok = code < 400
+            # 403 is the unambiguous "scope not granted" signal. Other endpoints
+            # here are shaped to return 2xx when scoped; analytics can 400 on the
+            # throwaway query while still being scoped, so don't call that missing.
+            ok = code != 403
             print(f"  {label:15} {'[OK] granted' if ok else '[!!] NOT granted'} (HTTP {code})")
-        print("\nIf sell.marketing is ❌, the consent page reused your old grant and did "
+        print("\nIf a scope shows NOT granted, the consent page reused your old grant and did "
               "NOT add it.\nSee the note in get_consent_url(): the app doesn't appear in "
-              "your account's\nThird-Party App Access list, so it can't be revoked there — "
+              "your account's\nThird-Party App Access list, so it can't be revoked there - "
               "you'll need to\nre-run consent from a fresh eBay session, or contact eBay if "
               "it persists.")
     else:

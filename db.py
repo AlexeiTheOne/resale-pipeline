@@ -72,6 +72,25 @@ def create_tables() -> None:
             if column not in existing:
                 con.execute(f"ALTER TABLE items ADD COLUMN {column} {coltype}")
 
+        # One row per item per ISO week (Monday date, e.g. "2026-07-13") — the
+        # weekly repricing check's snapshot of eBay traffic/watch signals plus
+        # the diagnosis it produced. PRIMARY KEY on (item_id, week) makes
+        # re-running the check within the same week an upsert, not a duplicate.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS listing_stats (
+                item_id         TEXT NOT NULL,
+                week            TEXT NOT NULL,
+                impressions     INTEGER,
+                views           INTEGER,
+                watchers        INTEGER,
+                price           REAL,
+                verdict         TEXT,
+                suggested_price REAL,
+                created_at      TEXT NOT NULL,
+                PRIMARY KEY (item_id, week)
+            )
+        """)
+
 
 def create_item(photos: list[str]) -> str:
     item_id = str(uuid.uuid4())
@@ -126,6 +145,39 @@ def list_items(status: str | None = None) -> list[dict]:
 def delete_item(item_id: str) -> None:
     with _conn() as con:
         con.execute("DELETE FROM items WHERE item_id = ?", (item_id,))
+
+
+def record_listing_stats(item_id: str, week: str, *, impressions=None, views=None,
+                          watchers=None, price=None, verdict=None, suggested_price=None) -> None:
+    """Upsert this week's traffic/watch snapshot for an item (see listing_stats
+    in create_tables). Re-running the weekly check the same week overwrites the
+    existing row instead of adding a duplicate."""
+    with _conn() as con:
+        con.execute(
+            "INSERT INTO listing_stats (item_id, week, impressions, views, watchers, "
+            "price, verdict, suggested_price, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(item_id, week) DO UPDATE SET "
+            "impressions=excluded.impressions, views=excluded.views, watchers=excluded.watchers, "
+            "price=excluded.price, verdict=excluded.verdict, "
+            "suggested_price=excluded.suggested_price, created_at=excluded.created_at",
+            (item_id, week, impressions, views, watchers, price, verdict, suggested_price, _now()),
+        )
+
+
+def stats_history(item_id: str, limit: int = 8) -> list[dict]:
+    """Most recent weekly snapshots for an item, newest week first."""
+    with _conn() as con:
+        cur = con.execute(
+            "SELECT * FROM listing_stats WHERE item_id = ? ORDER BY week DESC LIMIT ?",
+            (item_id, limit),
+        )
+        keys = [d[0] for d in cur.description]
+        return [dict(zip(keys, row)) for row in cur.fetchall()]
+
+
+def latest_stats(item_id: str) -> dict | None:
+    history = stats_history(item_id, limit=1)
+    return history[0] if history else None
 
 
 create_tables()
