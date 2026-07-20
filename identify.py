@@ -14,12 +14,23 @@ from dotenv import load_dotenv
 from google.genai import errors, types
 
 from llm import error_code, generate_with_retry, make_client, response_text
-from config import GEMINI_MODEL, GEMINI_FAST_MODEL
+from config import GEMINI_MODEL, GEMINI_FAST_MODEL, GEMINI_RESEARCH_THINKING_LEVEL
 from receipt import read_product_upcs, ocr_text
 
 load_dotenv()
 
 client = make_client()
+
+# Resolve the configured research thinking level to the SDK enum once. Unknown
+# values fall back to LOW rather than erroring — a typo in .env shouldn't crash
+# identification. See config.GEMINI_RESEARCH_THINKING_LEVEL for why this is bounded.
+_THINKING_LEVELS = {
+    "MINIMAL": types.ThinkingLevel.MINIMAL,
+    "LOW": types.ThinkingLevel.LOW,
+    "MEDIUM": types.ThinkingLevel.MEDIUM,
+    "HIGH": types.ThinkingLevel.HIGH,
+}
+_RESEARCH_THINKING = _THINKING_LEVELS.get(GEMINI_RESEARCH_THINKING_LEVEL, types.ThinkingLevel.LOW)
 
 # The grounded research call occasionally returns an empty response; retry a few
 # times (with backoff between attempts) before giving up rather than falling
@@ -327,9 +338,13 @@ def identify_item(image_paths: list[str], scan_paths: list[str] | None = None) -
                 config=types.GenerateContentConfig(
                     system_instruction=RESEARCH_SYSTEM,
                     temperature=0,
-                    # flash is a thinking model with dynamic thinking on by default, and
-                    # those tokens count against this budget — give the findings report
-                    # enough headroom that thinking can't truncate it.
+                    # Bound the thinking explicitly. Left unset, gemini-3.5-flash's
+                    # dynamic thinking balloons and — with iterative google_search
+                    # grounding — blows Google's per-request deadline (504/503). An
+                    # explicit level keeps each call fast and predictable. See
+                    # config.GEMINI_RESEARCH_THINKING_LEVEL.
+                    thinking_config=types.ThinkingConfig(thinking_level=_RESEARCH_THINKING),
+                    # Headroom so the findings report itself isn't truncated.
                     max_output_tokens=8000,
                     tools=[types.Tool(google_search=types.GoogleSearch())],
                 ),

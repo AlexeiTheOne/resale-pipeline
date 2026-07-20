@@ -27,6 +27,17 @@ DEBUG_MODE = _env_bool("DEBUG_MODE", False)
 # Override GEMINI_MODEL in .env to pin a different model.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
+# Thinking level for that grounded research call. Gemini 3.x flash uses "dynamic
+# thinking" that, left unset, can balloon to ~160M tokens at its high level (2x+
+# Gemini 2.5 flash). Combined with iterative Google-Search grounding, a single
+# unbounded call churns past Google's per-request server deadline — surfacing as
+# 504 DEADLINE_EXCEEDED, and as 503 UNAVAILABLE when the overrun coincides with
+# load (the long-latency-then-5xx pattern we were seeing on PAID tier). Pinning an
+# explicit level makes latency predictable; the web-search grounding compensates
+# for shallower internal reasoning. LOW is a good balance; set MINIMAL for max
+# speed or MEDIUM/HIGH if identification quality needs more reasoning.
+GEMINI_RESEARCH_THINKING_LEVEL = os.getenv("GEMINI_RESEARCH_THINKING_LEVEL", "LOW").upper()
+
 # Cheaper model for steps that only STRUCTURE data we already have (no search):
 # the identify format stage and the draft writer. These never had the grounding
 # flakiness that pushed research to 3.5, and 3.5-flash costs several times more
@@ -64,3 +75,33 @@ EBAY_SHIP_FROM_ADDRESS = {
     "postalCode": "33172",
     "country": "US",
 }
+
+# --- Weekly repricing (pipeline/reprice.py) ---
+# A listing needs at least this many weeks of eBay search exposure before its
+# traffic numbers are trusted for a diagnosis; a brand-new listing just hasn't
+# had a chance to be seen yet.
+REPRICE_MIN_WEEKS_LIVE = int(os.getenv("REPRICE_MIN_WEEKS_LIVE", "1"))
+# Below this many impressions in the trailing week, the listing isn't being
+# surfaced in eBay search at all — a visibility problem, not a price problem.
+REPRICE_MIN_IMPRESSIONS = int(os.getenv("REPRICE_MIN_IMPRESSIONS", "50"))
+# Below this click-through rate (views / impressions), buyers see it in search
+# results but aren't clicking — points at the thumbnail/title/price, not comps.
+REPRICE_MIN_CTR = float(os.getenv("REPRICE_MIN_CTR", "0.01"))
+# Minimum trailing-week views before "zero watchers" is trusted as evidence the
+# price itself is the problem, rather than just low traffic.
+REPRICE_MIN_VIEWS_FOR_SIGNAL = int(os.getenv("REPRICE_MIN_VIEWS_FOR_SIGNAL", "15"))
+# Weeks unsold after which a listing is flagged stale (and gets an escalating
+# suggested cut) regardless of what the traffic signals show.
+REPRICE_STALE_WEEKS = int(os.getenv("REPRICE_STALE_WEEKS", "4"))
+# eBay fee assumptions used to compute the price floor a repricing suggestion
+# must clear (cost + fees + minimum margin) — same figures as report.py's Excel
+# assumptions, kept here as the defaults an env var can override.
+EBAY_FVF_PCT = float(os.getenv("EBAY_FVF_PCT", "0.1325"))
+EBAY_FIXED_FEE = float(os.getenv("EBAY_FIXED_FEE", "0.40"))
+# Smallest gross margin (paid price vs. suggested price, before shipping) a
+# repricing suggestion may land on — never suggest a cut that sells at a loss.
+REPRICE_MIN_MARGIN_DOLLARS = float(os.getenv("REPRICE_MIN_MARGIN_DOLLARS", "5"))
+# When the automatic weekly digest runs, in UTC. Default: Monday 14:00 UTC
+# (~9-10am US Eastern/Central).
+REPRICE_WEEKDAY = int(os.getenv("REPRICE_WEEKDAY", "0"))  # 0 = Monday
+REPRICE_HOUR_UTC = int(os.getenv("REPRICE_HOUR_UTC", "14"))
