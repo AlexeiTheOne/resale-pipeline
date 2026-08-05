@@ -3,18 +3,23 @@
 A Telegram bot that turns photos of an item into a ready-to-publish eBay
 listing. You send photos; it identifies the product, prices it against real eBay
 comps, writes the listing, pushes it to eBay as a draft, and publishes it on your
-command. You confirm the identification and the price along the way, and review
-and approve every item before anything goes live.
+command. It asks about the items it isn't sure of, and you review and approve
+every item before anything goes live.
 
 ## How it works
 
 Each item moves through a pipeline. Every step saves its result to a local
 SQLite database and advances the item's status, so a failure can be retried from
-where it stopped instead of starting over. The pipeline pauses for your OK after
-identification and after pricing, so you can correct either before it continues.
+where it stopped instead of starting over.
+
+The pipeline can pause for your OK after identification and after pricing, but it
+only does so when the evidence is weak — a confident identification and a
+solid-comp price go straight through. See
+[Gates only where they earn their keep](#gates-only-where-they-earn-their-keep).
 
 ```
-photos -> identify -> [confirm] -> price -> [confirm] -> draft -> [approve] -> eBay draft -> publish
+photos -> identify -> [confirm?] -> price -> [confirm?] -> draft -> [approve] -> eBay draft -> publish
+                          \_ skipped when the evidence is strong _/
 ```
 
 1. **Capture.** You send photos to the bot. They are batched (it waits a few
@@ -52,13 +57,37 @@ photos -> identify -> [confirm] -> price -> [confirm] -> draft -> [approve] -> e
    Tommy Jeans, color navy") that the model applies before re-showing it.
 
 3. **Price** (`pipeline/price.py`). Two eBay scrapers run in parallel via Apify:
-   sold listings and active listings. The bot filters to brand-relevant comps,
-   takes the median of sold prices, undercuts it (and the cheapest active
-   competitor), and rounds to a `.99` price. If there are too few sold comps, it
-   falls back to the resale estimate found during identification. The eBay URL of
-   the best-match comp the price is anchored to is saved on the item
-   (`price_source_url`). Status becomes `priced`. The bot shows the suggested
-   price and waits: reply `confirm` to continue, or type a price to override it
+   sold listings and active listings. **A price is only ever derived from real
+   comps** — when the comps aren't good enough, the bot returns *no price* and
+   asks you for one, rather than emitting a number it can't stand behind.
+
+   - **Query ladder.** The identify step's `search_query` is tried first. If it
+     doesn't yield usable comps, the search broadens — `brand + product_name`,
+     then `brand + item_type` — stopping at the first rung that works. Rungs only
+     run on a miss, so a well-identified item still costs a single pass.
+   - **Trim, then judge.** Comps are filtered to ones that actually name the
+     brand, used items are dropped, and the rest are outlier-trimmed to the
+     interquartile range. The surviving set is graded on **count and
+     dispersion** (p90/p10): 10 comps spanning 9× are worse evidence than 4 that
+     agree, so both bars must clear.
+     - `solid` — 5+ comps, ≤2.5× spread
+     - `thin` — 3+ comps, ≤4× spread (shown for a human look)
+     - `none` — no price is derived; you're asked for one
+   - **Price floors.** The median is undercut and capped by the cheapest active
+     competitor, but never below `sold_p10` — the 10th percentile of *proven*
+     sales. Undercutting past what people demonstrably paid isn't competing,
+     it's donating margin. An active listing far below the sold median is
+     treated as a different product and ignored entirely.
+   - **Research is a sanity check, not a price.** The resale estimate from
+     identification is *never* used as the price. If it disagrees with the comps
+     by more than ~2×, that's flagged for you to look at.
+
+   The eBay URL of the best-match comp is saved on the item
+   (`price_source_url`), and the machine's own suggestion is recorded
+   immutably as `machine_price` — a manual override replaces `suggested_price`
+   and is kept as `manual_price`, so the gap between the two stays measurable.
+   Status becomes `priced`. The bot shows the suggested price with its evidence
+   grade and waits: reply `confirm` to continue, or type a price to override it
    (a whole number is charm-priced, e.g. `35` → `$34.99`).
 
 4. **Draft** (`pipeline/draft.py`). Gemini (`gemini-2.5-flash`) writes the
@@ -90,6 +119,37 @@ photos -> identify -> [confirm] -> price -> [confirm] -> draft -> [approve] -> e
 You can also attach more photos to an existing item at any time with
 `/addphotos <id>` — new photos are appended, and if the item is already an eBay
 draft or live listing, the offer is rebuilt so the photos reach eBay.
+
+### Gates only where they earn their keep
+
+The identify and price gates clear themselves when the evidence is strong enough
+(`AUTO_CONFIRM`, on by default), so a clean item runs photos → draft without
+stopping and you're only asked about the ones that are genuinely ambiguous. A
+gate that does appear says why:
+
+- **identify** — auto-confirms at model confidence ≥ 0.8, or ≥ 0.6 when the
+  product's UPC barcode was decoded off the photos (hard evidence of exactly
+  which product it is, worth more than the model's self-assessment). Stops for an
+  unconfirmed item or any condition flags.
+- **price** — auto-confirms only on `solid` comp evidence with no review flags.
+  Thin comps, no comps, scraper schema drift, or a comps-vs-research conflict all
+  stop and ask.
+
+**The review gate before anything reaches eBay is never skipped** — nothing goes
+live without your explicit approve.
+
+### Hauls
+
+`/haul` arms multi-item capture. Send every item's photos back to back, each item
+ending with its Ross tag; the tag's CODE128 barcode is what splits the dump into
+items (decoding is local and free). All items then run at once, capped by
+`MAX_CONCURRENT_LISTINGS`.
+
+Because many items run together but only one can hold your attention, gates
+**queue**: you're asked about one item at a time, and answering it brings up the
+next. A closing digest summarizes where the whole batch landed. Photos after the
+last Ross tag mean an item without a tag — you're told, and it's left out rather
+than silently folded into the previous item.
 
 ## Architecture
 
@@ -189,9 +249,10 @@ Photos are stored on disk under `data/inbox/`.
 | Command          | What it does                                          |
 | ---------------- | ----------------------------------------------------- |
 | _(send photos)_  | Start a new item, then step through the confirm gates |
-| `confirm`        | At a gate: accept the identification / price and continue |
+| `confirm`        | At a gate: accept the identification / price and continue (strong-evidence items skip the gate entirely) |
 | _(free text)_    | At a gate: correct the identification, or set the price; at review, correct the draft or `approve`/`reject` |
 | `wait`           | Extend the photo-batching window for a large batch    |
+| `/haul`          | Multi-item mode: dump a whole Ross run and it's split into one item per Ross tag |
 | `/status [status]` | List items and their pipeline status; optional filter (e.g. `/status published`), with a count-per-status header |
 | `/listing [id]`  | Show the current draft for an item                    |
 | `/comps [id]`    | Show the sold/active comps the price was built from   |
@@ -225,12 +286,28 @@ Defaults are in `config.py`; the marked ones can be overridden in `.env`:
 - `GEMINI_MODEL` / `GEMINI_FAST_MODEL` — research vs. format/draft models
 - `GEMINI_PHOTO_LIMIT` — how many photos are sent to the paid API per item
 - `MAX_CONCURRENT_LISTINGS` — how many items may run the pipeline at once
-- `COMPS_COUNT` / `ACTIVE_COUNT` — how many comps to pull when pricing
+- `COMPS_COUNT` / `ACTIVE_COUNT` — how many comps to *keep* after trimming
+- `COMPS_FETCH_COUNT` / `ACTIVE_FETCH_COUNT` — how many raw rows to *pull* per
+  search (wider than the keep count, because outlier-trimming discards some)
 - `UNDERCUT_PCT` — how far below the comp median to price
-- `DEBUG_MODE` — pulls fewer comps (3 sold / 3 active) to save time and cost when
-  set. **Defaults to `false`.** Leave it off in production: with only 3 sold comps
-  the pipeline can't clear the ≥3 threshold it needs to trust comps and silently
-  falls back to the research estimate. Set `DEBUG_MODE=true` only for local testing.
+- `PRICE_SOLID_MIN_COMPS` / `PRICE_SOLID_MAX_DISPERSION` and
+  `PRICE_THIN_MIN_COMPS` / `PRICE_THIN_MAX_DISPERSION` — the bars a comp set must
+  clear to count as solid or thin evidence (see step 3)
+- `ACTIVE_FLOOR_MIN_RATIO` — how far below the sold median an active listing may
+  be before it's treated as a different product and ignored
+- `RESEARCH_SANITY_RATIO` — comp-vs-research disagreement that triggers a flag
+- `AUTO_CONFIRM` — let strong-evidence items clear their own identify/price gates
+  (default on; the eBay review gate is never skipped), plus
+  `AUTO_CONFIRM_MIN_IDENT_CONFIDENCE` and
+  `AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC`
+- `EBAY_SHIP_CHARGED` / `EBAY_SHIP_COST` — shipping both directions, used by the
+  repricing floor. **Set these to your real numbers** — they default to `10`/`10`
+  to match `report.py`'s assumptions, and if you actually ship free the floor is
+  wrong by the full postage until `EBAY_SHIP_CHARGED` is `0` here too.
+- `DEBUG_MODE` — pulls only 3 sold / 3 active comps to save time and cost when
+  set. **Defaults to `false`.** Leave it off in production: 3 comps can't clear
+  the `solid` bar, so every item lands on `thin` at best and stops to ask you.
+  Set `DEBUG_MODE=true` only for local testing.
 - `TELEGRAM_ALLOWED_USER_IDS` — comma-separated Telegram user ids allowed to use
   the bot. **Unset means the bot is open to anyone** (a loud warning prints on
   startup). Send `/whoami` to the bot to get your id, then set this and restart.
@@ -251,8 +328,15 @@ Defaults are in `config.py`; the marked ones can be overridden in `.env`:
   plain-text line breaks.
 - The price gate flags **comp starvation**: if the Apify scrapers return rows but
   none have a parseable price (a sign the third-party actor changed its output
-  schema), the suggested price shows a ⚠️ warning instead of quietly falling back
-  to the research estimate.
+  schema), the suggested price shows a ⚠️ warning. It also explains itself when a
+  price was held up off the active floor, or when comps and research disagree.
+- Neither scraper is sent a condition filter. eBay's maps to "New" (condition
+  1000) only, which throws away new-without-tags and open-box comps — most of the
+  pool for apparel. Used rows are dropped locally instead, on the row's own
+  condition text, which keeps the pool wide and the filtering visible.
+- `_call` retries transient Apify failures (connection resets, 5xx, 429). The
+  query ladder makes up to one scrape per rung, so an un-retried blip would cost
+  an item its comps.
 
 ## Backups
 

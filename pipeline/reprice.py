@@ -27,6 +27,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from config import (
     EBAY_DEFAULT_AD_RATE_PCT, EBAY_FIXED_FEE, EBAY_FVF_PCT,
+    EBAY_SHIP_CHARGED, EBAY_SHIP_COST,
     REPRICE_MIN_CTR, REPRICE_MIN_IMPRESSIONS, REPRICE_MIN_MARGIN_DOLLARS,
     REPRICE_MIN_VIEWS_FOR_SIGNAL, REPRICE_MIN_WEEKS_LIVE, REPRICE_STALE_WEEKS,
 )
@@ -65,10 +66,17 @@ def _charm(price: float) -> float:
 
 
 def _cost_floor(item: dict) -> float | None:
-    """Lowest price a repricing suggestion may land on: what was paid at Ross
-    plus eBay's final-value fee, fixed fee, and ad rate, plus a minimum margin —
-    so a suggested cut never sells at a loss. None if the receipt cost is
-    unknown (no floor can be computed, so no cut is suggested)."""
+    """Lowest price a repricing suggestion may land on, so a cut never sells at a
+    loss. None when the Ross cost is unknown — the caller must then refuse to
+    suggest a cut at all rather than cutting blind.
+
+    Solves report.py's own profit formula for the price P where net == the
+    minimum margin, so the floor and the profit report can't disagree:
+
+        net(P) = P + S_chg - [FVF*(P + S_chg) + fixed] - ad*P - S_cost - paid
+
+    Note the FVF applies to the shipping you charge as well as the item, which is
+    why shipping doesn't cancel out even when charged == cost."""
     paid = (item.get("receipt") or {}).get("reduced_price")
     if paid is None:
         return None
@@ -76,7 +84,9 @@ def _cost_floor(item: dict) -> float | None:
     denom = 1 - EBAY_FVF_PCT - ad_rate
     if denom <= 0:
         return None
-    return (REPRICE_MIN_MARGIN_DOLLARS + EBAY_FIXED_FEE + paid) / denom
+    numerator = (REPRICE_MIN_MARGIN_DOLLARS + EBAY_FIXED_FEE + paid + EBAY_SHIP_COST
+                 - EBAY_SHIP_CHARGED * (1 - EBAY_FVF_PCT))
+    return numerator / denom
 
 
 def _diagnose(traffic: dict, watchers: int | None, prev_watchers, weeks_live: float | None) -> str:
@@ -103,32 +113,47 @@ def _diagnose(traffic: dict, watchers: int | None, prev_watchers, weeks_live: fl
     return verdict
 
 
-def _suggest_price(item: dict, verdict: str, current_price: float | None, weeks_live: float | None) -> float | None:
+def _suggest_price(item: dict, verdict: str, current_price: float | None,
+                   weeks_live: float | None) -> tuple[float | None, str | None]:
+    """(suggested_price, note). The note explains a withheld suggestion — a cut
+    that can't be computed safely, or a listing already sitting on its floor —
+    because "no suggestion" and "no suggestion, and here's the problem" are very
+    different messages to get in a weekly digest."""
     if current_price is None:
-        return None
+        return None, None
+    if verdict not in ("OVERPRICED", "STALE"):
+        return None, None
+
     floor = _cost_floor(item)
+    if floor is None:
+        # No recorded Ross cost means no floor can be computed. Cutting anyway is
+        # how a listing gets discounted below what it cost — refuse, and say so.
+        return None, "no Ross cost recorded — can't compute a safe floor. /receipt to set it"
+
+    if current_price <= floor:
+        return None, (f"already at the ${_charm(floor):.2f} floor (cost + fees + margin) — "
+                      f"cutting further loses money. Send offers to watchers, relist, or accept it")
 
     if verdict == "OVERPRICED":
         ident = item.get("identification") or {}
         query = ident.get("search_query")
         if not query:
-            return None
+            return None, "no search query to re-pull comps with"
         pricing = get_pricing(query, research=ident)
         candidate = pricing.get("suggested_price")
-        if candidate is None or candidate >= current_price:
-            return None
-        if floor is not None:
-            candidate = max(candidate, floor)
-        return _charm(candidate) if candidate < current_price else None
+        if candidate is None:
+            return None, "no comp-backed price available to re-price against"
+        if candidate >= current_price:
+            return None, "comps don't support a lower price"
+        candidate = max(candidate, floor)
+        return (_charm(candidate), None) if candidate < current_price else (None, None)
 
-    if verdict == "STALE":
-        cut_pct = 0.15 if (weeks_live or 0) >= REPRICE_STALE_WEEKS * 2 else 0.07
-        candidate = current_price * (1 - cut_pct)
-        if floor is not None:
-            candidate = max(candidate, floor)
-        return _charm(candidate) if candidate < current_price else None
-
-    return None
+    # STALE
+    cut_pct = 0.15 if (weeks_live or 0) >= REPRICE_STALE_WEEKS * 2 else 0.07
+    candidate = max(current_price * (1 - cut_pct), floor)
+    if candidate >= current_price:
+        return None, f"a {int(cut_pct * 100)}% cut would land under the floor — held"
+    return _charm(candidate), None
 
 
 def evaluate_item(item: dict) -> dict | None:
@@ -152,7 +177,7 @@ def evaluate_item(item: dict) -> dict | None:
     current_price = (item.get("listing") or {}).get("price")
     weeks_live = _weeks_live(item)
     verdict = _diagnose(traffic, watchers, prev_watchers, weeks_live)
-    suggested = _suggest_price(item, verdict, current_price, weeks_live)
+    suggested, floor_note = _suggest_price(item, verdict, current_price, weeks_live)
 
     record_listing_stats(
         item["item_id"], week,
@@ -165,6 +190,7 @@ def evaluate_item(item: dict) -> dict | None:
         "impressions": traffic.get("impressions"), "views": traffic.get("views"),
         "ctr": traffic.get("ctr"), "watchers": watchers,
         "current_price": current_price, "suggested_price": suggested,
+        "floor_note": floor_note,
         "weeks_live": weeks_live,
     }
 
