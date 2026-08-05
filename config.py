@@ -4,6 +4,32 @@ COMPS_COUNT = 10
 ACTIVE_COUNT = 5
 UNDERCUT_PCT = 0.15
 
+# --- Comp evidence quality (pipeline/price.py) ---
+# How many raw sold rows to pull per search before filtering and outlier-trimming.
+# Deliberately larger than COMPS_COUNT (which caps what's KEPT): the trim throws
+# away a chunk of every fetch, and a wide fetch that survives trimming beats a
+# narrow one that leaves nothing to reason about.
+COMPS_FETCH_COUNT = int(os.getenv("COMPS_FETCH_COUNT", "25"))
+ACTIVE_FETCH_COUNT = int(os.getenv("ACTIVE_FETCH_COUNT", "15"))
+# An item's comps are "solid" evidence at or above this many trimmed comps AND at
+# or below this price dispersion (p90/p10). Dispersion is the check that matters:
+# a median over comps spanning 9x isn't a price, it's a coin flip — those comps
+# are different products that happen to share search words.
+PRICE_SOLID_MIN_COMPS = int(os.getenv("PRICE_SOLID_MIN_COMPS", "5"))
+PRICE_SOLID_MAX_DISPERSION = float(os.getenv("PRICE_SOLID_MAX_DISPERSION", "2.5"))
+# "Thin" evidence: usable, but shown for a human OK rather than trusted silently.
+PRICE_THIN_MIN_COMPS = int(os.getenv("PRICE_THIN_MIN_COMPS", "3"))
+PRICE_THIN_MAX_DISPERSION = float(os.getenv("PRICE_THIN_MAX_DISPERSION", "4.0"))
+# Below this fraction of the sold median, the cheapest active listing is treated
+# as a different product rather than a competitor, and does NOT cap our price.
+# Without this an unrelated cheap listing drags a good comp-backed price down.
+ACTIVE_FLOOR_MIN_RATIO = float(os.getenv("ACTIVE_FLOOR_MIN_RATIO", "0.5"))
+# If the comp price and the research estimate disagree by more than this ratio,
+# the item is flagged for a human look. The comps still set the price — research
+# is a sanity check here, never a price source (an LLM resale guess priced 60% of
+# past inventory and was overridden most of the time).
+RESEARCH_SANITY_RATIO = float(os.getenv("RESEARCH_SANITY_RATIO", "2.0"))
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -19,6 +45,22 @@ def _env_bool(name: str, default: bool) -> bool:
 # up local runs. This was hardcoded True and is the reason real pricing has been
 # running on debug-sized samples.
 DEBUG_MODE = _env_bool("DEBUG_MODE", False)
+
+# --- Auto-confirm (telegram_bot.py's advance()) ---
+# When on, the pipeline clears its own identify/price gates for items where the
+# evidence is strong enough, and stops only for the ones that genuinely need a
+# decision. The review gate before anything reaches eBay is NEVER skipped —
+# nothing goes live without an explicit approve.
+AUTO_CONFIRM = _env_bool("AUTO_CONFIRM", True)
+# An identification clears its gate unattended only at or above this model
+# confidence (identify.py returns 0.0-1.0)...
+AUTO_CONFIRM_MIN_IDENT_CONFIDENCE = float(
+    os.getenv("AUTO_CONFIRM_MIN_IDENT_CONFIDENCE", "0.8"))
+# ...or at or above this lower bar when the product's UPC barcode was decoded off
+# the photos, which is hard evidence of exactly which product this is and worth
+# more than the model's own self-assessment.
+AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC = float(
+    os.getenv("AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC", "0.6"))
 
 # The grounded research step (identify stage 1). Defaults to gemini-3.5-flash:
 # the 2.5 generation's search-grounding path frequently returned empty responses
@@ -98,8 +140,16 @@ REPRICE_STALE_WEEKS = int(os.getenv("REPRICE_STALE_WEEKS", "4"))
 # assumptions, kept here as the defaults an env var can override.
 EBAY_FVF_PCT = float(os.getenv("EBAY_FVF_PCT", "0.1325"))
 EBAY_FIXED_FEE = float(os.getenv("EBAY_FIXED_FEE", "0.40"))
-# Smallest gross margin (paid price vs. suggested price, before shipping) a
-# repricing suggestion may land on — never suggest a cut that sells at a loss.
+# Shipping, both directions. These mirror report.py's editable assumptions so the
+# repricing floor and the profit report agree on what an item actually nets. With
+# charged == cost the postage cancels out, but eBay's FVF still applies to the
+# shipping you charge, so leaving both at zero understates the floor.
+# SET THESE TO YOUR REAL NUMBERS — if you ship free (charge 0, pay postage), the
+# floor is wrong by the full postage until EBAY_SHIP_CHARGED is 0 here too.
+EBAY_SHIP_CHARGED = float(os.getenv("EBAY_SHIP_CHARGED", "10"))
+EBAY_SHIP_COST = float(os.getenv("EBAY_SHIP_COST", "10"))
+# Smallest NET margin (after eBay fees, ad rate, and shipping) a repricing
+# suggestion may land on — never suggest a cut that sells at a loss.
 REPRICE_MIN_MARGIN_DOLLARS = float(os.getenv("REPRICE_MIN_MARGIN_DOLLARS", "5"))
 # When the automatic weekly digest runs, in UTC. Default: Monday 14:00 UTC
 # (~9-10am US Eastern/Central).
