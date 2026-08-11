@@ -146,21 +146,17 @@ item. That blackout frame is the divider. All items then run at once, capped by
 `MAX_CONCURRENT_LISTINGS`.
 
 **Why a blackout frame and not the Ross tag?** The tag was tried first and
-measured against the real photo library (61 items, 413 photos):
+measured against the real photo library. Of the 59 actual Ross tag photos, the
+18-digit CODE128 decodes on **26 (44%)** — glare, angle and Telegram's
+compression defeat the rest, and OCR of those is mostly noise (the patterns that
+survive, like a bare 12-digit number or "MSRP", appear on manufacturer labels
+too, so they identify nothing).
 
-| Signal | Fires on a tag photo | False positives on merchandise |
-| ------ | -------------------- | ------------------------------ |
-| 18-digit CODE128 decode | 41% | 0 |
-| Any barcode at all | 39% | 5% |
-| OCR finding Ross wording | 23% | 0 |
-| All three combined | **44%** | 5% |
-
-Glare, angle and focus defeat the rest. A divider that misses more than half the
-time is worse than none, because every miss silently welds two items into one
-listing. A blackout frame has no such failure mode: the darkest of 413 real
-photos averaged 56/255 and a covered lens lands near zero, so
-`DARK_FRAME_MAX_LUMA` (default 25) sits in a gap nothing real occupies — measured
-false-positive rate across the whole library is **0 of 413**.
+A divider that misses more than half the time is worse than none, because every
+miss silently welds two items into one listing. A blackout frame has no such
+failure mode: the darkest of 413 real photos averaged 56/255 and a covered lens
+lands near zero, so `DARK_FRAME_MAX_LUMA` (default 25) sits in a gap nothing real
+occupies — measured false-positive rate across the whole library is **0 of 413**.
 
 A tag barcode that *does* decode still ends its item, since it's free and never
 wrong when it fires — so a cleanly-shot haul may need no dividers at all. No
