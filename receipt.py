@@ -64,6 +64,17 @@ _PRICE_RE = re.compile(r"\$?\s*(\d[\d,]*)[.,](\d{2})(?!\d)")
 _CODE_RE = re.compile(r"(?<!\d)(\d{12})(?!\d)")
 # Lines that quote the retail/compare-at price rather than what we paid.
 _ORIGINAL_HINT = re.compile(r"\b(original|compare|comp\s*at|retail|msrp|reg(?:ular)?)\b", re.I)
+# Evidence that a photo is the ROSS tag rather than the manufacturer's label
+# (see looks_like_tag). Both of these are deliberately narrow:
+#
+#   _ROSS_CODE_RE — every Ross item code observed starts 400 (26/26 across the
+#     decoded-barcode history: 4002xxxxxxx and 4003xxxxxxx). Requiring the prefix
+#     is what separates a Ross code from a manufacturer style number or a UPC —
+#     a bare 12-digit match hit labels like "650753752001  M.S.R.P 185.00".
+#   _TAG_TEXT — "REDUCED" is Ross's own wording. MSRP / retail / compare-at were
+#     tried and are printed on manufacturer labels too, so they identify nothing.
+_ROSS_CODE_RE = re.compile(r"(?<!\d)(400\d{9})(?!\d)")
+_TAG_TEXT = re.compile(r"\breduc(?:ed)?\b", re.I)
 
 
 # --- Frame brightness (haul separators) ---------------------------------------
@@ -94,6 +105,40 @@ def is_dark_frame(image_path: str) -> bool:
     """Is this photo a deliberate blackout separator rather than merchandise?"""
     luma = mean_luma(image_path)
     return luma is not None and luma < DARK_FRAME_MAX_LUMA
+
+
+# --- Is this photo the Ross tag? ----------------------------------------------
+
+def looks_like_tag(image_path: str) -> str | None:
+    """How this photo was recognised as the Ross tag, or None if it isn't one.
+
+    Returns "barcode" / "code" / "text" so callers can report which evidence
+    fired. Cheapest first, and each is checked against what is ACTUALLY printed
+    on a Ross tag:
+
+      barcode — the 18-digit CODE128. Definitive, but it decodes on well under
+                half of real tag photos (glare, angle, Telegram's compression).
+      code    — OCR finds the Ross item code (12 digits, 400-prefixed). The
+                workhorse: printed large, it survives OCR long after the barcode
+                stops decoding.
+      text    — OCR finds Ross's "REDUCED" wording next to a money amount.
+
+    Two things are deliberately NOT used, both because they misfire on real
+    merchandise: the word "Ross" (these tags don't print it at all), and a bare
+    12-digit number or MSRP/retail wording (that is what a manufacturer's label
+    looks like — matching it peeled genuine product photos off listings)."""
+    digits = decode_barcode(image_path)
+    if digits and len(digits) == 18:
+        return "barcode"
+    try:
+        text = ocr_text(image_path) or ""
+    except Exception:
+        return None
+    if _ROSS_CODE_RE.search(text):
+        return "code"
+    if _TAG_TEXT.search(text) and _PRICE_RE.search(text):
+        return "text"
+    return None
 
 
 # --- Barcode (primary) --------------------------------------------------------
