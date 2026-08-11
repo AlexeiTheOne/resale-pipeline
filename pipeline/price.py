@@ -204,10 +204,22 @@ def _finalize_price(base, active_floor):
 def _brand_match(title, brand):
     """Does this comp's title actually name the brand? Accepts the brand as a
     phrase or as all of its words present separately ("Calvin Klein Jeans" vs a
-    title reading "Jeans by Calvin Klein")."""
+    title reading "Jeans by Calvin Klein").
+
+    Matching is on whole words: a substring test lets "Old Navy" match "Womens
+    Gold Navy Blue Blouse" ("old" inside "gold"), and since the unfiltered-comps
+    fallback is gone, false positives like that become the entire comp set and
+    can be graded solid."""
     text = (title or "").lower()
-    brand = brand.lower().strip()
-    return brand in text or all(word in text for word in brand.split())
+    brand = (brand or "").lower().strip()
+    if not brand:
+        return False
+    words = brand.split()
+    if not words:
+        return False
+    if re.search(rf"\b{re.escape(brand)}\b", text):
+        return True
+    return all(re.search(rf"\b{re.escape(word)}\b", text) for word in words)
 
 
 def _fetch_rung(query, brand, fetch_sold, fetch_active, comps_count, active_count):
@@ -299,6 +311,29 @@ def get_pricing(search_query: str, research: dict | None = None) -> dict:
     # are good enough to price from. Rungs run sequentially (each is a ~1min
     # scrape) but only on a miss, so a well-identified item still costs one pass.
     ladder = _query_ladder(search_query, research)
+    if not ladder:
+        # Nothing to search on at all (no query, no brand, no product/type). Not
+        # reachable from identify.py, which backstops search_query, but a typed
+        # correction through revise_identification has no such net — and an empty
+        # ladder would otherwise blow up on max() of no attempts.
+        return {
+            "suggested_price": None, "machine_price": None,
+            "confidence": "none", "price_basis": "none",
+            "evidence": "none", "needs_review": True,
+            "review_flags": ["no_query"],
+            "comp_warning": "nothing to search comps with — the item has no search "
+                            "query, brand, or product type. Fix the identification "
+                            "or type a price.",
+            "sold_count": 0, "sold_comps": [], "active_count": 0, "active_listings": [],
+            "sold_median": None, "sold_p10": None, "sold_p90": None,
+            "active_floor": None, "reference": None, "stock_image_url": None,
+            "price_source_url": None, "query_rung": None, "query_used": None,
+            "rungs_tried": [], "dispersion": None,
+            "retail_price": research.get("retail_price"),
+            "resale_estimate": research.get("resale_estimate"),
+            "research_resale": None,
+            "price_evidence": research.get("price_evidence"),
+        }
     attempts = []
     for name, query in ladder:
         rung = _fetch_rung(query, brand, fetch_sold, fetch_active, comps_count, active_count)

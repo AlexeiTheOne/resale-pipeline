@@ -145,11 +145,20 @@ ending with its Ross tag; the tag's CODE128 barcode is what splits the dump into
 items (decoding is local and free). All items then run at once, capped by
 `MAX_CONCURRENT_LISTINGS`.
 
+Haul mode **stays armed until `/cancel`**, so a pause longer than the capture
+window doesn't silently drop you back to single-item mode and turn the next
+armful of photos into one item containing several products.
+
 Because many items run together but only one can hold your attention, gates
 **queue**: you're asked about one item at a time, and answering it brings up the
-next. A closing digest summarizes where the whole batch landed. Photos after the
-last Ross tag mean an item without a tag — you're told, and it's left out rather
-than silently folded into the previous item.
+next. Deleting an item, or hitting one that was already deleted, hands the slot
+to the next in line rather than stranding the rest. A closing digest summarizes
+where the whole batch landed. Photos after the last Ross tag mean an item without
+a tag — you're told, and it's left out rather than silently folded into the
+previous item.
+
+While a haul is running, `approve` and `reject` always go to the draft waiting at
+review, never to whichever item happens to be sitting at a gate.
 
 ## Architecture
 
