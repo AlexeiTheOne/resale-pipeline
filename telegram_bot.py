@@ -32,7 +32,7 @@ from db import (
     update_field, update_status, VALID_STATUSES,
 )
 from identify import identify_item
-from receipt import decode_barcode, extract_receipt, is_dark_frame
+from receipt import decode_barcode, extract_receipt, is_dark_frame, ocr_text
 from pipeline.price import get_pricing
 from pipeline.draft import generate_draft, revise_draft, revise_identification
 from pipeline.reprice import run_weekly_check
@@ -86,6 +86,10 @@ capture_window = {} # user_id -> seconds to batch photos (default DEFAULT_CAPTUR
 staging = {}        # user_id -> {item_id, folder, paths, chat_id, task} awaiting Start/Wait/Cancel
 awaiting_photos = {}# user_id -> item_id  (photos should attach to this existing item, set by /addphotos)
 appending = {}      # user_id -> {item_id, folder, base, new, chat_id, task} while an append batch is collected
+# Wording that only appears on a Ross price tag — the fallback for finding the
+# tag photo when its barcode won't decode (see _find_tag_photo).
+_ROSS_TAG_TEXT = re.compile(r"ross|dress for less|compare at|our price", re.I)
+
 gate = {}           # user_id -> {item_id, stage}  paused at "identify"/"price" awaiting confirm/correction
 gate_queue = {}     # user_id -> [{item_id, stage, reason}]  gates waiting their turn (a /haul runs many
                     # items at once, and only one can hold the single gate slot; the rest queue here
@@ -1038,19 +1042,65 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _safe_reply(query.message, f"❌ Rejected {item_id[:8]}.")
 
 
+def _find_tag_photo(paths: list[str]) -> int | None:
+    """Index of the Ross tag among these photos, or None if there isn't one.
+
+    Two passes, cheapest first: the tag's 18-digit CODE128 (definitive, and free),
+    then OCR looking for the wording only a Ross tag carries. Scanning from the
+    END because the tag is normally shot last — the usual case still costs one
+    decode. OCR runs only if no barcode decoded anywhere, since it's the slow
+    path."""
+    for idx in range(len(paths) - 1, -1, -1):
+        try:
+            digits = decode_barcode(paths[idx])
+        except Exception:
+            continue
+        if digits and len(digits) == 18:
+            return idx
+
+    for idx in range(len(paths) - 1, -1, -1):
+        try:
+            text = ocr_text(paths[idx]) or ""
+        except Exception:
+            continue
+        if _ROSS_TAG_TEXT.search(text):
+            return idx
+    return None
+
+
 def _split_receipt(item_id, paths, notify=lambda _t: None) -> list[str]:
-    """Peel the last photo — always the Ross receipt — off the listing photos,
-    OCR it for the paid price + 12-digit code, and persist both. The receipt is
-    dropped from `photos` so it never reaches eBay. Idempotent: if the receipt
-    was already processed for this item, returns the stored listing photos."""
+    """Find the Ross tag among the photos, read the paid price + 12-digit code off
+    it, and drop it from `photos` so it never reaches eBay. Idempotent: if the
+    receipt was already processed for this item, returns the stored listing photos.
+
+    This used to assume the tag was always the LAST photo and peel it
+    unconditionally. Measured over the real library that assumption held for only
+    25 of 63 items — for the rest the last photo was merchandise, and a genuine
+    product shot was being deleted from the listing on every one of them. So the
+    tag is now located rather than assumed, and when no tag can be found nothing
+    is peeled at all: better to ask for /receipt than to silently cost the listing
+    a photo."""
     item = get_item(item_id)
     if item and item.get("receipt"):
         return item.get("photos") or []
     if len(paths) < 2:
         return list(paths)  # nothing to peel — no receipt to separate
 
-    listing_photos = list(paths[:-1])
-    data = extract_receipt(paths[-1])
+    tag_idx = _find_tag_photo(paths)
+    if tag_idx is None:
+        # No tag anywhere. Keep every photo, and record the miss so the item isn't
+        # re-scanned on each retry and the user gets one clear ask.
+        update_field(item_id, "receipt", {
+            "code": None, "reduced_price": None, "original_price": None,
+            "source": "not_found",
+            "error": "no Ross tag barcode or tag text found in any photo",
+        })
+        notify(f"🧾 No Ross tag found in these photos — keeping all {len(paths)} for the "
+               f"listing. Add the cost manually: /receipt {item_id[:8]} <price> [code]")
+        return list(paths)
+
+    listing_photos = [p for idx, p in enumerate(paths) if idx != tag_idx]
+    data = extract_receipt(paths[tag_idx])
     update_field(item_id, "photos", listing_photos)
     update_field(item_id, "receipt", data)
     if data.get("code") and data.get("reduced_price") is not None:
