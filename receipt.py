@@ -66,6 +66,36 @@ _CODE_RE = re.compile(r"(?<!\d)(\d{12})(?!\d)")
 _ORIGINAL_HINT = re.compile(r"\b(original|compare|comp\s*at|retail|msrp|reg(?:ular)?)\b", re.I)
 
 
+# --- Frame brightness (haul separators) ---------------------------------------
+
+# A deliberately dark frame — lens covered, or pointed at something black — used
+# to mark the end of an item in a /haul. Measured across 401 real item photos the
+# darkest was mean luminance 56, so 25 leaves better than a 2x margin: no real
+# photo of merchandise comes close, and covering the lens lands near zero.
+DARK_FRAME_MAX_LUMA = float(os.getenv("DARK_FRAME_MAX_LUMA", "25"))
+
+
+def mean_luma(image_path: str) -> float | None:
+    """Average brightness of an image, 0-255, or None if it can't be read.
+    Downsampled first — a 64px thumbnail settles this and avoids decoding a
+    12-megapixel photo just to average it."""
+    if Image is None:
+        return None
+    try:
+        img = ImageOps.exif_transpose(Image.open(image_path)).convert("L")
+        img.thumbnail((64, 64))
+        pixels = list(img.getdata())
+        return sum(pixels) / len(pixels) if pixels else None
+    except Exception:
+        return None
+
+
+def is_dark_frame(image_path: str) -> bool:
+    """Is this photo a deliberate blackout separator rather than merchandise?"""
+    luma = mean_luma(image_path)
+    return luma is not None and luma < DARK_FRAME_MAX_LUMA
+
+
 # --- Barcode (primary) --------------------------------------------------------
 
 def decode_barcode(image_path: str) -> str | None:
