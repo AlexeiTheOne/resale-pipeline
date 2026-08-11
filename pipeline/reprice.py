@@ -10,12 +10,16 @@ Diagnosis, from cheapest-to-fix to most decisive:
                  Fix: promotion/title, not price.
   LOW_CTR      — enough impressions, few views: they see it, don't click.
                  Fix: cover photo or price-vs-thumbnail, not necessarily comps.
+  STALE_UNSEEN — old and unsold, but with too little traffic to blame the price.
+                 Fix: discovery (title/keywords/category/promotion). Never a cut:
+                 a listing nobody has looked at hasn't been rejected on price.
   SEND_OFFERS  — watchers present and not shrinking, still unsold: buyers are
                  interested but waiting — a private offer beats a public cut.
   OVERPRICED   — enough views, zero watchers, unsold: the listing page itself
                  isn't converting — price is above what the market will pay.
-  STALE        — unsold past REPRICE_STALE_WEEKS with no other signal firing —
-                 the backstop for listings the traffic heuristics can't diagnose.
+  STALE        — unsold past REPRICE_STALE_WEEKS despite real views, with no
+                 other signal firing: people are looking and not buying, so the
+                 price is the remaining variable.
   HEALTHY      — none of the above.
 """
 import sys
@@ -108,8 +112,16 @@ def _diagnose(traffic: dict, watchers: int | None, prev_watchers, weeks_live: fl
     else:
         verdict = "HEALTHY"
 
-    if weeks_live is not None and weeks_live >= REPRICE_STALE_WEEKS and verdict in ("HEALTHY", "LOW_CTR"):
-        verdict = "STALE"
+    # Age alone is not evidence about price. A cut is only justified when people
+    # are demonstrably LOOKING and still not buying; if nobody is seeing the
+    # listing, or they see it and don't click, the problem is discovery (title,
+    # keywords, category, photo, promotion) and cutting the price just donates
+    # margin without fixing anything.
+    #
+    # So LOW_CTR is never escalated to a cut, and an old listing with too little
+    # traffic to judge becomes STALE_UNSEEN (visibility work) rather than STALE.
+    if weeks_live is not None and weeks_live >= REPRICE_STALE_WEEKS and verdict == "HEALTHY":
+        verdict = "STALE" if views >= REPRICE_MIN_VIEWS_FOR_SIGNAL else "STALE_UNSEEN"
     return verdict
 
 
