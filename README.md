@@ -171,6 +171,7 @@ review, never to whichever item happens to be sitting at a gate.
 | `receipt.py` | Decode the Ross tag (last photo): barcode → paid price + 12-digit code, OCR → original price |
 | `ebay/auth.py` | eBay OAuth: user token (seller) and app token (catalog) |
 | `ebay/inventory.py` | Step 6/7: build, create, and publish eBay offers |
+| `ebay/listings.py` | Enumerate every live listing on the account (Trading API), including ones the bot didn't create |
 | `ebay/marketing.py` | Promoted Listings: campaign + per-listing ad rate |
 | `ebay/taxonomy.py` | eBay category validation and item-aspect metadata (cached) |
 | `db.py` | SQLite item store |
@@ -269,12 +270,12 @@ Photos are stored on disk under `data/inbox/`.
 | `/receipt [id] <price> <code>` | Manually set the Ross cost + 12-digit code (when the tag barcode couldn't be read) |
 | `/setprice [id] <price>` | Set the price (charm-priced); pushes to eBay if the item has an offer |
 | `/setqty [id] <n>` | Set the available quantity on eBay (once the item has an offer); listings default to 1 |
-| `/sync`          | Pull each item's live price/quantity from eBay into the DB (e.g. after a manual Seller-Hub edit); flags ended/out-of-stock listings that likely sold |
+| `/sync`          | Reconcile with eBay: pull live price/quantity, auto-record sold orders, **adopt listings you made by hand in Seller Hub**, and re-link items that were relisted under a new listing id |
 | `/activate [id]` | Publish an eBay draft, making it a live listing       |
 | `/end [id]`      | End a live listing (withdraw it); drops back to a draft to relist |
 | `/sold [id] [price]` | Mark an item sold and record the sale price; replies with profit vs. Ross cost |
 | `/profit`        | Summarize profit across all sold items (before eBay fees/shipping) |
-| `/report`        | Build & send an Excel profit report: photo, title, price, shipping, cost, and profit net of eBay fees + ad rate (fee assumptions editable in the sheet) |
+| `/report`        | Build & send an Excel profit report: photo, title, price, shipping, cost, and profit net of eBay fees + ad rate (fee assumptions editable in the sheet). Totals are banded **SOLD (realized)** / **STILL LISTED (projected)** / TOTAL, so money you've actually been paid isn't added to money you only hope for |
 | `/promote [id] <pct>` | Set/adjust a listing's Promoted Listings ad rate (2–100%) |
 | `/retry [id]`    | Re-run the failed pipeline step for an item (honors the confirm gates) |
 | `/delete [id]`   | Delete an item, its photos, and its eBay offer (ends it first if live) |
@@ -346,6 +347,47 @@ Defaults are in `config.py`; the marked ones can be overridden in `.env`:
 - `_call` retries transient Apify failures (connection resets, 5xx, 429). The
   query ladder makes up to one scrape per rung, so an un-retried blip would cost
   an item its comps.
+
+## Listings the bot didn't create
+
+The Sell Inventory API only knows about offers created *through* it, so a listing
+you make by hand in Seller Hub is invisible to it — and therefore to `/status`,
+`/report`, `/profit` and the weekly price check. `ebay/listings.py` closes that
+hole using the Trading API's `GetMyeBaySelling`, which returns every active
+listing regardless of origin (authenticated with the same OAuth token, passed as
+`X-EBAY-API-IAF-TOKEN`).
+
+`/sync` then reconciles three ways:
+
+- **Adopts** a live listing with no bot SKU as a local item at status `published`,
+  with its real title, price and quantity. It has no photos and no Ross cost —
+  the report flags the missing cost in orange rather than reporting the whole
+  sale price as profit.
+- **Re-links** an item whose listing id changed. A relist mints a *new* id, which
+  leaves the stored one pointing at a dead listing — and the weekly price check
+  reading traffic for the wrong thing.
+- **Flags, without changing,** any item that eBay says is live while the local
+  status says otherwise. That's usually a relist after a sale, but it can equally
+  be a mistaken `/sold`, and guessing either way would rewrite sales history.
+
+## Weekly price check: price problems vs. findability problems
+
+A price cut is only ever suggested when people are demonstrably **looking and not
+buying**. If nobody is seeing the listing, the problem is discovery, and cutting
+the price donates margin without fixing anything:
+
+| Verdict | Means | Fix |
+| ------- | ----- | --- |
+| `OVERPRICED` | Real views, zero watchers | **Price cut** |
+| `STALE` | Old, real views, nothing else firing | **Price cut** |
+| `SEND_OFFERS` | Watchers building, still unsold | Offer to watchers first |
+| `LOW_CTR` | Seen in search, not clicked | Cover photo, then title |
+| `INVISIBLE` | Barely any impressions | Title keywords, category, `/promote` |
+| `STALE_UNSEEN` | Old, but too few views to blame the price | Findability, or relist to refresh ranking |
+| `TOO_NEW` / `HEALTHY` | — | Nothing |
+
+Every suggested cut is still floored at cost + fees + shipping + minimum margin,
+and an item with no recorded Ross cost is never cut at all.
 
 ## Backups
 

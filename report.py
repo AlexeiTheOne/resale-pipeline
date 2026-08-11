@@ -182,25 +182,43 @@ def build_report(path: str) -> str:
             ws.cell(row=r, column=col).border = border
         r += 1
 
-    # --- Totals row ---
+    # --- Totals rows ---
+    # Three bands, not one. A single grand total adds money you have actually
+    # been paid to money you merely hope to be paid, and reads as profit — with
+    # most of the inventory unsold, that number is mostly wishful. SOLD is what
+    # the business has really made; STILL LISTED is the projection.
+    #
+    # Banded with SUMIF over the status column rather than row ranges, so the
+    # split stays correct no matter how the rows are sorted.
     last = r - 1
     if last >= first:
-        ws.cell(row=r, column=2, value="TOTAL").font = bold
-        # Sum units and every money column (skip unit price F and margin N — a sum
-        # of per-unit prices or percentages is meaningless).
-        for col_letter in ("E", "G", "H", "I", "J", "K", "L", "M"):
-            c = ws.cell(row=r, column=ord(col_letter) - 64,
-                        value=f"=SUM({col_letter}{first}:{col_letter}{last})")
-            c.number_format = "0" if col_letter == "E" else MONEY
-            c.font = bold
-        # Blended margin on the totals: total net / total revenue.
-        ws.cell(row=r, column=14,
-                value=f'=IF(G{r}=0,"",M{r}/G{r})').number_format = "0.0%"
-        ws.cell(row=r, column=14).font = bold
-        for col in range(2, 15):
-            cell = ws.cell(row=r, column=col)
-            cell.fill = total_fill
-            cell.border = border
+        money_cols = ("E", "G", "H", "I", "J", "K", "L", "M")
+        bands = [
+            ("SOLD (realized)", f'"sold"'),
+            ("STILL LISTED (projected)", f'"<>sold"'),
+            ("TOTAL", None),
+        ]
+        for label, criterion in bands:
+            ws.cell(row=r, column=2, value=label).font = bold
+            for col_letter in money_cols:
+                if criterion is None:
+                    formula = f"=SUM({col_letter}{first}:{col_letter}{last})"
+                else:
+                    formula = (f"=SUMIF($D${first}:$D${last},{criterion},"
+                               f"{col_letter}{first}:{col_letter}{last})")
+                c = ws.cell(row=r, column=ord(col_letter) - 64, value=formula)
+                c.number_format = "0" if col_letter == "E" else MONEY
+                c.font = bold
+            # Blended margin for the band: its net / its revenue.
+            ws.cell(row=r, column=14,
+                    value=f'=IF(G{r}=0,"",M{r}/G{r})').number_format = "0.0%"
+            ws.cell(row=r, column=14).font = bold
+            for col in range(2, 15):
+                cell = ws.cell(row=r, column=col)
+                cell.fill = total_fill
+                cell.border = border
+            r += 1
+        r -= 1  # the note below is positioned relative to the last written row
 
     # --- Widths + note ---
     widths = {"A": 14, "B": 10, "C": 40, "D": 11, "E": 6, "F": 10, "G": 10,

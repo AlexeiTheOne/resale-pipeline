@@ -39,6 +39,7 @@ from pipeline.reprice import run_weekly_check
 from ebay.auth import get_access_token
 from ebay.analytics import traffic_status
 from ebay.orders import finances_status, orders_status, sales_by_item
+from ebay.listings import get_active_listings, listings_status
 from ebay.inventory import (
     create_draft_offer,
     delete_offer,
@@ -1724,6 +1725,35 @@ def _sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
             "likely_sold": likely_sold, "listing_status": listing_status}
 
 
+def _adopt_listing(row: dict) -> str:
+    """Create a local item for a live eBay listing the bot didn't make.
+
+    It gets status 'published' and the listing's real title/price/quantity, so it
+    counts in /status, /report, /profit and the weekly price check immediately.
+    What it can't have is a Ross cost (no receipt was ever scanned) or photos —
+    both are marked, and the report already flags a missing cost in orange rather
+    than quietly reporting the full sale price as profit."""
+    item_id = create_item([])
+    update_field(item_id, "listing", {
+        "title": row["title"],
+        "price": row["price"],
+        "description": None,
+    })
+    update_field(item_id, "ebay", {
+        "listing_id": row["listing_id"],
+        "view_item_url": row["view_item_url"],
+        "sku": row["sku"],
+        "quantity": row["quantity"],
+        # Marks this as adopted rather than built here: there are no photos, no
+        # identification and no offer_id, so the pipeline must not try to redraft
+        # or re-push it.
+        "source": "external",
+        "published_at": datetime.now(timezone.utc).isoformat(),
+    })
+    update_status(item_id, "published")
+    return f"{item_id[:8]} ${row['price']} {row['title'][:40]}"
+
+
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Reconcile the local DB with eBay: walk every item that has an eBay offer,
     pull its current price and quantity from eBay, and write back anything that
@@ -1777,7 +1807,57 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if result["likely_sold"]:
             sold_flags.append(result["item_id"])
 
+    # Reconcile against every listing actually live on eBay, not just the ones we
+    # already know about. Listings made by hand in Seller Hub never touch the
+    # Inventory API, so without this pass they're invisible to /status, /report,
+    # /profit and the weekly price check. A relist also mints a NEW listing id,
+    # which leaves the stored one pointing at a dead listing (and the price check
+    # reading traffic for the wrong thing).
+    adopted, relinked, live_mismatch, discover_err = [], [], [], None
+    try:
+        live = await asyncio.to_thread(get_active_listings)
+        by_sku = {i["item_id"]: i for i in list_items()}
+        known_ids = {(i.get("ebay") or {}).get("listing_id") for i in by_sku.values()}
+        for row in live:
+            item = by_sku.get(row["sku"]) if row["sku"] else None
+            if item is not None:
+                ebay_data = dict(item.get("ebay") or {})
+                if ebay_data.get("listing_id") != row["listing_id"]:
+                    ebay_data["listing_id"] = row["listing_id"]
+                    ebay_data["view_item_url"] = row["view_item_url"]
+                    update_field(item["item_id"], "ebay", ebay_data)
+                    relinked.append(f"{item['item_id'][:8]} → {row['listing_id']}")
+                # eBay says this is live; the local status says otherwise. That's
+                # usually a relist after a sale, but it could equally be a wrong
+                # /sold — and flipping the status either way would rewrite sales
+                # history on a guess. Report it and let the human decide.
+                if item["status"] != "published":
+                    live_mismatch.append(
+                        f"{item['item_id'][:8]} is '{item['status']}' locally but LIVE "
+                        f"at ${row['price']}")
+                continue
+            if row["listing_id"] in known_ids:
+                continue
+            adopted.append(_adopt_listing(row))
+    except Exception as e:
+        traceback.print_exc()
+        _record_error("sync discover", e)
+        discover_err = f"{type(e).__name__}: {str(e)[:150]}"
+
     lines = [f"✅ Sync done — checked {len(items)} item(s) (orders: last {days}d)."]
+    if adopted:
+        lines += ["", f"🆕 Adopted {len(adopted)} listing(s) made outside the bot:"]
+        lines += [f"  {a}" for a in adopted]
+        lines.append("  (no photos or Ross cost locally — /receipt <id> <price> <code> "
+                     "to make their profit real)")
+    if relinked:
+        lines += ["", f"🔗 Re-linked {len(relinked)} relisted item(s):"] + [f"  {x}" for x in relinked]
+    if live_mismatch:
+        lines += ["", f"❓ Live on eBay but not 'published' here ({len(live_mismatch)}) — "
+                  "relisted, or marked sold by mistake? Status left alone:"]
+        lines += [f"  {x}" for x in live_mismatch]
+    if discover_err:
+        lines += ["", f"⚠️ Couldn't enumerate live listings ({discover_err})"]
     if auto_sold:
         lines += ["", f"🟢 Recorded sold from eBay orders ({len(auto_sold)}):"] + [f"  {a}" for a in auto_sold]
     if updated:
@@ -2218,10 +2298,24 @@ _VERDICT_LABEL = {
     "LOW_CTR": "😐 Seen but not clicked",
     "OVERPRICED": "💸 Views but no watchers — likely overpriced",
     "SEND_OFFERS": "👀 Watchers building — consider a private offer before cutting",
-    "STALE": "🕸️ Stale — unsold a while",
+    "STALE": "🕸️ Stale — real views, still unsold",
+    "STALE_UNSEEN": "🔍 Unsold but barely seen — a findability problem, not a price one",
     "TOO_NEW": "🌱 Too new to judge yet",
     "HEALTHY": "✅ Healthy",
     "ERROR": "⚠️ Couldn't check",
+}
+
+# What to actually do about it. The visibility verdicts never carry a suggested
+# price (pipeline/reprice.py only prices OVERPRICED and STALE), so without this
+# they'd arrive as a diagnosis with no next step.
+_VERDICT_ADVICE = {
+    "INVISIBLE": "Fix findability: title keywords, category, item specifics. "
+                 "/promote to buy impressions.",
+    "LOW_CTR": "They see it and scroll past: cover photo first, then title. "
+               "Not a price cut.",
+    "STALE_UNSEEN": "Too few views to blame the price. Rework the title/keywords "
+                    "and consider /promote, or /end and relist to refresh ranking.",
+    "SEND_OFFERS": "Send an offer to the watchers before cutting the public price.",
 }
 
 
@@ -2238,6 +2332,8 @@ def _format_reprice_line(r: dict) -> str:
              f"{watchers if watchers is not None else '?'} watchers · ${r.get('current_price')}")
     if r.get("suggested_price"):
         line += f" → suggest ${r['suggested_price']}"
+    elif _VERDICT_ADVICE.get(r["verdict"]):
+        line += f"\n  💡 {_VERDICT_ADVICE[r['verdict']]}"
     elif r.get("floor_note"):
         # Why there's no suggested cut. Without this the digest shows a problem
         # item with no action and no explanation, which reads as a bug.
@@ -2418,6 +2514,11 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"❌ Traffic analytics (sell.analytics.readonly): {str(e)[:150]}\n"
             "   → if this is a scope/403 error, re-run `python -m ebay.auth` to re-consent."
         )
+
+    try:
+        lines.append(await asyncio.to_thread(listings_status))
+    except Exception as e:
+        lines.append(f"❌ Active listings (Trading API): {str(e)[:150]}")
 
     try:
         status = await asyncio.to_thread(orders_status)
