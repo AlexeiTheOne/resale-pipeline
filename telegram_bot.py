@@ -321,14 +321,21 @@ async def finalize_capture(user_id, update, context):
     print(f"📷 Capture: {len(paths)} photo(s) written to disk in {folder}")
 
     if user_id in haul_mode:
-        haul_mode.discard(user_id)
+        # Haul mode stays armed until /cancel, as the /haul message promises.
+        # Consuming it on the first batch meant a pause longer than the capture
+        # window silently dropped back to single-item mode, and the next armful
+        # of photos became ONE item containing several products and their tags.
+        # Re-splitting a single item is harmless: one tag yields one group.
+        # Keep the long window armed for the next armful too; finalize_capture
+        # resets it to the default after every batch.
+        capture_window[user_id] = EXTENDED_CAPTURE_WINDOW
         groups, trailing = await asyncio.to_thread(_split_haul, paths)
         if not groups:
             await _safe_reply(
                 update.message,
                 "📦 Haul: couldn't find a Ross tag barcode in any of those photos, so "
-                "there's nothing to split on. Send them again as a single item, or "
-                "re-shoot the tags.")
+                "there's nothing to split on. Re-shoot the tags and send again, or "
+                "/cancel to leave haul mode and send this as a single item.")
             return
         if trailing:
             await _safe_reply(
@@ -751,6 +758,13 @@ async def _advance_one(user_id, item_id, message, context) -> None:
                 f"comps — writing the listing...")
 
         elif status == "priced":
+            # An item can sit at 'priced' with no price: pricing found no usable
+            # comps and refused to guess. Drafting anyway writes "$None" into the
+            # listing. The gate's own confirm path guards this, but /retry comes
+            # straight here and would sail past it.
+            if (item.get("pricing") or {}).get("suggested_price") is None:
+                await _show_price_gate(user_id, item_id, message, "no comp-backed price")
+                return
             _, err = await _run_stage(item_id, message, _stage_draft)
             if err is None:
                 await _show_review(user_id, item_id, message)
@@ -1229,6 +1243,9 @@ async def _handle_gate(user_id, text, update, context) -> None:
     if get_item(item_id) is None:
         gate.pop(user_id, None)
         await _safe_reply(update.message, "That item no longer exists.")
+        # Hand the slot on — otherwise a deleted item takes the rest of a haul's
+        # queued gates down with it.
+        await _activate_next_gate(user_id, update.message)
         return
 
     if low in _CONFIRM_WORDS:
@@ -1290,8 +1307,19 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Confirm gates (after identify / after price) take precedence over the draft
     # review — an item pauses here for a typed 'confirm' or a correction.
-    if user_id in gate:
+    #
+    # Exception: 'approve'/'reject' are review words, never gate words. During a
+    # haul one item can be gated while another waits at review, and routing an
+    # "approve" into the gate fed it to revise_identification as a correction on
+    # a different item. Send those to the review handler instead.
+    if user_id in gate and low not in ("approve", "reject"):
         await _handle_gate(user_id, text, update, context)
+        return
+    if user_id in gate and user_id not in review:
+        await _safe_reply(
+            update.message,
+            "Nothing is waiting for approval. This item is at a gate — "
+            "'confirm' to accept it, or type a correction / a price.")
         return
 
     if user_id not in review:
@@ -1952,7 +1980,16 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     delete_item(item_id)
     last_item.pop(user_id, None)
     review.pop(user_id, None)
+    # Drop the deleted item from the gate slot and the queue, then let whatever
+    # was waiting behind it through. Without this, deleting the item currently
+    # holding the gate leaves the rest of a haul queued behind a ghost.
+    released = gate.get(user_id) is not None and gate[user_id]["item_id"] == item_id
+    if released:
+        gate.pop(user_id, None)
+    gate_queue[user_id] = [e for e in gate_queue.get(user_id, []) if e["item_id"] != item_id]
     await _safe_reply(update.message, f"🗑️ Deleted {item_id[:8]} (offer {offer_id or 'none'} removed).")
+    if released:
+        await _activate_next_gate(user_id, update.message)
 
 
 async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2419,9 +2456,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     was_gated = gate.pop(user_id, None) is not None
     was_hauling = user_id in haul_mode
     haul_mode.discard(user_id)
-    # Drop the whole queue too: cancelling one gate but leaving a haul's worth of
-    # others armed would hand the user a prompt they thought they'd just dismissed.
-    queued = len(gate_queue.pop(user_id, []) or [])
+    # Only drop the queue when a gate was actually what got cancelled. Popping it
+    # unconditionally meant cancelling an unrelated photo capture silently threw
+    # away every queued haul gate and said nothing about it.
+    queued = len(gate_queue.pop(user_id, []) or []) if was_gated else 0
 
     if data:
         await _safe_reply(update.message, f"🛑 Cancelled capture ({len(data['files'])} photo(s) discarded).")
