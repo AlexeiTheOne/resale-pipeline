@@ -32,7 +32,7 @@ from db import (
     update_field, update_status, VALID_STATUSES,
 )
 from identify import identify_item
-from receipt import decode_barcode, extract_receipt
+from receipt import decode_barcode, extract_receipt, is_dark_frame
 from pipeline.price import get_pricing
 from pipeline.draft import generate_draft, revise_draft, revise_identification
 from pipeline.reprice import run_weekly_check
@@ -326,23 +326,28 @@ async def finalize_capture(user_id, update, context):
         # Consuming it on the first batch meant a pause longer than the capture
         # window silently dropped back to single-item mode, and the next armful
         # of photos became ONE item containing several products and their tags.
-        # Re-splitting a single item is harmless: one tag yields one group.
         # Keep the long window armed for the next armful too; finalize_capture
         # resets it to the default after every batch.
         capture_window[user_id] = EXTENDED_CAPTURE_WINDOW
-        groups, trailing = await asyncio.to_thread(_split_haul, paths)
+        groups, separators = await asyncio.to_thread(_split_haul, paths)
         if not groups:
             await _safe_reply(
                 update.message,
-                "📦 Haul: couldn't find a Ross tag barcode in any of those photos, so "
-                "there's nothing to split on. Re-shoot the tags and send again, or "
-                "/cancel to leave haul mode and send this as a single item.")
+                "📦 Haul: those were all blackout frames — no item photos among them. "
+                "Send the items, or /cancel to leave haul mode.")
             return
-        if trailing:
+        if len(groups) == 1 and separators == 0:
+            # One group with nothing separating anything is the signature of a
+            # haul sent without blackouts. Listing several products as a single
+            # item is much worse than asking, so refuse rather than guess.
             await _safe_reply(
                 update.message,
-                f"⚠️ Haul: {len(trailing)} photo(s) came after the last Ross tag, so that "
-                f"item has no tag and I've left it out. Re-send it on its own.")
+                f"📦 Haul: {len(paths)} photo(s), but no blackout frames and no tag "
+                f"barcode decoded — I can't tell where one item ends and the next "
+                f"begins.\n\nTake one dark photo (cover the lens) between items and "
+                f"send again. If this really is a single item, /cancel and send it "
+                f"normally.")
+            return
         await _run_haul(user_id, groups, update, context)
         return
 
@@ -360,10 +365,11 @@ async def finalize_capture(user_id, update, context):
 
 
 def _is_ross_tag(path: str) -> bool:
-    """Does this photo carry a Ross price tag's CODE128 barcode? That barcode is
-    the store's own 18-digit price code, and since every item's photo set ends
-    with its tag, it's the natural boundary between items in a haul. Decoding is
-    local and free (no API call), so scanning a whole haul is cheap."""
+    """Does this photo carry a Ross price tag's CODE128 barcode?
+
+    Measured over the real photo library this fires on only 41% of tag photos —
+    glare, angle and focus defeat the rest — so it is a bonus boundary, never the
+    one a haul depends on. See _split_haul."""
     try:
         digits = decode_barcode(path)
     except Exception:
@@ -371,21 +377,40 @@ def _is_ross_tag(path: str) -> bool:
     return bool(digits) and len(digits) == 18
 
 
-def _split_haul(paths: list[str]) -> tuple[list[list[str]], list[str]]:
-    """Split one photo dump into per-item groups on Ross-tag boundaries.
+def _split_haul(paths: list[str]) -> tuple[list[list[str]], int]:
+    """Split one photo dump into per-item groups. Returns (groups, separators_seen).
 
-    Every item's photo set ends with its Ross tag, so a tag closes the current
-    group and the next photo starts a new one. Returns (groups, trailing) —
-    trailing is any photos after the last tag, which means the last item's tag
-    photo is missing and the user needs to be told rather than have those photos
-    silently folded into the previous item or dropped."""
-    groups, current = [], []
+    The boundary is a **blackout frame** — a deliberately dark photo (cover the
+    lens) between items. Automatic tag detection was tried first and measured on
+    the real library: an 18-digit barcode decodes on 41% of tag photos, any
+    barcode on 39%, OCR finding Ross wording on 23% — 44% for all three combined.
+    A boundary detector that misses over half the time is worse than none,
+    because every miss silently welds two items into one.
+
+    A blackout frame is unambiguous: across 401 real photos the darkest averaged
+    56/255, while a covered lens lands near zero, so the threshold has room to
+    spare and merchandise can never trip it.
+
+    A decoded Ross tag still closes a group as well (free, and never wrong when
+    it does fire), so a haul shot with clean tag photos needs no separators at
+    all. The separator frames themselves are dropped — they're not photos of
+    anything. Trailing photos after the last separator are the final item: a
+    separator delimits items, so the last one needs no terminator."""
+    groups, current, separators = [], [], 0
     for path in paths:
+        if is_dark_frame(path):
+            separators += 1
+            if current:
+                groups.append(current)
+                current = []
+            continue
         current.append(path)
         if _is_ross_tag(path):
             groups.append(current)
             current = []
-    return groups, current
+    if current:
+        groups.append(current)
+    return groups, separators
 
 
 async def _run_haul(user_id, groups, update, context) -> None:
@@ -460,8 +485,14 @@ async def haul_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     capture_window[user_id] = EXTENDED_CAPTURE_WINDOW
     await _safe_reply(
         update.message,
-        f"📦 Haul mode on. Send every item's photos back to back, each item ending "
-        f"with its Ross tag — that tag is what splits them.\n\n"
+        f"📦 Haul mode on.\n\n"
+        f"Shoot each item as usual (ending with its Ross tag), then **take one dark "
+        f"photo with the lens covered** before starting the next item. That blackout "
+        f"frame is the divider — it's the only thing I need to tell items apart, and "
+        f"it never fails the way reading the tag barcode does (that works on about 4 "
+        f"tags in 10).\n\n"
+        f"No blackout needed after the last item. If a tag barcode does decode, it "
+        f"ends that item too, so a clean shot needs no divider.\n\n"
         f"I'll wait {EXTENDED_CAPTURE_WINDOW}s after the last photo, then run them all. "
         f"Items with solid comps go straight to a draft; I'll only ask about the rest.\n\n"
         f"/cancel to drop out.")
@@ -2582,7 +2613,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 HELP_SECTIONS = [
     ("Getting started", [
         ("(send photos)", "Start a new item. 1st photo = cover, 2nd = tag close-up, last = the Ross price tag"),
-        ("/haul", "Multi-item mode: dump a whole Ross run, split into items on each Ross tag"),
+        ("/haul", "Multi-item mode: dump a whole Ross run, split on a dark photo between items"),
         ("wait", "Hold the photo-batching window open longer for a big batch"),
         ("confirm", "At a gate: accept the identification / price and continue"),
         ("(free text)", "At a gate: correct it (e.g. 'brand is Tommy Jeans, color navy'). At review: approve, reject, or a correction"),

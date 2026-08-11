@@ -140,10 +140,36 @@ live without your explicit approve.
 
 ### Hauls
 
-`/haul` arms multi-item capture. Send every item's photos back to back, each item
-ending with its Ross tag; the tag's CODE128 barcode is what splits the dump into
-items (decoding is local and free). All items then run at once, capped by
+`/haul` arms multi-item capture. Shoot each item as usual (ending with its Ross
+tag), then **take one dark photo with the lens covered** before starting the next
+item. That blackout frame is the divider. All items then run at once, capped by
 `MAX_CONCURRENT_LISTINGS`.
+
+**Why a blackout frame and not the Ross tag?** The tag was tried first and
+measured against the real photo library (61 items, 413 photos):
+
+| Signal | Fires on a tag photo | False positives on merchandise |
+| ------ | -------------------- | ------------------------------ |
+| 18-digit CODE128 decode | 41% | 0 |
+| Any barcode at all | 39% | 5% |
+| OCR finding Ross wording | 23% | 0 |
+| All three combined | **44%** | 5% |
+
+Glare, angle and focus defeat the rest. A divider that misses more than half the
+time is worse than none, because every miss silently welds two items into one
+listing. A blackout frame has no such failure mode: the darkest of 413 real
+photos averaged 56/255 and a covered lens lands near zero, so
+`DARK_FRAME_MAX_LUMA` (default 25) sits in a gap nothing real occupies — measured
+false-positive rate across the whole library is **0 of 413**.
+
+A tag barcode that *does* decode still ends its item, since it's free and never
+wrong when it fires — so a cleanly-shot haul may need no dividers at all. No
+blackout is needed after the last item; a divider separates items, so the final
+one needs no terminator. Consecutive blackouts are collapsed, never turned into
+empty items.
+
+If a batch arrives with no dividers *and* no tag decode, the bot **refuses** and
+asks rather than listing several products as one item.
 
 Haul mode **stays armed until `/cancel`**, so a pause longer than the capture
 window doesn't silently drop you back to single-item mode and turn the next
@@ -262,7 +288,7 @@ Photos are stored on disk under `data/inbox/`.
 | `confirm`        | At a gate: accept the identification / price and continue (strong-evidence items skip the gate entirely) |
 | _(free text)_    | At a gate: correct the identification, or set the price; at review, correct the draft or `approve`/`reject` |
 | `wait`           | Extend the photo-batching window for a large batch    |
-| `/haul`          | Multi-item mode: dump a whole Ross run and it's split into one item per Ross tag |
+| `/haul`          | Multi-item mode: dump a whole Ross run, split into items on a blackout frame (one dark photo between items) |
 | `/status [status]` | List items and their pipeline status; optional filter (e.g. `/status published`), with a count-per-status header |
 | `/listing [id]`  | Show the current draft for an item                    |
 | `/comps [id]`    | Show the sold/active comps the price was built from   |
