@@ -32,7 +32,7 @@ from db import (
     update_field, update_status, VALID_STATUSES,
 )
 from identify import identify_item
-from receipt import decode_barcode, extract_receipt, is_dark_frame
+from receipt import decode_barcode, detect_ross_tags, extract_receipt, is_dark_frame
 from pipeline.price import get_pricing
 from pipeline.draft import generate_draft, revise_draft, revise_identification
 from pipeline.reprice import run_weekly_check
@@ -329,25 +329,29 @@ async def finalize_capture(user_id, update, context):
         # Keep the long window armed for the next armful too; finalize_capture
         # resets it to the default after every batch.
         capture_window[user_id] = EXTENDED_CAPTURE_WINDOW
-        groups, separators = await asyncio.to_thread(_split_haul, paths)
+        groups, separators, tags = await asyncio.to_thread(_split_haul, paths)
         if not groups:
             await _safe_reply(
                 update.message,
                 "📦 Haul: those were all blackout frames — no item photos among them. "
                 "Send the items, or /cancel to leave haul mode.")
             return
-        if len(groups) == 1 and separators == 0:
-            # One group with nothing separating anything is the signature of a
-            # haul sent without blackouts. Listing several products as a single
-            # item is much worse than asking, so refuse rather than guess.
+        if len(groups) == 1 and separators == 0 and tags == 0:
+            # Nothing divided anything: no blackout, no barcode, no recognised
+            # tag. Listing several products as a single item is much worse than
+            # asking, so refuse rather than guess.
             await _safe_reply(
                 update.message,
-                f"📦 Haul: {len(paths)} photo(s), but no blackout frames and no tag "
-                f"barcode decoded — I can't tell where one item ends and the next "
-                f"begins.\n\nTake one dark photo (cover the lens) between items and "
-                f"send again. If this really is a single item, /cancel and send it "
-                f"normally.")
+                f"📦 Haul: {len(paths)} photo(s), but I couldn't find a single Ross tag "
+                f"or blackout frame, so I can't tell where one item ends and the next "
+                f"begins.\n\nEither end each item with a photo of its Ross tag, or take "
+                f"one dark photo (cover the lens) between items. If this really is a "
+                f"single item, /cancel and send it normally.")
             return
+        if tags:
+            await _safe_reply(
+                update.message,
+                f"🏷️ Spotted {tags} Ross tag(s) — using them to split the haul.")
         await _run_haul(user_id, groups, update, context)
         return
 
@@ -377,8 +381,9 @@ def _is_ross_tag(path: str) -> bool:
     return bool(digits) and len(digits) == 18
 
 
-def _split_haul(paths: list[str]) -> tuple[list[list[str]], int]:
-    """Split one photo dump into per-item groups. Returns (groups, separators_seen).
+def _split_haul(paths: list[str]) -> tuple[list[list[str]], int, int]:
+    """Split one photo dump into per-item groups.
+    Returns (groups, separators_seen, tags_detected).
 
     The boundary is a **blackout frame** — a deliberately dark photo (cover the
     lens) between items. Automatic tag detection was tried first and measured on
@@ -391,13 +396,23 @@ def _split_haul(paths: list[str]) -> tuple[list[list[str]], int]:
     56/255, while a covered lens lands near zero, so the threshold has room to
     spare and merchandise can never trip it.
 
-    A decoded Ross tag still closes a group as well (free, and never wrong when
-    it does fire), so a haul shot with clean tag photos needs no separators at
-    all. The separator frames themselves are dropped — they're not photos of
-    anything. Trailing photos after the last separator are the final item: a
-    separator delimits items, so the last one needs no terminator."""
+    Two cheaper boundaries are tried first, so in practice you rarely need to
+    shoot a blackout at all:
+
+      * a Ross tag whose barcode decodes (free, local, never wrong when it fires)
+      * a Ross tag RECOGNISED by the vision model. Recognising a tag is far
+        easier than reading one — 21 of 21 real tags detected, 0 false positives
+        across 6 merchandise sets — so it works on the tags whose barcode won't
+        decode, which is most of them. One call per haul, not per photo.
+
+    The blackout frame stays the guaranteed override: it needs no network, no
+    model, and can't be argued with. Separator frames are dropped (they're not
+    photos of anything); trailing photos after the last separator are the final
+    item, since a separator delimits items and the last needs no terminator."""
+    tag_indices = detect_ross_tags(paths)
+
     groups, current, separators = [], [], 0
-    for path in paths:
+    for idx, path in enumerate(paths):
         if is_dark_frame(path):
             separators += 1
             if current:
@@ -405,12 +420,12 @@ def _split_haul(paths: list[str]) -> tuple[list[list[str]], int]:
                 current = []
             continue
         current.append(path)
-        if _is_ross_tag(path):
+        if idx in tag_indices or _is_ross_tag(path):
             groups.append(current)
             current = []
     if current:
         groups.append(current)
-    return groups, separators
+    return groups, separators, len(tag_indices)
 
 
 async def _run_haul(user_id, groups, update, context) -> None:

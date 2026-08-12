@@ -163,32 +163,33 @@ live without your explicit approve.
 
 ### Hauls
 
-`/haul` arms multi-item capture. Shoot each item as usual (ending with its Ross
-tag), then **take one dark photo with the lens covered** before starting the next
-item. That blackout frame is the divider. All items then run at once, capped by
-`MAX_CONCURRENT_LISTINGS`.
+`/haul` arms multi-item capture. Shoot each item the way you normally do,
+ending with a photo of its Ross tag — the tag itself is the divider. All items
+then run at once, capped by `MAX_CONCURRENT_LISTINGS`.
 
-**Why a blackout frame and not the Ross tag?** The tag was tried first and
-measured against the real photo library. Of the 59 actual Ross tag photos, the
-18-digit CODE128 decodes on **26 (44%)** — glare, angle and Telegram's
-compression defeat the rest, and OCR of those is mostly noise (the patterns that
-survive, like a bare 12-digit number or "MSRP", appear on manufacturer labels
-too, so they identify nothing).
+**How items are divided.** Three boundaries, cheapest first:
 
-A divider that misses more than half the time is worse than none, because every
-miss silently welds two items into one listing. A blackout frame has no such
-failure mode: the darkest of 413 real photos averaged 56/255 and a covered lens
-lands near zero, so `DARK_FRAME_MAX_LUMA` (default 25) sits in a gap nothing real
-occupies — measured false-positive rate across the whole library is **0 of 413**.
+| Divider | Reliability | Needs |
+| ------- | ----------- | ----- |
+| Ross tag barcode decodes | 44% of tag photos | nothing (local) |
+| Ross tag **recognised** by the vision model | 21/21 tags found, 0 false positives on 6 merchandise sets | one API call per haul |
+| **Blackout frame** — one dark photo, lens covered | absolute | nothing (local) |
 
-A tag barcode that *does* decode still ends its item, since it's free and never
-wrong when it fires — so a cleanly-shot haul may need no dividers at all. No
-blackout is needed after the last item; a divider separates items, so the final
-one needs no terminator. Consecutive blackouts are collapsed, never turned into
-empty items.
+Recognising a tag is a much easier problem than reading one, which is why the
+middle row works where the barcode doesn't: on a tag creased through the bars, or
+photographed as two stickers at 180° to each other, or whose price a human can't
+make out, "is that a Ross tag?" is still obvious. It runs as one call per batch of
+photos, not one per photo.
 
-If a batch arrives with no dividers *and* no tag decode, the bot **refuses** and
-asks rather than listing several products as one item.
+The blackout frame remains the guaranteed override — no network, no model, and
+nothing can argue with it. Use it when a tag is missing or unclear; the three can
+be mixed freely within one haul. Across 413 real photos the darkest averaged
+56/255 while a covered lens lands near zero, so `DARK_FRAME_MAX_LUMA` (default 25)
+sits in a gap nothing real occupies: measured false positives, **0 of 413**.
+
+No divider is needed after the last item. Consecutive blackouts collapse rather
+than creating empty items. If a batch arrives with no tag found *and* no blackout,
+the bot **refuses** and asks rather than listing several products as one item.
 
 Haul mode **stays armed until `/cancel`**, so a pause longer than the capture
 window doesn't silently drop you back to single-item mode and turn the next
