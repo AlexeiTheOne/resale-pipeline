@@ -135,19 +135,37 @@ REPRICE_MIN_VIEWS_FOR_SIGNAL = int(os.getenv("REPRICE_MIN_VIEWS_FOR_SIGNAL", "15
 # Weeks unsold after which a listing is flagged stale (and gets an escalating
 # suggested cut) regardless of what the traffic signals show.
 REPRICE_STALE_WEEKS = int(os.getenv("REPRICE_STALE_WEEKS", "4"))
-# eBay fee assumptions used to compute the price floor a repricing suggestion
-# must clear (cost + fees + minimum margin) — same figures as report.py's Excel
-# assumptions, kept here as the defaults an env var can override.
-EBAY_FVF_PCT = float(os.getenv("EBAY_FVF_PCT", "0.1325"))
+# --- What a sale actually costs -----------------------------------------------
+# These drive BOTH the repricing floor and the profit report's editable
+# assumptions, so the two can't disagree about what an item nets.
+#
+# Every default below is measured from real settled orders rather than quoted
+# from eBay's rate card, because the rate card understates the bill:
+#
+#   EBAY_FVF_PCT — eBay's headline rate is 13.25%, and the itemised
+#     FINAL_VALUE_FEE does come to 13.60% (some categories 15.00%). But it is
+#     charged on the order total INCLUDING sales tax, while everything here
+#     reckons against item + shipping. Measured against that base the real bill
+#     is 15.5% (per-item range 13.5-17.0%, n=10). Using 13.25% understated fees
+#     on all ten sold items without exception.
+#   EBAY_AD_FEE_PCT — Promoted Listings billed $53.17 against $1066.78 of sold
+#     revenue = 5.0%, not the 4% ad rate set on the listings. eBay posts these as
+#     account-level charges with no order id, so they can't be attributed per
+#     item; this is the effective cost rate to model with. Distinct from
+#     EBAY_DEFAULT_AD_RATE_PCT above, which is the rate applied TO a listing.
+#   EBAY_SHIP_CHARGED / EBAY_SHIP_COST — medians of what buyers actually paid
+#     and what the eBay labels actually cost. Means are higher ($12.80 / $10.52)
+#     but skewed by one heavy item, so the medians are the safer default.
+#
+# Re-derive these from your own orders any time with `python -m ebay.orders`.
+EBAY_FVF_PCT = float(os.getenv("EBAY_FVF_PCT", "0.155"))
 EBAY_FIXED_FEE = float(os.getenv("EBAY_FIXED_FEE", "0.40"))
-# Shipping, both directions. These mirror report.py's editable assumptions so the
-# repricing floor and the profit report agree on what an item actually nets. With
-# charged == cost the postage cancels out, but eBay's FVF still applies to the
-# shipping you charge, so leaving both at zero understates the floor.
-# SET THESE TO YOUR REAL NUMBERS — if you ship free (charge 0, pay postage), the
-# floor is wrong by the full postage until EBAY_SHIP_CHARGED is 0 here too.
-EBAY_SHIP_CHARGED = float(os.getenv("EBAY_SHIP_CHARGED", "10"))
-EBAY_SHIP_COST = float(os.getenv("EBAY_SHIP_COST", "10"))
+EBAY_AD_FEE_PCT = float(os.getenv("EBAY_AD_FEE_PCT", "0.05"))
+# SET THESE TO YOUR REAL NUMBERS if your shipping differs — and if you ship free
+# (charge 0, pay postage), EBAY_SHIP_CHARGED must be 0 or the floor is wrong by
+# the full postage.
+EBAY_SHIP_CHARGED = float(os.getenv("EBAY_SHIP_CHARGED", "10.86"))
+EBAY_SHIP_COST = float(os.getenv("EBAY_SHIP_COST", "10.09"))
 # Smallest NET margin (after eBay fees, ad rate, and shipping) a repricing
 # suggestion may land on — never suggest a cut that sells at a loss.
 REPRICE_MIN_MARGIN_DOLLARS = float(os.getenv("REPRICE_MIN_MARGIN_DOLLARS", "5"))

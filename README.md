@@ -380,10 +380,22 @@ Defaults are in `config.py`; the marked ones can be overridden in `.env`:
   (default on; the eBay review gate is never skipped), plus
   `AUTO_CONFIRM_MIN_IDENT_CONFIDENCE` and
   `AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC`
-- `EBAY_SHIP_CHARGED` / `EBAY_SHIP_COST` — shipping both directions, used by the
-  repricing floor. **Set these to your real numbers** — they default to `10`/`10`
-  to match `report.py`'s assumptions, and if you actually ship free the floor is
-  wrong by the full postage until `EBAY_SHIP_CHARGED` is `0` here too.
+- `EBAY_FVF_PCT`, `EBAY_FIXED_FEE`, `EBAY_AD_FEE_PCT`, `EBAY_SHIP_CHARGED`,
+  `EBAY_SHIP_COST` — what a sale actually costs. These drive **both** the
+  repricing floor and the profit report's assumptions, so the two can't disagree.
+  Defaults are measured from settled orders, not eBay's rate card:
+  - `EBAY_FVF_PCT` is **15.5%**, not the headline 13.25%. The itemised
+    `FINAL_VALUE_FEE` is 13.60% (15.00% in some categories), but it's charged on
+    the order total **including sales tax**, while everything here reckons
+    against item + shipping. Measured against that base it's 15.5% — and 13.25%
+    understated the fee on every sold item without exception.
+  - `EBAY_AD_FEE_PCT` is **5.0%**, the Promoted Listings spend actually billed
+    against sold revenue — not the 4% ad rate set on listings
+    (`EBAY_DEFAULT_AD_RATE_PCT`). eBay posts these as account-level charges with
+    no order id, so they can't be attributed per item.
+  - Shipping defaults are medians of what buyers really paid and what the labels
+    really cost. **If you ship free**, set `EBAY_SHIP_CHARGED=0` or the floor is
+    wrong by the full postage.
 - `DEBUG_MODE` — pulls only 3 sold / 3 active comps to save time and cost when
   set. **Defaults to `false`.** Leave it off in production: 3 comps can't clear
   the `solid` bar, so every item lands on `thin` at best and stops to ask you.

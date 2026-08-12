@@ -2115,12 +2115,20 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     cost, and profit net of eBay fees + the ad rate — and send it as a file. It
     reflects the current database each time, and the fee/shipping assumptions are
     editable cells in the sheet that recalc every row."""
+    # Optional look-back for the account-level charge reconciliation under the
+    # table (Promoted Listings). Everything else in the report is local data.
+    ad_days = 90
+    if context.args:
+        try:
+            ad_days = max(1, int(context.args[0]))
+        except ValueError:
+            pass
     await _safe_reply(update.message, "📊 Building the profit report...")
     import report as report_mod
 
     out = Path(tempfile.gettempdir()) / f"ross_report_{int(time.time())}.xlsx"
     try:
-        await asyncio.to_thread(report_mod.build_report, str(out))
+        await asyncio.to_thread(report_mod.build_report, str(out), ad_days)
     except Exception as e:
         traceback.print_exc()
         _record_error("report build", e)

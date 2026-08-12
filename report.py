@@ -18,6 +18,9 @@ from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
+from config import (
+    EBAY_AD_FEE_PCT, EBAY_FIXED_FEE, EBAY_FVF_PCT, EBAY_SHIP_CHARGED, EBAY_SHIP_COST,
+)
 from db import list_items
 
 try:
@@ -81,7 +84,10 @@ def _thumbnail(cover_path, dest_dir):
         return None
 
 
-def build_report(path: str) -> str:
+def build_report(path: str, ad_days: int = 90) -> str:
+    """`ad_days` is the look-back for the account-level charge reconciliation
+    printed under the table (Promoted Listings, which eBay bills without an
+    order id and no row can therefore carry)."""
     items = [i for i in list_items()
              if (i.get("listing") or {}).get("price") is not None and i["status"] in _REPORTABLE]
     items.sort(key=lambda i: (i["status"], i.get("created_at", "")))
@@ -105,12 +111,15 @@ def build_report(path: str) -> str:
                 + "  ·  edit the yellow assumption cells to recalc every row")
 
     # --- Assumptions (editable, rows 4-9) ---
+    # Defaults come from config.py so the report and the repricing floor can't
+    # disagree about what a sale costs. They're measured from settled orders, not
+    # eBay's rate card — see the comments there.
     assumptions = [
-        ("eBay final value fee %", 0.1325, PCT),
-        ("eBay fixed fee per order", 0.40, MONEY),
-        ("Promoted Listings ad rate %", 0.04, PCT),
-        ("Shipping charged to buyer", 10.0, MONEY),
-        ("Your shipping cost (postage)", 10.0, MONEY),
+        ("eBay fee % (effective, incl. fee charged on tax)", EBAY_FVF_PCT, PCT),
+        ("eBay fixed fee per order", EBAY_FIXED_FEE, MONEY),
+        ("Promoted Listings, effective %", EBAY_AD_FEE_PCT, PCT),
+        ("Shipping charged to buyer", EBAY_SHIP_CHARGED, MONEY),
+        ("Your shipping cost (postage)", EBAY_SHIP_COST, MONEY),
         # Items with no scanned receipt used to be costed at ZERO, which reported
         # their entire sale price as profit — one showed a 68% margin purely
         # because its cost was missing. A share of the list price beats a flat
@@ -274,6 +283,42 @@ def build_report(path: str) -> str:
     for col, w in widths.items():
         ws.column_dimensions[col].width = w
     ws.freeze_panes = "A12"
+
+    # --- Ad-spend reconciliation ---
+    # The one cost the per-row maths can't carry. eBay bills Promoted Listings as
+    # periodic charges with no orderId, so each row can only ever show the ASSUMED
+    # ad rate. Printing what was actually billed, against the revenue it was billed
+    # on, is the only way to know whether that assumption is anywhere near right —
+    # on a recent window it was 5.0% actual against 4% assumed.
+    recon_row = r + 2
+    try:
+        from ebay.orders import account_charges
+        charges = account_charges(ad_days)
+        sold_revenue = sum(
+            round(float(_price_for(i)), 2) * _report_qty(i)
+            for i in items if i["status"] == "sold")
+        lines = [f"eBay billed ${charges['total']:.2f} in account-level charges over the "
+                 f"last {ad_days} days ({charges['count']} charges), which no row above can "
+                 f"attribute — eBay posts them without an order id."]
+        for memo, bucket in sorted(charges["by_memo"].items(), key=lambda kv: -kv[1]["total"]):
+            share = f" = {bucket['total'] / sold_revenue * 100:.1f}% of sold revenue" if sold_revenue else ""
+            lines.append(f"    {memo}: ${bucket['total']:.2f} ({bucket['count']}){share}")
+        if sold_revenue:
+            lines.append(f"    Compare with the assumed ad rate in C6. Sold revenue: ${sold_revenue:.2f}.")
+        ws.cell(row=recon_row, column=2, value="  ".join(lines[:1]))
+        ws.cell(row=recon_row, column=2).font = Font(italic=True, color="808080")
+        for offset, line in enumerate(lines[1:], start=1):
+            ws.cell(row=recon_row + offset, column=2, value=line)
+            ws.cell(row=recon_row + offset, column=2).font = Font(italic=True, color="808080")
+        r = recon_row + len(lines)
+    except Exception as e:
+        # No finances scope, no network, standalone run — the report is still
+        # complete without it, so say why rather than failing the build.
+        ws.cell(row=recon_row, column=2,
+                value=f"(Could not read eBay account-level charges — Promoted Listings spend is "
+                      f"not reflected above: {type(e).__name__})")
+        ws.cell(row=recon_row, column=2).font = Font(italic=True, color="808080")
+        r = recon_row
 
     note_row = r + 2
     ws.cell(row=note_row, column=2,

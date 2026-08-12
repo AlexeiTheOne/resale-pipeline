@@ -203,6 +203,36 @@ def sales_by_item(days: int = 90) -> dict[str, dict]:
     return out
 
 
+def account_charges(days: int = 90) -> dict:
+    """Charges eBay bills to the account rather than to an order.
+
+    Promoted Listings is the big one, and it is invisible to per-item accounting:
+    eBay posts it as periodic NON_SALE_CHARGE transactions with NO orderId, so
+    there is nothing to attribute a share of to any line item. Over a recent
+    120-day window that was $53.17 across 14 charges — real money that the
+    per-order maths (_fees_by_order, which only reads SALE and SHIPPING_LABEL)
+    counts nowhere.
+
+    Returns {"total": float, "count": int, "by_memo": {memo: {"total", "count"}}}
+    so a report can reconcile the assumed ad rate against what was actually
+    billed. Raises like the other calls if the finances scope is missing."""
+    out = {"total": 0.0, "count": 0, "by_memo": {}}
+    for txn in get_transactions(days):
+        if txn.get("transactionType") != "NON_SALE_CHARGE":
+            continue
+        amount = _money(txn.get("amount"))
+        memo = (txn.get("transactionMemo") or "other charge").strip()
+        out["total"] += amount
+        out["count"] += 1
+        bucket = out["by_memo"].setdefault(memo, {"total": 0.0, "count": 0})
+        bucket["total"] += amount
+        bucket["count"] += 1
+    out["total"] = round(out["total"], 2)
+    for bucket in out["by_memo"].values():
+        bucket["total"] = round(bucket["total"], 2)
+    return out
+
+
 def orders_status() -> str:
     """Non-destructive /health check: a limit=1 read returns 2xx when
     sell.fulfillment.readonly is granted and 403 when it isn't."""
