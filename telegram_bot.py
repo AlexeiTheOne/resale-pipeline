@@ -1943,19 +1943,33 @@ def _sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
         net = sale["net_proceeds"] if sale["fees_known"] else None
         changes.append(f"SOLD ${sale['sale_price']}" + (f" · net ${net}" if net is not None else ""))
 
-    listing_status = (offer.get("listing") or {}).get("listingStatus")
-    # A published listing eBay reports as ended or out of stock, that we DIDN'T
-    # just match to a real order above, has probably sold (or was ended in Seller
-    # Hub) — flag it so /sold can record a price the orders feed didn't carry
-    # (e.g. an order older than the sold_map window). availableQuantity dropping
-    # to 0 is the same signal.
-    likely_sold = (
-        not auto_sold
-        and item["status"] == "published"
-        and (listing_status in ("ENDED", "OUT_OF_STOCK") or ebay_qty == 0)
-    )
+    listing_info = offer.get("listing") or {}
+    listing_status = listing_info.get("listingStatus")
+    try:
+        sold_qty = int(listing_info.get("soldQuantity") or 0)
+    except (TypeError, ValueError):
+        sold_qty = 0
+
+    # An ended listing holds no live stock, whatever quantity the offer still
+    # records. Zero it, or the report keeps counting merchandise that isn't for
+    # sale — a listing ended after selling one unit was still projecting its
+    # remaining units as inventory.
+    if listing_status == "ENDED" and (ebay.get("quantity") or 0) != 0:
+        ebay["quantity"] = 0
+        update_field(item_id, "ebay", ebay)
+        changes.append("ended on eBay → qty 0")
+
+    ended = (not auto_sold and item["status"] == "published"
+             and (listing_status in ("ENDED", "OUT_OF_STOCK") or ebay_qty == 0))
+    # "Ended" alone says nothing about whether it SOLD. eBay reports
+    # soldQuantity, so use it: a listing that ended with soldQuantity 0 and stock
+    # still on it expired or was ended by hand, and wants relisting — telling the
+    # user to record a sale sends them to invent one that never happened.
+    likely_sold = ended and sold_qty > 0
+    ended_unsold = ended and sold_qty == 0
     return {"item_id": item_id, "changes": changes, "auto_sold": auto_sold,
-            "likely_sold": likely_sold, "listing_status": listing_status}
+            "likely_sold": likely_sold, "ended_unsold": ended_unsold,
+            "listing_status": listing_status}
 
 
 def _adopt_listing(row: dict) -> str:
@@ -2024,7 +2038,7 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         _record_error("sync (orders)", e)
         sold_map_err = f"{type(e).__name__}: {str(e)[:150]}"
 
-    updated, auto_sold, sold_flags, errors = [], [], [], []
+    updated, auto_sold, sold_flags, errors, ended_flags = [], [], [], [], []
     for item in items:
         try:
             result = await asyncio.to_thread(_sync_one, item, sold_map)
@@ -2039,6 +2053,8 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             updated.append(f"{result['item_id'][:8]}: {', '.join(result['changes'])}")
         if result["likely_sold"]:
             sold_flags.append(result["item_id"])
+        if result.get("ended_unsold"):
+            ended_flags.append(result["item_id"])
 
     # Reconcile against every listing actually live on eBay, not just the ones we
     # already know about. Listings made by hand in Seller Hub never touch the
@@ -2115,6 +2131,11 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # new listing id. Drop those: reporting a live listing as probably-sold sends
     # you off to record a sale that never happened.
     sold_flags = [sid for sid in sold_flags if sid not in live_item_ids]
+    ended_flags = [sid for sid in ended_flags if sid not in live_item_ids]
+    if ended_flags:
+        lines += ["", f"🔁 Ended WITHOUT selling ({len(ended_flags)}) — eBay reports "
+                  "soldQuantity 0 with stock left. Relist with /activate <id>:"]
+        lines += [f"  {sid[:8]}" for sid in ended_flags]
     if sold_flags:
         lines += ["", "🛒 Likely sold (ended/out of stock, no order matched) — record with "
                   "/sold <id> <price>:"]
