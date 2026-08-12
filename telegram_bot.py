@@ -2047,19 +2047,32 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # which leaves the stored one pointing at a dead listing (and the price check
     # reading traffic for the wrong thing).
     adopted, relinked, live_mismatch, discover_err = [], [], [], None
+    live_item_ids: set[str] = set()
     try:
         live = await asyncio.to_thread(get_active_listings)
+        live_item_ids = {row["sku"] for row in live if row["sku"]}
         by_sku = {i["item_id"]: i for i in list_items()}
         known_ids = {(i.get("ebay") or {}).get("listing_id") for i in by_sku.values()}
         for row in live:
             item = by_sku.get(row["sku"]) if row["sku"] else None
             if item is not None:
                 ebay_data = dict(item.get("ebay") or {})
+                changed = False
                 if ebay_data.get("listing_id") != row["listing_id"]:
                     ebay_data["listing_id"] = row["listing_id"]
                     ebay_data["view_item_url"] = row["view_item_url"]
-                    update_field(item["item_id"], "ebay", ebay_data)
+                    changed = True
                     relinked.append(f"{item['item_id'][:8]} → {row['listing_id']}")
+                # Take the LIVE quantity from here. _sync_one reads it from the
+                # stored offer_id, which after a relist points at the dead offer
+                # and reports 0 — so an item that sold one unit and still has
+                # stock looked like it had none, and its remaining inventory
+                # stopped being counted anywhere.
+                if row["quantity"] and ebay_data.get("quantity") != row["quantity"]:
+                    ebay_data["quantity"] = row["quantity"]
+                    changed = True
+                if changed:
+                    update_field(item["item_id"], "ebay", ebay_data)
                 # eBay says this is live; the local status says otherwise. That's
                 # usually a relist after a sale, but it could equally be a wrong
                 # /sold — and flipping the status either way would rewrite sales
@@ -2097,6 +2110,11 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         lines += ["", f"📝 Updated ({len(updated)}):"] + [f"  {u}" for u in updated]
     elif not auto_sold:
         lines.append("No price/quantity changes found.")
+    # A relisted item's OLD offer reads as ended/out-of-stock, which is exactly
+    # the "likely sold" signal — but the item is demonstrably still live under a
+    # new listing id. Drop those: reporting a live listing as probably-sold sends
+    # you off to record a sale that never happened.
+    sold_flags = [sid for sid in sold_flags if sid not in live_item_ids]
     if sold_flags:
         lines += ["", "🛒 Likely sold (ended/out of stock, no order matched) — record with "
                   "/sold <id> <price>:"]
