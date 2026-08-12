@@ -37,6 +37,29 @@ photos -> identify -> [confirm?] -> price -> [confirm?] -> draft -> [approve] ->
      posted to eBay**. If neither the barcode nor OCR yields the price and code,
      the bot asks you to set them with `/receipt <price> <code>`.
 
+   Reading the tag is a three-tier chain, each tier only reached when the one
+   above it fails to produce the **paid price** (the number every profit
+   calculation rests on):
+
+   1. **Barcode** — exact and free, but it only decodes on 44% of real tag
+      photos. Glare, angle, a crease through the bars and Telegram's compression
+      defeat the rest.
+   2. **OCR, multiple renderings** — plain, upscaled, and rotated 180/90/270.
+      Tags are frequently photographed upside down, or as two stickers
+      overlapping at 180° to each other, so a single rendering isn't enough; the
+      old single `--psm 6` pass recovered nothing at all on the hard tags.
+   3. **Vision model** — one cheap `gemini-2.5-flash` call. Reading a creased,
+      rotated, double-stickered tag is ordinary work for it and hopeless for
+      Tesseract. Disable with `TAG_VISION_FALLBACK=false`.
+
+   Measured over the real library, this takes automatic cost capture from 26 of
+   59 tags to **41 of 59**. The vision tier is validated against the 26 tags
+   whose barcode gives ground truth: **26/26 prices correct**, with its three
+   misses being *omissions* rather than wrong values. It is never consulted when
+   the barcode already gave an exact price, its code must match a real Ross shape
+   (12 digits, `400` prefix) to be accepted, and when a tag genuinely doesn't
+   show a price it returns nothing rather than guessing.
+
 2. **Identify** (`identify.py`). Before calling the model, the product's
    UPC/EAN barcode is decoded directly off the photos with `pyzbar` (scanning
    every photo, since the tag isn't always in the first few) — the exact digits,
