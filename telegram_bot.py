@@ -1273,6 +1273,38 @@ def format_pricing(pricing: dict) -> str:
     return "\n".join(lines)
 
 
+# A typed correction that is really a price instruction: "159.99", "price 159.99",
+# "make it $159.99", "sell for 160". Deliberately narrow — it must not fire on
+# ordinary copy edits that happen to contain a number ("size 10 not 8", "2 front
+# pockets"), so a price word or a currency symbol is required unless the whole
+# message is just the number.
+_PRICE_CORRECTION = re.compile(
+    r"^(?:(?:the\s+)?price\s*(?:should\s*be|is|to|=)?|set\s+(?:the\s+)?price\s*(?:to)?|"
+    r"make\s+it|change\s+(?:it|the\s+price)\s*(?:to)?|sell\s+(?:it\s+)?for|list\s+(?:it\s+)?at)?"
+    r"\s*\$?\s*(\d{1,5}(?:\.\d{1,2})?)\s*(?:dollars|usd|bucks)?\s*$",
+    re.I)
+
+
+def _price_from_correction(text: str) -> float | None:
+    """The price a typed correction is asking for, or None if it isn't one.
+
+    Charm-prices a whole number the same way the price gate does (35 -> 34.99),
+    so the two entry points can't disagree."""
+    match = _PRICE_CORRECTION.match(text.strip())
+    if not match:
+        return None
+    raw = text.strip()
+    # A bare number with no price word and no "$" is ambiguous in a sentence, but
+    # unambiguous when it's the entire message.
+    if not re.search(r"price|\$|sell|list|make it|change", raw, re.I) and not re.fullmatch(
+            r"\$?\s*\d{1,5}(?:\.\d{1,2})?", raw):
+        return None
+    try:
+        return _charm_price(float(match.group(1)))
+    except (TypeError, ValueError):
+        return None
+
+
 def _apply_manual_price(pricing: dict, price: float) -> dict:
     """Record a human price override without erasing what the machine proposed.
 
@@ -1528,6 +1560,23 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     item = get_item(item_id)
     current = item["listing"]
+
+    # A correction that names a price is a price change, and it goes through the
+    # proper path: recorded as manual_price with machine_price preserved, exactly
+    # as typing a price at the price gate does. Without this the copywriter would
+    # be the one setting it — and the guard that stops the model drifting the
+    # price would silently revert the user's own number too.
+    wanted = _price_from_correction(text)
+    if wanted is not None:
+        pricing = _apply_manual_price(item.get("pricing") or {}, wanted)
+        update_field(item_id, "pricing", pricing)
+        listing = dict(current)
+        listing["price"] = wanted
+        update_field(item_id, "listing", listing)
+        await _safe_reply(update.message, f"💲 Price set to ${wanted} for {item_id[:8]}.")
+        await _show_review(user_id, item_id, update.message)
+        return
+
     await _safe_reply(update.message, "✏️ Applying your correction...")
     try:
         revised = await asyncio.to_thread(revise_draft, current, text)

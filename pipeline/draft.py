@@ -309,7 +309,11 @@ def revise_draft(current_draft: dict, correction: str) -> dict:
     # the margin floor.
     current_price = current_draft.get("price")
     if current_price is not None and revised.get("price") != current_price:
-        print(f"⚠️ revision changed price {current_price} -> {revised.get('price')}, keeping {current_price}")
+        # Drift, not intent: a message that actually asks for a price is handled
+        # before this is ever called (telegram_bot._price_from_correction), so
+        # anything reaching here is the model repricing a copy edit on its own.
+        print(f"⚠️ copy edit tried to reprice {current_price} -> {revised.get('price')}; "
+              f"keeping {current_price} (say 'price 159.99' to change it deliberately)")
         revised["price"] = current_price
     return revised
 
