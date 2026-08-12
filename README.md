@@ -118,10 +118,17 @@ photos -> identify -> [confirm?] -> price -> [confirm?] -> draft -> [approve] ->
    (a whole number is charm-priced, e.g. `35` → `$34.99`).
 
 4. **Draft** (`pipeline/draft.py`). Gemini (`gemini-2.5-flash`) writes the
-   listing — title, description, item specifics, category, and price — using the
+   listing — title, description, item specifics, and category — using the
    identification data plus a hint block listing the exact item specifics eBay
    defines for the likely category. A standard shipping/returns/about section is
    appended. Status becomes `review`.
+
+   **The copywriter does not set the price.** It's asked to echo the computed
+   price and mostly does, but on 6 of 64 real listings it wrote its own number
+   instead — from −22% to +71% off — and that number went live. The price is now
+   overwritten with the computed one after generation, and a typed correction at
+   review can't move it either. Price changes go through the price gate or
+   `/setprice`, which record what changed and respect the margin floor.
 
 5. **Review.** The bot sends you the draft. You reply:
    - `approve` to push it to eBay,

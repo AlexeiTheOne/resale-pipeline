@@ -244,6 +244,22 @@ def generate_draft(identification: dict, pricing: dict, examples: list | None = 
 
     draft["description"] = draft["description"] + "\n\n" + STORE_BOILERPLATE.strip()
     draft["stock_image_url"] = stock_url
+
+    # The price is decided by pipeline/price.py (or by you at the gate), never by
+    # the copywriter. The prompt asks it to echo suggested_price exactly and it
+    # mostly does — but on 6 of 64 real listings it wrote its own number instead,
+    # from -22% to +71% off, and that number is what went live. An LLM's aside is
+    # not a pricing decision, so the value is overwritten here rather than
+    # trusted.
+    if suggested is not None:
+        model_price = draft.get("price")
+        try:
+            drifted = model_price is None or round(float(model_price), 2) != round(float(suggested), 2)
+        except (TypeError, ValueError):
+            drifted = True
+        if drifted:
+            print(f"⚠️ draft model priced at {model_price}, overriding with {suggested}")
+        draft["price"] = suggested
     return draft
 
 
@@ -283,9 +299,19 @@ def revise_draft(current_draft: dict, correction: str) -> dict:
     if start != -1 and end > start:
         raw = raw[start:end]
     try:
-        return json.loads(raw)
+        revised = json.loads(raw)
     except json.JSONDecodeError:
         raise ValueError(raw)
+
+    # Same rule as generate_draft: a copy edit must not move the price. Rewording
+    # a title should never quietly reprice a live listing — price changes go
+    # through the price gate or /setprice, which record what changed and check
+    # the margin floor.
+    current_price = current_draft.get("price")
+    if current_price is not None and revised.get("price") != current_price:
+        print(f"⚠️ revision changed price {current_price} -> {revised.get('price')}, keeping {current_price}")
+        revised["price"] = current_price
+    return revised
 
 
 def revise_identification(current: dict, correction: str) -> dict:
