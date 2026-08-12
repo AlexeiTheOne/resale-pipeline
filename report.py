@@ -176,13 +176,35 @@ def build_report(path: str) -> str:
         ws.cell(row=r, column=5, value=qty).alignment = center
         ws.cell(row=r, column=6, value=unit_price).number_format = MONEY
         ws.cell(row=r, column=7, value=f"=F{r}*E{r}").number_format = MONEY           # revenue
-        ws.cell(row=r, column=8, value=f"={A_SHIP_CHG}*E{r}").number_format = MONEY    # ship charged
-        # FVF% applies to (item revenue + shipping charged); the fixed per-order fee
-        # is charged per unit sold.
-        ws.cell(row=r, column=9,
-                value=f"={A_FVF}*(G{r}+H{r})+{A_FIXED}*E{r}").number_format = MONEY    # eBay fee
+
+        # A SOLD item doesn't need assumptions — eBay billed real amounts, and
+        # /sync stored them. Use those: the shipping the buyer actually paid, the
+        # fees actually charged, and the actual cost of the label bought through
+        # eBay. Across the sold items the assumptions were off by +$28 on shipping
+        # collected, +$25 on fees and +$5 on postage, all in the same direction:
+        # they understated what really came in.
+        #
+        # Ad fees stay on the assumption even here. eBay bills Promoted Listings
+        # as periodic "General fee" transactions with NO orderId, so there is
+        # nothing to attribute to a line item; see the ad-spend note written below
+        # the table for the real total.
+        ebay_data = item.get("ebay") or {}
+        actual = ebay_data.get("sale_price") is not None and ebay_data.get("fees_known")
+        if actual:
+            ws.cell(row=r, column=8,
+                    value=round(float(ebay_data.get("shipping_collected") or 0), 2)).number_format = MONEY
+            ws.cell(row=r, column=9,
+                    value=round(float(ebay_data.get("ebay_fees") or 0), 2)).number_format = MONEY
+            ws.cell(row=r, column=11,
+                    value=round(float(ebay_data.get("shipping_label_cost") or 0), 2)).number_format = MONEY
+        else:
+            ws.cell(row=r, column=8, value=f"={A_SHIP_CHG}*E{r}").number_format = MONEY    # ship charged
+            # FVF% applies to (item revenue + shipping charged); the fixed per-order
+            # fee is charged per unit sold.
+            ws.cell(row=r, column=9,
+                    value=f"={A_FVF}*(G{r}+H{r})+{A_FIXED}*E{r}").number_format = MONEY    # eBay fee
+            ws.cell(row=r, column=11, value=f"={A_SHIP_COST}*E{r}").number_format = MONEY  # ship cost
         ws.cell(row=r, column=10, value=f"={A_AD}*G{r}").number_format = MONEY         # ad fee
-        ws.cell(row=r, column=11, value=f"={A_SHIP_COST}*E{r}").number_format = MONEY  # ship cost
         cost_cell = ws.cell(row=r, column=12)
         cost_cell.number_format = MONEY
         if paid is not None:
@@ -255,7 +277,9 @@ def build_report(path: str) -> str:
 
     note_row = r + 2
     ws.cell(row=note_row, column=2,
-            value="Orange 'Cost (Ross)' cells = no receipt was captured, so the cost is ESTIMATED "
+            value="Sold rows use REAL eBay figures (shipping collected, fees, and the postage you "
+                  "actually paid for the label); unsold rows use the assumptions above.  ·  "
+                  "Orange 'Cost (Ross)' cells = no receipt was captured, so the cost is ESTIMATED "
                   "from the list price (see the assumption above) — type the real amount to replace it.  ·  "
                   "'Net / unit' is the profit ONE unit makes; the money columns are line totals (per-unit x qty).")
     ws.cell(row=note_row, column=2).font = Font(italic=True, color="808080")
