@@ -84,12 +84,45 @@ def _thumbnail(cover_path, dest_dir):
         return None
 
 
+def _expand_partially_sold(items: list[dict]) -> list[dict]:
+    """Split an item that sold a unit but still has stock into two rows.
+
+    A multi-quantity listing can sell one unit and stay live with the rest, but
+    an item has a single status, so it goes to 'sold' and its remaining stock
+    stops being counted anywhere — $268.92 of live inventory in one measurement,
+    invisible to the report and to the weekly price check.
+
+    Neither row alone is right: the realized sale belongs in SOLD, the remaining
+    units belong in STILL LISTED. So emit both, sharing the item id."""
+    out = []
+    for item in items:
+        ebay = item.get("ebay") or {}
+        remaining = 0
+        try:
+            remaining = int(ebay.get("quantity") or 0)
+        except (TypeError, ValueError):
+            remaining = 0
+        if item["status"] != "sold" or remaining <= 0:
+            out.append(item)
+            continue
+
+        out.append(item)  # the realized sale, qty 1 (see _report_qty)
+        still_listed = dict(item)
+        still_listed["status"] = "published"
+        # Drop the sale so this row prices at the CURRENT list price, not the
+        # price the sold unit fetched.
+        still_listed["ebay"] = {k: v for k, v in ebay.items() if k != "sale_price"}
+        out.append(still_listed)
+    return out
+
+
 def build_report(path: str, ad_days: int = 90) -> str:
     """`ad_days` is the look-back for the account-level charge reconciliation
     printed under the table (Promoted Listings, which eBay bills without an
     order id and no row can therefore carry)."""
     items = [i for i in list_items()
              if (i.get("listing") or {}).get("price") is not None and i["status"] in _REPORTABLE]
+    items = _expand_partially_sold(items)
     items.sort(key=lambda i: (i["status"], i.get("created_at", "")))
 
     wb = Workbook()
