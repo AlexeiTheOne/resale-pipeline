@@ -28,14 +28,18 @@ photos -> identify -> [confirm?] -> price -> [confirm?] -> draft -> [approve] ->
    - the **1st** photo is the overview (used as the eBay gallery cover),
    - the **2nd** photo is the tag close-up (fed to Gemini to identify the item;
      on the eBay listing it is moved to appear as the *last* product image),
-   - the **last** photo is always the Ross price tag/check. Its CODE128 barcode
-     is decoded (`receipt.py`) for the 12-digit item code and the price you paid
-     — Ross barcodes are `<12-digit code><6-digit price in cents>`, e.g.
-     `400286461425000999` → code `400286461425`, paid `$9.99`. OCR reads the
-     printed "Original $XX.XX" line (not in the barcode) and backs up the barcode
-     if it can't be decoded. The result is stored as cost data and **never
-     posted to eBay**. If neither the barcode nor OCR yields the price and code,
-     the bot asks you to set them with `/receipt <price> <code>`.
+   - the **last** photo should be the Ross price tag. It carries the 12-digit
+     item code and the price you paid — Ross barcodes are `<12-digit code><6-digit
+     price in cents>`, e.g. `400286461425000999` → code `400286461425`, paid
+     `$9.99`. The tag is stored as cost data and **never posted to eBay**.
+
+     The tag is *located* rather than assumed: if a photo elsewhere in the set
+     decodes a Ross barcode, that one is peeled instead (`/addphotos` can append
+     photos after the tag). If none decodes, the last photo is peeled anyway —
+     that fallback is load-bearing, because only 44% of real tag photos decode
+     and refusing to peel would leave the tag, showing what you paid, in the
+     listing. When the price can't be read at all, the bot asks for it with
+     `/receipt <price> [code]`.
 
    Reading the tag is a three-tier chain, each tier only reached when the one
    above it fails to produce the **paid price** (the number every profit
@@ -319,9 +323,9 @@ Photos are stored on disk under `data/inbox/`.
 | ---------------- | ----------------------------------------------------- |
 | _(send photos)_  | Start a new item, then step through the confirm gates |
 | `confirm`        | At a gate: accept the identification / price and continue (strong-evidence items skip the gate entirely) |
-| _(free text)_    | At a gate: correct the identification, or set the price; at review, correct the draft or `approve`/`reject` |
+| _(free text)_    | At a gate: correct the identification, or set the price; at review, correct the draft or `approve`/`reject`. During a haul, **reply** to an item's message or prefix its id (`a1b2c3d4 color is navy`) to aim at that one |
 | `wait`           | Extend the photo-batching window for a large batch    |
-| `/haul`          | Multi-item mode: dump a whole Ross run, split into items on a blackout frame (one dark photo between items) |
+| `/haul`          | Multi-item mode: dump a whole Ross run, split into items on each Ross tag (or a blackout frame — one dark photo — where a tag is missing) |
 | `/status [status]` | List items and their pipeline status; optional filter (e.g. `/status published`), with a count-per-status header |
 | `/listing [id]`  | Show the current draft for an item                    |
 | `/comps [id]`    | Show the sold/active comps the price was built from   |
