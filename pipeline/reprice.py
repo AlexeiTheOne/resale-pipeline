@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from datetime import date, datetime, timedelta, timezone
 
 from config import (
-    EBAY_DEFAULT_AD_RATE_PCT, EBAY_FIXED_FEE, EBAY_FVF_PCT,
+    EBAY_AD_FEE_PCT, EBAY_FIXED_FEE, EBAY_FVF_PCT,
     EBAY_SHIP_CHARGED, EBAY_SHIP_COST,
     REPRICE_MIN_CTR, REPRICE_MIN_IMPRESSIONS, REPRICE_MIN_MARGIN_DOLLARS,
     REPRICE_MIN_VIEWS_FOR_SIGNAL, REPRICE_MIN_WEEKS_LIVE, REPRICE_STALE_WEEKS,
@@ -84,7 +84,10 @@ def _cost_floor(item: dict) -> float | None:
     paid = (item.get("receipt") or {}).get("reduced_price")
     if paid is None:
         return None
-    ad_rate = (EBAY_DEFAULT_AD_RATE_PCT or 0) / 100
+    # The EFFECTIVE ad cost, not the rate set on the listing: eBay billed 5.0%
+    # of sold revenue against a 4% configured rate, and a floor built on the
+    # lower number would approve cuts that don't actually clear.
+    ad_rate = EBAY_AD_FEE_PCT or 0
     denom = 1 - EBAY_FVF_PCT - ad_rate
     if denom <= 0:
         return None
