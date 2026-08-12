@@ -35,6 +35,7 @@ THUMB_PX = 92
 
 # Assumption cell addresses (column C, rows 4-8) — referenced by the row formulas.
 A_FVF, A_FIXED, A_AD, A_SHIP_CHG, A_SHIP_COST = "$C$4", "$C$5", "$C$6", "$C$7", "$C$8"
+A_COST_RATIO = "$C$9"   # assumed Ross cost as a share of list price, when unknown
 
 
 def _price_for(item):
@@ -103,13 +104,20 @@ def build_report(path: str) -> str:
     ws["A2"] = ("Generated " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                 + "  ·  edit the yellow assumption cells to recalc every row")
 
-    # --- Assumptions (editable, rows 4-8) ---
+    # --- Assumptions (editable, rows 4-9) ---
     assumptions = [
         ("eBay final value fee %", 0.1325, PCT),
         ("eBay fixed fee per order", 0.40, MONEY),
         ("Promoted Listings ad rate %", 0.04, PCT),
         ("Shipping charged to buyer", 10.0, MONEY),
         ("Your shipping cost (postage)", 10.0, MONEY),
+        # Items with no scanned receipt used to be costed at ZERO, which reported
+        # their entire sale price as profit — one showed a 68% margin purely
+        # because its cost was missing. A share of the list price beats a flat
+        # guess: across 63 items with a known cost it lands at a median 29% of
+        # list (p25 22%, p75 34%), so it scales with the item instead of costing
+        # a $110 listing the same as a $30 one.
+        ("Assumed Ross cost when unknown (% of list)", 0.29, PCT),
     ]
     for idx, (label, val, fmt) in enumerate(assumptions):
         r = 4 + idx
@@ -121,16 +129,23 @@ def build_report(path: str) -> str:
         cell.fill = edit_fill
         cell.border = border
 
-    # --- Table header (row 10) ---
+    # --- Table header (row 11) ---
     # Every money column is a LINE TOTAL (per-unit × qty), so a multi-quantity
-    # listing projects its full profit, not one unit's. "Unit price" stays
-    # per-unit for reference; "Revenue" = unit price × qty is what the fee/profit
-    # math builds on. Qty comes from _report_qty (offer quantity for live items;
-    # 1 for sold, whose sale_price is already the realized amount).
+    # listing projects its full profit. That's right for a projection but wrong
+    # for judging the item: a qty-4 row shows four units' profit blended into one
+    # figure, which isn't the number you decide on. "Net / unit" is that number —
+    # the profit one of these actually makes, whatever the quantity.
+    #
+    # (Margin % is the same either way, since every term scales with qty. It's the
+    # DOLLARS that multiply — and the TOTAL row's margin is revenue-weighted, so a
+    # qty-5 listing counts five times toward the blended figure.)
+    #
+    # Qty comes from _report_qty: the offer quantity for live items, 1 for sold
+    # ones whose sale_price is already the realized amount.
     headers = ["Photo", "ID", "Title", "Status", "Qty", "Unit price", "Revenue",
                "Ship chg", "eBay fee", "Ad fee", "Ship cost", "Cost (Ross)",
-               "Net profit", "Margin"]
-    HR = 10
+               "Net profit", "Margin", "Net / unit"]
+    HR = 11
     for col, h in enumerate(headers, start=1):
         cell = ws.cell(row=HR, column=col, value=h)
         cell.font = bold
@@ -173,12 +188,21 @@ def build_report(path: str) -> str:
         if paid is not None:
             cost_cell.value = f"={round(float(paid), 2)}*E{r}"  # unit cost × qty
         else:
-            cost_cell.fill = missing_fill  # unknown — treated as 0 until you fill it
+            # No receipt was captured. Estimate from the list price rather than
+            # leaving it empty: an empty cell reads as zero cost, which reported
+            # the whole sale price as profit. Still orange, so an estimate is
+            # never mistaken for a real figure — type the amount to replace it.
+            cost_cell.value = f"={A_COST_RATIO}*F{r}*E{r}"
+            cost_cell.fill = missing_fill
         ws.cell(row=r, column=13,
                 value=f"=G{r}+H{r}-I{r}-J{r}-K{r}-L{r}").number_format = MONEY         # net profit
         ws.cell(row=r, column=14,
                 value=f'=IF((G{r}+H{r})=0,"",M{r}/(G{r}+H{r}))').number_format = "0.0%"  # margin
-        for col in range(2, 15):
+        # Per-unit profit: what ONE of these makes, so a multi-quantity row can
+        # still be judged as an item rather than as a batch.
+        ws.cell(row=r, column=15,
+                value=f'=IF(E{r}=0,"",M{r}/E{r})').number_format = MONEY
+        for col in range(2, 16):
             ws.cell(row=r, column=col).border = border
         r += 1
 
@@ -209,11 +233,13 @@ def build_report(path: str) -> str:
                 c = ws.cell(row=r, column=ord(col_letter) - 64, value=formula)
                 c.number_format = "0" if col_letter == "E" else MONEY
                 c.font = bold
-            # Blended margin for the band: its net / its revenue.
+            # Blended margin for the band: its net / its revenue. Note this is
+            # revenue-weighted, so a multi-quantity listing counts once per unit
+            # toward it — read "Net / unit" for per-item economics.
             ws.cell(row=r, column=14,
                     value=f'=IF(G{r}=0,"",M{r}/G{r})').number_format = "0.0%"
             ws.cell(row=r, column=14).font = bold
-            for col in range(2, 15):
+            for col in range(2, 16):
                 cell = ws.cell(row=r, column=col)
                 cell.fill = total_fill
                 cell.border = border
@@ -222,14 +248,16 @@ def build_report(path: str) -> str:
 
     # --- Widths + note ---
     widths = {"A": 14, "B": 10, "C": 40, "D": 11, "E": 6, "F": 10, "G": 10,
-              "H": 9, "I": 10, "J": 9, "K": 10, "L": 12, "M": 12, "N": 9}
+              "H": 9, "I": 10, "J": 9, "K": 10, "L": 12, "M": 12, "N": 9, "O": 11}
     for col, w in widths.items():
         ws.column_dimensions[col].width = w
-    ws.freeze_panes = "A11"
+    ws.freeze_panes = "A12"
 
     note_row = r + 2
     ws.cell(row=note_row, column=2,
-            value="Orange 'Cost (Ross)' cells = no receipt was captured; type the amount you paid to complete the profit.")
+            value="Orange 'Cost (Ross)' cells = no receipt was captured, so the cost is ESTIMATED "
+                  "from the list price (see the assumption above) — type the real amount to replace it.  ·  "
+                  "'Net / unit' is the profit ONE unit makes; the money columns are line totals (per-unit x qty).")
     ws.cell(row=note_row, column=2).font = Font(italic=True, color="808080")
 
     wb.save(path)

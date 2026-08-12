@@ -345,7 +345,7 @@ Photos are stored on disk under `data/inbox/`.
 | `/end [id]`      | End a live listing (withdraw it); drops back to a draft to relist |
 | `/sold [id] [price]` | Mark an item sold and record the sale price; replies with profit vs. Ross cost |
 | `/profit`        | Summarize profit across all sold items (before eBay fees/shipping) |
-| `/report`        | Build & send an Excel profit report: photo, title, price, shipping, cost, and profit net of eBay fees + ad rate (fee assumptions editable in the sheet). Totals are banded **SOLD (realized)** / **STILL LISTED (projected)** / TOTAL, so money you've actually been paid isn't added to money you only hope for |
+| `/report`        | Build & send an Excel profit report: photo, title, price, shipping, cost, and profit net of eBay fees + ad rate (assumptions editable in the sheet). Totals band **SOLD (realized)** / **STILL LISTED (projected)** / TOTAL. Money columns are line totals (per-unit × qty); **Net / unit** is what one unit makes. Items with no scanned receipt are costed from an editable % of list price rather than as free |
 | `/promote [id] <pct>` | Set/adjust a listing's Promoted Listings ad rate (2–100%) |
 | `/retry [id]`    | Re-run the failed pipeline step for an item (honors the confirm gates) |
 | `/delete [id]`   | Delete an item, its photos, and its eBay offer (ends it first if live) |
