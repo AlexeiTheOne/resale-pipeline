@@ -206,6 +206,19 @@ previous item.
 While a haul is running, `approve` and `reject` always go to the draft waiting at
 review, never to whichever item happens to be sitting at a gate.
 
+**Aiming a correction at one item.** A haul puts several drafts on screen at
+once, so "which one did you mean?" can't be answered by a most-recent pointer —
+that lands the correction on whichever draft was shown last, rarely the one
+you're looking at. Two ways to aim:
+
+- **Reply** to that item's message (the natural one), or
+- **lead with its id**: `a1b2c3d4 color is navy`.
+
+Every gate and draft is labelled with its item id so you can tell them apart, and
+an aimed message wins over whatever else is active — including pulling an item
+back to its gate, with the displaced one returned to the front of the queue.
+Un-aimed messages behave exactly as they do for a single item.
+
 ## Architecture
 
 | File | Responsibility |

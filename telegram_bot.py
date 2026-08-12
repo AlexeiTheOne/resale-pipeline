@@ -1,5 +1,5 @@
 import os, sys, re, uuid, asyncio, shutil, tempfile, time, traceback
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -91,6 +91,31 @@ gate_queue = {}     # user_id -> [{item_id, stage, reason}]  gates waiting their
                     # items at once, and only one can hold the single gate slot; the rest queue here
                     # instead of overwriting each other and getting lost)
 haul_mode = set()   # user_ids whose next photo batch is a multi-item haul to be split on Ross tags
+# message_id of a gate/draft the bot sent -> the item it was about. A haul puts
+# several drafts on screen at once, so "which item did you mean?" can't be
+# answered by a single most-recent pointer: replying to a specific message is how
+# the user says which one. Bounded so a long session can't grow it forever.
+msg_target: "OrderedDict[int, str]" = OrderedDict()
+MSG_TARGET_MAX = 400
+
+
+def _remember_target(sent, item_id: str) -> None:
+    """Tie a message the bot just sent to the item it's about, so a reply to it
+    is unambiguous even with a dozen drafts on screen."""
+    if sent is None or not getattr(sent, "message_id", None):
+        return
+    msg_target[sent.message_id] = item_id
+    while len(msg_target) > MSG_TARGET_MAX:
+        msg_target.popitem(last=False)
+
+
+def _replied_item(update) -> str | None:
+    """The item the user is replying to, if they replied to one of our messages."""
+    replied = getattr(update.message, "reply_to_message", None)
+    if replied is None:
+        return None
+    item_id = msg_target.get(replied.message_id)
+    return item_id if item_id and get_item(item_id) else None
 
 
 def _lock_for(user_id):
@@ -99,13 +124,16 @@ def _lock_for(user_id):
     return locks[user_id]
 
 
-async def _safe_reply(message, text: str, **kwargs) -> None:
+async def _safe_reply(message, text: str, **kwargs):
     """Best-effort status ping. A transient network failure sending this
-    message must never abort the actual work that follows it."""
+    message must never abort the actual work that follows it. Returns the sent
+    Message (or None if it failed) so callers can tie it to an item — see
+    _remember_target."""
     try:
-        await message.reply_text(text, **kwargs)
+        return await message.reply_text(text, **kwargs)
     except Exception as e:
         print(f"WARNING: reply_text failed (continuing anyway): {type(e).__name__}: {e}")
+        return None
 
 
 TELEGRAM_MAX_CHARS = 3900  # under the 4096 hard limit, leaving headroom
@@ -693,8 +721,12 @@ async def _show_review(user_id, item_id, message) -> None:
     last_item[user_id] = item_id
     result = {"identification": item["identification"], "pricing": item["pricing"],
               "listing": item["listing"]}
-    await _safe_reply(message, format_draft(result), parse_mode=None,
-                      reply_markup=_review_markup(item_id))
+    # Lead with the id: during a haul several drafts sit on screen together, and
+    # a typed correction has to be aimed at one of them.
+    body = f"📄 Draft {item_id[:8]}\n" + format_draft(result)
+    sent = await _safe_reply(message, body, parse_mode=None,
+                             reply_markup=_review_markup(item_id))
+    _remember_target(sent, item_id)
 
 
 async def _publish_and_report(item_id, message) -> None:
@@ -891,14 +923,15 @@ async def _show_identify_gate(user_id, item_id, message, reason=None) -> None:
     gate[user_id] = {"item_id": item_id, "stage": "identify"}
     review.pop(user_id, None)
     last_item[user_id] = item_id
-    body = format_identification(item["identification"])
+    body = f"🔎 {item_id[:8]}\n" + format_identification(item["identification"])
     if reason:
         body += f"\n\n🛑 Needs you: {reason}"
-    await _safe_reply(
+    sent = await _safe_reply(
         message,
         body + "\n\nType 'confirm' to price it, or tell me what to fix "
                "(e.g. 'brand is Tommy Jeans, color navy').",
     )
+    _remember_target(sent, item_id)
 
 
 async def _show_price_gate(user_id, item_id, message, reason=None) -> None:
@@ -912,14 +945,17 @@ async def _show_price_gate(user_id, item_id, message, reason=None) -> None:
     gate[user_id] = {"item_id": item_id, "stage": "price"}
     review.pop(user_id, None)
     last_item[user_id] = item_id
-    body = format_pricing(item["pricing"])
+    title = ((item.get("identification") or {}).get("product_name")
+             or (item.get("identification") or {}).get("item_type") or "")
+    body = f"💲 {item_id[:8]} {title}".rstrip() + "\n" + format_pricing(item["pricing"])
     if reason:
         body += f"\n\n🛑 Needs you: {reason}"
-    await _safe_reply(
+    sent = await _safe_reply(
         message,
         body + "\n\nType 'confirm' to write the listing, or type a price to set it "
                "(e.g. 35 -> $34.99).",
     )
+    _remember_target(sent, item_id)
 
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1317,6 +1353,61 @@ def format_draft(result) -> str:
 _CONFIRM_WORDS = ("confirm", "yes", "ok", "okay", "y", "✅", "👍")
 
 
+def _explicit_target(update, text: str) -> tuple[str | None, str]:
+    """Which item this message is aimed at, and the message with any id stripped.
+
+    Two ways to aim, both needed once a haul puts several items in play at once:
+      * reply to the bot's message for that item (the natural one), or
+      * lead with its id: "a1b2c3d4 color is navy".
+    Returns (None, text) when neither applies, so single-item use is unchanged."""
+    replied = _replied_item(update)
+    if replied:
+        return replied, text
+    parts = text.split(None, 1)
+    if len(parts) == 2 and re.fullmatch(r"[0-9a-f-]{4,36}", parts[0].lower()):
+        item_id, _ = _resolve_item_id(0, [parts[0].lower()])
+        if item_id:
+            return item_id, parts[1]
+    return None, text
+
+
+async def _handle_targeted(user_id, item_id, text, update, context) -> bool:
+    """Apply a message to a specific item the user aimed at, whatever else is on
+    screen. Returns True if it was handled here.
+
+    Without this, a correction typed during a haul lands on whichever draft
+    happened to be shown last, which is rarely the one being looked at."""
+    item = get_item(item_id)
+    if item is None:
+        await _safe_reply(update.message, "That item no longer exists.")
+        return True
+    status = item["status"]
+
+    if status in ("drafted", "review"):
+        review[user_id] = item_id
+        last_item[user_id] = item_id
+        return False  # fall through to the review handler, now pointed correctly
+
+    if status in ("identified", "priced"):
+        stage = "identify" if status == "identified" else "price"
+        active = gate.get(user_id)
+        if active and active["item_id"] != item_id:
+            # Put the item we're displacing back at the front of the queue rather
+            # than dropping it.
+            gate_queue.setdefault(user_id, []).insert(
+                0, {"item_id": active["item_id"], "stage": active["stage"],
+                    "reason": "returning to this one"})
+        gate[user_id] = {"item_id": item_id, "stage": stage}
+        await _handle_gate(user_id, text, update, context)
+        return True
+
+    await _safe_reply(
+        update.message,
+        f"{item_id[:8]} is '{status}' — nothing to change here. "
+        f"/listing {item_id[:8]} to see it, or /setprice to change the price.")
+    return True
+
+
 async def _handle_gate(user_id, text, update, context) -> None:
     """Handle a typed message while an item is paused at the identify/price gate:
     'confirm' advances to the next stage; anything else is applied as a change and
@@ -1390,6 +1481,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
+    # An explicitly aimed message wins over everything: replying to an item's
+    # message, or leading with its id, is the user saying which one they mean.
+    target, text = _explicit_target(update, text)
+    if target:
+        low = text.lower().strip()
+        if await _handle_targeted(user_id, target, text, update, context):
+            return
+        # Not handled means it's a review item and `review` now points at it.
+
     # Confirm gates (after identify / after price) take precedence over the draft
     # review — an item pauses here for a typed 'confirm' or a correction.
     #
@@ -1397,7 +1497,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # haul one item can be gated while another waits at review, and routing an
     # "approve" into the gate fed it to revise_identification as a correction on
     # a different item. Send those to the review handler instead.
-    if user_id in gate and low not in ("approve", "reject"):
+    if user_id in gate and not target and low not in ("approve", "reject"):
         await _handle_gate(user_id, text, update, context)
         return
     if user_id in gate and user_id not in review:
