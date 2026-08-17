@@ -175,6 +175,19 @@ change to eBay immediately for a draft or live listing. Arranging by hand also
 said what the order is, the builder stops second-guessing it, since the "photo 2
 is the tag" assumption no longer holds.
 
+**Items sealed in retail packaging.** For new-in-package goods — bedding above
+all — every photo you can take is a plastic bag with a branded band, and the
+buyer never sees the pattern they are buying. `/stockphoto <url>` fetches a
+retailer's styled product shot, re-hosts it on Cloudinary and slots it in at #2,
+directly after your real cover. The URL has to come from you: every retailer
+that owns these photos (Macy's, Belk, Ralph Lauren, Wayfair, Amazon, Dillard's)
+blocks automated fetching from their product pages, and more to the point you
+are the one holding the item — a wrong colourway is worse than no photo at all.
+Match the *piece*, not the collection: a full made-up bed on a listing for one
+flat sheet promises a set. These duvets are mostly reversible and the reverse is
+far more distinctive than the front, so if the packaging shows both sides, match
+the reverse and you're safe.
+
 ### Gates only where they earn their keep
 
 The identify and price gates clear themselves when the evidence is strong enough
@@ -362,6 +375,7 @@ Photos are stored on disk under `data/inbox/`.
 | `/photos [id]`   | Show the photos as an album **in listing order**, numbered, so `#1` is the gallery cover buyers see in search |
 | `/cover [id] <n>`| Make photo `n` the gallery cover |
 | `/arrange [id] <order>` | Reorder photos, e.g. `/arrange 3,1,2`. Numbers not listed keep their relative order at the end, so `/arrange 4` just promotes photo 4 |
+| `/stockphoto [id] <url>` | Add a retailer's product photo as #2. For items sealed in packaging, where your own photos can only show the bag. Needs the direct image address, not the product page |
 | `/receipt [id] <price> <code>` | Manually set the Ross cost + 12-digit code (when the tag barcode couldn't be read) |
 | `/setprice [id] <price>` | Set the price (charm-priced); pushes to eBay if the item has an offer |
 | `/setqty [id] <n>` | Set the available quantity on eBay (once the item has an offer); listings default to 1 |
