@@ -4,7 +4,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 import httpx
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update,
+)
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (
     Application,
@@ -26,6 +28,9 @@ from config import (
     AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC,
     GEMINI_PHOTO_LIMIT, MAX_CONCURRENT_LISTINGS, EBAY_DEFAULT_AD_RATE_PCT,
     REPRICE_WEEKDAY, REPRICE_HOUR_UTC,
+    OFFER_MIN_WATCHERS, OFFER_MIN_NET, OFFER_MIN_DAYS_LIVE,
+    OFFER_DISCOUNT_SMALL, OFFER_DISCOUNT_LARGE,
+    OFFER_LARGE_THRESHOLD, OFFER_MESSAGE,
 )
 from db import (
     create_item, delete_item, get_item, latest_stats, list_items,
@@ -36,22 +41,28 @@ from receipt import decode_barcode, detect_ross_tags, extract_receipt, is_dark_f
 from pipeline.price import get_pricing
 from pipeline.draft import generate_draft, revise_draft, revise_identification
 from pipeline.reprice import run_weekly_check
+from profit import breakeven_price, format_projection, project
 from ebay.auth import get_access_token
-from ebay.analytics import traffic_status
+from ebay.analytics import get_watch_count, traffic_status
 from ebay.orders import finances_status, orders_status, sales_by_item
-from ebay.listings import get_active_listings, listings_status
+from ebay.listings import audit_listing_photos, get_active_listings, listings_status
 from ebay.inventory import (
     create_draft_offer,
     delete_offer,
     get_offer,
     get_policy_id,
+    listing_photo_order,
     publish_offer,
+    refresh_offer_description,
     update_offer_price,
     update_offer_quantity,
     withdraw_offer,
     MissingRequiredAspectsError,
 )
 from ebay.marketing import promote_listing, marketing_status
+from ebay.negotiation import (
+    MIN_DISCOUNT_PCT, eligible_listing_ids, negotiation_status, send_offer,
+)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 INBOX = Path("data/inbox")
@@ -124,19 +135,56 @@ def _lock_for(user_id):
     return locks[user_id]
 
 
+# Every secret this process holds, longest first so an overlapping value can't
+# leave a fragment behind. Read once at import: these come from the environment
+# and don't change while the bot runs.
+_SECRETS = sorted(
+    (v for v in (os.getenv(k) for k in (
+        "APIFY_TOKEN", "TELEGRAM_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+        "EBAY_CLIENT_SECRET", "EBAY_CLIENT_ID", "EBAY_REFRESH_TOKEN",
+        "CLOUDINARY_API_SECRET", "CLOUDINARY_API_KEY", "CLOUDINARY_URL",
+    )) if v and len(v) >= 8),
+    key=len, reverse=True)
+
+
+def _scrub(text: str) -> str:
+    """Replace any credential that made it into an outbound string.
+
+    Belt and braces, not the primary defence — the real fix is not putting
+    secrets somewhere they can be formatted into a message (see pipeline/price.py's
+    _call). But error text reaches Telegram through several paths, str(e) on a
+    third-party exception can embed anything, and a chat log is forever. Cheap
+    insurance against the next library that decides to be helpful."""
+    if not text:
+        return text
+    for secret in _SECRETS:
+        if secret in text:
+            text = text.replace(secret, "***REDACTED***")
+    return text
+
+
 async def _safe_reply(message, text: str, **kwargs):
     """Best-effort status ping. A transient network failure sending this
     message must never abort the actual work that follows it. Returns the sent
     Message (or None if it failed) so callers can tie it to an item — see
     _remember_target."""
     try:
-        return await message.reply_text(text, **kwargs)
+        return await message.reply_text(_scrub(text), **kwargs)
     except Exception as e:
         print(f"WARNING: reply_text failed (continuing anyway): {type(e).__name__}: {e}")
         return None
 
 
 TELEGRAM_MAX_CHARS = 3900  # under the 4096 hard limit, leaving headroom
+
+# Upper bound on a hand-typed /setqty. Ross stock is near-always single units and
+# the largest real listing so far held 5, so anything past this is a typo or a
+# mis-parsed item id rather than an inventory decision.
+_MAX_SANE_QTY = 500
+# Same idea for a price. The dearest item handled so far listed around $200, so
+# five figures is not a decision anyone makes by typing into a chat window — it's
+# an item id, a barcode, or a slipped decimal point.
+_MAX_SANE_PRICE = 10_000.0
 
 
 async def _send_chunked(message, lines: list[str]) -> None:
@@ -161,7 +209,9 @@ _recent_errors: deque = deque(maxlen=10)
 def _record_error(where: str, exc: BaseException) -> None:
     ts = datetime.now(timezone.utc).strftime("%m-%d %H:%M:%SZ")
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    _recent_errors.append((ts, where, tb.strip()))
+    # Scrubbed at capture, not at display: /errors is one reader of this buffer
+    # and a traceback holds request URLs, headers and locals.
+    _recent_errors.append((ts, where, _scrub(tb.strip())))
 
 
 async def _auth_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -248,6 +298,45 @@ def _resolve_item_id(user_id: int, args: list[str]) -> tuple[str | None, str | N
     if item_id is None:
         return None, "No item specified and no recent item to fall back to. Provide an item_id."
     return item_id, None
+
+
+# Every id shown back to the user — /status, /photos, error messages, all of
+# it — is item_id[:8]. That's the shortest prefix anyone actually types or
+# pastes, so it's also the shortest prefix _names_an_item should ever credit as
+# "the user meant an id". See its docstring for why a shorter floor breaks it.
+_ITEM_ID_PREFIX_LEN = 8
+
+
+def _names_an_item(token: str) -> bool:
+    """Whether this token identifies an existing item (full id or prefix).
+
+    Commands that take an optional trailing number — /sold, /setqty, /setprice —
+    must ask this BEFORE trying to parse one. Item ids are uuid4 hex, so roughly
+    2.3% of the 8-char prefixes /status prints are all digits: `/sold 40286146`
+    parsed as a $40,286,146 sale price, then fell through to `last_item` and
+    booked it against whatever item was touched last.
+
+    Getting it wrong in this direction is cheap (the arg resolves to an item and
+    no value is set — visible immediately); getting it wrong the other way
+    writes nonsense to an item the user never named.
+
+    The prefix check below only fires past _ITEM_ID_PREFIX_LEN characters. Below
+    that, hex digits and decimal digits are the same alphabet and there simply
+    isn't enough token left to tell "item id" from "quantity" apart: with ~90
+    items in the store, a plain "2" is a startswith-prefix of *some* uuid4 far
+    more often than not, so every single-digit /setqty and every two-digit
+    /sold price was being misread as the id — in both cases the number the user
+    typed, not any id, and both directions of `/setqty <id> <n>` broke because
+    of it. No real quantity or sane price (see _MAX_SANE_QTY/_MAX_SANE_PRICE)
+    is long enough to reach the floor, so genuine short values never get
+    swept up here — only the 8+-char strings this bot actually calls an id."""
+    if not token:
+        return False
+    if get_item(token) is not None:
+        return True
+    if len(token) < _ITEM_ID_PREFIX_LEN:
+        return False
+    return any(i["item_id"].startswith(token) for i in list_items())
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -447,8 +536,21 @@ def _split_haul(paths: list[str]) -> tuple[list[list[str]], int, int]:
                 groups.append(current)
                 current = []
             continue
+        is_tag = idx in tag_indices or _is_ross_tag(path)
+        # Two tags in a row — a double-stickered item photographed twice, or a
+        # re-shoot of an unreadable tag — would otherwise close a group whose
+        # only member is the second tag. _split_receipt returns early on a
+        # single-photo group without peeling, so that phantom item's ONE photo
+        # is the Ross tag itself, and it goes to eBay showing what you paid.
+        # A tag closes the group it belongs to; it never opens one.
+        if is_tag and not current:
+            if groups:
+                groups[-1].append(path)   # belongs to the item just closed
+            else:
+                current.append(path)      # haul opens on a tag; it'll be peeled
+            continue
         current.append(path)
-        if idx in tag_indices or _is_ross_tag(path):
+        if is_tag:
             groups.append(current)
             current = []
     if current:
@@ -588,7 +690,15 @@ async def _finalize_append(user_id, item_id, update, context) -> None:
         # Order the newly-added photos by message_id (send order), then append them
         # after the item's original photos so the gallery cover/tag order is kept.
         new_sorted = [path for _, path in sorted(ap["new"], key=lambda mp: mp[0])]
-        photos = ap["base"] + new_sorted
+        # Re-read rather than trusting ap["base"], the snapshot taken when the
+        # first append photo arrived. Minutes can pass between that snapshot and
+        # this commit, and the pipeline may well have run in between — writing
+        # the stale list back resurrects the peeled Ross price tag and drops
+        # whatever else was written meanwhile. Fall back to the snapshot only if
+        # the item has vanished.
+        current = (get_item(item_id) or {}).get("photos")
+        base = current if current is not None else ap["base"]
+        photos = list(base) + [p for p in new_sorted if p not in base]
 
     update_field(item_id, "photos", photos)
     last_item[user_id] = item_id
@@ -622,9 +732,16 @@ async def _resync_photos(item_id: str, message) -> None:
         )
         return
 
-    # create_draft_offer returns fresh sku/offer_id/image_urls; merge so we keep
-    # any listing_id / view_item_url already stored for a published item.
-    merged = {**(item.get("ebay") or {}), **result}
+    # create_draft_offer returns fresh sku/offer_id/image_urls/quantity; merge so
+    # we keep any listing_id / view_item_url already stored for a published item.
+    #
+    # Re-read first: `item` was loaded before create_draft_offer, which spends
+    # many seconds uploading a photo per call and making several eBay round
+    # trips. update_field replaces the whole column, so merging onto the stale
+    # snapshot silently reverts anything written meanwhile — a sale recorded by
+    # a concurrent /sync, most expensively.
+    fresh = (get_item(item_id) or {}).get("ebay") or {}
+    merged = {**fresh, **result}
     update_field(item_id, "ebay", merged)
 
     if status == "published":
@@ -641,6 +758,169 @@ async def _resync_photos(item_id: str, message) -> None:
         await _safe_reply(message, f"✅ Live listing updated. {merged.get('view_item_url', '')}".strip())
     else:
         await _safe_reply(message, "✅ eBay draft updated with the new photos. /activate when ready.")
+
+
+async def _send_photo_index(item: dict, message) -> None:
+    """Send the item's photos as albums, in listing order, with a numbered key.
+
+    Telegram shows an album in order but puts no visible number on each frame, so
+    the text index is what makes 'photo 3' unambiguous. Albums cap at 10, so a big
+    set goes out in batches."""
+    ordered = listing_photo_order(item)
+    existing = [p for p in ordered if Path(p).exists()]
+    missing = len(ordered) - len(existing)
+
+    for start in range(0, len(existing), 10):
+        batch = existing[start:start + 10]
+        media = []
+        for offset, path in enumerate(batch, start=start + 1):
+            with open(path, "rb") as fh:
+                media.append(InputMediaPhoto(fh.read(), caption=f"#{offset}"))
+        try:
+            await message.reply_media_group(media)
+        except Exception as e:
+            print(f"WARNING: media group failed: {type(e).__name__}: {e}")
+            await _safe_reply(message, f"⚠️ Couldn't send photos {start + 1}-{start + len(batch)}: "
+                                       f"{type(e).__name__}")
+
+    lines = [f"🖼️ {item['item_id'][:8]} — {len(existing)} photo(s), in listing order:",
+             "  #1 is the gallery cover (the thumbnail buyers see in search)."]
+    if missing:
+        lines.append(f"  ⚠️ {missing} file(s) missing from disk and skipped.")
+    if not (item.get("photo_layout") or {}).get("manual"):
+        lines.append("  Order is automatic: your 2nd photo (the tag) is moved to the end.")
+    lines += ["", "  /cover <n> — make photo n the cover",
+              "  /arrange <order> — reorder, e.g. /arrange 3,1,2"]
+    await _safe_reply(message, "\n".join(lines))
+
+
+async def photos_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show an item's photos in listing order, numbered. Usage: /photos [id]."""
+    user_id = update.effective_user.id
+    item_id, err = _resolve_item_id(user_id, context.args)
+    if err:
+        await _safe_reply(update.message, f"⚠️ {err}")
+        return
+    item = get_item(item_id)
+    if item is None:
+        await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
+        return
+    last_item[user_id] = item_id
+    if not (item.get("photos") or []):
+        await _safe_reply(update.message, f"{item_id[:8]} has no photos. /addphotos to add some.")
+        return
+    await _send_photo_index(item, update.message)
+
+
+async def _apply_photo_order(item_id: str, new_order: list[str], message, note: str) -> None:
+    """Persist a hand-set photo order and push it to eBay.
+
+    Marks the layout manual so the builder stops applying its own reorder — the
+    stored list is now exactly what the listing should show."""
+    update_field(item_id, "photos", new_order)
+    update_field(item_id, "photo_layout", {"manual": True})
+    await _safe_reply(message, note)
+    await _resync_photos(item_id, message)
+
+
+def _photo_args(user_id, args: list[str]) -> tuple[str | None, str | None, str | None]:
+    """(item_id, spec, error) from '<id> <spec>' or just '<spec>' — the trailing
+    argument is the instruction, anything before it names the item (same shape as
+    /promote, so the id stays optional)."""
+    if not args:
+        return None, None, "missing argument"
+    item_id, err = _resolve_item_id(user_id, args[:-1])
+    if err:
+        return None, None, err
+    return item_id, args[-1], None
+
+
+async def cover_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Make one photo the gallery cover. Usage: /cover <n> or /cover <id> <n>,
+    where n is the number shown by /photos."""
+    user_id = update.effective_user.id
+    item_id, spec, err = _photo_args(user_id, list(context.args or []))
+    if err:
+        await _safe_reply(update.message,
+            f"⚠️ {err}\nUsage: /cover <n>  (see /photos for the numbers)")
+        return
+
+    item = get_item(item_id)
+    if item is None:
+        await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
+        return
+    ordered = listing_photo_order(item)
+    try:
+        n = int(spec)
+    except ValueError:
+        await _safe_reply(update.message, f"'{spec}' isn't a photo number. Usage: /cover 3")
+        return
+    if not 1 <= n <= len(ordered):
+        await _safe_reply(update.message,
+            f"{item_id[:8]} has {len(ordered)} photo(s), so pick 1-{len(ordered)}.")
+        return
+
+    last_item[user_id] = item_id
+    if n == 1:
+        await _safe_reply(update.message, f"Photo #1 is already the cover for {item_id[:8]}.")
+        return
+    chosen = ordered[n - 1]
+    await _apply_photo_order(
+        item_id, [chosen] + [p for p in ordered if p != chosen], update.message,
+        f"🖼️ Photo #{n} is now the cover for {item_id[:8]}.")
+
+
+async def arrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reorder an item's photos. Usage: /arrange 3,1,2 or /arrange <id> 3,1,2.
+
+    Numbers are the ones /photos shows. Any photo you leave out keeps its
+    relative position at the end, so /arrange 4 just promotes photo 4 to the
+    front and leaves the rest alone."""
+    user_id = update.effective_user.id
+    item_id, spec, err = _photo_args(user_id, list(context.args or []))
+    if err:
+        await _safe_reply(update.message,
+            f"⚠️ {err}\nUsage: /arrange 3,1,2  (see /photos for the numbers)")
+        return
+
+    item = get_item(item_id)
+    if item is None:
+        await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
+        return
+    ordered = listing_photo_order(item)
+
+    picks, seen = [], set()
+    for token in re.split(r"[,\s]+", spec.strip()):
+        if not token:
+            continue
+        try:
+            n = int(token)
+        except ValueError:
+            await _safe_reply(update.message,
+                f"'{token}' isn't a photo number. Usage: /arrange 3,1,2")
+            return
+        if not 1 <= n <= len(ordered):
+            await _safe_reply(update.message,
+                f"{item_id[:8]} has {len(ordered)} photo(s), so pick 1-{len(ordered)} (got {n}).")
+            return
+        if n in seen:
+            await _safe_reply(update.message, f"Photo {n} is listed twice — each one once, please.")
+            return
+        seen.add(n)
+        picks.append(ordered[n - 1])
+
+    if not picks:
+        await _safe_reply(update.message, "Usage: /arrange 3,1,2  (see /photos for the numbers)")
+        return
+
+    last_item[user_id] = item_id
+    # Anything not named keeps its current relative order, appended after the
+    # photos that were — so a partial spec is a promotion, not a truncation.
+    rest = [p for p in ordered if p not in picks]
+    await _apply_photo_order(
+        item_id, picks + rest, update.message,
+        f"🖼️ Reordered {item_id[:8]} — photo #{picks and ordered.index(picks[0]) + 1} is now the cover"
+        + (f", {len(rest)} unlisted photo(s) kept at the end." if rest else "."))
 
 
 async def addphotos_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -730,15 +1010,31 @@ async def _show_review(user_id, item_id, message) -> None:
 
 
 async def _publish_and_report(item_id, message) -> None:
-    """Publish an ebay_draft offer, report the live URL, then auto-promote at the
-    default ad rate if one is configured. Shared by /activate and advance()."""
+    """Publish an ebay_draft offer, report the live URL and what it stands to
+    make, then auto-promote at the default ad rate if one is configured. Shared
+    by /activate and advance()."""
     try:
         ebay_data = await asyncio.to_thread(_activate_item, item_id)
     except Exception as e:
         traceback.print_exc()
         await _safe_reply(message, f"⚠️ Activate failed: {type(e).__name__}: {str(e)[:300]}")
         return
-    await _safe_reply(message, f"🎉 Published! {ebay_data['view_item_url']}")
+
+    # The profit picture rides along with the "it's live" message rather than
+    # waiting for the next /report: the moment to find out an item nets $3 is
+    # while you still remember the item, not at the end of the week. Best-effort
+    # — a listing that IS live must never be reported as a failed publish because
+    # the arithmetic tripped over a half-filled item.
+    body = f"🎉 Published! {ebay_data['view_item_url']}"
+    try:
+        projection = project(get_item(item_id))
+        if projection is not None:
+            body += "\n\n" + format_projection(projection)
+    except Exception as e:
+        print("PROFIT PROJECTION FAILED:", traceback.format_exc())
+        _record_error(f"profit projection ({item_id[:8]})", e)
+    await _safe_reply(message, body)
+
     if EBAY_DEFAULT_AD_RATE_PCT and EBAY_DEFAULT_AD_RATE_PCT > 0:
         await _promote_item(item_id, EBAY_DEFAULT_AD_RATE_PCT, message)
 
@@ -757,7 +1053,15 @@ def _identify_gate_reason(ident: dict) -> str | None:
         confidence = float(ident.get("confidence") or 0)
     except (TypeError, ValueError):
         return "confidence is unreadable"
-    bar = (AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC if ident.get("upc")
+    # Only a DECODED barcode lowers the bar. config.py promises "decoded off the
+    # photos", but identify.py only overwrites `upc` when pyzbar actually read
+    # one — otherwise the field holds whatever digits the vision model thought it
+    # saw, which is the least reliable thing it produces. Letting that lower the
+    # bar meant the weakest evidence on the item bought the loosest gate. Items
+    # identified before upc_decoded existed have no flag, and absence correctly
+    # reads as "not decoded" and leaves them at the higher bar.
+    bar = (AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC
+           if ident.get("upc") and ident.get("upc_decoded")
            else AUTO_CONFIRM_MIN_IDENT_CONFIDENCE)
     if confidence < bar:
         return f"confidence {confidence:.2f} is below {bar:.2f}"
@@ -968,13 +1272,19 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if action == "start":
+        # Identity is checked BEFORE the pop, and inside the lock. Popping first
+        # destroyed whatever was staged and only then noticed the button belonged
+        # to a different item — so tapping Start on a scrolled-back message
+        # cancelled the timer on the item currently waiting and left it stranded
+        # with no button and no countdown. Same reasoning in the "cancel" branch.
         async with _lock_for(user_id):
-            st = staging.pop(user_id, None)
-            if st and st["task"] is not None:
+            st = staging.get(user_id)
+            if st is None or st["item_id"] != item_id:
+                await query.edit_message_text("This item is no longer waiting.")
+                return
+            staging.pop(user_id, None)
+            if st["task"] is not None:
                 st["task"].cancel()
-        if st is None or st["item_id"] != item_id:
-            await query.edit_message_text("This item is no longer waiting.")
-            return
         paths = st["paths"]
         await query.edit_message_text(f"Starting. {len(paths)} photo(s). Processing...")
         # Launch as a background task so this handler returns immediately and
@@ -998,10 +1308,15 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(f"Waiting {WAIT_EXTENSION}s for more photos. Send them now.")
 
     elif action == "cancel":
+        # Only clear the staging slot if it's the item this button names. The
+        # unconditional pop discarded the item currently waiting while deleting a
+        # different one — losing both.
         async with _lock_for(user_id):
-            st = staging.pop(user_id, None)
-            if st and st["task"] is not None:
-                st["task"].cancel()
+            st = staging.get(user_id)
+            if st is not None and st["item_id"] == item_id:
+                staging.pop(user_id, None)
+                if st["task"] is not None:
+                    st["task"].cancel()
         item = get_item(item_id)
         if item is not None:
             photos = item.get("photos") or []
@@ -1090,17 +1405,30 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 def _find_tag_photo(paths: list[str]) -> tuple[int, str] | None:
-    """(index, "barcode") of the photo whose Ross CODE128 decodes, or None.
+    """(index, how) of the Ross price-tag photo, or None to fall back on position.
 
-    Only the barcode is trusted here. OCR evidence was tried and dropped: on
-    these Telegram-compressed tag photos Tesseract returns mostly noise, and the
-    patterns that survive ("a 12-digit number", "MSRP", "compare at") are equally
-    present on manufacturer labels — matching them picked a Ralph Lauren package
-    label over the real tag on 8 items. The caller falls back to the last photo
-    when this returns None, which is the shooting convention and safer than any
-    guess.
+    Two tiers of evidence, strongest first:
 
-    Scans from the END since the tag is normally shot last."""
+      1. barcode — the photo whose 18-digit Ross CODE128 decodes, wherever it
+         sits. Exact, but only about 41% of real tag photos decode (glare,
+         angle, a crease through the bars, Telegram's compression).
+      2. visual — receipt.detect_ross_tags, which recognises the tag's
+         appearance. Measured 21/21 with no false positives on the real library,
+         and it returns an empty set on any failure, so the positional default
+         below stays as the last tier.
+
+    OCR text was tried as evidence and dropped: the patterns that survive on a
+    compressed tag ("a 12-digit number", "MSRP", "compare at") are equally
+    present on manufacturer labels, and matching them picked a Ralph Lauren
+    package label over the real tag on 8 items.
+
+    Tier 2 matters because the caller's fallback is "peel the LAST photo", which
+    is only the tag under the shooting convention. Append photos after the tag
+    with /addphotos and the last photo is an innocent product shot — so that one
+    gets deleted and OCR'd as a receipt while the tag, showing what you paid,
+    stays in `photos` and goes up on eBay.
+
+    Both tiers scan from the END, since the tag is normally shot last."""
     for idx in range(len(paths) - 1, -1, -1):
         try:
             digits = decode_barcode(paths[idx])
@@ -1108,6 +1436,14 @@ def _find_tag_photo(paths: list[str]) -> tuple[int, str] | None:
             continue
         if digits and len(digits) == 18:
             return idx, "barcode"
+
+    try:
+        visual = detect_ross_tags(paths)
+    except Exception:
+        visual = set()
+    if visual:
+        # Highest index — keeps the shooting convention when several match.
+        return max(visual), "visual"
     return None
 
 
@@ -1128,7 +1464,17 @@ def _split_receipt(item_id, paths, notify=lambda _t: None) -> list[str]:
     showing what we paid — sitting in the eBay listing. A tag that can't be read
     still gets peeled; the user is simply asked for the price."""
     item = get_item(item_id)
-    if item and item.get("receipt"):
+    receipt = (item or {}).get("receipt") or {}
+    # Guard on a marker only THIS function writes, not on the mere presence of a
+    # receipt. /receipt writes a receipt by hand without touching `photos`, so
+    # "has a receipt" made a manually-priced item skip the peel entirely and
+    # publish its tag.
+    #
+    # A receipt with no marker predates the marker, and was therefore written by
+    # this function back when it always peeled — treat it as peeled. Re-peeling
+    # those would silently delete a real product photo, which is much worse than
+    # the leak this guard exists to catch.
+    if receipt and receipt.get("peeled", True):
         return item.get("photos") or []
     if len(paths) < 2:
         return list(paths)  # nothing to peel — no receipt to separate
@@ -1136,10 +1482,17 @@ def _split_receipt(item_id, paths, notify=lambda _t: None) -> list[str]:
     found = _find_tag_photo(paths)
     tag_idx = found[0] if found else len(paths) - 1
     if found and tag_idx != len(paths) - 1:
-        notify(f"🧾 Ross tag found at photo {tag_idx + 1} of {len(paths)}, not the last "
-               f"one — peeling that one instead.")
+        how = "barcode" if found[1] == "barcode" else "the tag's appearance"
+        notify(f"🧾 Ross tag found at photo {tag_idx + 1} of {len(paths)} by {how}, "
+               f"not the last one — peeling that one instead.")
     listing_photos = [p for idx, p in enumerate(paths) if idx != tag_idx]
     data = extract_receipt(paths[tag_idx])
+    # Keep whatever a manual /receipt already established — the operator read the
+    # tag with their own eyes, which beats OCR of a photo that defeated it.
+    for field in ("reduced_price", "code", "original_price"):
+        if receipt.get(field) is not None and data.get(field) is None:
+            data[field] = receipt[field]
+    data["peeled"] = True
     update_field(item_id, "photos", listing_photos)
     update_field(item_id, "receipt", data)
     if data.get("code") and data.get("reduced_price") is not None:
@@ -1338,9 +1691,29 @@ def _charm_price(value: float) -> float:
 
 def _parse_price_override(text: str) -> float | None:
     """Extract a price the user typed (e.g. '35', '$35', 'make it 42.50') and
-    charm-price it. Returns None if no number is present."""
-    m = re.search(r"\d+(?:\.\d{1,2})?", text.replace(",", ""))
-    return _charm_price(float(m.group(0))) if m else None
+    charm-price it. Returns None if the text doesn't name one.
+
+    Deliberately anchored. This used to `re.search` for a digit run ANYWHERE in
+    the text, which made every item id a valid price: `/setprice a1b2c3d4` (the
+    price forgotten) matched the "1", charm-priced it to $0.99, and — because
+    the id had been consumed as the price — pushed 99 cents to whatever listing
+    `last_item` happened to hold. A price is now either the whole token or
+    follows a word that means one."""
+    raw = text.replace(",", "").strip()
+    m = re.fullmatch(r"\$?\s*(\d+(?:\.\d{1,2})?)", raw)
+    if m is None:
+        # Allow a price embedded in a phrase, but only after an explicit cue —
+        # "make it 42.50", "price 35", "$35 please".
+        m = re.search(r"(?:price|sell|list|make it|change to|\$)\s*(\d+(?:\.\d{1,2})?)",
+                      raw, re.I)
+    if m is None:
+        return None
+    try:
+        value = float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    # A free item is never what someone meant to type.
+    return _charm_price(value) if value > 0 else None
 
 
 def format_draft(result) -> str:
@@ -1429,6 +1802,13 @@ async def _handle_targeted(user_id, item_id, text, update, context) -> bool:
             gate_queue.setdefault(user_id, []).insert(
                 0, {"item_id": active["item_id"], "stage": active["stage"],
                     "reason": "returning to this one"})
+        # This item is about to be handled here and now, so it must not also
+        # remain queued — during a haul it usually IS queued, and leaving the
+        # entry meant it came back around after being dealt with and asked for a
+        # decision on a gate it had already cleared.
+        queued = gate_queue.get(user_id)
+        if queued:
+            gate_queue[user_id] = [q for q in queued if q["item_id"] != item_id]
         gate[user_id] = {"item_id": item_id, "stage": stage}
         await _handle_gate(user_id, text, update, context)
         return True
@@ -1480,11 +1860,20 @@ async def _handle_gate(user_id, text, update, context) -> None:
         update_field(item_id, "identification", revised)
         await _show_identify_gate(user_id, item_id, update.message)
     else:  # price
-        price = _parse_price_override(text)
+        forced = low.endswith(" force")
+        price = _parse_price_override(text[:-6] if forced else text)
         if price is None:
             await _safe_reply(update.message, "Type a price to set it (e.g. 35 -> $34.99), or 'confirm'.")
             return
         item = get_item(item_id)
+        # Same floor the repricer and /setprice honour — the gate is a price
+        # entry point like any other, and this one leads straight to review.
+        if not forced:
+            refusal = _floor_refusal(item, price)
+            if refusal:
+                await _safe_reply(update.message,
+                                  f"⚠️ {refusal.splitlines()[0]}\nType '{price:.2f} force' to set it anyway.")
+                return
         pricing = _apply_manual_price(item.get("pricing") or {}, price)
         update_field(item_id, "pricing", pricing)
         await _show_price_gate(user_id, item_id, update.message)
@@ -1593,9 +1982,24 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _safe_reply(update.message, format_draft(result), reply_markup=_review_markup(item_id))
 
 
+# How many items /status lists by default. The full inventory is ~90 items and
+# growing, which is several screens of scrolling to reach the ones you're actually
+# working on. The per-status counts in the header still cover everything, so
+# nothing is hidden — only the row list is trimmed.
+STATUS_DEFAULT_LIMIT = 20
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List items and their pipeline status. Optional status filter: /status
-    published. Paginated so it never exceeds Telegram's message-size limit."""
+    """List items and their pipeline status, most recent last (nearest your
+    keyboard). Shows the newest STATUS_DEFAULT_LIMIT by default; the header counts
+    always cover everything.
+
+      /status              the 20 most recent
+      /status published    ...with that status
+      /status 50           a different number
+      /status all          every item, as before
+
+    Paginated so it never exceeds Telegram's message-size limit."""
     all_items = list_items()
     if not all_items:
         await _safe_reply(update.message, "No items yet.")
@@ -1606,7 +2010,17 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ordered = VALID_STATUSES + sorted(s for s in counts if s not in VALID_STATUSES)
     header = "📊 " + " · ".join(f"{s}:{counts[s]}" for s in ordered if counts[s])
 
-    status_filter = context.args[0].lower() if context.args else None
+    # Args in any order: a status filter, a row count, or "all" for no limit.
+    limit = STATUS_DEFAULT_LIMIT
+    status_filter = None
+    for arg in (a.lower() for a in (context.args or [])):
+        if arg in ("all", "full"):
+            limit = None
+        elif arg.isdigit():
+            limit = max(int(arg), 1)
+        else:
+            status_filter = arg
+
     if status_filter:
         items = [i for i in all_items if i["status"] == status_filter]
         if not items:
@@ -1615,8 +2029,15 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         items = all_items
 
-    lines = [header, ""]
-    for item in sorted(items, key=lambda i: i["created_at"]):
+    items.sort(key=lambda i: i["created_at"])
+    lines = [header]
+    if limit is not None and len(items) > limit:
+        hidden = len(items) - limit
+        items = items[-limit:]   # the tail: newest, and last on screen
+        lines.append(f"Showing the {limit} most recent · {hidden} older hidden "
+                     f"(/status all, or /status {min(len(all_items), 50)})")
+    lines.append("")
+    for item in items:
         listing = item.get("listing") or {}
         title = listing.get("title") or "(no listing yet)"
         lines.append(f"{item['item_id'][:8]} | {item['status']:10} | {title[:48]}")
@@ -1767,9 +2188,18 @@ def _sale_economics(item: dict) -> dict:
     falls back to a gross estimate (recorded/listed sale price, fees unknown).
 
     Returns paid, sale, fees, net (proceeds after fees), profit (net − paid),
-    margin (profit / sale), and fees_known."""
-    paid = (item.get("receipt") or {}).get("reduced_price")
+    margin (profit / sale), and fees_known.
+
+    `paid` is charged per unit SOLD: sale_price is the realized total across the
+    order(s), so a two-unit sale has to carry two units of Ross cost."""
     ebay = item.get("ebay") or {}
+    paid = (item.get("receipt") or {}).get("reduced_price")
+    try:
+        units = max(int(ebay.get("units_sold") or 1), 1)
+    except (TypeError, ValueError):
+        units = 1
+    if paid is not None:
+        paid = round(float(paid) * units, 2)
     sale = ebay.get("sale_price")
     if sale is None:
         sale = (item.get("listing") or {}).get("price")
@@ -1797,13 +2227,18 @@ async def sold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     sale_price = None
     id_args = args
-    if args:
+    # Item id first, number second — see _names_an_item. An all-digit id prefix
+    # otherwise parses as a price and retargets the command at last_item.
+    if args and not _names_an_item(args[-1]):
         maybe = args[-1].replace("$", "").replace(",", "")
         try:
             sale_price = round(float(maybe), 2)
             id_args = args[:-1]
         except ValueError:
             sale_price = None  # trailing arg wasn't a number — treat it all as the id
+        if sale_price is not None and sale_price <= 0:
+            await _safe_reply(update.message, f"'{args[-1]}' isn't a valid sale price.")
+            return
 
     item_id, err = _resolve_item_id(user_id, id_args)
     if err:
@@ -1817,6 +2252,15 @@ async def sold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ebay = dict(item.get("ebay") or {})
     if sale_price is not None:
         ebay["sale_price"] = sale_price
+        # A hand-typed price contradicts every figure /sync derived from the
+        # order it replaces. Leaving them behind mixes one order's fees and unit
+        # count with another order's revenue, and `fees_known` would keep
+        # presenting the result as measured. Drop them and fall back to the
+        # modelled rates until the next /sync supplies real ones.
+        for derived in ("net_proceeds", "ebay_fees", "shipping_collected",
+                        "shipping_label_cost", "units_sold", "order_id",
+                        "order_ids", "fees_known"):
+            ebay.pop(derived, None)
         update_field(item_id, "ebay", ebay)
     update_status(item_id, "sold")
     last_item[user_id] = item_id
@@ -1833,12 +2277,52 @@ async def sold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _safe_reply(update.message, msg)
 
 
+async def _item_profit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """One item's money, line by line — /profit <id>."""
+    user_id = update.effective_user.id
+    item_id, err = _resolve_item_id(user_id, context.args)
+    if err:
+        await _safe_reply(update.message, f"⚠️ {err}")
+        return
+    item = get_item(item_id)
+    if item is None:
+        await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
+        return
+    last_item[user_id] = item_id
+
+    projection = project(item)
+    if projection is None:
+        await _safe_reply(update.message,
+            f"{item_id[:8]} has no price yet (status '{item['status']}') — nothing to compute.")
+        return
+    title = ((item.get("listing") or {}).get("title") or "(untitled)")[:48]
+    verb = "Realized" if projection["actual"] else "Projected"
+    margin = (f" · {projection['margin'] * 100:.0f}% margin"
+              if projection["margin"] is not None else "")
+    header = (f"💰 {item_id[:8]} · {title}\n"
+              f"{verb}: ${projection['net']:.2f} net{margin}")
+    sent = await _safe_reply(update.message, format_projection(projection, header=header))
+    _remember_target(sent, item_id)
+
+
 async def profit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Summarize profit across all items marked sold: per-item paid → sold → fees
-    → net → margin, and the totals. Uses REAL eBay fees for items /sync has pulled
-    an order for; items without one fall back to a gross number (fees unknown).
-    Run /sync first to fill in real fees."""
-    sold = [i for i in list_items() if i["status"] == "sold"]
+    """/profit summarizes every sold item: per-item paid → sold → fees → net →
+    margin, plus the totals. Uses REAL eBay fees for items /sync has pulled an
+    order for; items without one fall back to a gross number (fees unknown).
+    Run /sync first to fill in real fees.
+
+    /profit <id> instead breaks ONE item down line by line — the same figures
+    posted when it went live, so you can pull them back up after a price change
+    without waiting for a /report."""
+    if context.args:
+        await _item_profit(update, context)
+        return
+
+    # Anything that has actually taken money, not just anything flagged 'sold'. A
+    # partially-sold listing goes back to 'published' once /sync confirms it still
+    # has stock live, and its realized sale must not vanish from the totals with it.
+    sold = [i for i in list_items()
+            if i["status"] == "sold" or (i.get("ebay") or {}).get("sale_price") is not None]
     if not sold:
         await _safe_reply(update.message, "No sold items yet. Run /sync to pull sold orders, "
                           "or mark one by hand with /sold <id> <price>.")
@@ -1921,27 +2405,71 @@ def _sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
     # Real sale from the Fulfillment/Finances APIs: if this item shows up in the
     # sold_map, record the actual sale price + eBay fees + net and mark it sold
     # outright — no manual /sold guess. Matched by sku (== item_id) first, then by
-    # the stored listing_id. Skipped if already sold so re-runs are idempotent.
+    # the stored listing_id.
+    #
+    # NOT skipped when the item is already sold, which is how later sales used to
+    # go missing: a multi-quantity listing sells a unit at a time and a relist
+    # sells again under the same sku, so "already sold once" is the START of the
+    # sales history, not the end of it. The sold_map figures are aggregates across
+    # every order for this item, and order_ids is what makes re-runs idempotent —
+    # nothing is written unless an order we haven't seen shows up.
     auto_sold = False
     sale = None
-    if sold_map and item["status"] != "sold":
+    if sold_map:
         sale = sold_map.get(item_id)
         if sale is None and ebay.get("listing_id"):
             sale = sold_map.get(str(ebay["listing_id"]))
+
+    new_orders = []
     if sale is not None:
+        known = set(ebay.get("order_ids") or [])
+        if not known and ebay.get("order_id"):
+            known = {ebay["order_id"]}   # recorded before order_ids existed
+        new_orders = [oid for oid in (sale.get("order_ids") or []) if oid not in known]
+
+    # `sales_by_item(days)` only aggregates orders INSIDE the look-back window,
+    # and the block below replaces the stored figures wholesale. So an order that
+    # has aged out of the window is erased along with the money it brought in —
+    # a `/sync 7` on an item that sold months ago rewrites its lifetime revenue
+    # down to whatever the last week happens to contain.
+    #
+    # Until sales_by_item can return a per-order breakdown to fold in additively,
+    # refuse any write that would shrink the record: the stored order ids must
+    # all still be present in the incoming set. `known - incoming` being
+    # non-empty means the window can't see the whole history, so the aggregate
+    # in hand is a subset, not an update.
+    incoming = set((sale or {}).get("order_ids") or [])
+    missing_from_window = (known - incoming) if sale is not None else set()
+    if missing_from_window:
+        changes.append(
+            f"⚠️ sale figures NOT updated — this look-back sees {len(incoming)} of "
+            f"its {len(known | incoming)} orders, so writing them would erase "
+            f"${ebay.get('sale_price', 0)} already recorded. Re-run /sync with a "
+            f"wider window (e.g. /sync 365) to fold in the newer ones.")
+
+    if sale is not None and not missing_from_window and (item["status"] != "sold" or new_orders):
         ebay["sale_price"] = sale["sale_price"]
         ebay["shipping_collected"] = sale["shipping_collected"]
         ebay["ebay_fees"] = sale["ebay_fees"]
         ebay["shipping_label_cost"] = sale["shipping_label_cost"]
         ebay["net_proceeds"] = sale["net_proceeds"]
         ebay["order_id"] = sale["order_id"]
+        ebay["order_ids"] = list(sale.get("order_ids") or [])
+        # How many units the money above covers. The report needs it to charge the
+        # Ross cost per unit sold: one order took 2 units of the same item, and
+        # costing that sale once understated what it took to make.
+        ebay["units_sold"] = sale.get("units") or 1
         ebay["sold_at"] = sale["sold_at"]
         ebay["fees_known"] = sale["fees_known"]
         update_field(item_id, "ebay", ebay)
-        update_status(item_id, "sold")
-        auto_sold = True
         net = sale["net_proceeds"] if sale["fees_known"] else None
-        changes.append(f"SOLD ${sale['sale_price']}" + (f" · net ${net}" if net is not None else ""))
+        if item["status"] != "sold":
+            update_status(item_id, "sold")
+            auto_sold = True
+            changes.append(f"SOLD ${sale['sale_price']}" + (f" · net ${net}" if net is not None else ""))
+        else:
+            changes.append(f"+{len(new_orders)} later sale(s) → {ebay['units_sold']} unit(s) "
+                           f"total ${sale['sale_price']}" + (f" · net ${net}" if net is not None else ""))
 
     listing_info = offer.get("listing") or {}
     listing_status = listing_info.get("listingStatus")
@@ -2063,18 +2591,47 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # which leaves the stored one pointing at a dead listing (and the price check
     # reading traffic for the wrong thing).
     adopted, relinked, live_mismatch, discover_err = [], [], [], None
+    relisted_live = []   # were 'sold' locally but still have stock live on eBay
     live_item_ids: set[str] = set()
     try:
         live = await asyncio.to_thread(get_active_listings)
         live_item_ids = {row["sku"] for row in live if row["sku"]}
-        by_sku = {i["item_id"]: i for i in list_items()}
-        known_ids = {(i.get("ebay") or {}).get("listing_id") for i in by_sku.values()}
+        all_items = list_items()
+        by_sku = {i["item_id"]: i for i in all_items}
+        # Second index, on the eBay listing id, because the sku index can't reach
+        # an adopted listing: one made by hand in Seller Hub has no SKU at all, so
+        # `by_sku.get(row["sku"])` misses, `known_ids` then skipped the row as
+        # already-adopted, and _sync_one never touched it either (that loop
+        # requires an offer_id, which a hand-made listing doesn't have). Every
+        # adopted listing was therefore frozen at whatever price and quantity it
+        # had on the day it was adopted, permanently — and _adopt_listing exists
+        # precisely so those listings COUNT in /status, /report and /profit.
+        by_listing_id = {}
+        for i in all_items:
+            lid = (i.get("ebay") or {}).get("listing_id")
+            if lid:
+                by_listing_id[str(lid)] = i
+        known_ids = set(by_listing_id)
         for row in live:
             item = by_sku.get(row["sku"]) if row["sku"] else None
+            if item is None:
+                item = by_listing_id.get(str(row["listing_id"]))
             if item is not None:
                 ebay_data = dict(item.get("ebay") or {})
+                # Price, for the listings _sync_one can't reach. It owns this for
+                # anything with an offer_id and has already run by now; this fills
+                # the gap for adopted listings, whose only link to eBay is the row
+                # in hand.
+                if not ebay_data.get("offer_id") and row["price"] is not None:
+                    new_price = round(float(row["price"]), 2)
+                    listing = dict(item.get("listing") or {})
+                    old_price = listing.get("price")
+                    if old_price is None or round(float(old_price), 2) != new_price:
+                        listing["price"] = new_price
+                        update_field(item["item_id"], "listing", listing)
+                        updated.append(f"{item['item_id'][:8]}: price ${old_price}→${new_price} (eBay)")
                 changed = False
-                if ebay_data.get("listing_id") != row["listing_id"]:
+                if str(ebay_data.get("listing_id") or "") != str(row["listing_id"]):
                     ebay_data["listing_id"] = row["listing_id"]
                     ebay_data["view_item_url"] = row["view_item_url"]
                     changed = True
@@ -2083,20 +2640,34 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 # stored offer_id, which after a relist points at the dead offer
                 # and reports 0 — so an item that sold one unit and still has
                 # stock looked like it had none, and its remaining inventory
-                # stopped being counted anywhere.
-                if row["quantity"] and ebay_data.get("quantity") != row["quantity"]:
+                # stopped being counted anywhere. row["quantity"] is AVAILABLE
+                # stock (ebay/listings.py nets off QuantitySold); 0 is a real
+                # value and must be written, not treated as "no data".
+                if row["quantity"] is not None and ebay_data.get("quantity") != row["quantity"]:
                     ebay_data["quantity"] = row["quantity"]
                     changed = True
                 if changed:
                     update_field(item["item_id"], "ebay", ebay_data)
-                # eBay says this is live; the local status says otherwise. That's
-                # usually a relist after a sale, but it could equally be a wrong
-                # /sold — and flipping the status either way would rewrite sales
-                # history on a guess. Report it and let the human decide.
+                # eBay says this listing is live and the local status says sold.
+                # Both can be true at once — a multi-quantity listing that sold one
+                # unit, or a relist — and the status is the half that's wrong,
+                # because it describes the LISTING while the sale lives in its own
+                # ebay fields. So put the status back to what eBay demonstrably
+                # says, which loses no sales history: sale_price, order_ids and
+                # units_sold are untouched, and the report still counts the money.
+                #
+                # Only when stock is actually available. Sold out but still active
+                # (eBay leaves a listing up briefly) stays 'sold'.
                 if item["status"] != "published":
-                    live_mismatch.append(
-                        f"{item['item_id'][:8]} is '{item['status']}' locally but LIVE "
-                        f"at ${row['price']}")
+                    if item["status"] == "sold" and row["quantity"] > 0:
+                        update_status(item["item_id"], "published")
+                        relisted_live.append(
+                            f"{item['item_id'][:8]} — {row['sold_quantity']} sold, "
+                            f"{row['quantity']} still live at ${row['price']} → back to 'published'")
+                    else:
+                        live_mismatch.append(
+                            f"{item['item_id'][:8]} is '{item['status']}' locally but LIVE "
+                            f"at ${row['price']} with {row['quantity']} available")
                 continue
             if row["listing_id"] in known_ids:
                 continue
@@ -2114,9 +2685,13 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                      "to make their profit real)")
     if relinked:
         lines += ["", f"🔗 Re-linked {len(relinked)} relisted item(s):"] + [f"  {x}" for x in relinked]
+    if relisted_live:
+        lines += ["", f"♻️ Sold but still selling ({len(relisted_live)}) — stock left on the "
+                  "listing, so these are live inventory again (the recorded sale is kept):"]
+        lines += [f"  {x}" for x in relisted_live]
     if live_mismatch:
         lines += ["", f"❓ Live on eBay but not 'published' here ({len(live_mismatch)}) — "
-                  "relisted, or marked sold by mistake? Status left alone:"]
+                  "no stock available, so the status is left alone. /end it if it's gone:"]
         lines += [f"  {x}" for x in live_mismatch]
     if discover_err:
         lines += ["", f"⚠️ Couldn't enumerate live listings ({discover_err})"]
@@ -2303,6 +2878,12 @@ async def receipt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     receipt = dict(item.get("receipt") or {})
     receipt.update({"reduced_price": price, "code": code,
                     "source": "manual", "code_generated": auto})
+    # Writing a receipt is not the same as removing the tag photo. Say so
+    # explicitly, or _split_receipt reads this as "already handled" and the tag
+    # showing what you paid stays in `photos` all the way to eBay. Preserve an
+    # existing True — re-pricing an item whose tag was already peeled must not
+    # queue up a second peel.
+    receipt.setdefault("peeled", False)
     update_field(item_id, "receipt", receipt)
     last_item[user_id] = item_id
     tag = " (auto)" if auto else ""
@@ -2352,6 +2933,265 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _activate_next_gate(user_id, update.message)
 
 
+def _refresh_descriptions(apply: bool, force: bool) -> dict:
+    """Re-render every eBay-side item's description and (when apply) push it. Runs
+    in a worker thread — one eBay GET per item, plus a PUT for each one changed.
+    Per-item failures are collected, never fatal: one bad offer must not strand
+    the other ninety."""
+    results = {"updated": [], "current": [], "diverged": [], "no_offer": [], "error": []}
+    for item in list_items():
+        if item["status"] not in ("ebay_draft", "published"):
+            continue
+        try:
+            outcome = refresh_offer_description(item, apply=apply, force=force)
+        except Exception as e:
+            _record_error(f"refreshdesc ({item['item_id'][:8]})", e)
+            results["error"].append(f"{item['item_id'][:8]}: {type(e).__name__}")
+            continue
+        results[outcome].append(item["item_id"][:8])
+    return results
+
+
+async def refreshdesc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Push the current description copy to listings that are ALREADY on eBay —
+    the WYSIWYG line only reaches a listing when its offer is built, so anything
+    live from before is untouched until this runs.
+
+    /refreshdesc            dry run: what would change, touching nothing
+    /refreshdesc apply      push it (live listings update immediately)
+    /refreshdesc apply force  also overwrite descriptions edited in Seller Hub
+    """
+    args = [a.lower() for a in (context.args or [])]
+    apply = "apply" in args
+    force = "force" in args
+
+    await _safe_reply(update.message,
+        ("✍️ Updating descriptions on eBay..." if apply
+         else "🔍 Checking descriptions (dry run — nothing will be changed)..."))
+    results = await asyncio.to_thread(_refresh_descriptions, apply, force)
+
+    verb = "Updated" if apply else "Would update"
+    lines = [f"📝 Description refresh — {verb.lower()} {len(results['updated'])} listing(s).", ""]
+    if results["updated"]:
+        lines.append(f"{verb}: {', '.join(results['updated'])}")
+    if results["current"]:
+        lines.append(f"Already current ({len(results['current'])}) — no change needed.")
+    if results["diverged"]:
+        lines += ["",
+                  f"✋ Skipped {len(results['diverged'])} whose live description isn't the one we "
+                  f"generated — edited in Seller Hub, or listed before a change to the renderer. "
+                  f"Pushing ours would throw that away: {', '.join(results['diverged'])}",
+                  "Add 'force' to overwrite them anyway."]
+    if results["no_offer"]:
+        lines.append(f"No eBay offer / no description ({len(results['no_offer'])}) — skipped.")
+    if results["error"]:
+        lines += ["", f"⚠️ Failed ({len(results['error'])}): {', '.join(results['error'])}"]
+    if not apply and results["updated"]:
+        lines += ["", "Nothing was changed. Run /refreshdesc apply to push it."]
+    await _send_chunked(update.message, lines)
+
+
+def _items_with_live_stock() -> list[dict]:
+    """Everything that still has units for sale on eBay.
+
+    That is NOT the same set as status == 'published'. A multi-quantity listing
+    that sells one unit is marked 'sold' while the rest stays live, and a relist
+    keeps the sold status until the next /sync — so filtering on the status alone
+    silently drops real, for-sale inventory. That case is the exact scenario
+    config.py's OFFER_* block cites as the reason offers exist, and it was the one
+    case /offers couldn't see.
+
+    Mirrors pipeline/reprice.py's eligibility rule, which had the same bug."""
+    out = []
+    for item in list_items("published") + list_items("sold"):
+        if item["status"] == "published":
+            out.append(item)
+            continue
+        try:
+            remaining = int((item.get("ebay") or {}).get("quantity") or 0)
+        except (TypeError, ValueError):
+            remaining = 0
+        if remaining > 0:
+            out.append(item)
+    return out
+
+
+def _offer_plan(discount_override: float | None = None) -> list[dict]:
+    """Decide which live listings should get an offer to their watchers.
+
+    The gates, in order:
+      1. eBay says the listing is eligible (findEligibleItems) — no offer already
+         out, and a format that accepts one.
+      2. Somebody is actually watching (OFFER_MIN_WATCHERS), read LIVE from eBay
+         rather than from the weekly snapshot, which is up to seven days stale and
+         blind to everything listed since it ran.
+      3. The listing has had a fair run at full price (OFFER_MIN_DAYS_LIVE).
+      4. The discount clears eBay's 5% minimum.
+      5. What's left still pays: above break-even, and at least OFFER_MIN_NET a
+         unit.
+
+    Returns a row per candidate with a `verdict` explaining any skip, so the dry
+    run can show the reasoning rather than an unexplained short list. Read-only —
+    sending is the caller's job. Ranked by watchers, because that's the ranking of
+    how likely the offer is to land."""
+    eligible = eligible_listing_ids()
+    rows = []
+    for item in _items_with_live_stock():
+        listing_id = str((item.get("ebay") or {}).get("listing_id") or "")
+        price = (item.get("listing") or {}).get("price")
+        if not listing_id or listing_id not in eligible or price is None:
+            continue
+
+        price = round(float(price), 2)
+        # Price passed explicitly. project() now treats any supplied price as a
+        # question about the future and refuses to answer it with a past order's
+        # figures — see profit.project's docstring. Passing it here is still the
+        # right call (it names the listing's current price rather than relying on
+        # the default), but it is no longer the only thing standing between a
+        # partially-sold listing and a discount priced off economics that belong
+        # to units already gone.
+        projection = project(item, price=price)
+        watchers = get_watch_count(listing_id)
+        if watchers is None:   # call failed or eBay omits the field at zero
+            watchers = (latest_stats(item["item_id"]) or {}).get("watchers") or 0
+        row = {
+            "item_id": item["item_id"], "listing_id": listing_id, "price": price,
+            "margin": projection["margin"] if projection else None,
+            "watchers": watchers, "qty": projection["qty"] if projection else 1,
+            "title": ((item.get("listing") or {}).get("title") or "")[:38],
+            "cost_estimated": projection["cost_estimated"] if projection else True,
+        }
+
+        if watchers < OFFER_MIN_WATCHERS:
+            row["verdict"] = "nobody watching"
+            rows.append(row)
+            continue
+
+        # A young listing hasn't been rejected on price — it hasn't finished being
+        # considered. Its watchers arrived days ago and are still deciding.
+        when = (item.get("ebay") or {}).get("published_at") or item.get("created_at")
+        days_live = None
+        if when:
+            then = datetime.fromisoformat(when)
+            if then.tzinfo is None:
+                then = then.replace(tzinfo=timezone.utc)
+            days_live = (datetime.now(timezone.utc) - then).total_seconds() / 86400
+        row["days_live"] = days_live
+        if days_live is not None and days_live < OFFER_MIN_DAYS_LIVE:
+            row["verdict"] = f"only {days_live:.1f}d old — let it sell at full price first"
+            rows.append(row)
+            continue
+
+        discount = discount_override if discount_override is not None else (
+            OFFER_DISCOUNT_LARGE if price >= OFFER_LARGE_THRESHOLD else OFFER_DISCOUNT_SMALL)
+        offer_price = round(price - discount, 2)
+        pct = (discount / price) * 100 if price else 0
+
+        # eBay rejects an offer that barely undercuts the listing, and raising the
+        # discount to clear that bar would spend more than was authorised — so
+        # this is a skip with a reason, not a silent bigger discount.
+        if pct < MIN_DISCOUNT_PCT:
+            need = price * MIN_DISCOUNT_PCT / 100
+            row["verdict"] = f"${discount:.0f} is only {pct:.1f}% — eBay needs 5% (${need:.2f})"
+            rows.append(row)
+            continue
+
+        floor = breakeven_price(item)
+        if floor is not None and offer_price <= floor:
+            row["verdict"] = f"${offer_price:.2f} is under the ${floor:.2f} break-even"
+            rows.append(row)
+            continue
+
+        after = project(item, price=offer_price)
+        net_after = after["net_per_unit"] if after else 0
+        if net_after < OFFER_MIN_NET:
+            row["verdict"] = f"would net only ${net_after:.2f}/unit"
+            rows.append(row)
+            continue
+
+        row.update({"send": True, "discount": discount, "offer_price": offer_price,
+                    "pct": pct, "margin_after": after["margin"] if after else None,
+                    "net_after": net_after, "net_total": after["net"] if after else None})
+        rows.append(row)
+    rows.sort(key=lambda r: (not r.get("send"), -(r.get("watchers") or 0)))
+    return rows
+
+
+async def offers_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send private discounts to the people watching your listings.
+
+    Targets intent, not margin: an offer only converts someone who already wants
+    the item, so the gate is live watchers, floored on the money left afterwards.
+    A private offer beats a public price cut — it converts the interested buyer
+    without giving the same money away to everyone else.
+
+      /offers              dry run — who'd get what, and why the rest won't
+      /offers apply        send them
+      /offers apply 8      send with a flat $8 off instead of the $5/$10 default
+    """
+    args = [a.lower() for a in (context.args or [])]
+    apply = "apply" in args
+    override = None
+    for arg in args:
+        try:
+            override = float(arg.replace("$", ""))
+        except ValueError:
+            continue
+
+    await _safe_reply(update.message,
+        "💌 Sending offers to watchers..." if apply
+        else "🔍 Checking which listings have watchers and margin (dry run)...")
+    try:
+        rows = await asyncio.to_thread(_offer_plan, override)
+    except Exception as e:
+        traceback.print_exc()
+        _record_error("offers", e)
+        await _safe_reply(update.message,
+            f"⚠️ Couldn't read eligible listings: {type(e).__name__}: {str(e)[:250]}\n"
+            "If that's a 403, the sell.negotiation scope is missing — re-run "
+            "`python -m ebay.auth`.")
+        return
+
+    send = [r for r in rows if r.get("send")]
+    skip = [r for r in rows if not r.get("send")]
+    sent, failed = [], []
+    if apply:
+        for row in send:
+            try:
+                await asyncio.to_thread(send_offer, row["listing_id"], row["offer_price"],
+                                        OFFER_MESSAGE)
+                sent.append(row)
+            except Exception as e:
+                _record_error(f"offer ({row['item_id'][:8]})", e)
+                failed.append((row, f"{type(e).__name__}: {str(e)[:90]}"))
+
+    verb = "Sent" if apply else "Would send"
+    lines = [f"💌 Offers to watchers — {verb.lower()} {len(sent) if apply else len(send)} offer(s).", ""]
+    for row in (sent if apply else send):
+        est = " ⚠️est cost" if row["cost_estimated"] else ""
+        units = f" ×{row['qty']}" if row.get("qty", 1) > 1 else ""
+        lines.append(
+            f"{row['item_id'][:8]} {row['watchers']}w · ${row['price']:.2f} → ${row['offer_price']:.2f} "
+            f"(−${row['discount']:.0f}, {row['pct']:.0f}%){units} · keeps ${row['net_after']:.2f}/unit "
+            f"({row['margin_after'] * 100:.0f}%){est} · {row['title']}")
+    if failed:
+        lines += ["", f"⚠️ Failed ({len(failed)}):"]
+        lines += [f"  {r['item_id'][:8]}: {why}" for r, why in failed]
+    if skip:
+        lines += ["", f"Skipped {len(skip)} eligible listing(s):"]
+        lines += [f"  {r['item_id'][:8]} ${r['price']:.2f} — {r['verdict']} · {r['title']}"
+                  for r in skip[:15]]
+        if len(skip) > 15:
+            lines.append(f"  ...and {len(skip) - 15} more")
+    if not apply and send:
+        lines += ["", f"Nothing sent. /offers apply to send these {len(send)} offer(s) — "
+                      f"they go straight to buyers and can't be recalled."]
+    if not rows:
+        lines = ["💌 No listings are eligible for offers right now — eBay needs watchers "
+                 "(or carted items) and no offer already outstanding."]
+    await _send_chunked(update.message, lines)
+
+
 async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """End a live listing (withdraw it from eBay) without deleting the item. The
     offer drops back to a draft, so you can /activate it again later. Use this when
@@ -2389,18 +3229,54 @@ async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🛑 Ended the live listing for {item_id[:8]} — it's back to a draft. /activate to relist.")
 
 
+def _floor_refusal(item: dict, price: float) -> str | None:
+    """Why this price shouldn't be set, or None if it's fine.
+
+    The README has always promised that price changes "respect the margin
+    floor", and pipeline/reprice honours it — but the automated path was the
+    only one that did. A price typed by hand went straight to eBay, so the one
+    route nothing reviews afterwards was also the one with no floor under it.
+
+    Returns None when the cost is unknown: breakeven_price refuses to guess from
+    an estimated cost, and a floor nobody can compute must not become a wall."""
+    floor = breakeven_price(item)
+    if floor is None or price > floor:
+        return None
+    return (f"${price:.2f} is at or below the ${floor:.2f} break-even — it would "
+            f"sell at a loss after fees, ads and postage.\n"
+            f"Add `force` to do it anyway (e.g. /setprice {item['item_id'][:8]} "
+            f"{price:.2f} force).")
+
+
 async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set an item's price. Usage: /setprice [id] <price> (a whole number is
-    charm-priced, 35 -> $34.99). Updates the stored price, and if the item already
-    has an eBay offer (draft or live), pushes the new price to eBay too."""
+    """Set an item's price. Usage: /setprice [id] <price> [force] (a whole number
+    is charm-priced, 35 -> $34.99). Updates the stored price, and if the item
+    already has an eBay offer (draft or live), pushes the new price to eBay too.
+
+    Refuses a price below break-even unless `force` is given."""
     user_id = update.effective_user.id
     args = list(context.args)
+    forced = bool(args) and args[-1].lower() in ("force", "-f", "!")
+    if forced:
+        args = args[:-1]
     if not args:
         await _safe_reply(update.message, "Usage: /setprice [id] <price>  (e.g. /setprice 35 -> $34.99)")
+        return
+    # Item id first — an all-digit id prefix is a valid-looking price, and
+    # consuming it as one leaves no id behind, so the command silently retargets
+    # at last_item and pushes that number to a LIVE listing.
+    if _names_an_item(args[-1]):
+        await _safe_reply(update.message,
+            f"'{args[-1]}' names an item, not a price. Usage: /setprice {args[-1]} <price>")
         return
     price = _parse_price_override(args[-1])
     if price is None:
         await _safe_reply(update.message, f"'{args[-1]}' isn't a valid price.")
+        return
+    if price > _MAX_SANE_PRICE:
+        await _safe_reply(update.message,
+            f"${price:,.2f} is past the ${_MAX_SANE_PRICE:,.0f} sanity cap — "
+            f"pass a smaller number, or edit it in Seller Hub if you really mean it.")
         return
     item_id, err = _resolve_item_id(user_id, args[:-1])
     if err:
@@ -2411,6 +3287,12 @@ async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
         return
     last_item[user_id] = item_id
+
+    if not forced:
+        refusal = _floor_refusal(item, price)
+        if refusal:
+            await _safe_reply(update.message, f"⚠️ {refusal}")
+            return
 
     # Update the stored price on both the listing and the pricing record.
     listing = dict(item.get("listing") or {})
@@ -2447,6 +3329,12 @@ async def setqty_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not args:
         await _safe_reply(update.message, "Usage: /setqty [id] <quantity>  (e.g. /setqty 3)")
         return
+    # Item id first — an all-digit id prefix would otherwise parse as a quantity
+    # and push a 40-million stock count to eBay against the wrong listing.
+    if _names_an_item(args[-1]):
+        await _safe_reply(update.message,
+            f"'{args[-1]}' names an item, not a quantity. Usage: /setqty {args[-1]} <n>")
+        return
     try:
         qty = int(args[-1])
     except ValueError:
@@ -2454,6 +3342,10 @@ async def setqty_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     if qty < 0:
         await _safe_reply(update.message, "Quantity can't be negative.")
+        return
+    if qty > _MAX_SANE_QTY:
+        await _safe_reply(update.message,
+            f"{qty} units? That's past the {_MAX_SANE_QTY} sanity cap — pass a smaller number.")
         return
     item_id, err = _resolve_item_id(user_id, args[:-1])
     if err:
@@ -2566,10 +3458,20 @@ async def promote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _promote_item(item_id, pct, update.message)
 
 
-def _reprice_markup(item_id: str) -> InlineKeyboardMarkup:
+def _reprice_markup(item_id: str, price: float) -> InlineKeyboardMarkup:
+    """Apply/Skip for one digest row. The price the button will apply is carried
+    IN the callback data, because the button is the record of what was authorised:
+    tapping Apply means "yes, that price", and a digest message sits in the chat
+    indefinitely. Re-reading the suggestion at tap time — which is what this used
+    to do — hands you whatever the most recent /pricecheck stored instead, so a
+    second run between the digest and the tap silently substitutes a different
+    number for the one on screen.
+
+    Telegram caps callback_data at 64 bytes; this is 58 at worst (a 36-char uuid
+    plus a 7-char price)."""
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Apply", callback_data=f"reprice:apply:{item_id}"),
-        InlineKeyboardButton("Skip", callback_data=f"reprice:skip:{item_id}"),
+        InlineKeyboardButton("✅ Apply", callback_data=f"reprice:apply:{price:.2f}:{item_id}"),
+        InlineKeyboardButton("Skip", callback_data=f"reprice:skip:-:{item_id}"),
     ]])
 
 
@@ -2582,6 +3484,7 @@ _VERDICT_LABEL = {
     "STALE_UNSEEN": "🔍 Unsold but barely seen — a findability problem, not a price one",
     "TOO_NEW": "🌱 Too new to judge yet",
     "HEALTHY": "✅ Healthy",
+    "NO_WATCH_DATA": "❔ Couldn't read the watch count — not judged",
     "ERROR": "⚠️ Couldn't check",
 }
 
@@ -2596,6 +3499,9 @@ _VERDICT_ADVICE = {
     "STALE_UNSEEN": "Too few views to blame the price. Rework the title/keywords "
                     "and consider /promote, or /end and relist to refresh ranking.",
     "SEND_OFFERS": "Send an offer to the watchers before cutting the public price.",
+    "NO_WATCH_DATA": "eBay didn't return a watch count, and every remaining check "
+                     "depends on it. Nothing is wrong with the listing as far as "
+                     "this run can tell — re-run /pricecheck later.",
 }
 
 
@@ -2608,8 +3514,17 @@ def _format_reprice_line(r: dict) -> str:
         line += f"\n  {r.get('error', '')[:150]}"
         return line
     watchers = r.get("watchers")
-    line += (f"\n  {r.get('impressions', 0)} impr · {r.get('views', 0)} views · "
-             f"{watchers if watchers is not None else '?'} watchers · ${r.get('current_price')}")
+    # Cumulative views alongside this week's, because the OVERPRICED/STALE
+    # verdicts are decided on the running total — showing only the week's figure
+    # made those diagnoses look like they'd been reached on 3 views.
+    cum = r.get("cumulative_views")
+    views = f"{r.get('views', 0)} views"
+    if cum is not None and cum != r.get("views"):
+        views += f" ({cum} total)"
+    ctr = r.get("ctr")
+    line += (f"\n  {r.get('impressions', 0)} impr · {views} · "
+             + (f"{ctr * 100:.2f}% CTR · " if ctr else "")
+             + f"{watchers if watchers is not None else '?'} watchers · ${r.get('current_price')}")
     if r.get("suggested_price"):
         line += f" → suggest ${r['suggested_price']}"
     elif _VERDICT_ADVICE.get(r["verdict"]):
@@ -2640,7 +3555,8 @@ async def _send_reprice_digest(bot, chat_id, results: list[dict]) -> None:
 
     for r in flagged:
         text = _format_reprice_line(r)
-        markup = _reprice_markup(r["item_id"]) if r.get("suggested_price") else None
+        markup = (_reprice_markup(r["item_id"], r["suggested_price"])
+                  if r.get("suggested_price") else None)
         try:
             await bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
         except Exception as e:
@@ -2671,7 +3587,7 @@ async def reprice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     await query.answer()
     try:
-        _, action, item_id = query.data.split(":", 2)
+        _, action, price_field, item_id = query.data.split(":", 3)
     except ValueError:
         return
     try:
@@ -2686,10 +3602,17 @@ async def reprice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if item is None:
         await _safe_reply(query.message, "That item no longer exists.")
         return
-    stats = latest_stats(item_id)
-    price = stats.get("suggested_price") if stats else None
-    if price is None:
-        await _safe_reply(query.message, "No suggested price on file anymore — run /pricecheck again.")
+    # The price comes from the button, not from the DB — it's the figure that was
+    # displayed above this button and the one the tap authorises. See
+    # _reprice_markup.
+    try:
+        price = round(float(price_field), 2)
+    except (TypeError, ValueError):
+        await _safe_reply(query.message,
+                          "That button is from an older digest and no longer carries its "
+                          "price — run /pricecheck again.")
+        return
+    if price <= 0:
         return
 
     listing = dict(item.get("listing") or {})
@@ -2761,6 +3684,50 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await advance(user_id, item_id, update.message, context)
 
 
+async def photocheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check that every live listing still shows every photo we uploaded for it.
+
+    A listing that quietly drops to one photo is invisible everywhere else: it
+    keeps accruing impressions, so the traffic report shows a slow CTR decay
+    rather than a fault, and nothing in /status or /report looks at images at
+    all. This is the only thing that would catch it.
+
+    Deliberately reads the LIVE listing (Trading GetItem), not the Inventory
+    API's inventory_item — see ebay/listings.audit_listing_photos for why that
+    field cannot be used for this.
+
+    Usage: /photocheck
+    """
+    items = [i for i in list_items() if (i.get("ebay") or {}).get("listing_id")]
+    if not items:
+        await _safe_reply(update.message, "No live listings to check.")
+        return
+
+    await _safe_reply(update.message,
+                      f"🖼️ Checking photos on {len(items)} live listing(s)... "
+                      "one eBay call each, so give it a minute.")
+    try:
+        short = await asyncio.to_thread(audit_listing_photos, items)
+    except Exception as e:
+        _record_error("photocheck", e)
+        await _safe_reply(update.message, f"⚠️ Photo check failed: {type(e).__name__}: {str(e)[:200]}")
+        return
+
+    if not short:
+        await _safe_reply(update.message,
+                          f"✅ All {len(items)} live listing(s) show every photo we hold. "
+                          "Nothing missing.")
+        return
+
+    lines = [f"⚠️ {len(short)} listing(s) are showing fewer photos than we uploaded:", ""]
+    for f in short:
+        lines.append(f"{f['item_id'][:8]} — {f['live']}/{f['expected']} photos "
+                     f"({f['expected'] - f['live']} missing)\n   {f['title'][:60]}")
+    lines += ["", "The originals are still stored, so this is repairable: "
+              "/arrange or /cover on an item rebuilds its offer and re-sends every photo."]
+    await _send_chunked(update.message, lines)
+
+
 async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["🏥 Health check:"]
 
@@ -2818,6 +3785,19 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "   → if this is a scope/403 error, re-run `python -m ebay.auth` to re-consent."
         )
 
+    # /offers needs its own scope, and it's the one nothing else exercises — a
+    # missing sell.negotiation consent shows up as "no eligible listings", which
+    # reads as "nobody's watching anything" rather than as a broken permission.
+    # negotiation_status was imported for this check and then never called.
+    try:
+        status = await asyncio.to_thread(negotiation_status)
+        lines.append(f"✅ Offers to watchers (sell.negotiation): {status}")
+    except Exception as e:
+        lines.append(
+            f"❌ Offers to watchers (sell.negotiation): {str(e)[:150]}\n"
+            "   → if this is a scope/403 error, re-run `python -m ebay.auth` to re-consent."
+        )
+
     for name in ("CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"):
         lines.append(f"✅ {name}: set" if os.getenv(name) else f"❌ {name}: missing")
 
@@ -2834,6 +3814,13 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if ap and ap.get("task") is not None:
             ap["task"].cancel()
         was_appending = awaiting_photos.pop(user_id, None) is not None
+        # Photos already captured and sitting on a Start/Wait/Cancel prompt.
+        # /cancel skipped this slot entirely, so it answered "No capture in
+        # progress" while an item WAS staged — and the countdown task kept
+        # running, starting the pipeline on photos the user had just cancelled.
+        st = staging.pop(user_id, None)
+        if st and st.get("task") is not None:
+            st["task"].cancel()
     was_gated = gate.pop(user_id, None) is not None
     was_hauling = user_id in haul_mode
     haul_mode.discard(user_id)
@@ -2844,6 +3831,20 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if data:
         await _safe_reply(update.message, f"🛑 Cancelled capture ({len(data['files'])} photo(s) discarded).")
+    elif st:
+        # Same treatment as the Cancel button on the prompt: drop the item and its
+        # photos. Leaving the row behind would strand it at 'captured' forever,
+        # counted by /status and reachable by nothing.
+        staged_id = st["item_id"]
+        item = get_item(staged_id)
+        if item is not None:
+            photos = item.get("photos") or []
+            if photos:
+                shutil.rmtree(Path(photos[0]).parent, ignore_errors=True)
+            delete_item(staged_id)
+        await _safe_reply(
+            update.message,
+            f"🛑 Cancelled — {len(st.get('paths') or [])} photo(s) discarded before processing.")
     elif was_appending:
         await _safe_reply(update.message, "🛑 Cancelled — stopped waiting for photos to add.")
     elif was_gated:
@@ -2869,11 +3870,15 @@ HELP_SECTIONS = [
         ("/cancel", "Discard photos being captured, or drop out of a gate"),
     ]),
     ("Items", [
-        ("/status [status]", "List items and their stage. Filter, e.g. /status published"),
+        ("/status [status|n|all]", "List items and their stage — the 20 most recent by default. "
+                                   "Filter (/status published), widen (/status 50, /status all)"),
         ("/ross [missing]", "Audit Ross code + paid price per item; /ross missing shows only unpriced ones"),
         ("/listing [id]", "Show the current draft for an item"),
         ("/comps [id]", "Show the sold/active comps the price was built from"),
         ("/addphotos [id]", "Attach more photos to an existing item"),
+        ("/photos [id]", "Show the photos in listing order, numbered"),
+        ("/cover [id] <n>", "Make photo n the gallery cover (the search thumbnail)"),
+        ("/arrange [id] <order>", "Reorder photos, e.g. /arrange 3,1,2 — unlisted ones go last"),
         ("/receipt [id] <price> [code]", "Set the Ross cost by hand; code is optional (omit or 'none' to auto-fill)"),
     ]),
     ("Selling", [
@@ -2882,17 +3887,23 @@ HELP_SECTIONS = [
         ("/sync [days]", "Pull live price/quantity + real sold orders from eBay; auto-marks sold items with actual fees"),
         ("/activate [id]", "Publish an eBay draft — makes it live"),
         ("/end [id]", "End a live listing (drops to a draft; /activate to relist)"),
+        ("/refreshdesc [apply]", "Push the current description copy to listings already on eBay "
+                                 "(dry run without 'apply')"),
         ("/promote [id] <pct>", "Set the Promoted Listings ad rate (2-100%)"),
         ("/pricecheck", "Check live listings against eBay traffic/watchers; suggests price cuts (also runs weekly)"),
+        ("/offers [apply] [$]", "Send private discounts to people watching your listings. "
+                                "Dry run without 'apply'; add a number for a flat $ off"),
         ("/retry [id]", "Re-run the current pipeline step for an item"),
         ("/delete [id]", "Delete the item, its photos, and its eBay offer"),
     ]),
     ("Money", [
         ("/sold [id] [price]", "Mark an item sold and record the sale price; replies with profit"),
-        ("/profit", "Profit per sold item: paid → sold → fees → net → margin (real fees after /sync)"),
+        ("/profit [id]", "Profit per sold item: paid → sold → fees → net → margin (real fees after "
+                         "/sync). With an id: that one item's full breakdown"),
         ("/report", "Excel report: photos, prices, fees, and profit"),
     ]),
     ("Admin", [
+        ("/photocheck", "Verify every live listing still shows every photo we uploaded"),
         ("/health", "Check eBay token, business policies, ad scope, Cloudinary"),
         ("/auth [url]", "Re-consent eBay: no argument prints the consent URL; paste the redirect URL to finish"),
         ("/whoami", "Your Telegram user id (for TELEGRAM_ALLOWED_USER_IDS)"),
@@ -3012,6 +4023,11 @@ def main() -> None:
     app.add_handler(CommandHandler("addphotos", addphotos_command))
     app.add_handler(CommandHandler("delete", delete_command))
     app.add_handler(CommandHandler("end", end_command))
+    app.add_handler(CommandHandler("refreshdesc", refreshdesc_command))
+    app.add_handler(CommandHandler("photos", photos_command))
+    app.add_handler(CommandHandler("cover", cover_command))
+    app.add_handler(CommandHandler("arrange", arrange_command))
+    app.add_handler(CommandHandler("offers", offers_command))
     app.add_handler(CommandHandler("setprice", setprice_command))
     app.add_handler(CommandHandler("setqty", setqty_command))
     app.add_handler(CommandHandler("sync", sync_command))
@@ -3019,6 +4035,7 @@ def main() -> None:
     app.add_handler(CommandHandler("promote", promote_command))
     app.add_handler(CommandHandler("pricecheck", pricecheck_command))
     app.add_handler(CommandHandler("retry", retry_command))
+    app.add_handler(CommandHandler("photocheck", photocheck_command))
     app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("auth", auth_command))
     app.add_handler(CommandHandler("whoami", whoami_command))

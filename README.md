@@ -145,14 +145,35 @@ photos -> identify -> [confirm?] -> price -> [confirm?] -> draft -> [approve] ->
    `ebay_draft`. Nothing is live yet.
 
 7. **Publish.** `/activate` publishes the offer; the item goes live and status
-   becomes `published`. The bot replies with the listing URL. If a default ad
-   rate is set (`EBAY_DEFAULT_AD_RATE_PCT`, 4% by default), the listing is
-   automatically enrolled in Promoted Listings at that rate on publish; adjust
-   any individual listing with `/promote <id> <pct>`.
+   becomes `published`. The bot replies with the listing URL **and what the
+   listing stands to make** — price, shipping collected, eBay fees, ad spend,
+   postage and Ross cost down to a net figure, with the margin, the return on
+   what you paid, and the break-even price. No waiting for a `/report` to find
+   out an item nets $3. Pull the same breakdown up again any time with
+   `/profit <id>` (after a price change, say). If a default ad rate is set
+   (`EBAY_DEFAULT_AD_RATE_PCT`, 4% by default), the listing is automatically
+   enrolled in Promoted Listings at that rate on publish; adjust any individual
+   listing with `/promote <id> <pct>`.
+
+   The figures are a projection on measured averages, not a quote: fees and
+   shipping are what comparable orders really cost (see the rate settings
+   below), and an item with no scanned receipt has its cost **estimated** from
+   the list price and is flagged as such — `/receipt` to replace the guess.
 
 You can also attach more photos to an existing item at any time with
 `/addphotos <id>` — new photos are appended, and if the item is already an eBay
 draft or live listing, the offer is rebuilt so the photos reach eBay.
+
+**Photo order.** By default the listing leads with your first (overview) photo
+and pushes the second one — the Ross tag close-up — to the very end, because
+buyers want to lead with the product. `/photos` shows the set as an album in that
+final order, numbered; `/cover <n>` promotes one to the gallery cover (the
+thumbnail that appears in eBay search results, and the single biggest lever on
+whether anyone clicks); `/arrange 3,1,2` sets the order outright. Both push the
+change to eBay immediately for a draft or live listing. Arranging by hand also
+**switches the automatic tag-to-the-end reorder off for that item** — once you've
+said what the order is, the builder stops second-guessing it, since the "photo 2
+is the tag" assumption no longer holds.
 
 ### Gates only where they earn their keep
 
@@ -250,6 +271,7 @@ Un-aimed messages behave exactly as they do for a single item.
 | `retry_publish.py` | Helper script to rebuild an eBay draft for one item |
 | `backup.py` | Standalone backup of `data/ross.db` (online snapshot) + `data/inbox/` |
 | `report.py` | Build the Excel profit report (photos, fees, live formulas); also `/report` |
+| `profit.py` | What one item nets, evaluated in Python — the same maths `report.py` writes as Excel formulas. Powers the breakdown posted at publish, `/profit <id>`, and the repricing floor |
 
 ### Models
 
@@ -333,22 +355,27 @@ Photos are stored on disk under `data/inbox/`.
 | _(free text)_    | At a gate: correct the identification, or set the price; at review, correct the draft or `approve`/`reject`. During a haul, **reply** to an item's message or prefix its id (`a1b2c3d4 color is navy`) to aim at that one |
 | `wait`           | Extend the photo-batching window for a large batch    |
 | `/haul`          | Multi-item mode: dump a whole Ross run, split into items on each Ross tag (or a blackout frame — one dark photo — where a tag is missing) |
-| `/status [status]` | List items and their pipeline status; optional filter (e.g. `/status published`), with a count-per-status header |
+| `/status [status\|n\|all]` | List items and their pipeline status, **20 most recent by default** (the count-per-status header still covers everything). Filter with `/status published`, widen with `/status 50` or `/status all` |
 | `/listing [id]`  | Show the current draft for an item                    |
 | `/comps [id]`    | Show the sold/active comps the price was built from   |
 | `/addphotos [id]`| Attach more photos to an existing item                |
+| `/photos [id]`   | Show the photos as an album **in listing order**, numbered, so `#1` is the gallery cover buyers see in search |
+| `/cover [id] <n>`| Make photo `n` the gallery cover |
+| `/arrange [id] <order>` | Reorder photos, e.g. `/arrange 3,1,2`. Numbers not listed keep their relative order at the end, so `/arrange 4` just promotes photo 4 |
 | `/receipt [id] <price> <code>` | Manually set the Ross cost + 12-digit code (when the tag barcode couldn't be read) |
 | `/setprice [id] <price>` | Set the price (charm-priced); pushes to eBay if the item has an offer |
 | `/setqty [id] <n>` | Set the available quantity on eBay (once the item has an offer); listings default to 1 |
 | `/sync`          | Reconcile with eBay: pull live price/quantity, auto-record sold orders, **adopt listings you made by hand in Seller Hub**, and re-link items that were relisted under a new listing id |
 | `/activate [id]` | Publish an eBay draft, making it a live listing       |
 | `/end [id]`      | End a live listing (withdraw it); drops back to a draft to relist |
+| `/refreshdesc [apply] [force]` | Push the current description copy (e.g. the WYSIWYG line) to listings **already on eBay** — they otherwise keep what they were published with. Dry run unless `apply`; skips Seller-Hub-edited descriptions unless `force` |
 | `/sold [id] [price]` | Mark an item sold and record the sale price; replies with profit vs. Ross cost |
-| `/profit`        | Summarize profit across all sold items (before eBay fees/shipping) |
+| `/profit [id]`   | No id: summarize profit across all sold items. With an id: that one item's full breakdown — price, shipping, eBay fees, ads, postage, Ross cost → net, margin, return on cost and break-even price (the same figures posted when it went live) |
 | `/report`        | Build & send an Excel profit report: photo, title, price, shipping, cost, and profit net of eBay fees + ad rate (assumptions editable in the sheet). Totals band **SOLD (realized)** / **STILL LISTED (projected)** / TOTAL. Money columns are line totals (per-unit × qty); **Net / unit** is what one unit makes. **Sold rows use eBay's real figures** — shipping collected, fees charged, and the postage you actually paid for the label — while unsold rows use the assumptions. Items with no scanned receipt are costed from an editable % of list price rather than as free |
 | `/promote [id] <pct>` | Set/adjust a listing's Promoted Listings ad rate (2–100%) |
 | `/retry [id]`    | Re-run the failed pipeline step for an item (honors the confirm gates) |
 | `/delete [id]`   | Delete an item, its photos, and its eBay offer (ends it first if live) |
+| `/photocheck`    | Verify every live listing still shows every photo we uploaded for it. Reads the **live listing**, not the Inventory API's `inventory_item` — that field returns a lossy projection (it drops the description outright, and reports a single image on a quarter of items whose listings are actually fine), so auditing against it reports damage that isn't there. A listing that really did lose photos shows up nowhere else: impressions keep accruing and only the click-through decays |
 | `/health`        | Check eBay token, business policies, ad scope, and Cloudinary |
 | `/auth [url]`    | Re-consent the eBay account: no arg prints the consent URL; pass the redirect URL to finish |
 | `/whoami`        | Show your Telegram user id (to fill `TELEGRAM_ALLOWED_USER_IDS`) |
@@ -381,8 +408,9 @@ Defaults are in `config.py`; the marked ones can be overridden in `.env`:
   `AUTO_CONFIRM_MIN_IDENT_CONFIDENCE` and
   `AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC`
 - `EBAY_FVF_PCT`, `EBAY_FIXED_FEE`, `EBAY_AD_FEE_PCT`, `EBAY_SHIP_CHARGED`,
-  `EBAY_SHIP_COST` — what a sale actually costs. These drive **both** the
-  repricing floor and the profit report's assumptions, so the two can't disagree.
+  `EBAY_SHIP_COST` — what a sale actually costs. These drive the repricing
+  floor, the profit report's assumptions **and** the breakdown posted when a
+  listing goes live, so none of the three can disagree.
   Defaults are measured from settled orders, not eBay's rate card:
   - `EBAY_FVF_PCT` is **15.5%**, not the headline 13.25%. The itemised
     `FINAL_VALUE_FEE` is 13.60% (15.00% in some categories), but it's charged on
@@ -396,6 +424,10 @@ Defaults are in `config.py`; the marked ones can be overridden in `.env`:
   - Shipping defaults are medians of what buyers really paid and what the labels
     really cost. **If you ship free**, set `EBAY_SHIP_CHARGED=0` or the floor is
     wrong by the full postage.
+- `ASSUMED_COST_RATIO` (0.29) — what an item is assumed to have cost at Ross
+  when no receipt was captured, as a share of the list price. Costing those at
+  zero reported their whole sale price as profit; a share of list scales with
+  the item, unlike a flat guess. Always shown as an estimate.
 - `DEBUG_MODE` — pulls only 3 sold / 3 active comps to save time and cost when
   set. **Defaults to `false`.** Leave it off in production: 3 comps can't clear
   the `solid` bar, so every item lands on `thin` at best and stops to ask you.
@@ -417,7 +449,20 @@ Defaults are in `config.py`; the marked ones can be overridden in `.env`:
   required ones are auto-filled where it is safe, and you are told which ones
   could not be (rather than publishing something wrong).
 - The eBay description is rendered to HTML before sending, because eBay collapses
-  plain-text line breaks.
+  plain-text line breaks. Every description carries a **bold what-you-see-is-what-
+  you-get line** (`WYSIWYG_NOTE`) just above the SHIPPING boilerplate — the last
+  word on the item, after the specs and condition. It's added at render time
+  rather than by the copywriter so it's identical on every listing, and skipped if
+  the description already says it. The "(Photos may include manufacturer's
+  photos.)" hedge covers the stock catalog image the identify step sometimes
+  appends, which isn't on every listing and isn't reliably in the same position.
+  Set to `""` to drop the line.
+- Copy changes reach eBay when an offer is built, so listings **already live keep
+  the description they were published with**. `/refreshdesc` re-renders and pushes
+  the current copy to them — dry run by default, `/refreshdesc apply` to push. It
+  skips any listing whose live description isn't the one we generated (edited in
+  Seller Hub, or predating a renderer change) rather than silently overwriting
+  that work; `/refreshdesc apply force` includes those too.
 - The price gate flags **comp starvation**: if the Apify scrapers return rows but
   none have a parseable price (a sign the third-party actor changed its output
   schema), the suggested price shows a ⚠️ warning. It also explains itself when a
