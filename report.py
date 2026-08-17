@@ -19,7 +19,8 @@ from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 from config import (
-    EBAY_AD_FEE_PCT, EBAY_FIXED_FEE, EBAY_FVF_PCT, EBAY_SHIP_CHARGED, EBAY_SHIP_COST,
+    ASSUMED_COST_RATIO, EBAY_AD_FEE_PCT, EBAY_FIXED_FEE, EBAY_FVF_PCT,
+    EBAY_SHIP_CHARGED, EBAY_SHIP_COST,
 )
 from db import list_items
 
@@ -42,30 +43,59 @@ A_COST_RATIO = "$C$9"   # assumed Ross cost as a share of list price, when unkno
 
 
 def _price_for(item):
-    """Sale price if the item sold, else its listed price."""
+    """Sale price if the item sold, else its listed price.
+
+    NOTE this is a LINE TOTAL on a sold row — ebay/orders.py accumulates
+    `sale_price` across every unit and every order for the sku. Use
+    `_unit_price_for` for anything that then multiplies by quantity."""
     ebay = item.get("ebay") or {}
     if ebay.get("sale_price") is not None:
         return ebay["sale_price"]
     return (item.get("listing") or {}).get("price")
 
 
+def _unit_price_for(item, qty: int) -> float:
+    """What ONE unit of this row fetched — the figure column F claims to hold.
+
+    A still-listed row already stores a per-unit price, so it passes through.
+    A sold row stores the realized total for `units_sold` units, so it has to be
+    divided back down: every downstream formula multiplies column F by column E
+    (`=F*E` for revenue, the ad fee off that, the receipt-less cost cell off
+    both), and feeding a line total into that reports a two-unit sale at twice
+    the money that came in."""
+    price = round(float(_price_for(item)), 2)
+    if item["status"] == "sold" and (item.get("ebay") or {}).get("sale_price") is not None:
+        return round(price / max(qty, 1), 2)
+    return price
+
+
 def _report_qty(item) -> int:
     """How many units this row represents.
 
     For a still-listed item it's the offer's available quantity (what /setqty
-    pushed to eBay) — a listing of 5 should project 5× the per-unit profit. For a
-    SOLD item it's 1: `sale_price` is already the realized amount for what sold,
-    and the live offer quantity has usually dropped to 0, so multiplying would
-    either double-count or zero the row out. (Ross items are near-always unique
-    single units, so a multi-unit sold order is the rare exception, not the norm.)
-    """
+    pushed to eBay) — a listing of 5 should project 5× the per-unit profit.
+
+    For a SOLD row it's the number of units that sale actually covered, because
+    `sale_price` is the realized total for all of them: one order here took 2
+    units at $72.96, and charging a single Ross cost against it overstated the
+    profit by a whole unit's cost. Defaults to 1 (the norm — Ross items are
+    near-always unique single units) when nothing recorded the count."""
     if item["status"] == "sold":
-        return 1
+        try:
+            return max(int((item.get("ebay") or {}).get("units_sold") or 1), 1)
+        except (TypeError, ValueError):
+            return 1
     try:
         q = int((item.get("ebay") or {}).get("quantity", 1))
     except (TypeError, ValueError):
         q = 1
-    return q if q > 0 else 1
+    # A recorded 0 is a fact, not a missing value: /sync zeroes the quantity on a
+    # listing eBay says has ENDED. Coercing it back to 1 kept ended listings
+    # projecting a unit of revenue and profit they can no longer make, and the
+    # 'LIVE (projected)' band is the number inventory decisions get made on. An
+    # absent or unreadable quantity still defaults to 1 above, so this only ever
+    # sees a number something actually wrote.
+    return max(q, 0)
 
 
 def _thumbnail(cover_path, dest_dir):
@@ -88,12 +118,17 @@ def _expand_partially_sold(items: list[dict]) -> list[dict]:
     """Split an item that sold a unit but still has stock into two rows.
 
     A multi-quantity listing can sell one unit and stay live with the rest, but
-    an item has a single status, so it goes to 'sold' and its remaining stock
-    stops being counted anywhere — $268.92 of live inventory in one measurement,
-    invisible to the report and to the weekly price check.
+    an item has a single status, so its two halves can't both be told: whichever
+    status it carries, the other half stops being counted — $268.92 of live
+    inventory in one measurement, invisible to the report and to the weekly
+    price check.
 
     Neither row alone is right: the realized sale belongs in SOLD, the remaining
-    units belong in STILL LISTED. So emit both, sharing the item id."""
+    units belong in STILL LISTED. So emit both, sharing the item id.
+
+    Keyed off the SALE RECORD rather than the status, because either status can
+    carry this state — 'sold' with stock left, or back to 'published' by /sync
+    once eBay confirmed the listing is still live."""
     out = []
     for item in items:
         ebay = item.get("ebay") or {}
@@ -102,11 +137,13 @@ def _expand_partially_sold(items: list[dict]) -> list[dict]:
             remaining = int(ebay.get("quantity") or 0)
         except (TypeError, ValueError):
             remaining = 0
-        if item["status"] != "sold" or remaining <= 0:
+        if ebay.get("sale_price") is None or remaining <= 0:
             out.append(item)
             continue
 
-        out.append(item)  # the realized sale, qty 1 (see _report_qty)
+        realized = dict(item)
+        realized["status"] = "sold"   # the money actually taken, units_sold units
+        out.append(realized)
         still_listed = dict(item)
         still_listed["status"] = "published"
         # Drop the sale so this row prices at the CURRENT list price, not the
@@ -153,13 +190,9 @@ def build_report(path: str, ad_days: int = 90) -> str:
         ("Promoted Listings, effective %", EBAY_AD_FEE_PCT, PCT),
         ("Shipping charged to buyer", EBAY_SHIP_CHARGED, MONEY),
         ("Your shipping cost (postage)", EBAY_SHIP_COST, MONEY),
-        # Items with no scanned receipt used to be costed at ZERO, which reported
-        # their entire sale price as profit — one showed a 68% margin purely
-        # because its cost was missing. A share of the list price beats a flat
-        # guess: across 63 items with a known cost it lands at a median 29% of
-        # list (p25 22%, p75 34%), so it scales with the item instead of costing
-        # a $110 listing the same as a $30 one.
-        ("Assumed Ross cost when unknown (% of list)", 0.29, PCT),
+        # Also from config.py, so the estimate this report puts on a receipt-less
+        # item matches the one the bot quotes at publish time (see profit.py).
+        ("Assumed Ross cost when unknown (% of list)", ASSUMED_COST_RATIO, PCT),
     ]
     for idx, (label, val, fmt) in enumerate(assumptions):
         r = 4 + idx
@@ -200,8 +233,8 @@ def build_report(path: str, ad_days: int = 90) -> str:
     r = first
     for item in items:
         L = item.get("listing") or {}
-        unit_price = round(float(_price_for(item)), 2)
         qty = _report_qty(item)
+        unit_price = _unit_price_for(item, qty)
         paid = (item.get("receipt") or {}).get("reduced_price")
 
         ws.row_dimensions[r].height = 72
@@ -327,8 +360,13 @@ def build_report(path: str, ad_days: int = 90) -> str:
     try:
         from ebay.orders import account_charges
         charges = account_charges(ad_days)
+        # Column G is `=F*E`, so mirror it exactly — _unit_price_for already
+        # divided a realized total back to a unit price, and multiplying by the
+        # same qty reconstructs it. Using _price_for here instead would restate
+        # every multi-unit sale at units_sold times the money taken, and this
+        # figure is the denominator the ad rate is judged against.
         sold_revenue = sum(
-            round(float(_price_for(i)), 2) * _report_qty(i)
+            _unit_price_for(i, _report_qty(i)) * _report_qty(i)
             for i in items if i["status"] == "sold")
         lines = [f"eBay billed ${charges['total']:.2f} in account-level charges over the "
                  f"last {ad_days} days ({charges['count']} charges), which no row above can "
