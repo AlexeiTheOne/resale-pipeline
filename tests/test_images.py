@@ -99,3 +99,33 @@ if __name__ == "__main__":
         t()
         print(f"  ok  {t.__name__}")
     print(f"\n{len(tests)}/{len(tests)} passed")
+
+
+# --- description rendering -------------------------------------------------
+# The copywriter drifts into markdown emphasis, and '*' is a bullet prefix, so
+# '**SPECIFICATIONS:**' used to match as a bullet reading '*SPECIFICATIONS:**'.
+# Every section heading became a list item and literal asterisks shipped to the
+# live listing — measured at 63 of 114 live listings when it was found.
+
+def test_markdown_heading_becomes_a_heading_not_a_bullet():
+    html = inv._html_description("**SPECIFICATIONS:**\n* **Brand:** GUESS")
+    assert "<h3>SPECIFICATIONS</h3>" in html
+    assert "*SPECIFICATIONS" not in html
+
+
+def test_no_literal_asterisks_survive_into_the_listing():
+    html = inv._html_description("**SPECIFICATIONS:**\n* **Brand:** GUESS\n* **Color:** Green")
+    assert "**" not in html
+    assert "<li>Brand: GUESS</li>" in html
+
+
+def test_plain_bullets_and_headings_still_work():
+    html = inv._html_description("SPECIFICATIONS:\n- Brand: GUESS\n✓ Water resistant")
+    assert "<h3>SPECIFICATIONS</h3>" in html
+    assert "<li>Brand: GUESS</li>" in html
+    assert "<li>Water resistant</li>" in html
+
+
+def test_a_lone_asterisk_is_still_a_bullet_marker():
+    html = inv._html_description("* plain starred bullet")
+    assert "<li>plain starred bullet</li>" in html

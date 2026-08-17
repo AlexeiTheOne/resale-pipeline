@@ -724,6 +724,26 @@ def _enforce_single_cardinality(category_id: str, aspects: dict) -> dict:
 _BULLET_PREFIXES = ("-", "–", "—", "•", "*", "✓", "✔")
 
 
+_MD_EMPHASIS = re.compile(r"\*\*+(.+?)\*\*+")
+
+
+def _strip_markdown(line: str) -> str:
+    """Drop the markdown emphasis this renderer doesn't speak.
+
+    The copywriter drifts into **bold** on a large share of generations, and '*'
+    is a bullet prefix — so '**SPECIFICATIONS:**' matched as a bullet whose text
+    is '*SPECIFICATIONS:**'. Every section heading silently became a list item
+    and literal asterisks shipped to the live listing: 63 of 114 live listings
+    were rendering that way when this was found.
+
+    Emphasis is stripped rather than converted to <b>, because the bold tag is
+    what _strip_banner uses to recognise the WYSIWYG line by shape — emitting
+    <b> anywhere else would make an arbitrary bolded phrase look like the
+    banner and get silently deleted from the comparison."""
+    line = _MD_EMPHASIS.sub(r"\1", line)
+    return re.sub(r"\*{2,}", "", line).strip()
+
+
 def _is_heading(line: str) -> bool:
     """An all-caps line (e.g. 'SPECIFICATIONS:', 'ABOUT US:') is a section header."""
     stripped = line.rstrip(":").strip()
@@ -780,7 +800,9 @@ def _html_description(text: str) -> str:
             bullets.clear()
 
     for raw in text.splitlines():
-        line = raw.strip()
+        # Emphasis comes off before anything is classified: a '**HEADING:**' has
+        # to stop looking like a '*' bullet before the marker test sees it.
+        line = _strip_markdown(raw.strip())
         if not line:
             flush_bullets()
             continue

@@ -49,10 +49,23 @@ Carefully packaged to ensure safe delivery.
 
 RETURNS:
 30-day return policy. Buyer pays return shipping.
-Item must be in original condition with tags attached.
+Item must be returned in the same condition it was sent.{tags}
 
 Message us with any questions — we typically reply within 24 hours.
 """
+
+# Conditions where the item genuinely ships with the manufacturer's tags on it.
+# Everything else — new without tags, open box, used — must not demand tags back,
+# because the listing itself already says there weren't any. Left unbranched, a
+# NWOT listing told the buyer to return an item "with tags attached" that it had
+# just finished explaining has no tags.
+_TAGGED_CONDITIONS = {"1000"}
+
+
+def store_boilerplate(condition_id) -> str:
+    tags = (" Tags must still be attached."
+            if str(condition_id) in _TAGGED_CONDITIONS else "")
+    return STORE_BOILERPLATE.format(tags=tags).strip()
 
 SCHEMA_INSTRUCTIONS = """Generate an eBay listing as a valid JSON object matching this exact schema:
 
@@ -125,7 +138,16 @@ marketing fluff. Use this structure:
 - SPECIFICATIONS: short bullet list — brand, color, material, size/dimensions.
 - FEATURES: 3-5 one-line bullets with ✓ (concise, no filler).
 - CONDITION: one short bullet on condition and any flags.
-- INCLUDED: bullet list of exactly what ships."""
+- INCLUDED: bullet list of exactly what ships.
+- Write section headings as bare ALL-CAPS text ending in a colon, e.g.
+  SPECIFICATIONS: — plain, on their own line.
+- NO MARKDOWN. Never wrap anything in ** or * for emphasis. The renderer treats
+  a leading * as a bullet marker, so a heading written as **SPECIFICATIONS:**
+  is read as a bullet and the heading disappears from the published listing,
+  asterisks and all. Bullets start with -, • or ✓ and nothing else.
+- INCLUDED must describe what is actually in the photos, not just the item
+  itself: if a pouch, retail box, dust bag, tags or adapters are visible in the
+  images, list them. Do not invent packaging that isn't shown."""
 
 
 def _aspect_hint_block(identification: dict) -> str | None:
@@ -266,7 +288,8 @@ def generate_draft(identification: dict, pricing: dict, examples: list | None = 
     except json.JSONDecodeError:
         raise ValueError(raw)
 
-    draft["description"] = draft["description"] + "\n\n" + STORE_BOILERPLATE.strip()
+    draft["description"] = (draft["description"] + "\n\n"
+                            + store_boilerplate(draft.get("condition_id")))
     draft["stock_image_url"] = stock_url
 
     # The price is decided by pipeline/price.py (or by you at the gate), never by
