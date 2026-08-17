@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import time
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 
@@ -62,8 +63,24 @@ def get_traffic_report(listing_ids: list[str], days: int = 7) -> dict[str, dict]
         "filter": filter_str,
         "metric": "LISTING_IMPRESSION_TOTAL,LISTING_VIEWS_TOTAL,CLICK_THROUGH_RATE",
     }
-    r = httpx.get(f"{EBAY_API_BASE}/sell/analytics/v1/traffic_report",
-                   headers=_headers(), params=params, timeout=30)
+    # eBay rate-limits this endpoint, and a weekly run makes one call per listing —
+    # at ~110 listings the tail of the run reliably 429s (4 items lost their whole
+    # diagnosis to it on the first real run). A 429 is not a failure of the item,
+    # it's a failure of pacing, so back off and retry rather than reporting ERROR
+    # on a listing we simply asked about too quickly.
+    # Two quick retries only. A 429 here is usually the DAILY quota rather than a
+    # burst — measured: after ~104 calls every subsequent request 429s and stays
+    # 429 through 21s of backoff — and no wait short enough to be worth doing will
+    # clear that. Batching (pipeline/reprice._traffic_for_all) is the actual fix;
+    # this just absorbs a genuine burst without turning a quota failure into two
+    # minutes of pointless sleeping.
+    for attempt in range(3):
+        r = httpx.get(f"{EBAY_API_BASE}/sell/analytics/v1/traffic_report",
+                      headers=_headers(), params=params, timeout=30)
+        if r.status_code != 429:
+            break
+        if attempt < 2:
+            time.sleep(2 + attempt * 2)   # 2s, 4s
     if r.status_code >= 400:
         raise RuntimeError(f"eBay Analytics API traffic_report failed [{r.status_code}]: {r.text}")
 
