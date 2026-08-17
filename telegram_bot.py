@@ -54,6 +54,7 @@ from ebay.inventory import (
     listing_photo_order,
     publish_offer,
     refresh_offer_description,
+    save_stock_photo,
     update_offer_price,
     update_offer_quantity,
     withdraw_offer,
@@ -921,6 +922,49 @@ async def arrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         item_id, picks + rest, update.message,
         f"🖼️ Reordered {item_id[:8]} — photo #{picks and ordered.index(picks[0]) + 1} is now the cover"
         + (f", {len(rest)} unlisted photo(s) kept at the end." if rest else "."))
+
+
+async def stockphoto_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a retailer's product photo from a URL. Usage: /stockphoto <url> or
+    /stockphoto <id> <url>.
+
+    For anything sealed in retail packaging — bedding above all — every photo we
+    can take is a plastic bag with a branded band, and the buyer never sees the
+    pattern they are buying. The retailer's styled shot is the only way to show
+    it, and it lands at #2, right after the real cover.
+
+    The URL comes from you because the retailers who own these photos block
+    automated fetching, and because you are the one holding the item: a wrong
+    colourway is worse than no photo at all."""
+    user_id = update.effective_user.id
+    item_id, url, err = _photo_args(user_id, list(context.args or []))
+    if err:
+        await _safe_reply(update.message,
+            f"⚠️ {err}\nUsage: /stockphoto <url>  (right-click the photo → Copy image address)")
+        return
+    if not url.lower().startswith(("http://", "https://")):
+        await _safe_reply(update.message,
+            f"'{url[:60]}' isn't a URL. It needs to be the direct image address "
+            "(right-click the photo → Copy image address), not the product page.")
+        return
+
+    last_item[user_id] = item_id
+    await _safe_reply(update.message, "⬇️ Fetching that image...")
+    try:
+        await asyncio.to_thread(save_stock_photo, item_id, url)
+    except ValueError as e:
+        await _safe_reply(update.message, f"⚠️ {e}")
+        return
+    except Exception as e:
+        traceback.print_exc()
+        await _safe_reply(update.message, f"⚠️ Couldn't save it: {type(e).__name__}: {str(e)[:200]}")
+        return
+
+    n = len(listing_photo_order(get_item(item_id) or {}))
+    await _safe_reply(update.message,
+        f"🖼️ Added as photo #2 of {n} for {item_id[:8]}. /photos to see them, "
+        "/arrange to move it.")
+    await _resync_photos(item_id, update.message)
 
 
 async def addphotos_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3879,6 +3923,7 @@ HELP_SECTIONS = [
         ("/photos [id]", "Show the photos in listing order, numbered"),
         ("/cover [id] <n>", "Make photo n the gallery cover (the search thumbnail)"),
         ("/arrange [id] <order>", "Reorder photos, e.g. /arrange 3,1,2 — unlisted ones go last"),
+        ("/stockphoto [id] <url>", "Add a retailer's product photo as #2 — for items sealed in packaging"),
         ("/receipt [id] <price> [code]", "Set the Ross cost by hand; code is optional (omit or 'none' to auto-fill)"),
     ]),
     ("Selling", [
@@ -4027,6 +4072,7 @@ def main() -> None:
     app.add_handler(CommandHandler("photos", photos_command))
     app.add_handler(CommandHandler("cover", cover_command))
     app.add_handler(CommandHandler("arrange", arrange_command))
+    app.add_handler(CommandHandler("stockphoto", stockphoto_command))
     app.add_handler(CommandHandler("offers", offers_command))
     app.add_handler(CommandHandler("setprice", setprice_command))
     app.add_handler(CommandHandler("setqty", setqty_command))
