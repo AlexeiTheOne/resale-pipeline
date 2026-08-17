@@ -1,8 +1,16 @@
-google-genai
-httpx
-python-dotenv
-python-telegram-bot>=20.0
-pytesseract
-Pillow
-pyzbar
-openpyxl
+# Pinned to the versions this bot is actually running against.
+#
+# Unpinned, a rebuild silently picks up whatever is current — and two of these
+# are load-bearing in ways a major bump would break quietly rather than loudly:
+# google-genai's response/thinking-config surface moves between minors (llm.py
+# and identify.py read .text, .candidates[0].finish_reason and
+# types.ThinkingConfig directly), and python-telegram-bot went through breaking
+# async rewrites. Bump deliberately, one at a time, and run tests/ after.
+google-genai==2.8.0
+httpx==0.28.1
+python-dotenv==1.1.1
+python-telegram-bot==22.8
+pytesseract==0.3.13
+Pillow==11.3.0
+pyzbar==0.1.9
+openpyxl==3.1.5
