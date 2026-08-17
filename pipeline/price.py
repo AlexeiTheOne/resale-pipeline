@@ -4,6 +4,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import concurrent.futures
 import re
+import threading
 import time
 import httpx
 import json
@@ -18,6 +19,21 @@ from config import (
 
 load_dotenv()
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
+# Second key, tried only after Apify rejects APIFY_TOKEN outright (401/403).
+# Optional: if unset, _call's behavior is identical to before this existed.
+APIFY_TOKEN_BACKUP = os.getenv("APIFY_TOKEN_BACKUP")
+
+# Sticky, process-wide: once the primary token is confirmed rejected, every
+# later _call (the query ladder alone can make a dozen in one pricing run)
+# should go straight to the backup instead of paying for a doomed round trip
+# on a key already known to be dead. A bool is enough for this codebase's
+# usage (the bot invokes pricing via asyncio.to_thread, i.e. one worker
+# thread at a time, occasionally two here via the sold/active
+# ThreadPoolExecutor in _fetch_rung) — the lock only serializes the
+# check-and-set so the "switched over" notice below prints exactly once even
+# if both of those two threads hit the 401/403 at the same moment.
+_use_backup_token = False
+_token_switch_lock = threading.Lock()
 
 # Mapped by ACTUAL behavior (re-confirmed against the live actors):
 #   SOLD   -> oTtB3VgfuE9GtxQt2 , input {"keyword": q, "count": N},
@@ -33,6 +49,25 @@ SOLD_URL = "https://api.apify.com/v2/acts/oTtB3VgfuE9GtxQt2/run-sync-get-dataset
 ACTIVE_URL = "https://api.apify.com/v2/acts/Y7h6Aodb7ZXkv6Ieb/run-sync-get-dataset-items"
 
 
+def _activate_backup_token():
+    """Flip to APIFY_TOKEN_BACKUP for the rest of the process. Idempotent and
+    thread-safe: only the caller that actually flips the flag prints the
+    notice, so a race between the sold/active calls in _fetch_rung's
+    ThreadPoolExecutor can't print it twice."""
+    global _use_backup_token
+    with _token_switch_lock:
+        first = not _use_backup_token
+        _use_backup_token = True
+    if first:
+        print("⚠️ Apify: primary token rejected (401/403) — switching to "
+              "APIFY_TOKEN_BACKUP for the rest of this run")
+
+
+def _post(url, payload, token):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    return httpx.post(url, headers=headers, json=payload, timeout=180)
+
+
 def _call(url, payload, attempts=3):
     """POST one Apify run-sync scrape, retrying transient failures.
 
@@ -42,17 +77,45 @@ def _call(url, payload, attempts=3):
     would fail the whole pricing run; retrying here keeps a network hiccup from
     costing the item its comps.
 
+    A 401 or 403 is different: it means THIS token is rejected, and retrying it
+    unchanged just burns the attempt budget on a call that can't succeed. If
+    APIFY_TOKEN_BACKUP is configured, the first 401/403 flips the sticky
+    module-level flag (see _activate_backup_token) and immediately retries the
+    same request with the backup token, in the same attempt — not a fresh one —
+    so a rejection on the very last attempt still gets a real shot with the
+    backup instead of being swallowed by the loop ending. If the backup is
+    ALSO rejected, that's an account-level problem (both keys revoked, or a
+    single quota shared by both), not a one-off blip, so it fails immediately
+    with a clear combined message rather than retrying either dead token
+    twice more. With no backup configured, a 401/403 behaves exactly as before
+    this existed: raise_for_status() raises, the generic except below catches
+    it like any other HTTPStatusError, and it gets retried `attempts` times
+    against the same (rejected) primary token before giving up.
+
     The token goes in an Authorization header, NOT the query string. httpx builds
     HTTPStatusError's message as "... for url '<full url>'", query string
     included, and three separate paths put str(e) into a Telegram message —
     _run_stage's error reply, /pricecheck's, and the unprompted weekly digest.
     A 402 (quota exhausted) or 404 (actor retired) leaves the token perfectly
-    valid and pastes it into a chat log that keeps it forever."""
+    valid and pastes it into a chat log that keeps it forever. The same goes
+    for the combined-rejection message raised below: it names the env var, not
+    the secret, and is built from nothing but the HTTP status code."""
     last = None
-    headers = {"Authorization": f"Bearer {APIFY_TOKEN}"} if APIFY_TOKEN else {}
     for attempt in range(attempts):
+        using_backup = _use_backup_token
+        token = APIFY_TOKEN_BACKUP if using_backup else APIFY_TOKEN
         try:
-            r = httpx.post(url, headers=headers, json=payload, timeout=180)
+            r = _post(url, payload, token)
+            if r.status_code in (401, 403) and APIFY_TOKEN_BACKUP and not using_backup:
+                _activate_backup_token()
+                using_backup = True
+                r = _post(url, payload, APIFY_TOKEN_BACKUP)
+            if r.status_code in (401, 403) and using_backup and APIFY_TOKEN_BACKUP:
+                raise RuntimeError(
+                    "Apify rejected both APIFY_TOKEN and APIFY_TOKEN_BACKUP "
+                    f"(HTTP {r.status_code}). Both keys are bad, or the account "
+                    "itself is the problem (suspended / out of quota) — swapping "
+                    "keys again won't fix it.")
             if r.status_code == 429 or r.status_code >= 500:
                 raise httpx.HTTPStatusError(
                     f"Apify returned {r.status_code}", request=r.request, response=r)

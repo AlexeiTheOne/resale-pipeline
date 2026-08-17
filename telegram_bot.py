@@ -141,7 +141,8 @@ def _lock_for(user_id):
 # and don't change while the bot runs.
 _SECRETS = sorted(
     (v for v in (os.getenv(k) for k in (
-        "APIFY_TOKEN", "TELEGRAM_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+        "APIFY_TOKEN", "APIFY_TOKEN_BACKUP", "TELEGRAM_TOKEN",
+        "GEMINI_API_KEY", "GOOGLE_API_KEY",
         "EBAY_CLIENT_SECRET", "EBAY_CLIENT_ID", "EBAY_REFRESH_TOKEN",
         "CLOUDINARY_API_SECRET", "CLOUDINARY_API_KEY", "CLOUDINARY_URL",
     )) if v and len(v) >= 8),
