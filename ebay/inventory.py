@@ -3,6 +3,7 @@ import html
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -20,6 +21,7 @@ from config import (
     EBAY_MERCHANT_LOCATION_KEY,
     EBAY_RETURN_POLICY_ID,
     EBAY_SHIP_FROM_ADDRESS,
+    WYSIWYG_NOTE,
 )
 from db import get_item, update_field
 from ebay.auth import get_access_token
@@ -90,13 +92,27 @@ def upload_photos(paths: list[str]) -> list[str]:
     return [_upload_image(p) for p in paths]
 
 
-def _reorder_for_listing(paths: list[str]) -> list[str]:
+def _reorder_for_listing(paths: list[str], manual: bool = False) -> list[str]:
     """Move the tag close-up (always the 2nd photo the user sends) to the end so
     it shows as the last image in the eBay listing — buyers want to lead with the
-    product, not the tag. Leaves the first (overview) photo as the gallery cover."""
-    if len(paths) >= 2:
-        return paths[:1] + paths[2:] + [paths[1]]
-    return paths
+    product, not the tag. Leaves the first (overview) photo as the gallery cover.
+
+    `manual` turns this off: once /cover or /arrange has set the order by hand,
+    the stored list IS the intended order, and the "2nd photo is the tag"
+    assumption no longer holds — applying it anyway would move whichever photo
+    the user deliberately put second to the back of the listing."""
+    if manual or len(paths) < 2:
+        return paths
+    return paths[:1] + paths[2:] + [paths[1]]
+
+
+def listing_photo_order(item: dict) -> list[str]:
+    """An item's photos in the order the eBay listing will actually show them —
+    first is the gallery cover. The one place that answers "which photo is #3",
+    so the bot's /photos numbering and the published listing can't disagree."""
+    return _reorder_for_listing(
+        list(item.get("photos") or []),
+        manual=bool((item.get("photo_layout") or {}).get("manual")))
 
 
 def _download_brand_image(url, item_id: str) -> str | None:
@@ -129,6 +145,58 @@ def _download_brand_image(url, item_id: str) -> str | None:
         return path
     except Exception:
         return None
+
+
+def save_stock_photo(item_id: str, url: str, position: int = 2) -> str:
+    """Download a product photo from a URL and add it to an item's photo set.
+
+    For anything sold sealed in retail packaging — bedding above all — every
+    photo we can take is a plastic bag with a branded band, and the buyer never
+    sees the pattern they are buying. The retailer's styled shot is the only way
+    to show it.
+
+    This exists because the retailers who own those photos (Macy's, Belk, Ralph
+    Lauren, Wayfair, Amazon, Dillard's) all block automated fetching — measured,
+    every one of them, via both a browser-UA client and a separate fetch
+    service. A person's browser is not blocked, so the URL comes from the
+    seller, who is also the only one who can confirm the pattern actually
+    matches the item in hand. A wrong colourway is worse than no photo.
+
+    The file is stored beside the item's own photos, not in a temp dir, so it
+    survives the next rebuild. Returns the saved path.
+
+    position is 1-based in listing order; the default of 2 puts it directly
+    after the real cover, where it is the first thing the carousel shows.
+    """
+    item = get_item(item_id)
+    if item is None:
+        raise ValueError(f"No item {item_id[:8]}")
+
+    path = _download_brand_image(url, item_id)
+    if not path:
+        raise ValueError(
+            "That URL didn't return a usable image. It needs to be the direct "
+            "image address (right-click the photo → Copy image address), not "
+            "the product page.")
+
+    existing = list(item.get("photos") or [])
+    if not existing:
+        raise ValueError(f"{item_id[:8]} has no photos of its own yet")
+    folder = Path(existing[0]).parent
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / f"{item_id}_stock{Path(path).suffix or '.jpg'}"
+    shutil.move(path, dest)
+
+    ordered = listing_photo_order(item)
+    ordered = [p for p in ordered if Path(p) != dest]
+    index = max(0, min(len(ordered), position - 1))
+    ordered.insert(index, str(dest))
+
+    update_field(item_id, "photos", ordered)
+    # The stored list is now exactly the intended order, so stop the builder
+    # applying its own tag-to-the-back reorder on top of it.
+    update_field(item_id, "photo_layout", {"manual": True})
+    return str(dest)
 
 
 def _headers() -> dict:
@@ -184,6 +252,21 @@ def _create_offer(offer: dict) -> str:
     if r.status_code >= 400:
         existing_id = _existing_offer_id(r.text)
         if existing_id:
+            # An offer already exists for this sku. Returning its id alone threw
+            # away everything we just built — price, description, category — and
+            # every caller then reported success, so a /setprice that failed
+            # transiently and was "recovered" by rebuilding the offer left eBay
+            # selling at the old price forever while the DB, the report and the
+            # repricer all agreed on the new one.
+            #
+            # PUT the body we built onto the offer that exists. Same full-replace
+            # shape update_offer_price and _update_offer_description already use.
+            p = httpx.put(f"{EBAY_API_BASE}/sell/inventory/v1/offer/{existing_id}",
+                          headers=_headers(), json=offer, timeout=30)
+            if p.status_code >= 400:
+                raise RuntimeError(
+                    f"eBay offer {existing_id} already existed for this SKU and "
+                    f"updating it failed [{p.status_code}]: {p.text}")
             return existing_id
         raise RuntimeError(f"eBay API POST /sell/inventory/v1/offer failed [{r.status_code}]: {r.text}")
     return r.json()["offerId"]
@@ -247,11 +330,164 @@ def update_offer_price(offer_id: str, price) -> None:
     _request("PUT", f"/sell/inventory/v1/offer/{offer_id}", json=body)
 
 
+# Inventory-item fields that carry over when we re-send one to change its title.
+# Like updateOffer, the inventory_item PUT is a full replace — anything omitted is
+# erased, and `sku` and `locale` are read-only on the way back in.
+_INVENTORY_UPDATABLE_FIELDS = (
+    "product", "condition", "conditionDescription", "conditionDescriptors",
+    "packageWeightAndSize", "availability",
+)
+
+
+class InventoryImagesMissingError(Exception):
+    """About to write an inventory item with fewer images than it should have,
+    and there is no stored list to repair it from.
+
+    Raised instead of writing, because the inventory_item PUT is a FULL REPLACE:
+    sending back a truncated product block makes the truncation permanent and
+    strips a live listing down to whatever came back."""
+
+
+def _stored_image_urls(sku: str) -> list[str]:
+    """The Cloudinary URLs we uploaded for this SKU, from our own DB.
+
+    This — not eBay's GET — is the authoritative list. SKU is the item_id
+    (create_draft_offer sets `sku = item_id`), so the lookup is direct."""
+    item = get_item(sku) or {}
+    return list((item.get("ebay") or {}).get("image_urls") or [])
+
+
+def update_inventory_title(sku: str, title: str, known_images: int | None = None) -> str:
+    """Change just the title on an existing inventory item, live listing included.
+
+    The alternative is create_draft_offer, which is the only title path the bot
+    had — but that rebuilds the whole item and RE-UPLOADS every photo to
+    Cloudinary on the way through. For a title fix that's several hundred
+    needless uploads across a catalogue and minutes of wall-clock, to change one
+    string. This reads the item, swaps the title, and sends it back.
+
+    Returns the title eBay ended up with, which is not always the one passed:
+    eBay hard-caps titles at 80 characters and _truncate_title cuts at a word
+    boundary, so the caller can compare and notice if anything was lost.
+
+    IMAGES ARE NEVER TAKEN FROM eBay's RESPONSE. getInventoryItem returns a
+    lossy projection of the record: it drops `product.description` on every
+    item, and on a substantial minority of them it returns `imageUrls` collapsed
+    to the single first URL while the live listing still shows the full set.
+    Measured here: 30 of 109 items reported one image each, at the same rate for
+    items this function had never touched (3 of 13) as for those it had (27 of
+    96), and one item reverted to a single URL twice within twenty minutes with
+    nothing writing to it. Because the PUT is a full replace, echoing that back
+    is what would turn eBay's bad read into a real, buyer-visible loss. So the
+    stored list wins and a short response is repaired, not propagated.
+
+    The trade-off: a photo deliberately deleted in Seller Hub gets restored on
+    the next title edit. That is recoverable in a way a listing stripped to one
+    photo is not.
+    """
+    current = _request("GET", f"/sell/inventory/v1/inventory_item/{sku}").json()
+    body = {k: current[k] for k in _INVENTORY_UPDATABLE_FIELDS
+            if current.get(k) is not None}
+    product = dict(body.get("product") or {})
+
+    returned = product.get("imageUrls") or []
+    stored = _stored_image_urls(sku)
+    expected = known_images if known_images is not None else len(stored)
+    if len(returned) < expected:
+        if not stored:
+            raise InventoryImagesMissingError(
+                f"{sku}: eBay returned {len(returned)} image(s), fewer than the "
+                f"{expected} expected, and no stored URLs exist to repair it "
+                f"from. Refusing to PUT — that would make the loss permanent.")
+        print(f"🖼️ {sku[:8]}: eBay returned {len(returned)} image(s); "
+              f"restoring the stored {len(stored)} instead of echoing the loss")
+        product["imageUrls"] = stored
+
+    product["title"] = _truncate_title(title)
+    body["product"] = product
+
+    # eBay hands back `{"weight": {"value": 0.0, "unit": "POUND"}}` on GET for any
+    # item whose weight was never set, then rejects that exact payload on PUT with
+    # errorId 25709 "Invalid value for weight.value". Round-tripping its own
+    # response fails on every such item — 11 of 40 here. A zero weight carries no
+    # information (it IS the unset placeholder), so dropping it loses nothing and
+    # is the only way the update can succeed.
+    pkg = dict(body.get("packageWeightAndSize") or {})
+    if pkg:
+        try:
+            weight_value = float((pkg.get("weight") or {}).get("value") or 0)
+        except (TypeError, ValueError):
+            weight_value = 0.0
+        if weight_value <= 0:
+            pkg.pop("weight", None)
+        # What's left may be just `{"shippingIrregular": false}`, which is not
+        # worth sending on its own.
+        if not pkg or set(pkg) <= {"shippingIrregular"} and not pkg.get("shippingIrregular"):
+            body.pop("packageWeightAndSize", None)
+        else:
+            body["packageWeightAndSize"] = pkg
+
+    _request("PUT", f"/sell/inventory/v1/inventory_item/{sku}", json=body)
+    return product["title"]
+
+
 def get_offer(offer_id: str) -> dict:
     """Read an offer's current state from eBay: price, availableQuantity, and the
     nested `listing` container (listingId + listingStatus). Used by /sync to pull
     manual Seller-Hub edits back into the local DB."""
     return _request("GET", f"/sell/inventory/v1/offer/{offer_id}").json()
+
+
+def _update_offer_description(offer_id: str, current: dict, description_html: str) -> None:
+    """Swap an existing offer's description, live listing included. Same full-PUT
+    replace as update_offer_price — and note pricingSummary is carried over
+    explicitly: it's excluded from _OFFER_UPDATABLE_FIELDS, so a PUT without it
+    would strip the price off the listing."""
+    body = {k: current[k] for k in _OFFER_UPDATABLE_FIELDS if current.get(k) is not None}
+    body["listingDescription"] = description_html
+    price = ((current.get("pricingSummary") or {}).get("price") or {})
+    if price.get("value") is not None:
+        body["pricingSummary"] = {"price": {"value": str(price["value"]),
+                                            "currency": price.get("currency") or EBAY_CURRENCY}}
+    _request("PUT", f"/sell/inventory/v1/offer/{offer_id}", json=body)
+
+
+def refresh_offer_description(item: dict, apply: bool = False, force: bool = False) -> str:
+    """Re-render one item's stored description and push it to its existing eBay
+    offer, so a listing that went live before a copy change (the WYSIWYG line) can
+    pick it up without being rebuilt or relisted.
+
+    Returns what happened, or would happen when apply is False:
+      no_offer  — nothing on eBay to update
+      current   — eBay already has exactly this description
+      diverged  — the live description isn't what we'd generate from our stored
+                  text, so someone edited it in Seller Hub (or it predates a
+                  change to the renderer). Skipped unless force: overwriting it
+                  would silently throw that editing away.
+      updated   — pushed (or, in a dry run, would be)
+
+    Read-only when apply is False: it only ever GETs the offer."""
+    offer_id = (item.get("ebay") or {}).get("offer_id")
+    text = (item.get("listing") or {}).get("description")
+    if not offer_id or not text:
+        return "no_offer"
+
+    new_html = _html_description(text)
+    current = _request("GET", f"/sell/inventory/v1/offer/{offer_id}").json()
+    live = current.get("listingDescription") or ""
+
+    if live == new_html:
+        return "current"
+    # Compare with the banner taken off BOTH sides: what's left is the listing's
+    # actual copy. Equal means the live description is ours and the only change is
+    # the promise line (or a rewording of it) — safe to replace. Different means
+    # someone edited it in Seller Hub, and overwriting would throw that away.
+    if not force and _strip_banner(live) != _strip_banner(new_html):
+        return "diverged"
+
+    if apply:
+        _update_offer_description(offer_id, current, new_html)
+    return "updated"
 
 
 def update_offer_quantity(sku: str, offer_id: str, quantity: int) -> None:
@@ -494,13 +730,48 @@ def _is_heading(line: str) -> bool:
     return len(stripped) >= 2 and any(c.isalpha() for c in stripped) and stripped == stripped.upper()
 
 
+def _already_says_wysiwyg(text: str) -> bool:
+    """Whether the description already makes the promise, in any punctuation or
+    casing — so a copywriter that wrote it, or a listing being rebuilt from a
+    description that already carries it, doesn't get told twice."""
+    squashed = re.sub(r"[^a-z]", "", text.lower())
+    return "whatyouseeiswhatyouget" in squashed
+
+
+def _wysiwyg_banner(text: str) -> str:
+    if not WYSIWYG_NOTE or _already_says_wysiwyg(text):
+        return ""
+    return f'<p style="margin:16px 0 12px"><b>{html.escape(WYSIWYG_NOTE)}</b></p>'
+
+
+def _strip_banner(description_html: str) -> str:
+    """A rendered description with any WYSIWYG line removed, for comparing one
+    against another without the promise itself getting in the way. The renderer
+    emits <b> nowhere else, so a bold-only paragraph is always the banner —
+    including an older wording of it, which is why this strips by shape rather
+    than by matching the current WYSIWYG_NOTE text."""
+    return re.sub(r"<p[^>]*><b>.*?</b></p>", "", description_html, count=1, flags=re.DOTALL)
+
+
+# Store-policy headings, i.e. where the item's own description ends and the
+# boilerplate begins. The WYSIWYG line goes immediately above the first of these:
+# it's the closing word on the item, read after the specs and condition, not a
+# banner over them. SHIPPING is always the first in practice (see draft.py's
+# STORE_BOILERPLATE); the rest are here so a revised description that dropped or
+# reordered a section still puts the line in the right place.
+_POLICY_HEADINGS = ("SHIPPING", "RETURNS", "ABOUT US")
+
+
 def _html_description(text: str) -> str:
     """eBay renders descriptions as HTML and collapses plain-text line breaks, so a
     nicely laid-out plain description arrives as one unformatted blob. Convert the
     generated text — all-caps headings and '-'/'✓' bullet lines — into simple, valid
-    HTML so the published listing keeps its structure."""
+    HTML so the published listing keeps its structure, with the bold
+    what-you-see-is-what-you-get promise (WYSIWYG_NOTE in config.py) sitting just
+    above the shipping/returns boilerplate."""
     blocks: list[str] = []
     bullets: list[str] = []
+    policy_at: int | None = None   # index of the first store-policy heading
 
     def flush_bullets() -> None:
         if bullets:
@@ -518,11 +789,20 @@ def _html_description(text: str) -> str:
             bullets.append(line[len(marker):].strip())
         elif _is_heading(line):
             flush_bullets()
-            blocks.append(f"<h3>{html.escape(line.rstrip(':').strip())}</h3>")
+            heading = line.rstrip(":").strip()
+            if policy_at is None and heading.upper() in _POLICY_HEADINGS:
+                policy_at = len(blocks)
+            blocks.append(f"<h3>{html.escape(heading)}</h3>")
         else:
             flush_bullets()
             blocks.append(f"<p>{html.escape(line)}</p>")
     flush_bullets()
+
+    # No policy section at all (a hand-written description, say) — the line still
+    # has to appear, so it goes last rather than being silently dropped.
+    banner = _wysiwyg_banner(text)
+    if banner:
+        blocks.insert(policy_at if policy_at is not None else len(blocks), banner)
 
     body = "".join(blocks)
     return f'<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5">{body}</div>'
@@ -594,7 +874,7 @@ def create_draft_offer(item_id: str) -> dict:
     # one) as a secondary image after the seller's real photos, re-hosted via
     # Cloudinary. Kept secondary — never the gallery cover — so the buyer always
     # leads with photos of the actual item, regardless of condition.
-    image_paths = _reorder_for_listing(list(photos))
+    image_paths = listing_photo_order(item)
     stock_url = (item.get("identification") or {}).get("product_image_url")
     stock_path = _download_brand_image(stock_url, item_id)
     if stock_path:
@@ -615,10 +895,27 @@ def create_draft_offer(item_id: str) -> dict:
     product = _build_product(listing, image_urls, aspects, description_html)
     print(f"📤 Draft: {len(product['imageUrls'])} imageUrl(s) in the eBay inventory_item payload")
 
+    # Stock comes from the item, not a literal. This function is also the REBUILD
+    # path — /addphotos, /cover and /arrange all route back through it for an
+    # already-published listing — so a hard-coded 1 silently dropped a listing
+    # stocked with /setqty back to a single unit. The inventory_item PUT is a
+    # full replace, and _create_offer's already-exists branch left the offer
+    # advertising the old count, so eBay ended up holding 1 unit against an offer
+    # for 5 while the DB (and the report, and the repricer) still said 5.
+    #
+    # A missing key means "never set" -> 1; a stored 0 is a real answer (an ended
+    # or sold-out listing) and is preserved, since re-stocking it here would put
+    # merchandise back on sale that /sync deliberately zeroed.
+    stored_qty = (item.get("ebay") or {}).get("quantity")
+    try:
+        quantity = 1 if stored_qty is None else max(int(stored_qty), 0)
+    except (TypeError, ValueError):
+        quantity = 1
+
     inventory_item = {
         "product": product,
         "condition": condition,
-        "availability": {"shipToLocationAvailability": {"quantity": 1}},
+        "availability": {"shipToLocationAvailability": {"quantity": quantity}},
     }
     _request("PUT", f"/sell/inventory/v1/inventory_item/{sku}", json=inventory_item)
 
@@ -626,7 +923,7 @@ def create_draft_offer(item_id: str) -> dict:
         "sku": sku,
         "marketplaceId": EBAY_MARKETPLACE_ID,
         "format": "FIXED_PRICE",
-        "availableQuantity": 1,
+        "availableQuantity": quantity,
         "categoryId": category_id,
         "listingDescription": description_html,
         "listingPolicies": {
@@ -645,6 +942,10 @@ def create_draft_offer(item_id: str) -> dict:
         "image_urls": image_urls,
         "category_id": category_id,
         "category_name": resolved_category_name,
+        # Echoed back so the caller's merge keeps the DB and eBay agreeing on
+        # stock. Without it a rebuild reported nothing about quantity and the
+        # stored value drifted from what eBay actually holds.
+        "quantity": quantity,
         "reselected_from": original_category_id if reselected else None,
         "reselected_from_name": category_name(original_category_id) if reselected else None,
     }
