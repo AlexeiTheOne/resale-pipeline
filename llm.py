@@ -80,6 +80,15 @@ def _suggested_delay(exc: "errors.APIError") -> float | None:
 FAST_RETRY_CODES = {500, 502, 504}
 FAST_RETRY_MAX = 6.0
 
+# Client-side transport failures — httpx.ReadTimeout when a call blows past
+# REQUEST_TIMEOUT_MS, plus dropped connections and protocol errors. These are
+# raised by the transport before any response exists, so they are NOT
+# errors.APIError and the retry loop below never saw them: one stalled socket on
+# the slow grounded research call failed the whole item outright, which is the
+# most likely failure mode there rather than an exotic one. Retried fewer times
+# than an APIError because each attempt can burn the full 180s timeout first.
+TRANSPORT_MAX_RETRIES = 3
+
 
 def _jitter(base: float) -> float:
     """Equal jitter: keep half the computed backoff as a floor, randomize the
@@ -145,11 +154,30 @@ def generate_with_retry(client, *, max_total_seconds: float | None = None, **kwa
     None (the default) for the fast calls, whose retries are cheap.
     """
     attempt = 0
+    transport_attempt = 0
     started = time.monotonic()
     while True:
         call_start = time.monotonic()
         try:
             return client.models.generate_content(**kwargs)
+        except httpx.TransportError as exc:
+            # Covers ReadTimeout/ConnectTimeout/ConnectError/RemoteProtocolError.
+            # Counted on its own budget so a request that keeps timing out at the
+            # full 180s can't stack six of those on top of the API-error retries.
+            took = time.monotonic() - call_start
+            elapsed = time.monotonic() - started
+            over_budget = max_total_seconds is not None and elapsed >= max_total_seconds
+            if transport_attempt >= TRANSPORT_MAX_RETRIES or over_budget:
+                reason = "time budget spent" if over_budget else "transport retries exhausted"
+                print(f"Gemini giving up ({reason}) after {took:.0f}s this call / "
+                      f"{elapsed:.0f}s total: {type(exc).__name__}: {exc}")
+                raise
+            transport_attempt += 1
+            delay = _jitter(min(1.5 * transport_attempt, FAST_RETRY_MAX))
+            print(f"Gemini {type(exc).__name__}: {exc} — after {took:.0f}s, retrying in "
+                  f"{delay:.0f}s (transport attempt {transport_attempt}/{TRANSPORT_MAX_RETRIES}, "
+                  f"{elapsed:.0f}s elapsed)")
+            time.sleep(delay)
         except errors.APIError as exc:
             took = time.monotonic() - call_start
             elapsed = time.monotonic() - started

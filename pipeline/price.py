@@ -40,11 +40,19 @@ def _call(url, payload, attempts=3):
     drops one now and then — mid-run connection resets and 5xx/429s are routine.
     The query ladder makes up to one call per rung, so a single un-retried blip
     would fail the whole pricing run; retrying here keeps a network hiccup from
-    costing the item its comps."""
+    costing the item its comps.
+
+    The token goes in an Authorization header, NOT the query string. httpx builds
+    HTTPStatusError's message as "... for url '<full url>'", query string
+    included, and three separate paths put str(e) into a Telegram message —
+    _run_stage's error reply, /pricecheck's, and the unprompted weekly digest.
+    A 402 (quota exhausted) or 404 (actor retired) leaves the token perfectly
+    valid and pastes it into a chat log that keeps it forever."""
     last = None
+    headers = {"Authorization": f"Bearer {APIFY_TOKEN}"} if APIFY_TOKEN else {}
     for attempt in range(attempts):
         try:
-            r = httpx.post(url, params={"token": APIFY_TOKEN}, json=payload, timeout=180)
+            r = httpx.post(url, headers=headers, json=payload, timeout=180)
             if r.status_code == 429 or r.status_code >= 500:
                 raise httpx.HTTPStatusError(
                     f"Apify returned {r.status_code}", request=r.request, response=r)
@@ -282,7 +290,12 @@ def _fetch_rung(query, brand, fetch_sold, fetch_active, comps_count, active_coun
     # Trim BEFORE capping to comps_count, so the cap keeps surviving comps rather
     # than truncating the pool the trim still needs to see.
     sold_comps = _iqr_trim(_brand_relevant(sold_comps))[:comps_count]
-    active_listings = _brand_relevant(active_listings)[:active_count]
+    # Sorted by price BEFORE the cap. active_floor downstream is min() of whatever
+    # survives this slice and is used as "the cheapest competitor we must undercut"
+    # — but the scraper returns rows in eBay's own order, so an unsorted slice made
+    # that floor a function of where a listing happened to land in the results.
+    # Pull the genuinely cheapest ACTIVE_COUNT and the floor means what it says.
+    active_listings = sorted(_brand_relevant(active_listings), key=lambda a: a["price"])[:active_count]
     sold_prices = sorted(c["price"] for c in sold_comps)
 
     return {

@@ -35,19 +35,36 @@ def _stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 
+# Snapshots are written under this prefix and renamed into place only once they
+# are complete. Two reasons a half-written file must never carry its final name:
+# prune() keeps the KEEP most recent by mtime, so a truncated snapshot from an
+# interrupted run counts as a keeper and evicts a good older one; and a restore
+# reaches for the newest file, which is exactly the broken one. The prefix is
+# deliberately outside prune()'s "ross-"/"inbox-" globs so leftovers can't be
+# mistaken for snapshots — _sweep_partials clears them at the start of each run.
+PARTIAL = ".partial-"
+
+
+def _sweep_partials(dest: Path) -> None:
+    for p in dest.glob(f"{PARTIAL}*"):
+        p.unlink(missing_ok=True)
+
+
 def backup_db(dest: Path) -> Path:
     if not DB_PATH.exists():
         raise FileNotFoundError(f"{DB_PATH} not found — nothing to back up.")
     out = dest / f"ross-{_stamp()}.db"
+    tmp = dest / f"{PARTIAL}{out.name}"
     src = sqlite3.connect(str(DB_PATH))
     try:
-        dst = sqlite3.connect(str(out))
+        dst = sqlite3.connect(str(tmp))
         try:
             src.backup(dst)  # consistent, WAL-safe online snapshot
         finally:
             dst.close()
     finally:
         src.close()
+    tmp.replace(out)
     return out
 
 
@@ -55,10 +72,12 @@ def backup_inbox(dest: Path) -> Path | None:
     if not INBOX.exists() or not any(p.is_file() for p in INBOX.rglob("*")):
         return None
     out = dest / f"inbox-{_stamp()}.zip"
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    tmp = dest / f"{PARTIAL}{out.name}"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
         for p in INBOX.rglob("*"):
             if p.is_file():
                 z.write(p, p.relative_to(INBOX.parent))
+    tmp.replace(out)
     return out
 
 
@@ -70,6 +89,7 @@ def prune(dest: Path, prefix: str, keep: int) -> None:
 
 def main() -> None:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    _sweep_partials(BACKUP_DIR)
 
     db_out = backup_db(BACKUP_DIR)
     print(f"[ok] DB backed up  -> {db_out} ({db_out.stat().st_size / 1024:.0f} KB)")

@@ -103,6 +103,24 @@ EBAY_RETURN_POLICY_ID = os.getenv("EBAY_RETURN_POLICY_ID")
 EBAY_MARKETPLACE_ID = "EBAY_US"
 EBAY_CURRENCY = "USD"
 
+# --- Listing copy -------------------------------------------------------------
+# The what-you-see-is-what-you-get promise, put in bold at the foot of every
+# description by ebay/inventory.py — just above the SHIPPING/RETURNS boilerplate,
+# so it's the last word on the item itself rather than a banner over it. It's
+# added there rather than by the copywriter so it's on EVERY listing identically —
+# including ones drafted before this existed — instead of being whatever the model
+# felt like writing that run. /refreshdesc pushes it to listings already live.
+#
+# The parenthetical is deliberately hedged. A manufacturer's catalog photo is
+# sometimes in the gallery and sometimes not, and it isn't reliably the last
+# image, so any wording that pins it down ("the final image is...") is wrong on
+# some listings. "May include" is true of every listing either way, which is what
+# a promise printed on all of them has to be. Set to "" to drop the line.
+WYSIWYG_NOTE = os.getenv(
+    "WYSIWYG_NOTE",
+    "WHAT YOU SEE IS WHAT YOU GET — you will receive the exact item photographed. "
+    "(Photos may include manufacturer's photos.)")
+
 # Promoted Listings (ads). The ad rate is a percentage of the final sale price
 # eBay charges only when the item sells via a promoted placement.
 EBAY_PROMOTED_CAMPAIGN_NAME = os.getenv("EBAY_PROMOTED_CAMPAIGN_NAME", "ross-auto-promoted")
@@ -118,6 +136,42 @@ EBAY_SHIP_FROM_ADDRESS = {
     "country": "US",
 }
 
+# --- Offers to watchers (/offers, ebay/negotiation.py) ---
+# A private discount to the people already watching an item.
+#
+# The gate is INTENT, not margin. A margin gate answers "can this item afford a
+# discount", which sounds prudent and picks the wrong listings: it sent offers to
+# two quiet duvets while excluding the best listing in the account — 9 watchers,
+# 5 units in stock, unsold for a month — purely because its margin was 41% rather
+# than 50%. Margin doesn't predict whether an offer converts; a watcher does. A
+# watcher is someone who found the item, saved it, and is waiting for a reason.
+#
+# So: offer where people are waiting, and protect the downside with a floor on
+# the money left afterwards rather than a floor on the ratio.
+OFFER_MIN_WATCHERS = int(os.getenv("OFFER_MIN_WATCHERS", "1"))
+# ...and only once the listing has had a fair run at its full price. Measured
+# median time-to-sell here is 9.8 days, and the three fastest sales on record all
+# closed inside a DAY at full price — so a watcher on a two-day-old listing is
+# still mid-decision, and discounting to them buys a sale that was probably
+# coming anyway. 14 days puts the listing past its own median before it's
+# treated as stuck.
+OFFER_MIN_DAYS_LIVE = int(os.getenv("OFFER_MIN_DAYS_LIVE", "14"))
+# What one unit must still net after the discount for the offer to be worth
+# making. $15 is roughly the point below which a sale stops paying for the
+# handling, and one return would wipe out several of them.
+OFFER_MIN_NET = float(os.getenv("OFFER_MIN_NET", "15"))
+# The discount itself, in dollars. Small items get the smaller one — $10 off a
+# $29.99 bag is a third of the price, which is a public price cut wearing a
+# private offer's clothes.
+OFFER_DISCOUNT_SMALL = float(os.getenv("OFFER_DISCOUNT_SMALL", "5"))
+OFFER_DISCOUNT_LARGE = float(os.getenv("OFFER_DISCOUNT_LARGE", "10"))
+OFFER_LARGE_THRESHOLD = float(os.getenv("OFFER_LARGE_THRESHOLD", "40"))
+# Note shown to the buyer with the offer. Kept short — eBay caps it at 250 chars.
+OFFER_MESSAGE = os.getenv(
+    "OFFER_MESSAGE",
+    "Thanks for watching! Here's a discount to save you a few dollars. "
+    "Ships within 1 business day.")
+
 # --- Weekly repricing (pipeline/reprice.py) ---
 # A listing needs at least this many weeks of eBay search exposure before its
 # traffic numbers are trusted for a diagnosis; a brand-new listing just hasn't
@@ -125,13 +179,36 @@ EBAY_SHIP_FROM_ADDRESS = {
 REPRICE_MIN_WEEKS_LIVE = int(os.getenv("REPRICE_MIN_WEEKS_LIVE", "1"))
 # Below this many impressions in the trailing week, the listing isn't being
 # surfaced in eBay search at all — a visibility problem, not a price problem.
+#
+# Kept at 50 against 194 measured weekly snapshots of this account: impressions
+# run a median of 185/week (p25 87, p90 627), so 50 fails only the bottom ~12%,
+# which is the intended rate. (docs/ebay-playbook.md proposes lowering this to
+# 23 on an assumed ~600 impressions/month; this account measures roughly 800, so
+# that recommendation doesn't apply here. Re-derive before changing it.)
 REPRICE_MIN_IMPRESSIONS = int(os.getenv("REPRICE_MIN_IMPRESSIONS", "50"))
-# Below this click-through rate (views / impressions), buyers see it in search
-# results but aren't clicking — points at the thumbnail/title/price, not comps.
-REPRICE_MIN_CTR = float(os.getenv("REPRICE_MIN_CTR", "0.01"))
-# Minimum trailing-week views before "zero watchers" is trusted as evidence the
+# Below this click-through rate, buyers see it in search results but aren't
+# clicking — points at the thumbnail/title/price, not comps.
+#
+# 0.0075 = half this account's own measured median CTR of 1.49% (179 snapshots,
+# p25 0.53% / p75 2.75%). An absolute benchmark borrowed from an SEO blog is the
+# wrong shape when the spread is that wide; half your own median is a listing
+# genuinely underperforming ITS catalogue.
+#
+# Was 0.01, and reprice.py compared it against eBay's own CLICK_THROUGH_RATE
+# field, which does NOT equal the views/impressions returned beside it — LOW_CTR
+# fired on listings measuring 3.4%, 3.6% and 4.6%. reprice.py now computes the
+# ratio itself from the two integers, so this threshold means what it says.
+REPRICE_MIN_CTR = float(os.getenv("REPRICE_MIN_CTR", "0.0075"))
+# Minimum CUMULATIVE views before "zero watchers" is trusted as evidence the
 # price itself is the problem, rather than just low traffic.
-REPRICE_MIN_VIEWS_FOR_SIGNAL = int(os.getenv("REPRICE_MIN_VIEWS_FOR_SIGNAL", "15"))
+#
+# Cumulative across every recorded week, NOT a single week. As a weekly figure
+# this was 15 against a measured median of 3 views/week (p90 11) — reached by 13
+# of 194 snapshots, which made OVERPRICED unreachable: it has never once fired.
+# 40 is still weak evidence on its own (at a 2-5% watch rate, 40 views yields
+# 0 watchers by chance ~30% of the time), which is why it only ever contributes
+# to a diagnosis rather than deciding one.
+REPRICE_MIN_VIEWS_FOR_SIGNAL = int(os.getenv("REPRICE_MIN_VIEWS_FOR_SIGNAL", "40"))
 # Weeks unsold after which a listing is flagged stale (and gets an escalating
 # suggested cut) regardless of what the traffic signals show.
 REPRICE_STALE_WEEKS = int(os.getenv("REPRICE_STALE_WEEKS", "4"))
@@ -164,8 +241,36 @@ EBAY_AD_FEE_PCT = float(os.getenv("EBAY_AD_FEE_PCT", "0.05"))
 # SET THESE TO YOUR REAL NUMBERS if your shipping differs — and if you ship free
 # (charge 0, pay postage), EBAY_SHIP_CHARGED must be 0 or the floor is wrong by
 # the full postage.
-EBAY_SHIP_CHARGED = float(os.getenv("EBAY_SHIP_CHARGED", "10.86"))
-EBAY_SHIP_COST = float(os.getenv("EBAY_SHIP_COST", "10.09"))
+#
+# Both re-measured 2026-08-16 against far more data than the n=10 medians above.
+# The postage figure was the badly wrong one: $10.09 against two INDEPENDENT
+# samples that agree closely — this account's 18 settled units at $7.20/unit, and
+# the previous account's full 2025 tax export, 156 units at $7.13/unit. 174 units
+# across two accounts is not a sampling accident; the old median was drawn from
+# ten orders and sat ~40% high.
+#
+# It matters because it lands in the break-even numerator directly: on a $13 Ross
+# item the floor was $18.00 and is $15.42 measured. The bot was refusing $2.58 of
+# perfectly profitable discount on every listing — the reason /offers and the
+# repricer kept reporting "already at the floor" on items with room left.
+#
+# (EBAY_FVF_PCT and ASSUMED_COST_RATIO were checked the same way and are RIGHT:
+# 15.50% and 0.28 measured on this account against 0.155 and 0.29 configured. The
+# old account measures 16.49% / 0.38 — a different category and buying mix, so
+# don't import those. EBAY_AD_FEE_PCT can't be re-derived here, since eBay posts
+# ad spend as account-level charges with no order id; the old account's 2025
+# export puts it at 3.77% of item sales against the 5.0% configured, which if it
+# holds here means the floor is still a little conservative.)
+EBAY_SHIP_CHARGED = float(os.getenv("EBAY_SHIP_CHARGED", "9.88"))
+EBAY_SHIP_COST = float(os.getenv("EBAY_SHIP_COST", "7.20"))
+# What to assume an item cost at Ross when no receipt was captured. Items with no
+# receipt used to be costed at ZERO, which reported their entire sale price as
+# profit — one showed a 68% margin purely because its cost was missing. A share of
+# the list price beats a flat guess: across 63 items with a known cost it lands at
+# a median 29% of list (p25 22%, p75 34%), so it scales with the item instead of
+# costing a $110 listing the same as a $30 one. Always presented as an estimate —
+# profit.py flags it, report.py colours the cell orange.
+ASSUMED_COST_RATIO = float(os.getenv("ASSUMED_COST_RATIO", "0.29"))
 # Smallest NET margin (after eBay fees, ad rate, and shipping) a repricing
 # suggestion may land on — never suggest a cut that sells at a loss.
 REPRICE_MIN_MARGIN_DOLLARS = float(os.getenv("REPRICE_MIN_MARGIN_DOLLARS", "5"))

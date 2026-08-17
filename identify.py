@@ -420,6 +420,13 @@ def identify_item(image_paths: list[str], scan_paths: list[str] | None = None) -
     # The decoded barcode is exact — trust it over whatever digits the model read.
     if upcs:
         result["upc"] = upcs[0]
+    # Whether that UPC came off a barcode or out of the model's eyes. The two are
+    # not remotely the same evidence: a decoded barcode is ground truth, while a
+    # model-read one is the least reliable field on this whole object (long digit
+    # strings under glare are exactly what vision models fumble — see
+    # _tag_signals). telegram_bot.py lowers the auto-confirm bar when a UPC is
+    # present, so it has to be able to tell which kind it's holding.
+    result["upc_decoded"] = bool(upcs)
 
     # Safety net: downstream pricing requires a search_query.
     if not result.get("search_query"):

@@ -30,7 +30,15 @@ def retry_publish(arg: str) -> None:
         print(" -> still failing:", e)
         return
 
-    update_field(item_id, "ebay", result)
+    # MERGE, don't replace. create_draft_offer returns only what it just made
+    # (sku, offer_id, quantity); writing that over the whole blob wipes every
+    # other key on it — listing_id, view_item_url, published_at, and on a retry
+    # after a partial sale the sale_price/order_ids/units_sold that /report and
+    # /profit are computed from. Losing those silently reports the money as never
+    # having come in.
+    ebay = dict((get_item(item_id) or {}).get("ebay") or {})
+    ebay.update(result)
+    update_field(item_id, "ebay", ebay)
     update_status(item_id, "ebay_draft")
     print(f" -> draft created: SKU {result['sku']}, offer {result['offer_id']}")
 

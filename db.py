@@ -13,7 +13,7 @@ VALID_STATUSES = [
 
 VALID_FIELDS = [
     "identification", "pricing", "listing", "ebay", "photos", "processed",
-    "price_source_url", "receipt",
+    "price_source_url", "receipt", "photo_layout",
 ]
 
 # Columns added after the initial schema shipped. Each is created with an
@@ -21,6 +21,10 @@ VALID_FIELDS = [
 _MIGRATIONS = {
     "price_source_url": "TEXT",  # link to the comp the suggested price is anchored to
     "receipt": "TEXT",           # OCR'd Ross receipt: cost, original price, 12-digit code
+    # {"manual": true} once /cover or /arrange has set the photo order by hand.
+    # Without it the listing builder would keep applying its own reorder (tag
+    # photo to the end) and quietly undo the arrangement on the next rebuild.
+    "photo_layout": "TEXT",
 }
 
 
@@ -45,7 +49,7 @@ def _row_to_dict(row, cursor):
     keys = [d[0] for d in cursor.description]
     d = dict(zip(keys, row))
     for field in ("photos", "processed", "identification", "pricing", "listing",
-                  "ebay", "price_source_url", "receipt"):
+                  "ebay", "price_source_url", "receipt", "photo_layout"):
         if d.get(field) is not None:
             d[field] = json.loads(d[field])
     return d

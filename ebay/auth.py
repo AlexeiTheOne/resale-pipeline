@@ -37,6 +37,11 @@ SCOPES = [
     # them, so re-run `python -m ebay.auth` after adding them.
     "https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly",
     "https://api.ebay.com/oauth/api_scope/sell.finances",
+    # Offers to watchers (ebay/negotiation.py, the /offers command). Same
+    # re-consent caveat as every scope above: a token issued before this line
+    # won't carry it, and sendOfferToInterestedBuyers will 403 until you re-run
+    # `python -m ebay.auth`.
+    "https://api.ebay.com/oauth/api_scope/sell.negotiation",
 ]
 
 DB_PATH = "data/ross.db"
