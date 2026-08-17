@@ -26,6 +26,22 @@ SYSTEM_PROMPT = (
     "You never claim an item is new if condition flags suggest otherwise."
 )
 
+# The word "authentic" is deliberately absent, and must stay absent.
+#
+# It used to appear twice here ("we specialize in authentic brand-name items…
+# All items are 100% authentic"), which put it on 109 of 114 live listings.
+# Claiming authenticity as a selling point is a documented VeRO trigger: it is
+# exactly the phrasing rights owners' automated sweeps look for, and a VeRO
+# takedown is a listing removal with no appeal path to eBay (only to the rights
+# owner), escalating to account restriction on repeats. It also appears in NO
+# traffic report, so a listing that vanished this way looks like a mystery.
+# Michael Kors, Coach, Kate Spade and Ralph Lauren — most of this catalogue —
+# are active VeRO participants. See docs/ebay-playbook.md §1.
+#
+# The same paragraph is also worth nothing: eBay's default search does not index
+# description body text (it's the opt-in "Title and description" checkbox), so
+# store boilerplate buys zero discoverability and only adds page weight above
+# the fold on mobile, where item specifics render before the description.
 STORE_BOILERPLATE = """
 SHIPPING:
 Ships within 1 business day via USPS with tracking number.
@@ -35,9 +51,7 @@ RETURNS:
 30-day return policy. Buyer pays return shipping.
 Item must be in original condition with tags attached.
 
-ABOUT US:
-Thank you for visiting our store! We specialize in authentic brand-name items at competitive prices. All items are 100% authentic and exactly as described.
-Questions? Feel free to message us - we typically respond within 24 hours!
+Message us with any questions — we typically reply within 24 hours.
 """
 
 SCHEMA_INSTRUCTIONS = """Generate an eBay listing as a valid JSON object matching this exact schema:
@@ -62,6 +76,13 @@ SCHEMA_INSTRUCTIONS = """Generate an eBay listing as a valid JSON object matchin
 
 Rules:
 - title MUST be under 80 characters. Count carefully. Never use ALL CAPS.
+- NEVER describe the item as "authentic", "100% authentic", "genuine article" or
+  "guaranteed genuine", in the title or the description — not even as the opening
+  adjective ("Authentic Michael Kors ..."). Claiming authenticity is what rights
+  owners' automated brand-protection sweeps look for, and it gets listings pulled
+  under VeRO with no appeal path to eBay. State what the item IS; never argue that
+  it is real. ("Genuine Leather" as a MATERIAL is fine — that is a different word
+  doing a different job.)
 - price: use the provided suggested_price exactly.
 - condition_id mapping: 1000=New with tags, 1500=New without tags, 2750=Like new, 3000=Good, 4000=Fair
 - description must mention any condition_flags honestly.
@@ -98,6 +119,9 @@ Rules for item_specifics:
 description: Keep it lightweight and scannable — bullets over paragraphs, no
 marketing fluff. Use this structure:
 - One short opening line summarizing the item (a single sentence, not a paragraph).
+- Do NOT write a "what you see is what you get" line yourself. It is added in bold
+  above the SHIPPING section of every listing automatically, and writing your own
+  only pushes the bold one out (see WYSIWYG_NOTE in config.py).
 - SPECIFICATIONS: short bullet list — brand, color, material, size/dimensions.
 - FEATURES: 3-5 one-line bullets with ✓ (concise, no filler).
 - CONDITION: one short bullet on condition and any flags.
