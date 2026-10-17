@@ -157,8 +157,6 @@ def main():
     ap.add_argument("--compare-csv", default="",
                     help="comma-separated earlier backtest CSVs; their v2_price is scored "
                          "as 'previous' (later files win per item)")
-    ap.add_argument("--broad-count", type=int,
-                    help="rows for the broad brand + item-type sold query")
     ap.add_argument("--one-sold-query", action="store_true",
                     help="for items not already cached, send only the search_query "
                          "sold query to Apify (cached queries are still used)")
@@ -169,8 +167,6 @@ def main():
     prefixes = [p.strip() for p in (args.items or "").split(",") if p.strip()]
     items = load_items(prefixes, args.limit)
     v2.apify_cap_usd = args.apify_cap
-    if args.broad_count:
-        v2.config.PRICING_V2_BROAD_SOLD_COUNT = args.broad_count
     from pipeline import msrp as msrp_mod
     history = msrp_mod.load_history()
     previous = {}

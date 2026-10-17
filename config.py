@@ -360,7 +360,7 @@ GEMINI_PRICES = [
 # --- Pricing engine v2 (pipeline/pricing_v2.py, docs/pricing-design.md) ---------
 # "v2" pools sold + active comps, has Claude judge
 # which are the same item and set the price, with the comp formula and the
-# store's MSRP range as cross-checks. On the 40-item outcome backtest it hit
+# store's MSRP range as cross-checks computed after Claude answers. On the 40-item outcome backtest it hit
 # about 21/39 against v1's 13/39 (v1 priced a median 26% under the sold
 # price). "v1" is the old comps ladder in pipeline/price.py: set
 # PRICING_ENGINE=v1 in .env to go back. The weekly repricer still uses v1.
@@ -386,9 +386,6 @@ UNDERCUT_V2_PCT = float(os.getenv("UNDERCUT_V2_PCT", "0.05"))
 # FREE Apify tier, plus $0.0001 per run start), and v2 runs up to 3 queries.
 PRICING_V2_SOLD_COUNT = int(os.getenv("PRICING_V2_SOLD_COUNT", "15"))
 PRICING_V2_ACTIVE_COUNT = int(os.getenv("PRICING_V2_ACTIVE_COUNT", "30"))
-# The broad brand + item-type sold query brings mostly variants; it can be held
-# smaller than the specific ones to keep its per-result Apify bill down.
-PRICING_V2_BROAD_SOLD_COUNT = int(os.getenv("PRICING_V2_BROAD_SOLD_COUNT", "15"))
 PRICING_V2_IMAGE_COUNT = int(os.getenv("PRICING_V2_IMAGE_COUNT", "20"))
 # Most candidates sent to the judge in one call (sold kept first).
 PRICING_V2_MAX_CANDIDATES = int(os.getenv("PRICING_V2_MAX_CANDIDATES", "60"))

@@ -206,35 +206,24 @@ def identity_record(ident: dict, receipt: dict | None = None) -> dict:
         "condition", "search_query")}
     rec["style_code"] = style_code(ident)
     rec["upc"] = upc_of(ident)
+    if ident.get("retail_price"):
+        rec["retail_price_from_research"] = ident.get("retail_price")
     # receipt: only reduced_price (our cost) is meaningful and it is not a market
     # signal; original_price is Ross's pre-markdown price and code/barcode are
     # Ross's own numbers. Nothing from it is sent to the judge or searched.
     return rec
 
 
-def broad_query(ident: dict) -> str | None:
-    """brand + item type, plus the size for watch bands (band sizes do not
-    fit each other, so a 38mm sale says little about a 45mm band)."""
-    brand, item_type = _clean(ident.get("brand")), _clean(ident.get("item_type"))
-    if not brand or not item_type:
-        return None
-    q = f"{brand} {item_type}"
-    size = _clean(ident.get("size"))
-    if size and re.search(r"\bband|strap", item_type.lower()) and len(size) <= 20:
-        q += f" {size}"
-    return q
-
-
 def sold_queries(ident: dict) -> list[tuple[str, str]]:
-    """(a) the identification's search_query, (b) brand + product name, (c) a
-    broad brand + item type query. Pooled, not a ladder: (c) mostly brings
-    variants, which are the fallback evidence when no same-item sale exists."""
     brand = _clean(ident.get("brand"))
     product = _clean(ident.get("product_name"))
-    out = [("search_query", _clean(ident.get("search_query")))]
+    code = style_code(ident)
+    out = []
+    if code:
+        out.append(("code", f"{brand} {code}".strip()))
+    out.append(("search_query", _clean(ident.get("search_query"))))
     if brand and product:
         out.append(("product", f"{brand} {product}"))
-    out.append(("broad", broad_query(ident) or ""))
     seen, ladder = set(), []
     for name, q in out:
         if q and q.lower() not in seen:
@@ -409,7 +398,6 @@ def calibration_examples(exclude_item_id: str | None, n: int = 15) -> list[dict]
         rows.append({"item_id": item_id, "brand": ident.get("brand"),
                      "item": _clean(ident.get("product_name") or ident.get("item_type"))[:60],
                      "type": _clean(ident.get("item_type"))[:40],
-                     "msrp": v1._to_float(ident.get("retail_price")),
                      "sold_price": round(e["sale_price"] / max(1, e.get("units_sold") or 1), 2)})
     if not rows:
         return []
@@ -433,12 +421,7 @@ Label every candidate:
 
 Judge from the title AND the thumbnail when one is shown; the thumbnail decides colour and pattern. Do not guess same_item from a vague title.
 
-Then give claude_price: the ITEM price (excluding shipping) you would list this item at as a Buy It Now, to sell within about two weeks. Order of evidence:
-1. same_item SOLD comps.
-2. If there are none: near-identical variant SOLD comps (same line, different colour or size). Prefer these over active asks.
-3. ACTIVE listings are asking prices, not sales: treat the cheapest comparable active as a CEILING a buyer can undercut us with, never as a target. Many actives sit unsold for months.
-4. The RESEARCH block (a web search) is weak evidence: it mixes asks, sales, used items and other sites. The STORE RANGE is a sanity check, not evidence: never price from it.
-Use this store's past sales below to calibrate what its stock actually sells for. Your price is the one we list at, so make it the price you believe in. confidence: high when several same_item sold comps agree, medium when the evidence is thin or only variants, low when you could not find the item. evidence: the 3-5 candidate ids your price leans on most, strongest first. reasoning: one line. disagreements: short notes where sources conflict (e.g. sold vs active, identity record vs photo, research retail vs comps); empty list if none.
+Then give claude_price: the ITEM price (excluding shipping) you would list this item at as a Buy It Now, to sell within about two weeks. Base it on same_item SOLD comps first, then variants, then actives, and use this store's past sales below to calibrate what its stock actually sells for. Your price is the one we list at, so make it the price you believe in. confidence: high when several same_item sold comps agree, medium when the evidence is thin or only variants, low when you could not find the item. evidence: the 3-5 candidate ids your price leans on most, strongest first. reasoning: one line. disagreements: short notes where sources conflict (e.g. sold vs active, identity record vs photo, research retail vs comps); empty list if none.
 
 This store's past sales (brand | item | sold item price, shipping excluded):
 {calibration}"""
@@ -493,8 +476,7 @@ def _candidate_line(c: dict) -> str:
 
 
 def build_judge_request(identity: dict, cands: list[dict], photo: bytes | None,
-                        calibration: list[dict], thumbnails: bool = True,
-                        context: str | None = None):
+                        calibration: list[dict], thumbnails: bool = True):
     """(system blocks, user content blocks). The system text depends only on the
     calibration set and the shipping constant, so it is identical from item to
     item and is marked for prompt caching."""
@@ -505,8 +487,6 @@ def build_judge_request(identity: dict, cands: list[dict], photo: bytes | None,
                "cache_control": {"type": "ephemeral"}}]
     content = [{"type": "text", "text": "ITEM identity record:\n" +
                 json.dumps({k: v for k, v in identity.items() if v}, indent=1)}]
-    if context:
-        content.append({"type": "text", "text": context})
     if photo:
         content.append({"type": "text", "text": "Our photo of the item:"})
         content.append(_image_block((photo, "image/jpeg")))
@@ -520,8 +500,7 @@ def build_judge_request(identity: dict, cands: list[dict], photo: bytes | None,
     return system, content
 
 
-def judge(identity, cands, photo, calibration, *, item_id=None, ask=None,
-          context: str | None = None) -> dict:
+def judge(identity, cands, photo, calibration, *, item_id=None, ask=None) -> dict:
     """One Claude call, escalated once on low confidence. Returns the parsed
     answer plus model / escalated / thumbnails_used."""
     import anthropic
@@ -529,8 +508,7 @@ def judge(identity, cands, photo, calibration, *, item_id=None, ask=None,
     ask = ask or claude_llm.ask
 
     def call(model, thumbnails, note=None):
-        system, content = build_judge_request(identity, cands, photo, calibration, thumbnails,
-                                              context)
+        system, content = build_judge_request(identity, cands, photo, calibration, thumbnails)
         if note:
             content.append({"type": "text", "text": note})
         judge_stats["calls"] += 1
@@ -641,9 +619,7 @@ def gather_candidates(ident: dict, photo_paths=None) -> dict:
         kept_q = [(n, q) for n, q in queries if n in allowed or sold_is_cached(q)]
         skipped = [q for n, q in queries if (n, q) not in kept_q]
         queries = kept_q
-    jobs = {f"sold:{name}": (fetch_sold, (q, config.PRICING_V2_BROAD_SOLD_COUNT
-                                         if name == "broad" else None))
-            for name, q in queries}
+    jobs = {f"sold:{name}": (fetch_sold, (q,)) for name, q in queries}
     if aq:
         jobs["active:text"] = (fetch_active, (aq, None))
     if gtin:
@@ -693,27 +669,6 @@ STORE_RANGE_SLACK = 0.25
 STORE_RANGE_MIN_N = 4
 
 
-def context_text(store: dict | None, ident: dict) -> str:
-    """STORE RANGE (sanity check only) and RESEARCH blocks for the judge."""
-    lines = []
-    if store and store.get("range_low") and store.get("range_high"):
-        flags = ", ".join(store.get("msrp_flags") or [])
-        lines.append("STORE RANGE (sanity check only; do NOT anchor on it):")
-        lines.append(f"- MSRP ${store['msrp']:g}" + (f" (doubtful: {flags})" if flags else "")
-                     + f"; {store['n']} past sale(s) ({store['level']} '{store['key']}') fetched "
-                     f"{store['q1']:.0%}-{store['q3']:.0%} of MSRP, i.e. "
-                     f"${store['range_low']:.2f}-${store['range_high']:.2f}. Price from the comps; "
-                     "this is only to notice when something is far off.")
-    ev = ident.get("price_evidence") or []
-    if ev or ident.get("resale_estimate"):
-        lines.append("RESEARCH (web search by another model; weak evidence):")
-        if ident.get("resale_estimate"):
-            lines.append(f"- its resale estimate: ${ident['resale_estimate']}")
-        for e in ev[:8]:
-            lines.append(f"- {e.get('source') or '?'}: ${e.get('price')} {(e.get('note') or '')[:60]}".rstrip())
-    return "\n".join(lines)
-
-
 def _pct_apart(a: float, b: float) -> float:
     return abs(a - b) / min(a, b) if a > 0 and b > 0 else float("inf")
 
@@ -729,6 +684,10 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
     from pipeline import msrp as msrp_mod
     ident = identification or {}
     identity = identity_record(ident, receipt)
+    # The store's MSRP range is NEVER shown to the judge: shown as an estimate
+    # (round 3) or as a range (round 4) it pulled prices down, 20/39 and 16/32
+    # outcome hits against round 2's 21/39 and 19/32. It is only checked in code
+    # after Claude answers (outside_store_range).
     try:
         store = msrp_mod.store_estimate(ident, receipt, exclude_item_id=item_id)
     except Exception as e:      # history is advisory; never lose the item over it
@@ -742,8 +701,7 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
     verdict_map, j = {}, None
     if cands:
         photo = _photo_bytes(g["photo"]) if g["photo"] else None
-        j = judge(identity, cands, photo, calibration_examples(item_id), item_id=item_id, ask=ask,
-                  context=context_text(store, ident))
+        j = judge(identity, cands, photo, calibration_examples(item_id), item_id=item_id, ask=ask)
         verdict_map = {x["id"]: x["verdict"] for x in j.get("judgments", [])}
         missing = [c["id"] for c in cands if c["id"] not in verdict_map]
         if missing:

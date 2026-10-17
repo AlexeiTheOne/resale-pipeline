@@ -80,37 +80,18 @@ def test_ratio_table_sorted_by_sales():
     assert table[0]["brand"] == "ralph lauren" and table[0]["n"] == 3
 
 
-# --- pricing_v2 round-3 additions ------------------------------------------------
+# --- pricing_v2: the range is a code-side check only ---------------------------
 
-def test_three_sold_queries_with_broad_band_size():
-    ident = {"brand": "Kate Spade", "product_name": "Scallop Link", "item_type": "Apple Watch Band",
-             "size": "38/40mm", "search_query": "Kate Spade Scallop Link Apple Watch Band 38mm"}
-    assert v2.sold_queries(ident) == [
-        ("search_query", "Kate Spade Scallop Link Apple Watch Band 38mm"),
-        ("product", "Kate Spade Scallop Link"),
-        ("broad", "Kate Spade Apple Watch Band 38/40mm")]
-    tote = {"brand": "DKNY", "item_type": "Tote Bag", "size": "Large", "search_query": "DKNY tote"}
-    assert v2.broad_query(tote) == "DKNY Tote Bag"
+def test_judge_never_sees_msrp_range():
+    import inspect
+    assert not hasattr(v2, "context_text") and not hasattr(v2, "broad_query")
+    assert "context" not in inspect.signature(v2.judge).parameters
 
 
-def test_context_gives_store_range_not_an_estimate_and_weak_research():
-    store = {"msrp": 150.0, "msrp_flags": ["equals_ross_tag_price"], "level": "brand",
-             "key": "ralph lauren", "n": 13, "ratio": 0.378, "q1": 0.33, "q3": 0.47,
-             "estimate": 55.99, "range_low": 49.5, "range_high": 70.5}
-    ident = {"resale_estimate": 60, "price_evidence": [{"source": "ebay sold", "price": 49.99,
-                                                        "note": "one sale"}]}
-    text = v2.context_text(store, ident)
-    assert "do NOT anchor" in text and "MSRP $150 (doubtful: equals_ross_tag_price)" in text
-    assert "13 past sale(s) (brand 'ralph lauren') fetched 33%-47% of MSRP" in text
-    assert "$49.50-$70.50" in text
-    assert "55.99" not in text                    # the point estimate is never shown
-    assert "weak evidence" in text and "ebay sold: $49.99 one sale" in text
-
-
-def test_store_estimate_gives_iqr_range():
-    est = msrp.store_estimate({"brand": "Ralph Lauren", "item_type": "Sham", "retail_price": 100},
-                              None, history=HISTORY)
-    assert (est["range_low"], est["range_high"]) == (100 * est["q1"], 100 * est["q3"])
+def test_round_two_sold_queries():
+    ident = {"brand": "Kate Spade", "product_name": "Scallop Link", "model": "KSS0089",
+             "item_type": "Apple Watch Band", "search_query": "Kate Spade Scallop Link KSS0089"}
+    assert [n for n, _ in v2.sold_queries(ident)] == ["code", "search_query", "product"]
 
 
 # --- backtest outcome scoring ---------------------------------------------------
