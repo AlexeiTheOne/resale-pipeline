@@ -313,7 +313,7 @@ def generate_draft(identification: dict, pricing: dict, examples: list | None = 
     # draft step on 429 retries. thinking_budget caps reasoning tokens so the schema
     # JSON always has room within max_output_tokens.
     response = generate_with_retry(
-        client,
+        client, stage="draft",
         model=MODEL,
         contents=user_message,
         config=types.GenerateContentConfig(
@@ -385,7 +385,7 @@ def revise_draft(current_draft: dict, correction: str,
         "\n\nReturn the full updated listing as JSON matching the same schema."
     )
     response = generate_with_retry(
-        client,
+        client, stage="draft_revise",
         model=MODEL,
         contents=user_message,
         config=types.GenerateContentConfig(
@@ -448,7 +448,7 @@ def revise_identification(current: dict, correction: str) -> dict:
         "\n\nReturn the full updated identification as JSON with the same fields."
     )
     response = generate_with_retry(
-        client,
+        client, stage="identification_revise",
         model=MODEL,
         contents=user_message,
         config=types.GenerateContentConfig(

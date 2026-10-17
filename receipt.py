@@ -353,7 +353,7 @@ def vision_read_tag(image_path: str) -> dict:
         part = types.Part.from_bytes(data=Path(image_path).read_bytes(),
                                      mime_type="image/jpeg")
         response = generate_with_retry(
-            make_client(), model=GEMINI_FAST_MODEL,
+            make_client(), stage="tag_vision", model=GEMINI_FAST_MODEL,
             contents=[part, types.Part.from_text(text=_VISION_PROMPT)])
         text = re.sub(r"^```(?:json)?|```$", "", response_text(response, "tag").strip(),
                       flags=re.M).strip()
@@ -435,7 +435,7 @@ def detect_ross_tags(paths: list[str]) -> set[int]:
             parts = [types.Part.from_bytes(data=Path(p).read_bytes(),
                                            mime_type="image/jpeg") for p in chunk]
             response = generate_with_retry(
-                client, model=GEMINI_FAST_MODEL,
+                client, stage="tag_detect", model=GEMINI_FAST_MODEL,
                 contents=[*parts, types.Part.from_text(text=_DETECT_PROMPT)])
             text = re.sub(r"^```(?:json)?|```$", "",
                           response_text(response, "tag-detect").strip(), flags=re.M).strip()
