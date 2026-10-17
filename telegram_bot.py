@@ -1705,7 +1705,43 @@ _EVIDENCE_LABEL = {
 }
 
 
+def _short(text: str, n: int = 50) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+
+
+def _format_pricing_v2(pricing: dict) -> str:
+    """Pricing v2 (pipeline/pricing_v2.py): Claude's price leads, with the comps
+    it leaned on, so the price can be checked from the phone in one glance."""
+    sp = pricing.get("suggested_price")
+    head = f"💰 Suggested price: ${sp}" if sp is not None else "💰 Price: none — type one"
+    conf = pricing.get("claude_confidence") or "none"
+    if pricing.get("price_basis") == "manual":
+        lines = [f"{head}  (typed; Claude said ${_fmt(pricing.get('claude_price'))}, {conf})"]
+    else:
+        lines = [f"{head}  (Claude, {conf} confidence)"]
+    ev = pricing.get("claude_evidence") or {}
+    if ev.get("reason"):
+        lines.append(f"  {ev['reason']}")
+    for c in ev.get("comps") or []:
+        kind = "sold" if c.get("source") == "sold" else "active"
+        line = f"  • ${c.get('price')} {kind} — {_short(c.get('title'))}"
+        if c.get("url"):
+            line += f"\n    {c['url'].split('?')[0]}"
+        lines.append(line)
+    n_same = pricing.get("same_item_sold_count") or 0
+    tail = f"  {n_same} same-item sale(s) of {pricing.get('candidate_count') or 0} comps"
+    if pricing.get("formula_price"):
+        tail += f"; formula ${pricing['formula_price']}"
+    lines.append(tail + " (comp prices include shipping)")
+    if pricing.get("comp_warning"):
+        lines.append(f"  ⚠️ {pricing['comp_warning']}")
+    return "\n".join(lines)
+
+
 def format_pricing(pricing: dict) -> str:
+    if pricing.get("engine") == "v2":
+        return _format_pricing_v2(pricing)
     sp = pricing.get("suggested_price")
     head = f"💰 Suggested price: ${sp}" if sp is not None else "💰 Price: none — type one"
     lines = [head]

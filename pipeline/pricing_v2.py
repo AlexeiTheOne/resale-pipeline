@@ -19,11 +19,15 @@ Flow
      an exact match against one of our listing titles.
   2. One Claude call (PRICING_JUDGE_MODEL) labels each candidate same_item /
      variant / wrong / bundle from its title and thumbnail, with one of our
-     photos and ~15 of the owner's past prices for calibration, and gives its
-     own price and confidence. Low confidence re-asks PRICING_ESCALATE_MODEL.
-  3. Price, in code, from same_item SOLD comps only: median, less
+     photos and ~15 of this store's past SALES (sold price) for calibration,
+     and gives its price, confidence and the 3-5 candidates it leaned on.
+     Low confidence re-asks PRICING_ESCALATE_MODEL.
+  3. Claude's price (.99) is the suggested price. The formula is a
+     cross-check, computed only with >= 3 same_item SOLD comps: median, less
      UNDERCUT_V2_PCT, capped at the cheapest same_item active listing, .99.
-     Evidence grade by how many same_item sold comps there are.
+     If the two differ by more than 20% the item is flagged formula_disagrees.
+     (The 17 Oct pilot found 0-1 same_item sold comps on all 10 items, so a
+     formula-first price was almost never available.)
 
 Price basis: item + shipping, what the buyer pays
   Our listings charge the buyer shipping (EBAY_SHIP_CHARGED, ~$9.99 flat on
@@ -68,6 +72,8 @@ NEW_CONDITION_IDS = (1000, 1500)   # New / New with tags, New other (no tags, op
 MIN_PRICE, MAX_PRICE = 3.0, 2000.0
 THUMB_SIZE = "s-l225"
 VERDICTS = ("same_item", "variant", "wrong", "bundle")
+# Claude's price vs the formula's: past this relative gap the item is flagged.
+FORMULA_DISAGREE_PCT = 0.20
 
 
 class ApifyBudgetExceeded(RuntimeError):
@@ -80,6 +86,10 @@ _lock = threading.Lock()
 apify_spend = {"calls": 0, "rows": 0, "usd": 0.0, "cache_hits": 0}
 apify_cap_usd: float | None = None
 judge_stats = {"calls": 0, "escalations": 0, "thumbnail_fallbacks": 0}
+# Which sold queries (by name: "code", "search_query", "product") may go to
+# Apify when their result is not cached. None = all of them. The backtest
+# narrows it to keep a large run cheap; cached results are always used.
+uncached_sold_queries: set | None = None
 
 
 def _apify_estimate(rows: int) -> float:
@@ -114,6 +124,14 @@ def _cached(kind: str, key: str, fetch):
 
 # --- fetchers ---------------------------------------------------------------
 
+def _sold_key(query: str, count: int) -> str:
+    return json.dumps({"keyword": query, "count": count}, sort_keys=True)
+
+
+def sold_is_cached(query: str, count: int | None = None) -> bool:
+    return _cache_path("sold", _sold_key(query, count or config.PRICING_V2_SOLD_COUNT)).exists()
+
+
 def fetch_sold(query: str, count: int | None = None) -> list[dict]:
     count = count or config.PRICING_V2_SOLD_COUNT
     payload = {"keyword": query, "count": count}
@@ -132,7 +150,7 @@ def fetch_sold(query: str, count: int | None = None) -> list[dict]:
             apify_spend["usd"] += _apify_estimate(len(rows))
         return rows
 
-    return _cached("sold", json.dumps(payload, sort_keys=True), go)
+    return _cached("sold", _sold_key(query, count), go)
 
 
 def fetch_active(query: str | None = None, gtin: str | None = None) -> list[dict]:
@@ -354,26 +372,24 @@ def own_listings() -> tuple[set, set]:
 
 
 def calibration_examples(exclude_item_id: str | None, n: int = 15) -> list[dict]:
-    """~n past owner pricing decisions, chosen deterministically (evenly spaced
-    by item id) so the judge's prompt prefix is the same from call to call.
-    One spare is drawn so excluding the item being priced still leaves n."""
+    """~n past SALES: what this store's stock actually sold for, per unit.
+    Unsold listed prices are left out: a price nobody has paid yet says what
+    the owner hoped for, not what the market pays, and the judge copied them.
+    Chosen deterministically (evenly spaced by item id) so the judge's prompt
+    prefix is the same from call to call; one spare is drawn so excluding the
+    item being priced still leaves n."""
     rows = []
-    for item_id, status, ident_json, listing_json, ebay_json in _db_rows(
-            "SELECT item_id, status, identification, listing, ebay FROM items "
-            "WHERE status IN ('published','sold') ORDER BY item_id"):
-        lst = json.loads(listing_json or "{}")
-        if not lst.get("price"):
+    for item_id, ident_json, ebay_json in _db_rows(
+            "SELECT item_id, identification, ebay FROM items "
+            "WHERE status = 'sold' ORDER BY item_id"):
+        e = json.loads(ebay_json or "{}")
+        if not e.get("sale_price"):
             continue
         ident = json.loads(ident_json or "{}")
-        e = json.loads(ebay_json or "{}")
-        sold_unit = None
-        if e.get("sale_price"):
-            sold_unit = round(e["sale_price"] / max(1, e.get("units_sold") or 1), 2)
         rows.append({"item_id": item_id, "brand": ident.get("brand"),
                      "item": _clean(ident.get("product_name") or ident.get("item_type"))[:60],
                      "type": _clean(ident.get("item_type"))[:40],
-                     "owner_price": lst["price"], "sold": status == "sold",
-                     "sold_price": sold_unit})
+                     "sold_price": round(e["sale_price"] / max(1, e.get("units_sold") or 1), 2)})
     if not rows:
         return []
     step = max(1, len(rows) // (n + 1))
@@ -396,9 +412,9 @@ Label every candidate:
 
 Judge from the title AND the thumbnail when one is shown; the thumbnail decides colour and pattern. Do not guess same_item from a vague title.
 
-Then give claude_price: the ITEM price (excluding shipping) you would list this item at as a Buy It Now, to sell within about two weeks. Base it on same_item SOLD comps first, then variants, then actives, and use the owner's past decisions below to calibrate how this store prices. confidence: high when several same_item sold comps agree, medium when the evidence is thin or only variants, low when you could not find the item. reasoning: one line. disagreements: short notes where sources conflict (e.g. sold vs active, identity record vs photo, research retail vs comps); empty list if none.
+Then give claude_price: the ITEM price (excluding shipping) you would list this item at as a Buy It Now, to sell within about two weeks. Base it on same_item SOLD comps first, then variants, then actives, and use this store's past sales below to calibrate what its stock actually sells for. Your price is the one we list at, so make it the price you believe in. confidence: high when several same_item sold comps agree, medium when the evidence is thin or only variants, low when you could not find the item. evidence: the 3-5 candidate ids your price leans on most, strongest first. reasoning: one line. disagreements: short notes where sources conflict (e.g. sold vs active, identity record vs photo, research retail vs comps); empty list if none.
 
-Owner's past pricing decisions (brand | item | owner's listed item price | outcome):
+This store's past sales (brand | item | sold item price, shipping excluded):
 {calibration}"""
 
 JUDGE_SCHEMA = {
@@ -411,20 +427,20 @@ JUDGE_SCHEMA = {
             "required": ["id", "verdict"]}},
         "claude_price": {"type": "number"},
         "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "evidence": {"type": "array", "items": {"type": "string"}},
         "reasoning": {"type": "string"},
         "disagreements": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["judgments", "claude_price", "confidence", "reasoning", "disagreements"],
+    "required": ["judgments", "claude_price", "confidence", "evidence", "reasoning",
+                 "disagreements"],
 }
 
 
 def _calibration_text(examples: list[dict]) -> str:
     lines = []
     for e in examples:
-        outcome = f"sold at ${e['sold_price']}" if e["sold"] and e.get("sold_price") else (
-            "sold" if e["sold"] else "listed, not sold yet")
         lines.append(f"- {e['brand'] or '?'} | {e['item'] or e['type'] or '?'} | "
-                     f"${e['owner_price']} | {outcome}")
+                     f"${e['sold_price']}")
     return "\n".join(lines) or "- (none)"
 
 
@@ -577,7 +593,14 @@ def gather_candidates(ident: dict, photo_paths=None) -> dict:
     queries = sold_queries(ident)
     aq, gtin = active_query(ident), upc_of(ident)
     photo = next((p for p in map(_resolve, photo_paths or []) if p), None)
-    errors = []
+    errors, skipped = [], []
+    if uncached_sold_queries is not None and queries:
+        allowed = set(uncached_sold_queries)
+        if not any(n in allowed for n, _ in queries):
+            allowed.add(queries[0][0])      # always at least one live query
+        kept_q = [(n, q) for n, q in queries if n in allowed or sold_is_cached(q)]
+        skipped = [q for n, q in queries if (n, q) not in kept_q]
+        queries = kept_q
     jobs = {f"sold:{name}": (fetch_sold, (q,)) for name, q in queries}
     if aq:
         jobs["active:text"] = (fetch_active, (aq, None))
@@ -615,12 +638,23 @@ def gather_candidates(ident: dict, photo_paths=None) -> dict:
         counters[p] += 1
         c["id"] = f"{p}{counters[p]}"
     return {"candidates": pooled, "dropped": dropped, "errors": errors,
-            "queries": [q for _, q in queries], "active_query": aq, "gtin": gtin,
+            "queries": [q for _, q in queries], "skipped_queries": skipped,
+            "active_query": aq, "gtin": gtin,
             "photo": photo, "raw_counts": {k: len(v) for k, v in raw.items()}}
+
+
+def _pct_apart(a: float, b: float) -> float:
+    return abs(a - b) / min(a, b) if a > 0 and b > 0 else float("inf")
 
 
 def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
                    item_id: str | None = None, ask=None) -> dict:
+    """Claude's price is the suggested price. The formula over same_item sold
+    comps is a cross-check: only computed with >= PRICE_THIN_MIN_COMPS of them,
+    and a gap over FORMULA_DISAGREE_PCT is flagged for review with both numbers.
+    (Pilot, 17 Oct 2026: same_item sold comps were 0-1 on all 10 items, so a
+    formula-first price existed for none of them, while Claude's was within 20%
+    of the owner's on 7.)"""
     ident = identification or {}
     identity = identity_record(ident, receipt)
     g = gather_candidates(ident, photo_paths)
@@ -639,29 +673,30 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
             warnings.append(f"judge skipped {len(missing)} candidate(s); treated as unjudged")
     else:
         flags.append("no_comps")
+        warnings.append("no comps found at all: type a price")
 
     priced = price_from_judged(cands, verdict_map)
     warnings += priced["warnings"]
     for c in cands:
         c["verdict"] = verdict_map.get(c["id"])
 
-    claude_price = j.get("claude_price") if j else None
+    claude_raw = v1._to_float(j.get("claude_price")) if j else None
     claude_conf = j.get("confidence") if j else None
-    p = priced["price"]
-    if priced["evidence"] == "none":
-        flags.append("no_comps" if not cands else "few_same_item_sold")
-        warnings.append(f"only {priced['same_item_sold']} same-item sold comp(s): type a price"
-                        + (f" (Claude suggests ${claude_price})" if claude_price else ""))
-    if p and claude_price and max(p, claude_price) / max(min(p, claude_price), 0.01) > 1.25:
-        flags.append("claude_disagrees")
-        warnings.append(f"code price ${p} vs Claude ${claude_price}")
+    p = charm(claude_raw) if claude_raw and claude_raw > 0 else None
+    formula = priced["price"]
+    if p and formula and _pct_apart(p, formula) > FORMULA_DISAGREE_PCT:
+        flags.append("formula_disagrees")
+        warnings.append(f"Claude says ${p}, the formula over {priced['same_item_sold']} "
+                        f"same-item sales says ${formula}")
     if claude_conf == "low":
         flags.append("judge_low_confidence")
+    if j and not p:
+        flags.append("no_claude_price")
     retail = v1._to_float(ident.get("retail_price"))
     if p and retail and p > retail:
         flags.append("above_retail")
         warnings.append(f"price ${p} is above the researched retail ${retail}")
-    if priced["dispersion"] and priced["dispersion"] > config.PRICE_THIN_MAX_DISPERSION:
+    if formula and priced["dispersion"] and priced["dispersion"] > config.PRICE_THIN_MAX_DISPERSION:
         flags.append("dispersed")
 
     same_sold = [c for c in cands if c["verdict"] == "same_item" and c["source"] == "sold"]
@@ -672,8 +707,13 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
                 "title": c["title"], "condition": c["condition"], "image": c["image"],
                 "url": c["url"]}
 
+    by_id = {c["id"]: c for c in cands}
+    ev_ids = [i for i in ((j.get("evidence") or []) if j else []) if i in by_id][:5]
+    ev_comps = [{"id": i, "source": "sold" if by_id[i]["source"] == "sold" else "active",
+                 "verdict": by_id[i]["verdict"], **comp(by_id[i])} for i in ev_ids]
+
     reference = stock_image_url = price_source_url = None
-    pool = sorted(same_sold, key=lambda c: abs(c["total"] - (priced["sold_median"] or 0))) \
+    pool = [by_id[i] for i in ev_ids if by_id[i]["verdict"] == "same_item"] or same_sold \
         or same_active
     if pool:
         top = pool[0]
@@ -686,15 +726,17 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
     research_resale = v1._research_resale(ident)
     return {
         # --- v1 shape ---
-        "suggested_price": p, "machine_price": p, "comp_suggested": p,
-        "price_basis": "comps" if p else "none",
-        "confidence": priced["evidence"] if p else "none",
+        "suggested_price": p, "machine_price": p,
+        # comp_suggested keeps its v1 meaning: the comp-formula price.
+        "comp_suggested": formula,
+        "price_basis": "claude" if p else "none",
+        "confidence": claude_conf or "none",
         "sold_median": priced["sold_median"], "sold_p10": priced["sold_p10"],
         "sold_p90": priced["sold_p90"], "active_floor": priced["active_floor"],
         "raw_active_floor": priced["raw_active_floor"],
         "comp_warning": "; ".join(warnings) or None,
         "review_flags": flags,
-        "needs_review": bool(flags) or priced["evidence"] != "solid",
+        "needs_review": bool(flags) or p is None,
         "evidence": priced["evidence"],
         "query_rung": "pooled", "query_used": " || ".join(g["queries"]),
         "rungs_tried": g["queries"], "dispersion": priced["dispersion"],
@@ -708,14 +750,18 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
         # --- v2 extras ---
         "engine": "v2", "comp_basis": "item+shipping total",
         "our_shipping": config.EBAY_SHIP_CHARGED, "target_total": priced["target_total"],
+        "formula_price": formula,
         "judged_comps": [{k: c.get(k) for k in ("id", "source", "verdict", "title", "total",
                                                  "item_price", "shipping", "shipping_imputed",
                                                  "condition", "url", "seller")} for c in cands],
         "candidate_count": len(cands), "dropped": g["dropped"],
+        "skipped_queries": g.get("skipped_queries") or [],
         "same_item_sold_count": priced["same_item_sold"],
         "same_item_active_count": priced["same_item_active"],
-        "claude_price": claude_price, "claude_confidence": claude_conf,
+        "claude_price": p, "claude_price_raw": claude_raw, "claude_confidence": claude_conf,
         "claude_reasoning": j.get("reasoning") if j else None,
+        "claude_evidence": {"ids": ev_ids, "comps": ev_comps,
+                            "reason": j.get("reasoning") if j else None},
         "disagreements": j.get("disagreements") if j else [],
         "judge_model": j.get("model") if j else None,
         "judge_escalated": bool(j and j.get("escalated")),

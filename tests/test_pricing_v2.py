@@ -154,41 +154,143 @@ def test_too_few_same_item_sold_gives_no_price():
 
 # --- end to end with stubs -----------------------------------------------------
 
-def test_get_pricing_v2_shape_with_stubs():
-    tmp = tempfile.mkdtemp()
+IDENT = {"brand": "Kate Spade", "product_name": "Scallop Band", "model": "KSS0089",
+         "search_query": "Kate Spade Scallop Band KSS0089 NWT"}
+SOLD_ROWS = [_sold_row("100000001", "50", "10"), _sold_row("100000002", "52", "8"),
+             _sold_row("100000003", "48", None, "free"),
+             _sold_row("100000004", "45", "10", seller="premium_designer_outlet")]
+
+
+def _run(claude_price, confidence="high", same=("S1", "S2", "S3", "A1"),
+         evidence=("S1", "S2", "A1"), sold_rows=SOLD_ROWS, sold_calls=None):
+    """get_pricing_v2 with every source stubbed. Totals of the three foreign
+    sold rows are 60, 60, 48 (median 60), so the formula, when it runs, says
+    60 * 0.95 = 57 total, minus our shipping."""
     saved = (config.PRICING_V2_CACHE_DIR, v2.fetch_sold, v2.fetch_active, v2.own_listings,
              v2.calibration_examples)
+    seen = {}
     try:
-        config.PRICING_V2_CACHE_DIR = tmp
-        v2.fetch_sold = lambda q, count=None: [
-            _sold_row("100000001", "50", "10"), _sold_row("100000002", "52", "8"),
-            _sold_row("100000003", "48", None, "free"),
-            _sold_row("100000004", "45", "10", seller="premium_designer_outlet")]
+        config.PRICING_V2_CACHE_DIR = tempfile.mkdtemp()
+
+        def fake_sold(q, count=None):
+            if sold_calls is not None:
+                sold_calls.append(q)
+            return sold_rows
+        v2.fetch_sold = fake_sold
         v2.fetch_active = lambda q=None, gtin=None: [_browse_row("200000001", 49, 10)]
         v2.own_listings = lambda: (set(), set())
         v2.calibration_examples = lambda exclude, n=15: []
-        seen = {}
 
         def fake_ask(stage, messages, **kw):
-            seen.update(kw, stage=stage, n_blocks=len(messages[0]["content"]))
-            return {"judgments": [{"id": i, "verdict": "same_item"} for i in ("S1", "S2", "S3", "A1")],
-                    "claude_price": 44.0, "confidence": "high", "reasoning": "r",
-                    "disagreements": []}
+            seen.update(kw, stage=stage)
+            ids = ("S1", "S2", "S3", "A1")
+            return {"judgments": [{"id": i, "verdict": "same_item" if i in same else "variant"}
+                                  for i in ids],
+                    "claude_price": claude_price, "confidence": confidence,
+                    "evidence": list(evidence), "reasoning": "one line", "disagreements": []}
 
-        ident = {"brand": "Kate Spade", "product_name": "Scallop Band", "model": "KSS0089",
-                 "search_query": "Kate Spade Scallop Band KSS0089 NWT"}
-        r = v2.get_pricing_v2(ident, item_id="x", ask=fake_ask)
-        assert seen["stage"] == v2.JUDGE_STAGE and seen["output_schema"] is v2.JUDGE_SCHEMA
-        assert r["dropped"]["own"] == 1 and r["candidate_count"] == 4
-        # totals 60, 60, 48 -> median 60 -> 57 total (active 59 is above it) - shipping
-        assert r["suggested_price"] == v2.charm(57 - config.EBAY_SHIP_CHARGED)
-        assert r["machine_price"] == r["suggested_price"] and r["claude_price"] == 44.0
-        for key in ("confidence", "price_basis", "sold_comps", "active_listings",
-                    "review_flags", "needs_review", "comp_warning", "stock_image_url"):
-            assert key in r
+        r = v2.get_pricing_v2(IDENT, item_id="x", ask=fake_ask)
     finally:
         (config.PRICING_V2_CACHE_DIR, v2.fetch_sold, v2.fetch_active, v2.own_listings,
          v2.calibration_examples) = saved
+    return r, seen
+
+
+FORMULA = v2.charm(57 - config.EBAY_SHIP_CHARGED)
+
+
+def test_claude_price_is_primary_and_v1_shape_kept():
+    r, seen = _run(45.2)
+    assert seen["stage"] == v2.JUDGE_STAGE and seen["output_schema"] is v2.JUDGE_SCHEMA
+    assert r["dropped"]["own"] == 1 and r["candidate_count"] == 4
+    assert r["suggested_price"] == 44.99 == r["machine_price"] == r["claude_price"]
+    assert r["price_basis"] == "claude" and r["confidence"] == "high"
+    assert r["formula_price"] == FORMULA and "formula_disagrees" not in r["review_flags"]
+    assert r["needs_review"] is False
+    for key in ("sold_comps", "active_listings", "review_flags", "comp_warning",
+                "stock_image_url", "judged_comps", "claude_evidence"):
+        assert key in r
+
+
+def test_formula_disagreement_is_flagged_with_both_numbers():
+    r, _ = _run(30)
+    assert r["suggested_price"] == 29.99
+    assert "formula_disagrees" in r["review_flags"] and r["needs_review"]
+    assert "$29.99" in r["comp_warning"] and f"${FORMULA}" in r["comp_warning"]
+
+
+def test_no_formula_below_three_same_item_sold():
+    r, _ = _run(30, same=("S1", "A1"))
+    assert r["formula_price"] is None and r["suggested_price"] == 29.99
+    assert "formula_disagrees" not in r["review_flags"]
+
+
+def test_low_confidence_needs_review():
+    r, _ = _run(45.2, confidence="low", same=("S1",))
+    assert r["needs_review"] and "judge_low_confidence" in r["review_flags"]
+
+
+def test_evidence_stored_and_unknown_ids_dropped():
+    r, _ = _run(45.2, evidence=("S2", "Z9", "A1"))
+    ev = r["claude_evidence"]
+    assert ev["ids"] == ["S2", "A1"] and ev["reason"] == "one line"
+    assert [c["source"] for c in ev["comps"]] == ["sold", "active"]
+    assert ev["comps"][0]["url"].endswith("100000002?nordt=true")
+    assert {c["id"] for c in r["judged_comps"]} == {"S1", "S2", "S3", "A1"}
+
+
+def test_backtest_policy_sends_one_uncached_sold_query():
+    calls = []
+    saved = v2.uncached_sold_queries
+    try:
+        v2.uncached_sold_queries = {"search_query"}
+        r, _ = _run(45.2, sold_calls=calls)
+    finally:
+        v2.uncached_sold_queries = saved
+    assert calls == [IDENT["search_query"]]
+    assert len(r["skipped_queries"]) == 2
+
+
+def test_calibration_is_sold_items_at_sold_price_only():
+    rows = [("aaa1", '{"brand": "Oakley", "item_type": "Sunglasses"}',
+             '{"sale_price": 159.98, "units_sold": 2}'),
+            ("bbb2", '{"brand": "DKNY"}', '{}'),                # sold row with no sale data
+            ("ccc3", '{"brand": "Coach"}', '{"sale_price": 99.99}')]
+    saved = v2._db_rows
+    try:
+        v2._db_rows = lambda sql: (rows if "status = 'sold'" in sql else [])
+        ex = v2.calibration_examples(None, n=5)
+        assert [(e["brand"], e["sold_price"]) for e in ex] == [("Oakley", 79.99), ("Coach", 99.99)]
+        assert [e["brand"] for e in v2.calibration_examples("ccc3", n=5)] == ["Oakley"]
+        assert "$79.99" in v2._calibration_text(ex)
+    finally:
+        v2._db_rows = saved
+
+
+# --- review screen -------------------------------------------------------------
+
+def test_review_screen_shows_claude_price_reason_and_evidence():
+    import telegram_bot as tb
+    r, _ = _run(45.2, evidence=("S1", "A1"))
+    text = tb.format_pricing(r)
+    assert text.startswith("💰 Suggested price: $44.99  (Claude, high confidence)")
+    assert "one line" in text
+    assert "• $60.0 sold — Bag" in text
+    assert "\n    https://www.ebay.com/itm/100000001\n" in text   # query string dropped
+    assert "active" in text and len(text.splitlines()) <= 10
+    long = dict(r, claude_evidence={"reason": "x", "comps": [
+        {"source": "sold", "price": 50.0, "title": "W" * 80, "url": None}]})
+    assert "W" * 49 + "…" in tb.format_pricing(long)
+
+
+def test_review_screen_v1_unchanged_and_manual_override_named():
+    import telegram_bot as tb
+    v1_text = tb.format_pricing({"suggested_price": 39.99, "evidence": "solid", "sold_count": 6,
+                                 "sold_median": 45.0, "confidence": "solid"})
+    assert "Claude" not in v1_text and "sold median: $45.0" in v1_text
+    r, _ = _run(45.2)
+    typed = dict(r, suggested_price=59.99, price_basis="manual", confidence="manual")
+    assert "(typed; Claude said $44.99, high)" in tb.format_pricing(typed)
 
 
 if __name__ == "__main__":
