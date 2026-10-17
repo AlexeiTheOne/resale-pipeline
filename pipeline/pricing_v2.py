@@ -435,12 +435,12 @@ Judge from the title AND the thumbnail when one is shown; the thumbnail decides 
 
 Then give claude_price: the ITEM price (excluding shipping) you would list this item at as a Buy It Now, to sell within about two weeks. Order of evidence:
 1. same_item SOLD comps.
-2. If there are none: near-identical variant SOLD comps (same line, different colour or size) together with the STORE HISTORY ESTIMATE (the item's MSRP times what this store's sales of the brand have fetched as a share of MSRP). Prefer these over active asks.
+2. If there are none: near-identical variant SOLD comps (same line, different colour or size). Prefer these over active asks.
 3. ACTIVE listings are asking prices, not sales: treat the cheapest comparable active as a CEILING a buyer can undercut us with, never as a target. Many actives sit unsold for months.
-4. The RESEARCH block (a web search) is weak evidence: it mixes asks, sales, used items and other sites.
+4. The RESEARCH block (a web search) is weak evidence: it mixes asks, sales, used items and other sites. The STORE RANGE is a sanity check, not evidence: never price from it.
 Use this store's past sales below to calibrate what its stock actually sells for. Your price is the one we list at, so make it the price you believe in. confidence: high when several same_item sold comps agree, medium when the evidence is thin or only variants, low when you could not find the item. evidence: the 3-5 candidate ids your price leans on most, strongest first. reasoning: one line. disagreements: short notes where sources conflict (e.g. sold vs active, identity record vs photo, research retail vs comps); empty list if none.
 
-This store's past sales (brand | item | MSRP | sold item price, shipping excluded):
+This store's past sales (brand | item | sold item price, shipping excluded):
 {calibration}"""
 
 JUDGE_SCHEMA = {
@@ -466,9 +466,8 @@ JUDGE_SCHEMA = {
 def _calibration_text(examples: list[dict]) -> str:
     lines = []
     for e in examples:
-        msrp = f"${e['msrp']:g}" if e.get("msrp") else "?"
         lines.append(f"- {e['brand'] or '?'} | {e['item'] or e['type'] or '?'} | "
-                     f"MSRP {msrp} | sold ${e['sold_price']}")
+                     f"${e['sold_price']}")
     return "\n".join(lines) or "- (none)"
 
 
@@ -688,19 +687,23 @@ def gather_candidates(ident: dict, photo_paths=None) -> dict:
             "photo": photo, "raw_counts": {k: len(v) for k, v in raw.items()}}
 
 
+# A price outside the store's MSRP range by more than this, with at least
+# STORE_RANGE_MIN_N sales behind the range, is flagged for review.
+STORE_RANGE_SLACK = 0.25
+STORE_RANGE_MIN_N = 4
+
+
 def context_text(store: dict | None, ident: dict) -> str:
-    """STORE HISTORY and RESEARCH blocks for the judge."""
+    """STORE RANGE (sanity check only) and RESEARCH blocks for the judge."""
     lines = []
-    if store:
-        m = store.get("msrp")
+    if store and store.get("range_low") and store.get("range_high"):
         flags = ", ".join(store.get("msrp_flags") or [])
-        lines.append("STORE HISTORY ESTIMATE (this store's own sales):")
-        lines.append(f"- MSRP: {'$%g' % m if m else 'unknown'}" + (f" (doubtful: {flags})" if flags else ""))
-        if store.get("ratio"):
-            lines.append(f"- {store['level']} '{store['key']}': {store['n']} past sale(s) fetched a median "
-                         f"{store['ratio']:.0%} of MSRP (middle half {store['q1']:.0%}-{store['q3']:.0%})")
-        if store.get("estimate"):
-            lines.append(f"- MSRP x ratio = ${store['estimate']} item price")
+        lines.append("STORE RANGE (sanity check only; do NOT anchor on it):")
+        lines.append(f"- MSRP ${store['msrp']:g}" + (f" (doubtful: {flags})" if flags else "")
+                     + f"; {store['n']} past sale(s) ({store['level']} '{store['key']}') fetched "
+                     f"{store['q1']:.0%}-{store['q3']:.0%} of MSRP, i.e. "
+                     f"${store['range_low']:.2f}-${store['range_high']:.2f}. Price from the comps; "
+                     "this is only to notice when something is far off.")
     ev = ident.get("price_evidence") or []
     if ev or ident.get("resale_estimate"):
         lines.append("RESEARCH (web search by another model; weak evidence):")
@@ -764,6 +767,18 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
                         f"same-item sales says ${formula}")
     if claude_conf == "low":
         flags.append("judge_low_confidence")
+    sold_judged = [c for c in cands if c["source"] == "sold"
+                   and c["verdict"] in ("same_item", "variant")]
+    if j and p and not sold_judged:
+        flags.append("priced_from_asks")
+        warnings.append("no sales found, priced from asking prices")
+    lo, hi = (store or {}).get("range_low"), (store or {}).get("range_high")
+    if p and lo and hi and (store.get("n") or 0) >= STORE_RANGE_MIN_N \
+            and not store.get("msrp_flags") \
+            and not lo / (1 + STORE_RANGE_SLACK) <= p <= hi * (1 + STORE_RANGE_SLACK):
+        flags.append("outside_store_range")
+        warnings.append(f"${p} is outside this store's usual ${lo:.0f}-${hi:.0f} for this MSRP "
+                        f"({store['n']} {store['level']} sales)")
     if j and not p:
         flags.append("no_claude_price")
     retail = v1._to_float(ident.get("retail_price"))

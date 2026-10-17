@@ -93,17 +93,24 @@ def test_three_sold_queries_with_broad_band_size():
     assert v2.broad_query(tote) == "DKNY Tote Bag"
 
 
-def test_context_gives_store_estimate_and_weak_research():
+def test_context_gives_store_range_not_an_estimate_and_weak_research():
     store = {"msrp": 150.0, "msrp_flags": ["equals_ross_tag_price"], "level": "brand",
              "key": "ralph lauren", "n": 13, "ratio": 0.378, "q1": 0.33, "q3": 0.47,
-             "estimate": 55.99}
+             "estimate": 55.99, "range_low": 49.5, "range_high": 70.5}
     ident = {"resale_estimate": 60, "price_evidence": [{"source": "ebay sold", "price": 49.99,
                                                         "note": "one sale"}]}
     text = v2.context_text(store, ident)
-    assert "MSRP: $150 (doubtful: equals_ross_tag_price)" in text
-    assert "13 past sale(s) fetched a median 38% of MSRP" in text
-    assert "MSRP x ratio = $55.99" in text
+    assert "do NOT anchor" in text and "MSRP $150 (doubtful: equals_ross_tag_price)" in text
+    assert "13 past sale(s) (brand 'ralph lauren') fetched 33%-47% of MSRP" in text
+    assert "$49.50-$70.50" in text
+    assert "55.99" not in text                    # the point estimate is never shown
     assert "weak evidence" in text and "ebay sold: $49.99 one sale" in text
+
+
+def test_store_estimate_gives_iqr_range():
+    est = msrp.store_estimate({"brand": "Ralph Lauren", "item_type": "Sham", "retail_price": 100},
+                              None, history=HISTORY)
+    assert (est["range_low"], est["range_high"]) == (100 * est["q1"], 100 * est["q3"])
 
 
 # --- backtest outcome scoring ---------------------------------------------------

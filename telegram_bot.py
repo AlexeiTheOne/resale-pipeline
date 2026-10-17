@@ -1643,8 +1643,8 @@ def _stage_price(item_id, notify=lambda _t: None) -> dict:
     notify("💰 Pricing...")
     t = time.perf_counter()
     if PRICING_ENGINE == "v2":
-        # Off by default (config.PRICING_ENGINE): v2 is on trial until the
-        # backtest agrees with the owner. Same return shape as v1.
+        # The default since 17 Oct 2026 (config.PRICING_ENGINE); same return
+        # shape as v1, which stays selectable with PRICING_ENGINE=v1.
         from pipeline.pricing_v2 import get_pricing_v2
         item = get_item(item_id)
         pricing = get_pricing_v2(ident, photo_paths=item.get("photos") or [],
@@ -1727,6 +1727,8 @@ def _format_pricing_v2(pricing: dict) -> str:
         lines = [f"{head}  (typed; Claude said ${_fmt(pricing.get('claude_price'))}, {conf})"]
     else:
         lines = [f"{head}  (Claude, {conf} confidence)"]
+    if "priced_from_asks" in (pricing.get("review_flags") or []):
+        lines.append("  ⚠️ no sales found, priced from asking prices")
     ev = pricing.get("claude_evidence") or {}
     if ev.get("reason"):
         lines.append(f"  {ev['reason']}")
@@ -1741,8 +1743,12 @@ def _format_pricing_v2(pricing: dict) -> str:
     if pricing.get("formula_price"):
         tail += f"; formula ${pricing['formula_price']}"
     lines.append(tail + " (comp prices include shipping)")
-    if pricing.get("comp_warning"):
-        lines.append(f"  ⚠️ {pricing['comp_warning']}")
+    warning = pricing.get("comp_warning")
+    if warning:   # the asks line above already says this part
+        warning = "; ".join(w for w in warning.split("; ")
+                            if w != "no sales found, priced from asking prices")
+    if warning:
+        lines.append(f"  ⚠️ {warning}")
     return "\n".join(lines)
 
 
@@ -2306,6 +2312,8 @@ async def comps_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if pricing.get("comp_warning"):
         lines.append(f"⚠️ {pricing['comp_warning']}")
 
+    if pricing.get("engine") == "v2":
+        lines.append("(v2: same-item comps only, prices include shipping)")
     sold = pricing.get("sold_comps") or []
     lines += ["", f"SOLD ({len(sold)}, median ${pricing.get('sold_median')}):"]
     lines += [f"  ${c.get('price')} · {(c.get('title') or '')[:48]}" for c in sold] or ["  (none)"]

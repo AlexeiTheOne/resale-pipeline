@@ -135,11 +135,16 @@ def store_estimate(ident: dict, receipt: dict | None = None, exclude_item_id: st
     history = load_history() if history is None else history
     m = msrp_of(ident)
     r = ratio_for(ident.get("brand"), ident.get("item_type"), history, exclude_item_id)
-    est = None
+    est = low = high = None
     if m and r["ratio"]:
         raw = m * r["ratio"]
         est = round(max(round(raw) - 0.01, 0.99), 2)
-    return {"msrp": m, "msrp_flags": msrp_flags(ident, receipt), **r, "estimate": est}
+        low, high = round(m * r["q1"], 2), round(m * r["q3"], 2)
+    # est is kept for the backtest's heuristic baseline. The judge only ever
+    # sees the range: as a point estimate it anchored Claude low in round 3
+    # (20/39 outcome hits vs 21/39 without it).
+    return {"msrp": m, "msrp_flags": msrp_flags(ident, receipt), **r, "estimate": est,
+            "range_low": low, "range_high": high}
 
 
 def ratio_table(history: list[dict]) -> list[dict]:

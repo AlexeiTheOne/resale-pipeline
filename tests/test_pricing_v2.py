@@ -6,6 +6,7 @@ temp dir and the own-listings lookup is replaced, so data/ross.db is not read.
 
 Run with `python tests/test_pricing_v2.py` or `pytest tests/`.
 """
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -163,7 +164,8 @@ SOLD_ROWS = [_sold_row("100000001", "50", "10"), _sold_row("100000002", "52", "8
 
 
 def _run(claude_price, confidence="high", same=("S1", "S2", "S3", "A1"),
-         evidence=("S1", "S2", "A1"), sold_rows=SOLD_ROWS, sold_calls=None):
+         evidence=("S1", "S2", "A1"), sold_rows=SOLD_ROWS, sold_calls=None,
+         other="variant", history=()):
     """get_pricing_v2 with every source stubbed. Totals of the three foreign
     sold rows are 60, 60, 48 (median 60), so the formula, when it runs, says
     60 * 0.95 = 57 total, minus our shipping."""
@@ -171,7 +173,7 @@ def _run(claude_price, confidence="high", same=("S1", "S2", "S3", "A1"),
     saved = (config.PRICING_V2_CACHE_DIR, v2.fetch_sold, v2.fetch_active, v2.own_listings,
              v2.calibration_examples, msrp.load_history)
     seen = {}
-    msrp.load_history = lambda: []          # never read data/ross.db from a test
+    msrp.load_history = lambda: list(history)   # never read data/ross.db from a test
     try:
         config.PRICING_V2_CACHE_DIR = tempfile.mkdtemp()
 
@@ -187,7 +189,7 @@ def _run(claude_price, confidence="high", same=("S1", "S2", "S3", "A1"),
         def fake_ask(stage, messages, **kw):
             seen.update(kw, stage=stage)
             ids = ("S1", "S2", "S3", "A1")
-            return {"judgments": [{"id": i, "verdict": "same_item" if i in same else "variant"}
+            return {"judgments": [{"id": i, "verdict": "same_item" if i in same else other}
                                   for i in ids],
                     "claude_price": claude_price, "confidence": confidence,
                     "evidence": list(evidence), "reasoning": "one line", "disagreements": []}
@@ -226,6 +228,33 @@ def test_no_formula_below_three_same_item_sold():
     r, _ = _run(30, same=("S1", "A1"))
     assert r["formula_price"] is None and r["suggested_price"] == 29.99
     assert "formula_disagrees" not in r["review_flags"]
+
+
+def test_no_sold_same_or_variant_is_flagged_priced_from_asks():
+    r, _ = _run(45.2, same=("A1",), other="wrong")
+    assert "priced_from_asks" in r["review_flags"] and r["needs_review"]
+    r, _ = _run(45.2, same=("A1",), other="variant")
+    assert "priced_from_asks" not in r["review_flags"]
+
+
+def test_outside_store_range_needs_four_sales_and_a_clean_msrp():
+    from pipeline import msrp
+    hist = msrp.sold_history([
+        (f"k{i}", json.dumps({"brand": "Kate Spade", "item_type": "Band", "retail_price": 100}),
+         json.dumps({"sale_price": 40 + i}), "null") for i in range(4)])   # 40-43% of MSRP
+    ident_msrp = dict(IDENT, retail_price=100)
+    saved = dict(IDENT)
+    try:
+        IDENT.update(ident_msrp)
+        r, _ = _run(80.0, history=hist)           # range ~$40-42; 79.99 is far above
+        assert "outside_store_range" in r["review_flags"]
+        r, _ = _run(48.0, history=hist)           # within 25% of the range
+        assert "outside_store_range" not in r["review_flags"]
+        r, _ = _run(80.0, history=hist[:3])       # only 3 sales: brand ratio not trusted
+        assert "outside_store_range" not in r["review_flags"]
+    finally:
+        IDENT.clear()
+        IDENT.update(saved)
 
 
 def test_low_confidence_needs_review():
@@ -338,6 +367,13 @@ def test_review_screen_shows_claude_price_reason_and_evidence():
     long = dict(r, claude_evidence={"reason": "x", "comps": [
         {"source": "sold", "price": 50.0, "title": "W" * 80, "url": None}]})
     assert "W" * 49 + "…" in tb.format_pricing(long)
+
+
+def test_review_screen_says_priced_from_asks_once():
+    import telegram_bot as tb
+    r, _ = _run(45.2, same=("A1",), other="wrong", evidence=("A1",))
+    text = tb.format_pricing(r)
+    assert text.count("no sales found, priced from asking prices") == 1
 
 
 def test_review_screen_v1_unchanged_and_manual_override_named():
