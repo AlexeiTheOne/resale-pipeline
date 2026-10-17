@@ -148,6 +148,84 @@ def test_record_job_run_is_an_upsert():
     assert rows == 1
 
 
+# --- a partial run is not a completed run ----------------------------------
+#
+# The weekly price check used to be stamped ok whenever run_weekly_check
+# returned, even when the traffic fetch had failed and the digest was 97
+# listings of "invisible" read off missing data (2026-10-05). A run with failed
+# traffic batches is now stamped "partial", which the catch-up logic doesn't
+# count as having served the slot.
+
+def test_partial_run_does_not_count_as_completed():
+    db.record_job_run("job_partial", status="partial", detail="1/6 failed")
+    assert db.job_run_status("job_partial") == "partial"
+    assert db.last_job_run("job_partial") is None
+    assert tb._missed_slot("job_partial", NOW, 11) is True
+    db.record_job_run("job_partial")
+    assert db.job_run_status("job_partial") == "ok"
+    assert db.last_job_run("job_partial") is not None
+
+
+def test_legacy_null_status_still_counts_as_completed():
+    _stamp("job_legacy", utc(2026, 9, 5, 11, 30))     # status left NULL
+    assert tb._missed_slot("job_legacy", NOW, 11) is False
+
+
+class _FakeBot:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id, text, reply_markup=None):
+        self.sent.append(text)
+
+
+class _FakeApp:
+    def __init__(self):
+        self.bot = _FakeBot()
+
+
+def _run_job_with(results, health):
+    import asyncio
+
+    saved = (tb.run_weekly_check, tb.ALLOWED_USER_IDS)
+    tb.run_weekly_check = lambda: (results, health)
+    tb.ALLOWED_USER_IDS = [1]
+    try:
+        app = _FakeApp()
+        asyncio.run(tb._run_reprice_job(app))
+        return app.bot.sent
+    finally:
+        tb.run_weekly_check, tb.ALLOWED_USER_IDS = saved
+
+
+_NO_TRAFFIC = {"item_id": "x" * 36, "verdict": "NO_TRAFFIC_DATA", "impressions": None,
+               "views": None, "cumulative_views": 0, "ctr": None, "watchers": 1,
+               "current_price": 20.0, "suggested_price": None}
+
+
+def test_reprice_job_with_failed_traffic_is_stamped_partial():
+    sent = _run_job_with([_NO_TRAFFIC] * 3, {"traffic_batches": 6, "traffic_failed": 6,
+                                            "watch_lookups": 3, "watch_failed": 0})
+    assert db.job_run_status(tb._JOB_REPRICE) == "partial"
+    assert db.last_job_run(tb._JOB_REPRICE) is None     # will be caught up
+    header = sent[0]
+    assert "6/6 traffic batch(es) failed" in header
+    assert "watch count missing for 0/3" in header
+    assert "3 not judged" in header and "Incomplete" in header
+    # Not-judged listings are counted, not posted one message each.
+    assert len(sent) == 1
+
+
+def test_reprice_job_with_full_data_is_stamped_ok():
+    sent = _run_job_with([dict(_NO_TRAFFIC, verdict="HEALTHY", impressions=500, views=20)],
+                         {"traffic_batches": 1, "traffic_failed": 0,
+                          "watch_lookups": 1, "watch_failed": 0})
+    assert db.job_run_status(tb._JOB_REPRICE) == "ok"
+    assert db.last_job_run(tb._JOB_REPRICE) is not None
+    assert "0/1 traffic batch(es) failed" in sent[0]
+    assert "Incomplete" not in sent[0]
+
+
 # --- /sync argument parsing ------------------------------------------------
 
 def test_sync_days_falls_back_to_the_configured_default():

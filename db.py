@@ -202,7 +202,11 @@ def latest_stats(item_id: str) -> dict | None:
 def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> None:
     """Stamp a scheduled job as having just completed. Called after the work,
     not before, so a crash mid-run leaves the old timestamp and the job retries
-    on the next start rather than believing it already ran."""
+    on the next start rather than believing it already ran.
+
+    A status other than "ok" (e.g. "partial": the weekly price check ran but
+    some traffic batches failed) records the attempt without counting it as
+    completed — last_job_run ignores it, so the slot is still caught up."""
     with _conn() as con:
         con.execute(
             "INSERT INTO job_runs (job, last_run_at, status, detail) VALUES (?, ?, ?, ?) "
@@ -212,11 +216,24 @@ def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> N
         )
 
 
-def last_job_run(job: str) -> datetime | None:
-    """When `job` last completed, as an aware UTC datetime, or None if never."""
+def job_run_status(job: str) -> str | None:
+    """The status the last attempt at `job` recorded ("ok", "partial", ...), or
+    None if it never recorded one."""
     with _conn() as con:
         row = con.execute(
-            "SELECT last_run_at FROM job_runs WHERE job = ?", (job,)
+            "SELECT status FROM job_runs WHERE job = ?", (job,)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def last_job_run(job: str) -> datetime | None:
+    """When `job` last completed, as an aware UTC datetime, or None if never.
+    An attempt recorded with a non-ok status didn't complete, so it reads as
+    None too (NULL status is a legacy ok row)."""
+    with _conn() as con:
+        row = con.execute(
+            "SELECT last_run_at FROM job_runs WHERE job = ? "
+            "AND (status IS NULL OR status = 'ok')", (job,)
         ).fetchone()
     if not row or not row[0]:
         return None

@@ -35,8 +35,8 @@ from config import (
     OFFER_LARGE_THRESHOLD, OFFER_MESSAGE,
 )
 from db import (
-    create_item, delete_item, get_item, last_job_run, latest_stats, list_items,
-    record_job_run, update_field, update_status, VALID_STATUSES,
+    create_item, delete_item, get_item, job_run_status, last_job_run, latest_stats,
+    list_items, record_job_run, update_field, update_status, VALID_STATUSES,
 )
 from identify import identify_item
 from receipt import decode_barcode, detect_ross_tags, extract_receipt, is_dark_frame
@@ -3596,6 +3596,7 @@ _VERDICT_LABEL = {
     "TOO_NEW": "🌱 Too new to judge yet",
     "HEALTHY": "✅ Healthy",
     "NO_WATCH_DATA": "❔ Couldn't read the watch count — not judged",
+    "NO_TRAFFIC_DATA": "❔ Couldn't load eBay traffic — not judged",
     "ERROR": "⚠️ Couldn't check",
 }
 
@@ -3613,6 +3614,9 @@ _VERDICT_ADVICE = {
     "NO_WATCH_DATA": "eBay didn't return a watch count, and every remaining check "
                      "depends on it. Nothing is wrong with the listing as far as "
                      "this run can tell — re-run /pricecheck later.",
+    "NO_TRAFFIC_DATA": "eBay's traffic report failed for this listing, so there "
+                       "are no impressions to judge — this is NOT \"invisible\". "
+                       "Re-run /pricecheck later.",
 }
 
 
@@ -3629,11 +3633,13 @@ def _format_reprice_line(r: dict) -> str:
     # verdicts are decided on the running total — showing only the week's figure
     # made those diagnoses look like they'd been reached on 3 views.
     cum = r.get("cumulative_views")
-    views = f"{r.get('views', 0)} views"
+    # None = the traffic fetch failed (NO_TRAFFIC_DATA) — show "?", not 0.
+    impr = r.get("impressions")
+    views = f"{r['views'] if r.get('views') is not None else '?'} views"
     if cum is not None and cum != r.get("views"):
         views += f" ({cum} total)"
     ctr = r.get("ctr")
-    line += (f"\n  {r.get('impressions', 0)} impr · {views} · "
+    line += (f"\n  {impr if impr is not None else '?'} impr · {views} · "
              + (f"{ctr * 100:.2f}% CTR · " if ctr else "")
              + f"{watchers if watchers is not None else '?'} watchers · ${r.get('current_price')}")
     if r.get("suggested_price"):
@@ -3647,17 +3653,47 @@ def _format_reprice_line(r: dict) -> str:
     return line
 
 
-async def _send_reprice_digest(bot, chat_id, results: list[dict]) -> None:
+def _reprice_health_line(health: dict | None) -> str | None:
+    """One line saying how much of eBay's data actually arrived. Without it a
+    run whose traffic fetch failed looked exactly like a week where nothing was
+    found in search (2026-08-17: 71 INVISIBLE; 2026-10-05: 97)."""
+    if not health:
+        return None
+    return (f"Data: {health.get('traffic_failed', 0)}/{health.get('traffic_batches', 0)} "
+            f"traffic batch(es) failed · watch count missing for "
+            f"{health.get('watch_failed', 0)}/{health.get('watch_lookups', 0)}.")
+
+
+async def _send_reprice_digest(bot, chat_id, results: list[dict],
+                               health: dict | None = None,
+                               incomplete_note: str | None = None) -> None:
     """Post a weekly price-check digest: one summary header, then one message per
     flagged item (with an Apply/Skip button when a suggested price exists) so
     each can be actioned independently. Healthy/too-new items are just counted in
-    the header, not spelled out individually."""
-    flagged = [r for r in results if r["verdict"] not in ("HEALTHY", "TOO_NEW")]
+    the header, not spelled out individually — and so are NO_TRAFFIC_DATA ones:
+    a failed traffic fetch covers whole batches, there is nothing to act on per
+    listing, and 97 "couldn't load" messages would bury the real flags.
+
+    `health` (from run_weekly_check) becomes a data-health line in the header;
+    `incomplete_note` is appended when traffic batches failed, to say what
+    happens next (the scheduler retries; /pricecheck is re-run by hand)."""
+    no_traffic = [r for r in results if r["verdict"] == "NO_TRAFFIC_DATA"]
+    flagged = [r for r in results
+               if r["verdict"] not in ("HEALTHY", "TOO_NEW", "NO_TRAFFIC_DATA")]
     healthy = [r for r in results if r["verdict"] == "HEALTHY"]
     too_new = [r for r in results if r["verdict"] == "TOO_NEW"]
 
     header = (f"📈 Weekly price check — {len(results)} live listing(s): "
-              f"{len(flagged)} flagged, {len(healthy)} healthy, {len(too_new)} too new to judge.")
+              f"{len(flagged)} flagged, {len(healthy)} healthy, {len(too_new)} too new to judge"
+              + (f", {len(no_traffic)} not judged (eBay traffic didn't load)" if no_traffic else "")
+              + ".")
+    health_line = _reprice_health_line(health)
+    if health_line:
+        header += f"\n{health_line}"
+    if (health or {}).get("traffic_failed"):
+        header += ("\n⚠️ Incomplete: listings without traffic data were NOT diagnosed "
+                   "as invisible — the numbers are missing, not zero."
+                   + (f" {incomplete_note}" if incomplete_note else ""))
     try:
         await bot.send_message(chat_id=chat_id, text=header)
     except Exception as e:
@@ -3681,7 +3717,7 @@ async def pricecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     where the evidence supports one and the receipt cost is on file."""
     await _safe_reply(update.message, "📈 Checking live listings against eBay traffic...")
     try:
-        results = await asyncio.to_thread(run_weekly_check)
+        results, health = await asyncio.to_thread(run_weekly_check)
     except Exception as e:
         traceback.print_exc()
         _record_error("pricecheck", e)
@@ -3690,7 +3726,8 @@ async def pricecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not results:
         await _safe_reply(update.message, "No published listings to check.")
         return
-    await _send_reprice_digest(context.bot, update.effective_chat.id, results)
+    await _send_reprice_digest(context.bot, update.effective_chat.id, results, health,
+                               incomplete_note="Re-run /pricecheck later.")
 
 
 async def reprice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3795,28 +3832,44 @@ def _missed_slot(job: str, now: datetime, hour_utc: int,
 
 
 async def _run_reprice_job(app: Application, *, catch_up: bool = False) -> None:
-    """One weekly price check + digest. Only stamps job_runs on success, so a run
-    that failed is retried at the next start rather than being counted as done."""
+    """One weekly price check + digest. Only stamps job_runs "ok" on a complete
+    run, so a run that failed is retried at the next start rather than being
+    counted as done.
+
+    A run where any traffic batch failed is stamped "partial", which
+    last_job_run doesn't count as completed — so it is caught up like a missed
+    slot. It used to be stamped ok: the 2026-10-05 run read 97 listings as
+    INVISIBLE off a failed fetch and the scheduler considered the week served."""
+    previous_status = job_run_status(_JOB_REPRICE)
     print(f"📈 Running {'catch-up' if catch_up else 'scheduled'} weekly price check...")
     try:
-        results = await asyncio.to_thread(run_weekly_check)
+        results, health = await asyncio.to_thread(run_weekly_check)
     except Exception as e:
         traceback.print_exc()
         _record_error("weekly reprice", e)
         return
-    record_job_run(_JOB_REPRICE, detail=f"{len(results)} listing(s)")
+    status = "partial" if health.get("traffic_failed") else "ok"
+    record_job_run(_JOB_REPRICE, status=status,
+                   detail=f"{len(results)} listing(s); {_reprice_health_line(health)}")
+    if status != "ok":
+        print(f"   price check incomplete: {_reprice_health_line(health)}")
     if not results:
         return
+    incomplete_note = (f"Recorded as incomplete — it re-runs automatically at the next "
+                       f"bot start within {JOB_CATCHUP_GRACE_HOURS}h of the slot, "
+                       f"or run /pricecheck later.")
     for uid in ALLOWED_USER_IDS:
         if catch_up:
+            notice = ("⏰ Retrying the price check: the last run couldn't load eBay "
+                      "traffic for some listings." if previous_status == "partial" else
+                      "⏰ Catch-up: last week's price check never ran (the bot "
+                      "wasn't up at its slot). Running it now.")
             try:
-                await app.bot.send_message(
-                    chat_id=uid,
-                    text="⏰ Catch-up: last week's price check never ran (the bot "
-                         "wasn't up at its slot). Running it now.")
+                await app.bot.send_message(chat_id=uid, text=notice)
             except Exception as e:
                 print(f"WARNING: catch-up notice failed: {type(e).__name__}: {e}")
-        await _send_reprice_digest(app.bot, uid, results)
+        await _send_reprice_digest(app.bot, uid, results, health,
+                                   incomplete_note=incomplete_note)
 
 
 async def _weekly_reprice_loop(app: Application) -> None:
