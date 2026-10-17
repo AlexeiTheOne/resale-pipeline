@@ -358,13 +358,17 @@ GEMINI_PRICES = [
 ]
 
 # --- Pricing engine v2 (pipeline/pricing_v2.py, docs/pricing-design.md) ---------
-# "v2" (default since 17 Oct 2026) pools sold + active comps, has Claude judge
+# "v2" pools sold + active comps, has Claude judge
 # which are the same item and set the price, with the comp formula and the
 # store's MSRP range as cross-checks. On the 40-item outcome backtest it hit
 # about 21/39 against v1's 13/39 (v1 priced a median 26% under the sold
 # price). "v1" is the old comps ladder in pipeline/price.py: set
 # PRICING_ENGINE=v1 in .env to go back. The weekly repricer still uses v1.
-PRICING_ENGINE = os.getenv("PRICING_ENGINE", "v2").strip().lower()
+# HELD at "v1": the cache-only confirmation run of this v2 (store range, 3
+# sold queries, asks-as-ceiling prompt) scored 16/32 vs round 2's 19/32 on the
+# same items, and priced a median 0.88x the sold price. Flip to "v2" once that
+# is fixed and re-confirmed.
+PRICING_ENGINE = os.getenv("PRICING_ENGINE", "v1").strip().lower()
 PRICING_JUDGE_MODEL = os.getenv("PRICING_JUDGE_MODEL", "claude-sonnet-5-5")
 # Low, not medium: the judge's job is sorting 30-60 titles+thumbnails into four
 # buckets and naming a price, which is perception more than reasoning; low keeps
