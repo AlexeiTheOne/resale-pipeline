@@ -155,6 +155,7 @@ def test_too_few_same_item_sold_gives_no_price():
 # --- end to end with stubs -----------------------------------------------------
 
 IDENT = {"brand": "Kate Spade", "product_name": "Scallop Band", "model": "KSS0089",
+         "item_type": "Apple Watch Band", "size": "38mm",
          "search_query": "Kate Spade Scallop Band KSS0089 NWT"}
 SOLD_ROWS = [_sold_row("100000001", "50", "10"), _sold_row("100000002", "52", "8"),
              _sold_row("100000003", "48", None, "free"),
@@ -166,9 +167,11 @@ def _run(claude_price, confidence="high", same=("S1", "S2", "S3", "A1"),
     """get_pricing_v2 with every source stubbed. Totals of the three foreign
     sold rows are 60, 60, 48 (median 60), so the formula, when it runs, says
     60 * 0.95 = 57 total, minus our shipping."""
+    from pipeline import msrp
     saved = (config.PRICING_V2_CACHE_DIR, v2.fetch_sold, v2.fetch_active, v2.own_listings,
-             v2.calibration_examples)
+             v2.calibration_examples, msrp.load_history)
     seen = {}
+    msrp.load_history = lambda: []          # never read data/ross.db from a test
     try:
         config.PRICING_V2_CACHE_DIR = tempfile.mkdtemp()
 
@@ -192,7 +195,7 @@ def _run(claude_price, confidence="high", same=("S1", "S2", "S3", "A1"),
         r = v2.get_pricing_v2(IDENT, item_id="x", ask=fake_ask)
     finally:
         (config.PRICING_V2_CACHE_DIR, v2.fetch_sold, v2.fetch_active, v2.own_listings,
-         v2.calibration_examples) = saved
+         v2.calibration_examples, msrp.load_history) = saved
     return r, seen
 
 
