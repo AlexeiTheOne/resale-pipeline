@@ -41,6 +41,8 @@ def _reset(primary=PRIMARY, backup=None):
     price.APIFY_TOKEN_BACKUP = backup
     price._use_backup_token = False
     price.time.sleep = lambda _seconds: None  # keep retry backoff out of test time
+    price._credit_checked_at = 0.0
+    price._fetch_remaining = lambda _tok: None  # no balance lookups: stays offline
 
 
 def _fake_post(status_by_token, ok_payload=None):
@@ -176,6 +178,67 @@ def test_failover_notice_is_printed_without_the_token():
     assert printed.strip(), "failover should print something visible"
     assert PRIMARY not in printed and BACKUP not in printed
     assert "backup" in printed.lower() or "APIFY_TOKEN_BACKUP" in printed
+
+def test_primary_402_out_of_credit_falls_back_to_backup():
+    """402 is Apify's out-of-credit answer: the account is fine but empty, so
+    the backup account should take over exactly as for a rejected key."""
+    _reset(backup=BACKUP)
+    fake, calls = _fake_post(
+        lambda tok: 200 if tok == BACKUP else 402,
+        ok_payload=[{"price": "9.99"}])
+    price._post = fake
+
+    assert price._call(URL, {"keyword": "x", "count": 3}) == [{"price": "9.99"}]
+    assert calls == [PRIMARY, BACKUP]
+    assert price._use_backup_token is True
+
+
+def test_low_primary_balance_switches_before_the_402():
+    _reset(backup=BACKUP)
+    price._fetch_remaining = lambda tok: 0.10 if tok == PRIMARY else 4.90
+    fake, calls = _fake_post(lambda tok: 200, ok_payload=[])
+    price._post = fake
+
+    price._call(URL, {"keyword": "x", "count": 3})
+
+    assert calls == [BACKUP], "primary under the floor: go straight to the backup"
+
+
+def test_switches_back_to_primary_after_monthly_reset():
+    _reset(backup=BACKUP)
+    price._use_backup_token = True
+    price._fetch_remaining = lambda tok: 5.00
+    fake, calls = _fake_post(lambda tok: 200, ok_payload=[])
+    price._post = fake
+
+    price._call(URL, {"keyword": "x", "count": 3})
+
+    assert calls == [PRIMARY]
+    assert price._use_backup_token is False
+
+
+def test_unreadable_balance_keeps_current_choice():
+    _reset(backup=BACKUP)
+    price._use_backup_token = True
+    fake, calls = _fake_post(lambda tok: 200, ok_payload=[])
+    price._post = fake
+
+    price._call(URL, {"keyword": "x", "count": 3})
+
+    assert calls == [BACKUP]
+
+
+def test_balance_checked_at_most_once_per_window():
+    _reset(backup=BACKUP)
+    looked_up = []
+    price._fetch_remaining = lambda tok: looked_up.append(tok) or 5.00
+    fake, _ = _fake_post(lambda tok: 200, ok_payload=[])
+    price._post = fake
+
+    price._call(URL, {"keyword": "x", "count": 3})
+    price._call(URL, {"keyword": "y", "count": 3})
+
+    assert looked_up == [PRIMARY], "second call inside the window must not re-check"
 
 
 if __name__ == "__main__":

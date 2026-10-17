@@ -19,9 +19,26 @@ from config import (
 
 load_dotenv()
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
-# Second key, tried only after Apify rejects APIFY_TOKEN outright (401/403).
+# Second key (a second free-tier account), used when APIFY_TOKEN is rejected
+# (401/403), out of credit (402), or about to run out (see _sync_token_choice).
 # Optional: if unset, _call's behavior is identical to before this existed.
 APIFY_TOKEN_BACKUP = os.getenv("APIFY_TOKEN_BACKUP")
+
+# Statuses that mean "this account can't run it", where retrying the same token
+# is pointless but the other account may work. 402 is Apify's out-of-credit
+# answer: both accounts are free tier ($5/month each), and the primary had $1.97
+# left on 2026-10-17 while the backup sat unused — before 402 was in this set,
+# running dry would have stopped pricing until the monthly reset.
+_ACCOUNT_REJECTED = (401, 402, 403)
+
+# Switch to the backup BEFORE the primary hits zero, not just on the 402: the
+# sold actor is pay-per-result, and a run that exhausts the credit mid-scrape can
+# come back 200 with a short dataset — a thin comp pool that looks like a real
+# answer. Checked at most once per APIFY_CREDIT_CHECK_SECONDS.
+APIFY_MIN_CREDIT_USD = float(os.getenv("APIFY_MIN_CREDIT_USD", "0.25"))
+APIFY_CREDIT_CHECK_SECONDS = int(os.getenv("APIFY_CREDIT_CHECK_SECONDS", "3600"))
+LIMITS_URL = "https://api.apify.com/v2/users/me/limits"
+_credit_checked_at = 0.0
 
 # Sticky, process-wide: once the primary token is confirmed rejected, every
 # later _call (the query ladder alone can make a dozen in one pricing run)
@@ -59,8 +76,52 @@ def _activate_backup_token():
         first = not _use_backup_token
         _use_backup_token = True
     if first:
-        print("⚠️ Apify: primary token rejected (401/403) — switching to "
-              "APIFY_TOKEN_BACKUP for the rest of this run")
+        print("⚠️ Apify: primary account can't run it (401/402/403) — switching "
+              "to APIFY_TOKEN_BACKUP")
+
+
+def _fetch_remaining(token) -> float | None:
+    """USD left this billing cycle on the account behind `token`, or None if it
+    can't be read. Never raises: a failed check must not block pricing."""
+    try:
+        r = httpx.get(LIMITS_URL, headers={"Authorization": f"Bearer {token}"},
+                      timeout=20)
+        if r.status_code != 200:
+            return None
+        d = r.json()["data"]
+        return float(d["limits"]["maxMonthlyUsageUsd"]) - float(d["current"]["monthlyUsageUsd"])
+    except Exception:
+        return None
+
+
+def _sync_token_choice():
+    """Pick the account by remaining credit, at most once per
+    APIFY_CREDIT_CHECK_SECONDS. Moves to the backup when the primary is under
+    APIFY_MIN_CREDIT_USD and the backup isn't, and BACK to the primary once it
+    has credit again (the monthly reset) — the plain sticky flag would otherwise
+    keep draining the backup until the bot restarted. An unreadable balance
+    leaves the current choice alone."""
+    global _use_backup_token, _credit_checked_at
+    if not APIFY_TOKEN_BACKUP:
+        return
+    now = time.monotonic()
+    with _token_switch_lock:
+        if _credit_checked_at and now - _credit_checked_at < APIFY_CREDIT_CHECK_SECONDS:
+            return
+        _credit_checked_at = now
+    primary = _fetch_remaining(APIFY_TOKEN)
+    if primary is None:
+        return
+    if primary >= APIFY_MIN_CREDIT_USD:
+        if _use_backup_token:
+            print(f"Apify: primary account has ${primary:.2f} again — switching back to it")
+        _use_backup_token = False
+        return
+    backup = _fetch_remaining(APIFY_TOKEN_BACKUP)
+    if backup is not None and backup >= APIFY_MIN_CREDIT_USD and not _use_backup_token:
+        print(f"⚠️ Apify: primary account down to ${primary:.2f} — switching to "
+              f"APIFY_TOKEN_BACKUP (${backup:.2f} left)")
+        _use_backup_token = True
 
 
 def _post(url, payload, token):
@@ -77,9 +138,9 @@ def _call(url, payload, attempts=3):
     would fail the whole pricing run; retrying here keeps a network hiccup from
     costing the item its comps.
 
-    A 401 or 403 is different: it means THIS token is rejected, and retrying it
+    A 401/402/403 is different: THIS account is rejected or out of credit, and retrying it
     unchanged just burns the attempt budget on a call that can't succeed. If
-    APIFY_TOKEN_BACKUP is configured, the first 401/403 flips the sticky
+    APIFY_TOKEN_BACKUP is configured, the first 401/402/403 flips the sticky
     module-level flag (see _activate_backup_token) and immediately retries the
     same request with the backup token, in the same attempt — not a fresh one —
     so a rejection on the very last attempt still gets a real shot with the
@@ -87,7 +148,7 @@ def _call(url, payload, attempts=3):
     ALSO rejected, that's an account-level problem (both keys revoked, or a
     single quota shared by both), not a one-off blip, so it fails immediately
     with a clear combined message rather than retrying either dead token
-    twice more. With no backup configured, a 401/403 behaves exactly as before
+    twice more. With no backup configured, a 401/402/403 behaves exactly as before
     this existed: raise_for_status() raises, the generic except below catches
     it like any other HTTPStatusError, and it gets retried `attempts` times
     against the same (rejected) primary token before giving up.
@@ -101,16 +162,17 @@ def _call(url, payload, attempts=3):
     for the combined-rejection message raised below: it names the env var, not
     the secret, and is built from nothing but the HTTP status code."""
     last = None
+    _sync_token_choice()
     for attempt in range(attempts):
         using_backup = _use_backup_token
         token = APIFY_TOKEN_BACKUP if using_backup else APIFY_TOKEN
         try:
             r = _post(url, payload, token)
-            if r.status_code in (401, 403) and APIFY_TOKEN_BACKUP and not using_backup:
+            if r.status_code in _ACCOUNT_REJECTED and APIFY_TOKEN_BACKUP and not using_backup:
                 _activate_backup_token()
                 using_backup = True
                 r = _post(url, payload, APIFY_TOKEN_BACKUP)
-            if r.status_code in (401, 403) and using_backup and APIFY_TOKEN_BACKUP:
+            if r.status_code in _ACCOUNT_REJECTED and using_backup and APIFY_TOKEN_BACKUP:
                 raise RuntimeError(
                     "Apify rejected both APIFY_TOKEN and APIFY_TOKEN_BACKUP "
                     f"(HTTP {r.status_code}). Both keys are bad, or the account "
