@@ -28,13 +28,15 @@ from config import (
     AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC,
     GEMINI_PHOTO_LIMIT, MAX_CONCURRENT_LISTINGS, EBAY_DEFAULT_AD_RATE_PCT,
     REPRICE_WEEKDAY, REPRICE_HOUR_UTC,
+    SYNC_ENABLED, SYNC_HOUR_UTC, SYNC_DAYS, JOB_CATCHUP_GRACE_HOURS,
+    FEEDBACK_ENABLED, FEEDBACK_HOUR_UTC, FEEDBACK_COMMENT,
     OFFER_MIN_WATCHERS, OFFER_MIN_NET, OFFER_MIN_DAYS_LIVE,
     OFFER_DISCOUNT_SMALL, OFFER_DISCOUNT_LARGE,
     OFFER_LARGE_THRESHOLD, OFFER_MESSAGE,
 )
 from db import (
-    create_item, delete_item, get_item, latest_stats, list_items,
-    update_field, update_status, VALID_STATUSES,
+    create_item, delete_item, get_item, last_job_run, latest_stats, list_items,
+    record_job_run, update_field, update_status, VALID_STATUSES,
 )
 from identify import identify_item
 from receipt import decode_barcode, detect_ross_tags, extract_receipt, is_dark_frame
@@ -45,6 +47,7 @@ from profit import breakeven_price, format_projection, project
 from ebay.auth import get_access_token
 from ebay.analytics import get_watch_count, traffic_status
 from ebay.orders import finances_status, orders_status, sales_by_item
+from ebay.feedback import leave_all_pending
 from ebay.listings import audit_listing_photos, get_active_listings, listings_status
 from ebay.inventory import (
     create_draft_offer,
@@ -201,6 +204,32 @@ async def _send_chunked(message, lines: list[str]) -> None:
         size += len(line) + 1
     if buf:
         await _safe_reply(message, "\n".join(buf))
+
+
+
+def _chunk_lines(lines: list[str]) -> list[str]:
+    """Group lines into messages that each fit under Telegram's cap."""
+    out, buf, size = [], [], 0
+    for line in lines:
+        if buf and size + len(line) + 1 > TELEGRAM_MAX_CHARS:
+            out.append("\n".join(buf))
+            buf, size = [], 0
+        buf.append(line)
+        size += len(line) + 1
+    if buf:
+        out.append("\n".join(buf))
+    return out
+
+
+async def _send_chunked_to(bot, chat_id, lines: list[str]) -> None:
+    """_send_chunked for an unprompted message — the scheduled jobs post to a
+    chat id rather than replying to an update, so there is no Message to reply
+    to. Same chunking, same best-effort behaviour."""
+    for chunk in _chunk_lines(lines):
+        try:
+            await bot.send_message(chat_id=chat_id, text=_scrub(chunk))
+        except Exception as e:
+            print(f"WARNING: send_message failed (continuing anyway): {type(e).__name__}: {e}")
 
 
 # Ring buffer of recent errors, dumped by /errors. The console isn't visible from
@@ -2582,23 +2611,60 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     with the actual sale price and eBay fees (so /profit shows real net/margin).
     Listings that ended without a matching order are flagged for a manual /sold.
     Usage: /sync [days] (order look-back window, default 90)."""
+    days = _sync_days(context.args)
+
+    async def _ping(text: str) -> None:
+        await _safe_reply(update.message, text)
+
+    lines = await _run_sync(days, on_progress=_ping)
+    await _send_chunked(update.message, lines)
+
+
+def _sync_days(args) -> int:
+    """Order look-back for a /sync run: first positional arg, else the default."""
+    if args:
+        try:
+            return max(1, int(args[0]))
+        except (TypeError, ValueError):
+            pass
+    return SYNC_DAYS
+
+
+# One reconciliation at a time. The nightly job and a hand-typed /sync can now
+# land together — and concurrent_updates(True) means two /syncs can overlap
+# anyway — which would let both passes see the same un-adopted listing and adopt
+# it twice, or interleave writes to the same item.
+_sync_lock = asyncio.Lock()
+
+
+async def _run_sync(days: int, on_progress=None) -> list[str]:
+    """The whole /sync reconciliation, as a function that RETURNS its report
+    lines instead of replying to a chat.
+
+    Split out of sync_command so the nightly job (_daily_sync_loop) runs exactly
+    the same reconciliation the manual command does, rather than a second,
+    drifting copy of it. `on_progress` is an optional async callback for the
+    interactive path's status ping; the scheduled path passes none.
+
+    Serialized on _sync_lock: a second caller waits rather than running a
+    concurrent pass over the same items."""
+    if _sync_lock.locked() and on_progress:
+        await on_progress("⏳ A sync is already running — waiting for it to finish...")
+    async with _sync_lock:
+        return await _run_sync_locked(days, on_progress)
+
+
+async def _run_sync_locked(days: int, on_progress=None) -> list[str]:
     items = [
         i for i in list_items()
         if (i.get("ebay") or {}).get("offer_id")
         and i["status"] in ("ebay_draft", "published", "sold")
     ]
     if not items:
-        await _safe_reply(update.message, "Nothing to sync — no items have an eBay offer yet.")
-        return
+        return ["Nothing to sync — no items have an eBay offer yet."]
 
-    days = 90
-    if context.args:
-        try:
-            days = max(1, int(context.args[0]))
-        except ValueError:
-            pass
-
-    await _safe_reply(update.message, f"🔄 Syncing {len(items)} item(s) from eBay...")
+    if on_progress:
+        await on_progress(f"🔄 Syncing {len(items)} item(s) from eBay...")
 
     # Pull real sold orders once (keyed by sku==item_id and listing_id) and hand
     # the map to every _sync_one. A missing fulfillment/finances scope shouldn't
@@ -2766,7 +2832,7 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                   "sell.fulfillment.readonly + sell.finances."]
     if errors:
         lines += ["", f"⚠️ Couldn't read ({len(errors)}):"] + [f"  {e}" for e in errors]
-    await _send_chunked(update.message, lines)
+    return lines
 
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3684,30 +3750,200 @@ async def reprice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _safe_reply(query.message, f"💲 Repriced {item_id[:8]} to ${price}.")
 
 
+# Names under which the scheduled jobs stamp db.job_runs. Changing one resets
+# that job's catch-up history, so don't.
+_JOB_REPRICE = "weekly_reprice"
+_JOB_SYNC = "daily_sync"
+_JOB_FEEDBACK = "daily_feedback"
+
+
+def _previous_slot(now: datetime, hour_utc: int, weekday: int | None = None) -> datetime:
+    """The most recent scheduled slot at or before `now`. `weekday` None = daily."""
+    if weekday is None:
+        slot = now.replace(hour=hour_utc, minute=0, second=0, microsecond=0)
+        return slot if slot <= now else slot - timedelta(days=1)
+    days_back = (now.weekday() - weekday) % 7
+    slot = (now - timedelta(days=days_back)).replace(
+        hour=hour_utc, minute=0, second=0, microsecond=0)
+    return slot if slot <= now else slot - timedelta(days=7)
+
+
+def _next_slot(now: datetime, hour_utc: int, weekday: int | None = None) -> datetime:
+    """The next scheduled slot strictly after `now`. `weekday` None = daily."""
+    period = timedelta(days=1 if weekday is None else 7)
+    return _previous_slot(now, hour_utc, weekday) + period
+
+
+def _missed_slot(job: str, now: datetime, hour_utc: int,
+                 weekday: int | None = None) -> bool:
+    """Whether `job` should run a catch-up right now, because it never ran for
+    the slot that has already passed.
+
+    This is the whole point of persisting job_runs. The loops used to compute
+    their next slot from `now` alone, so a process that wasn't alive at the slot
+    (laptop asleep, Windows Update reboot) skipped that run silently and waited a
+    full period — which is why the 2026-08-03 weekly digest simply never
+    happened and nothing recorded that it hadn't.
+
+    Bounded by JOB_CATCHUP_GRACE_HOURS: a run that is days late is stale news,
+    and firing it at startup would be noise rather than a recovery."""
+    previous = _previous_slot(now, hour_utc, weekday)
+    if now - previous > timedelta(hours=JOB_CATCHUP_GRACE_HOURS):
+        return False
+    last = last_job_run(job)
+    return last is None or last < previous
+
+
+async def _run_reprice_job(app: Application, *, catch_up: bool = False) -> None:
+    """One weekly price check + digest. Only stamps job_runs on success, so a run
+    that failed is retried at the next start rather than being counted as done."""
+    print(f"📈 Running {'catch-up' if catch_up else 'scheduled'} weekly price check...")
+    try:
+        results = await asyncio.to_thread(run_weekly_check)
+    except Exception as e:
+        traceback.print_exc()
+        _record_error("weekly reprice", e)
+        return
+    record_job_run(_JOB_REPRICE, detail=f"{len(results)} listing(s)")
+    if not results:
+        return
+    for uid in ALLOWED_USER_IDS:
+        if catch_up:
+            try:
+                await app.bot.send_message(
+                    chat_id=uid,
+                    text="⏰ Catch-up: last week's price check never ran (the bot "
+                         "wasn't up at its slot). Running it now.")
+            except Exception as e:
+                print(f"WARNING: catch-up notice failed: {type(e).__name__}: {e}")
+        await _send_reprice_digest(app.bot, uid, results)
+
+
 async def _weekly_reprice_loop(app: Application) -> None:
-    """Runs for the lifetime of the bot: sleeps until the next configured weekly
-    slot (REPRICE_WEEKDAY/REPRICE_HOUR_UTC), runs the price check, and posts the
-    digest to every allowed user. A manual /pricecheck doesn't reset this clock."""
+    """Runs for the lifetime of the bot: catches up on a missed slot, then sleeps
+    until the next configured weekly slot (REPRICE_WEEKDAY/REPRICE_HOUR_UTC),
+    runs the price check, and posts the digest to every allowed user. A manual
+    /pricecheck doesn't reset this clock."""
+    if _missed_slot(_JOB_REPRICE, datetime.now(timezone.utc),
+                    REPRICE_HOUR_UTC, REPRICE_WEEKDAY):
+        await _run_reprice_job(app, catch_up=True)
     while True:
         now = datetime.now(timezone.utc)
-        days_ahead = (REPRICE_WEEKDAY - now.weekday()) % 7
-        target = (now + timedelta(days=days_ahead)).replace(
-            hour=REPRICE_HOUR_UTC, minute=0, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=7)
+        target = _next_slot(now, REPRICE_HOUR_UTC, REPRICE_WEEKDAY)
         await asyncio.sleep((target - now).total_seconds())
+        await _run_reprice_job(app)
 
-        print("📈 Running scheduled weekly price check...")
+
+# A sync whose only news is "nothing changed" is not worth a phone notification;
+# anything else in the report is.
+_SYNC_QUIET_LINES = {"No price/quantity changes found."}
+
+
+async def _run_sync_job(app: Application, *, catch_up: bool = False) -> None:
+    """One scheduled reconciliation with eBay, using the same _run_sync the
+    manual /sync calls. Posts the report only when it actually says something."""
+    print(f"🔄 Running {'catch-up' if catch_up else 'scheduled'} eBay sync...")
+    try:
+        lines = await _run_sync(SYNC_DAYS)
+    except Exception as e:
+        traceback.print_exc()
+        _record_error("scheduled sync", e)
+        return
+    record_job_run(_JOB_SYNC, detail=f"{len(lines)} report line(s)")
+
+    notable = [ln for ln in lines[1:]
+               if ln.strip() and ln.strip() not in _SYNC_QUIET_LINES]
+    if not notable:
+        print("   sync: nothing changed, staying quiet.")
+        return
+    header = "⏰ Catch-up sync (the bot missed its slot):" if catch_up else None
+    for uid in ALLOWED_USER_IDS:
         try:
-            results = await asyncio.to_thread(run_weekly_check)
+            if header:
+                await app.bot.send_message(chat_id=uid, text=header)
+            await _send_chunked_to(app.bot, uid, lines)
         except Exception as e:
-            traceback.print_exc()
-            _record_error("weekly reprice", e)
-            continue
-        if not results:
-            continue
-        for uid in ALLOWED_USER_IDS:
-            await _send_reprice_digest(app.bot, uid, results)
+            print(f"WARNING: sync digest to {uid} failed: {type(e).__name__}: {e}")
+
+
+async def _daily_sync_loop(app: Application) -> None:
+    """Runs for the lifetime of the bot: keeps the local DB reconciled with eBay
+    once a day, so sold orders land in the DB without anyone remembering to type
+    /sync.
+
+    Before this existed /sync was manual-only, and every money figure built on
+    the DB (/profit, /report, COGS) quietly understated itself for as long as a
+    sync was overdue — the DB sat 10 days stale on 2026-09-03, missing 8 August
+    orders and putting that month's COGS 35% low."""
+    if _missed_slot(_JOB_SYNC, datetime.now(timezone.utc), SYNC_HOUR_UTC):
+        await _run_sync_job(app, catch_up=True)
+    while True:
+        now = datetime.now(timezone.utc)
+        target = _next_slot(now, SYNC_HOUR_UTC)
+        await asyncio.sleep((target - now).total_seconds())
+        await _run_sync_job(app)
+
+
+def _feedback_report(result: dict) -> list[str]:
+    """Report lines for a feedback run. Empty when there was nothing to do."""
+    left, skipped, errors = result["left"], result["skipped"], result["errors"]
+    if not (left or skipped or errors):
+        return []
+    lines = [f"⭐ Left positive feedback for {len(left)} buyer(s)."]
+    for e in left:
+        lines.append(f"  {e['buyer']}: {e['title'][:50]}")
+    if skipped:
+        lines += ["", f"Skipped ({len(skipped)}):"] + [
+            f"  {e['item_id']} {e['title'][:40]}: {why}" for e, why in skipped]
+    if errors:
+        lines += ["", f"⚠️ Failed ({len(errors)}):"] + [
+            f"  {e['item_id']} {e['title'][:40]}: {msg}" for e, msg in errors]
+    return lines
+
+
+async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/feedback: leave positive feedback for every buyer still waiting on it,
+    right now, instead of at the daily slot."""
+    await _safe_reply(update.message, "⭐ Leaving feedback for buyers...")
+    try:
+        result = await asyncio.to_thread(leave_all_pending, FEEDBACK_COMMENT)
+    except Exception as e:
+        _record_error("feedback", e)
+        await _safe_reply(update.message, f"❌ Feedback run failed: {e}")
+        return
+    record_job_run(_JOB_FEEDBACK, detail=f"{len(result['left'])} left (manual)")
+    lines = _feedback_report(result) or ["No buyers are waiting on feedback."]
+    await _send_chunked(update.message, lines)
+
+
+async def _run_feedback_job(app: Application) -> None:
+    """One automatic feedback run. Posts only when it left (or failed to leave)
+    something. Stamped only on success, so a failed run retries at next start."""
+    print("⭐ Running scheduled buyer feedback...")
+    try:
+        result = await asyncio.to_thread(leave_all_pending, FEEDBACK_COMMENT)
+    except Exception as e:
+        traceback.print_exc()
+        _record_error("scheduled feedback", e)
+        return
+    record_job_run(_JOB_FEEDBACK, detail=f"{len(result['left'])} left")
+    lines = _feedback_report(result)
+    if not lines:
+        return
+    for uid in ALLOWED_USER_IDS:
+        await _send_chunked_to(app.bot, uid, lines)
+
+
+async def _daily_feedback_loop(app: Application) -> None:
+    """Runs for the lifetime of the bot: leaves positive feedback for new buyers
+    once a day, catching up at startup if the slot was missed."""
+    if _missed_slot(_JOB_FEEDBACK, datetime.now(timezone.utc), FEEDBACK_HOUR_UTC):
+        await _run_feedback_job(app)
+    while True:
+        now = datetime.now(timezone.utc)
+        target = _next_slot(now, FEEDBACK_HOUR_UTC)
+        await asyncio.sleep((target - now).total_seconds())
+        await _run_feedback_job(app)
 
 
 async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3931,6 +4167,7 @@ HELP_SECTIONS = [
         ("/setprice [id] <price>", "Set the price (35 -> $34.99); pushes to eBay if it already has an offer"),
         ("/setqty [id] <n>", "Set the quantity on eBay (once the item has an offer); default is 1"),
         ("/sync [days]", "Pull live price/quantity + real sold orders from eBay; auto-marks sold items with actual fees"),
+        ("/feedback", "Leave positive feedback now for every paid buyer still waiting on it (also runs daily)"),
         ("/activate [id]", "Publish an eBay draft — makes it live"),
         ("/end [id]", "End a live listing (drops to a draft; /activate to relist)"),
         ("/refreshdesc [apply]", "Push the current description copy to listings already on eBay "
@@ -3994,6 +4231,28 @@ async def _post_init(app: Application) -> None:
     else:
         print("⚠️ Weekly price check NOT scheduled — no TELEGRAM_ALLOWED_USER_IDS to notify. "
               "Use /pricecheck manually, or set the allowlist to enable it.")
+
+    # The sync job is worth running even with no one to notify: its real product
+    # is a DB that matches eBay, which every money figure reads. The digest is
+    # just the by-product, so this is deliberately NOT inside the allowlist check
+    # above.
+    if SYNC_ENABLED:
+        app.create_task(_daily_sync_loop(app))
+        print(f"Daily eBay sync scheduled: hour={SYNC_HOUR_UTC} UTC "
+              f"(orders look-back {SYNC_DAYS}d, catch-up grace "
+              f"{JOB_CATCHUP_GRACE_HOURS}h).")
+        last = last_job_run(_JOB_SYNC)
+        print(f"   last completed sync: {last.isoformat() if last else 'never recorded'}")
+    else:
+        print("⚠️ Daily eBay sync DISABLED (SYNC_ENABLED=0) — sold orders will only "
+              "reach the DB when you run /sync by hand, and every money figure "
+              "understates itself until you do.")
+
+    if FEEDBACK_ENABLED:
+        app.create_task(_daily_feedback_loop(app))
+        print(f"Daily buyer feedback scheduled: hour={FEEDBACK_HOUR_UTC} UTC.")
+    else:
+        print("Buyer feedback automation disabled (FEEDBACK_ENABLED=0); use /feedback.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4078,6 +4337,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setprice", setprice_command))
     app.add_handler(CommandHandler("setqty", setqty_command))
     app.add_handler(CommandHandler("sync", sync_command))
+    app.add_handler(CommandHandler("feedback", feedback_command))
     app.add_handler(CommandHandler("activate", activate_command))
     app.add_handler(CommandHandler("promote", promote_command))
     app.add_handler(CommandHandler("pricecheck", pricecheck_command))

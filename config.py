@@ -278,3 +278,29 @@ REPRICE_MIN_MARGIN_DOLLARS = float(os.getenv("REPRICE_MIN_MARGIN_DOLLARS", "5"))
 # (~9-10am US Eastern/Central).
 REPRICE_WEEKDAY = int(os.getenv("REPRICE_WEEKDAY", "0"))  # 0 = Monday
 REPRICE_HOUR_UTC = int(os.getenv("REPRICE_HOUR_UTC", "14"))
+
+# Automatic /sync. Until this existed, /sync was manual-only and nothing else
+# wrote sold orders into the DB, so every money figure (/profit, /report, COGS)
+# silently understated whenever a sync was overdue — on 2026-09-03 the DB was
+# 10 days stale and missing 8 August orders, putting August COGS 35% low.
+# Daily rather than weekly because the reprice digest reads price/quantity that
+# a sale changes, and it should not run on a week-old picture of the account.
+SYNC_ENABLED = os.getenv("SYNC_ENABLED", "1") not in ("0", "false", "False")
+SYNC_HOUR_UTC = int(os.getenv("SYNC_HOUR_UTC", "11"))   # 3 hours before the digest
+# Order look-back per run. Matches /sync's own default; a window comfortably
+# wider than the sync interval means a run that gets missed loses nothing.
+SYNC_DAYS = int(os.getenv("SYNC_DAYS", "90"))
+# How late a scheduled job may be before a catch-up run is pointless rather than
+# useful. Inside the window, a job that missed its slot (laptop asleep, reboot)
+# runs shortly after startup; outside it, it just waits for the next slot.
+JOB_CATCHUP_GRACE_HOURS = int(os.getenv("JOB_CATCHUP_GRACE_HOURS", "48"))
+
+# Automatic positive feedback for buyers (ebay/feedback.py). Sellers can only
+# leave Positive, and the window closes 60 days after the sale, so the only way
+# to get it wrong is to forget. Daily, an hour after the sync.
+FEEDBACK_ENABLED = os.getenv("FEEDBACK_ENABLED", "1") not in ("0", "false", "False")
+FEEDBACK_HOUR_UTC = int(os.getenv("FEEDBACK_HOUR_UTC", "12"))
+# eBay caps this at 80 characters; anything longer is cut off.
+FEEDBACK_COMMENT = os.getenv(
+    "FEEDBACK_COMMENT",
+    "Great buyer, fast payment. Thank you for your purchase! A+")

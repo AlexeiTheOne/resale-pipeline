@@ -454,6 +454,48 @@ Defaults are in `config.py`; the marked ones can be overridden in `.env`:
 - `EBAY_DEFAULT_AD_RATE_PCT` — Promoted Listings ad rate auto-applied on publish
   (default `4`; set `0` to disable), and `EBAY_PROMOTED_CAMPAIGN_NAME`
 - eBay marketplace, currency, merchant location, and ship-from address
+- `SYNC_ENABLED` (on) / `SYNC_HOUR_UTC` (11) / `SYNC_DAYS` (90) — the automatic
+  daily `/sync`. See **Scheduled jobs** below; turn it off only if you intend to
+  run `/sync` by hand, because nothing else writes sold orders into the DB.
+- `FEEDBACK_ENABLED` (on) / `FEEDBACK_HOUR_UTC` (12) / `FEEDBACK_COMMENT` — the
+  daily automatic positive feedback for paid buyers (`/feedback` runs it now).
+  The comment is capped at 80 characters by eBay.
+- `JOB_CATCHUP_GRACE_HOURS` (48) — how late a missed scheduled run may be before
+  a catch-up is dropped as stale rather than fired at startup
+
+## Scheduled jobs
+
+Two jobs run in the bot process, so **they only run while the bot is running**:
+
+| Job | When (UTC) | What |
+| --- | --- | --- |
+| Daily sync | `SYNC_HOUR_UTC`, default 11:00 | The same reconciliation `/sync` does. Posts its report only if something actually changed. |
+| Weekly price check | `REPRICE_WEEKDAY`/`REPRICE_HOUR_UTC`, default Mon 14:00 | Traffic/watcher diagnosis + the repricing digest. |
+
+Both **catch up on a slot they missed**. Each stamps the `job_runs` table when it
+completes; on startup, a job whose last completed run predates the slot that has
+already passed runs immediately (bounded by `JOB_CATCHUP_GRACE_HOURS`, so a run
+that is uselessly late is dropped rather than fired as noise). A failed run is
+deliberately *not* stamped, so it retries rather than counting as done.
+
+This matters because the machine is not always up. Before catch-up existed the
+loops computed their next slot from the current time alone: a laptop asleep or a
+Windows Update reboot at the slot skipped that run silently and waited a full
+period. The 2026-08-03 weekly digest never ran for exactly this reason, and
+nothing recorded that it hadn't. And with `/sync` manual-only, every money figure
+built on the DB (`/profit`, `/report`, COGS) quietly understated itself for as
+long as a sync was overdue — on 2026-09-03 the DB was 10 days stale and missing 8
+August orders, putting that month's COGS 35% low.
+
+To check when a job last completed:
+
+```
+sqlite3 data/ross.db "SELECT * FROM job_runs"
+```
+
+Note that **`data/ross.db`'s file mtime is not a staleness signal** — any eBay
+call refreshes the stored OAuth token and writes `ebay_tokens`, bumping the mtime
+without syncing anything. Use `job_runs`, or the newest `sold_at` across `items`.
 
 ## Notes
 

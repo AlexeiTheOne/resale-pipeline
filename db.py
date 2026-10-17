@@ -95,6 +95,20 @@ def create_tables() -> None:
             )
         """)
 
+        # When each scheduled background job last COMPLETED, so a job can tell
+        # it missed its slot and catch up. Without this the bot's timers were
+        # pure in-process sleeps: if the process wasn't running at the slot
+        # (laptop asleep, Windows Update reboot), that run was skipped silently
+        # and the next one was a full period away. One row per job name.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS job_runs (
+                job         TEXT PRIMARY KEY,
+                last_run_at TEXT NOT NULL,
+                status      TEXT,
+                detail      TEXT
+            )
+        """)
+
 
 def create_item(photos: list[str]) -> str:
     item_id = str(uuid.uuid4())
@@ -183,5 +197,33 @@ def latest_stats(item_id: str) -> dict | None:
     history = stats_history(item_id, limit=1)
     return history[0] if history else None
 
+
+
+def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> None:
+    """Stamp a scheduled job as having just completed. Called after the work,
+    not before, so a crash mid-run leaves the old timestamp and the job retries
+    on the next start rather than believing it already ran."""
+    with _conn() as con:
+        con.execute(
+            "INSERT INTO job_runs (job, last_run_at, status, detail) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(job) DO UPDATE SET last_run_at=excluded.last_run_at, "
+            "status=excluded.status, detail=excluded.detail",
+            (job, _now(), status, detail),
+        )
+
+
+def last_job_run(job: str) -> datetime | None:
+    """When `job` last completed, as an aware UTC datetime, or None if never."""
+    with _conn() as con:
+        row = con.execute(
+            "SELECT last_run_at FROM job_runs WHERE job = ?", (job,)
+        ).fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        dt = datetime.fromisoformat(row[0])
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 create_tables()
