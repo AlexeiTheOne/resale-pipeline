@@ -137,17 +137,26 @@ def fetch_sold(query: str, count: int | None = None) -> list[dict]:
     payload = {"keyword": query, "count": count}
 
     def go():
+        # The worst case is reserved before the call and settled after it: the
+        # sold queries run in parallel, and checking without reserving let
+        # several pass the same check at once (round 3 overran $1.00 by $0.002).
+        worst = _apify_estimate(count)
         with _lock:
-            if apify_cap_usd is not None and \
-                    apify_spend["usd"] + _apify_estimate(count) > apify_cap_usd:
+            if apify_cap_usd is not None and apify_spend["usd"] + worst > apify_cap_usd:
                 raise ApifyBudgetExceeded(
                     f"Apify estimate ${apify_spend['usd']:.3f} + up to "
-                    f"${_apify_estimate(count):.3f} would pass the ${apify_cap_usd:.2f} cap")
-        rows = v1._call(v1.SOLD_URL, payload)
+                    f"${worst:.3f} would pass the ${apify_cap_usd:.2f} cap")
+            apify_spend["usd"] += worst
+        try:
+            rows = v1._call(v1.SOLD_URL, payload)
+        except Exception:
+            with _lock:
+                apify_spend["usd"] -= worst
+            raise
         with _lock:
             apify_spend["calls"] += 1
             apify_spend["rows"] += len(rows)
-            apify_spend["usd"] += _apify_estimate(len(rows))
+            apify_spend["usd"] += _apify_estimate(len(rows)) - worst
         return rows
 
     return _cached("sold", _sold_key(query, count), go)

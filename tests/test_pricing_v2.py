@@ -285,6 +285,45 @@ def test_zero_claude_price_is_asked_once_more():
     assert out["claude_price"] == 41.5 and len(notes) == 2 and "previous answer" in notes[1]
 
 
+def test_apify_cap_reserves_worst_case_across_parallel_queries():
+    import threading
+    from pipeline import price as v1
+    saved = (config.PRICING_V2_CACHE_DIR, v2.apify_cap_usd, dict(v2.apify_spend), v1._call)
+    gate = threading.Barrier(3, timeout=5)
+    try:
+        config.PRICING_V2_CACHE_DIR = tempfile.mkdtemp()
+        v2.apify_spend.update(usd=0.0, calls=0, rows=0)
+        v2.apify_cap_usd = 0.13          # room for two worst-case (15-row) queries, not three
+        started = []
+
+        def fake_call(url, payload):
+            started.append(payload["keyword"])
+            return [{}] * 15
+
+        v1._call = fake_call
+        results = []
+
+        def run(q):
+            gate.wait()
+            try:
+                v2.fetch_sold(q, 15)
+                results.append("ok")
+            except v2.ApifyBudgetExceeded:
+                results.append("capped")
+
+        threads = [threading.Thread(target=run, args=(f"q{i}",)) for i in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sorted(results) == ["capped", "ok", "ok"] and len(started) == 2
+        assert v2.apify_spend["usd"] <= 0.13
+    finally:
+        (config.PRICING_V2_CACHE_DIR, v2.apify_cap_usd, spend, v1._call) = saved
+        v2.apify_spend.clear()
+        v2.apify_spend.update(spend)
+
+
 # --- review screen -------------------------------------------------------------
 
 def test_review_screen_shows_claude_price_reason_and_evidence():
