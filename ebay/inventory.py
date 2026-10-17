@@ -611,6 +611,42 @@ def _build_aspects(item_specifics: dict) -> dict:
     return aspects
 
 
+def _type_forms(text: str) -> set[str]:
+    """Comparable forms of a type name: 'Satchel/Top Handle Bag' -> {'satchel/top
+    handle bag', 'satchel', 'top handle'}. Drops a trailing 'bag' so the
+    identifier's 'Tote Bag' meets the catalog's 'Tote'."""
+    def strip_bag(s):
+        s = s.strip().lower()
+        for suffix in (" handbag", " bags", " bag"):
+            if s.endswith(suffix):
+                return s[: -len(suffix)].strip()
+        return s
+    whole = text.strip().lower()
+    return {whole, strip_bag(whole)} | {strip_bag(p) for p in re.split(r"[/&]", whole) if p.strip()}
+
+
+def _match_type_hint(item_type_hint: str, allowed_values: list[str]) -> str | None:
+    """The allowed value naming the same kind of item as the hint, in the
+    catalog's exact casing. An exact match wins over a looser one."""
+    hint = item_type_hint.strip().lower()
+    for value in allowed_values:
+        if value.lower() == hint:
+            return value
+    hint_forms = _type_forms(item_type_hint)
+    for value in allowed_values:
+        if _type_forms(value) & hint_forms:
+            return value
+    return None
+
+
+def _category_department(allowed_values: list[str]) -> str | None:
+    """A gendered category (e.g. Women's Bags) offers its own gender plus unisex
+    options. Choosing the category already committed to that gender, so it is
+    the safe value; a category offering both Men and Women gets nothing."""
+    gendered = [v for v in allowed_values if v.lower() in ("women", "men")]
+    return gendered[0] if len(gendered) == 1 else None
+
+
 def _guess_fallback(name: str, item_type_hint: str | None, allowed_values: list[str]) -> str | None:
     key = name.strip().lower()
     if key == "brand":
@@ -620,10 +656,12 @@ def _guess_fallback(name: str, item_type_hint: str | None, allowed_values: list[
     if key in GTIN_ASPECT_NAMES:
         return "Does not apply"
     if key == "type" and item_type_hint:
-        for value in allowed_values:
-            if value.lower() == item_type_hint.strip().lower():
-                return value  # use the catalog's exact casing for SELECTION_ONLY
-        return item_type_hint
+        return _match_type_hint(item_type_hint, allowed_values) or item_type_hint
+    if key == "style" and item_type_hint and allowed_values:
+        # Only a catalog match: a raw 'Bag' would be a useless buyer filter.
+        return _match_type_hint(item_type_hint, allowed_values)
+    if key == "department":
+        return _category_department(allowed_values)
     if allowed_values and {v.lower() for v in allowed_values} == {"yes", "no"}:
         return next(v for v in allowed_values if v.lower() == "no")
     return None
@@ -634,6 +672,7 @@ def _guess_fallback(name: str, item_type_hint: str | None, allowed_values: list[
 # but the category requires "Exterior Color".
 ASPECT_SYNONYMS = [
     {"color", "colour", "exterior color", "main color", "main colour"},
+    {"material", "exterior material"},
 ]
 
 
