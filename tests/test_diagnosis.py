@@ -109,8 +109,143 @@ def test_only_a_decoded_upc_lowers_the_auto_confirm_bar():
     assert tb._identify_gate_reason({**base, "upc": "198928675698"}) is not None
 
 
+# --- a failed traffic fetch is not zero traffic ------------------------------
+#
+# The same bug again, one signal over: _traffic_for_all swallowed a failed batch,
+# the listings in it read as 0 impressions, and _diagnose called them INVISIBLE.
+# 2026-08-17: every row 0 impressions, 71 INVISIBLE. 2026-10-05: 97 INVISIBLE.
+# Watch counts were fine both weeks — only the traffic fetch had failed.
+
+def test_missing_traffic_is_not_invisible():
+    assert _diagnose(None, 3, None, OLD, ENOUGH) == "NO_TRAFFIC_DATA"
+    assert _diagnose(None, None, None, OLD, ENOUGH) == "NO_TRAFFIC_DATA"
+    # Too-new is decided on age alone and still wins.
+    assert _diagnose(None, 0, None, 0, 0) == "TOO_NEW"
+
+
+def test_a_genuine_zero_is_still_invisible():
+    """eBay omits listings it had no traffic for from a successful report; that
+    really is zero, and must stay INVISIBLE."""
+    assert _diagnose({"impressions": 0, "views": 0}, 0, None, OLD, 0) == "INVISIBLE"
+
+
+class _Patch:
+    """Swap module attributes for the duration of a with-block (no pytest
+    fixtures, so the file still runs as a plain script)."""
+    def __init__(self, module, **attrs):
+        self.module, self.attrs, self.saved = module, attrs, {}
+
+    def __enter__(self):
+        for k, v in self.attrs.items():
+            self.saved[k] = getattr(self.module, k)
+            setattr(self.module, k, v)
+
+    def __exit__(self, *exc):
+        for k, v in self.saved.items():
+            setattr(self.module, k, v)
+
+
+def _live(listing_id, item_id=None):
+    return {"item_id": item_id or f"item-{listing_id}", "status": "published",
+            "created_at": "2025-01-01T00:00:00+00:00",
+            "ebay": {"listing_id": listing_id}, "listing": {"price": 20.0}}
+
+
+def _flaky_report(bad: set):
+    """Fails any batch containing a `bad` id; otherwise reports traffic for every
+    id except those ending in '0' (eBay omitting a zero-traffic listing)."""
+    def report(ids):
+        if bad & set(ids):
+            raise RuntimeError("eBay Analytics API traffic_report failed [429]")
+        return {i: {"impressions": 500, "views": 20, "ctr": 0.0}
+                for i in ids if not i.endswith("0")}
+    return report
+
+
+def test_a_failed_batch_maps_to_none_not_absent():
+    import pipeline.reprice as rp
+
+    items = [_live(str(100 + n)) for n in range(5)]   # ids 100..104
+    with _Patch(rp, get_traffic_report=_flaky_report({"103"})):
+        traffic, health = rp._traffic_for_all(items, batch=2)
+    # Batches: [100,101] ok, [102,103] failed, [104] ok.
+    assert health == {"batches": 3, "failed": 1}
+    assert "100" not in traffic                        # genuine zero: omitted
+    assert traffic["101"]["impressions"] == 500
+    assert traffic["102"] is None and traffic["103"] is None
+    assert traffic["104"]["impressions"] == 500
+
+
+def _temp_db():
+    import tempfile
+
+    import db
+    path = str(Path(tempfile.mkdtemp(prefix="diag_")) / "test.db")
+    return db, path
+
+
+def test_failed_traffic_is_stored_as_null_not_zero():
+    """listing_stats is history later weeks sum over. A failed fetch must leave
+    NULL impressions/views there, while the watch count that DID arrive is kept."""
+    import pipeline.reprice as rp
+    db, path = _temp_db()
+    with _Patch(db, DB_PATH=path):
+        db.create_tables()
+        with _Patch(rp, get_watch_count=lambda _id: 2):
+            result = rp.evaluate_item(_live("555", "item-555"), {"555": None})
+        row = db.latest_stats("item-555")
+    assert result["verdict"] == "NO_TRAFFIC_DATA"
+    assert result["impressions"] is None and result["views"] is None
+    assert result["suggested_price"] is None
+    assert row["impressions"] is None and row["views"] is None
+    assert row["watchers"] == 2 and row["verdict"] == "NO_TRAFFIC_DATA"
+
+
+def test_null_traffic_history_does_not_break_cumulative_views():
+    import pipeline.reprice as rp
+    db, path = _temp_db()
+    with _Patch(db, DB_PATH=path):
+        db.create_tables()
+        db.record_listing_stats("item-777", "2026-08-17", impressions=None,
+                                views=None, watchers=1, verdict="NO_TRAFFIC_DATA")
+        db.record_listing_stats("item-777", "2026-08-10", impressions=300,
+                                views=12, watchers=1, verdict="HEALTHY")
+        with _Patch(rp, get_watch_count=lambda _id: 1):
+            result = rp.evaluate_item(
+                _live("777", "item-777"),
+                {"777": {"impressions": 400, "views": 8, "ctr": 0.0}})
+    assert result["cumulative_views"] == 20
+
+
+def test_run_reports_how_much_data_arrived():
+    import pipeline.reprice as rp
+    db, path = _temp_db()
+    items = [_live(str(200 + n)) for n in range(25)]   # 2 batches of 20
+    watch = lambda lid: None if lid == "201" else 1
+    with _Patch(db, DB_PATH=path):
+        db.create_tables()
+        with _Patch(rp, list_items=lambda s: items if s == "published" else [],
+                    get_traffic_report=_flaky_report({"224"}),
+                    get_watch_count=watch):
+            results, health = rp.run_weekly_check()
+    assert health == {"traffic_batches": 2, "traffic_failed": 1,
+                      "watch_lookups": 25, "watch_failed": 1}
+    verdicts = [r["verdict"] for r in results]
+    assert verdicts.count("NO_TRAFFIC_DATA") == 5        # the failed batch of 5
+    assert "INVISIBLE" in verdicts                       # 200/210: genuine zeros
+
+
+def test_digest_line_shows_unknown_traffic_as_question_marks():
+    import telegram_bot as tb
+    line = tb._format_reprice_line({
+        "item_id": "abcdef0123", "verdict": "NO_TRAFFIC_DATA", "impressions": None,
+        "views": None, "cumulative_views": 12, "ctr": None, "watchers": 2,
+        "current_price": 20.0, "suggested_price": None})
+    assert "? impr" in line and "? views" in line and "None" not in line
+
+
 if __name__ == "__main__":
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    tests =[v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
     for t in tests:
         try:

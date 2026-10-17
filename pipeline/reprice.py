@@ -6,7 +6,10 @@ taps "Apply" on in Telegram (telegram_bot.py's reprice_callback).
 Diagnosis, from cheapest-to-fix to most decisive:
   TOO_NEW      — not live long enough yet (REPRICE_MIN_WEEKS_LIVE) to trust any
                  of the below; every other check is skipped.
-  INVISIBLE    — too few impressions: nobody's finding it in search at all.
+  NO_TRAFFIC_DATA — the traffic batch this listing was in failed, so there are
+                 no impressions/views to judge. Diagnosed as nothing rather than
+                 read as zero traffic (= INVISIBLE); never produces a price.
+  INVISIBLE   — too few impressions: nobody's finding it in search at all.
                  Fix: promotion/title, not price.
   LOW_CTR      — enough impressions, few views: they see it, don't click.
                  Fix: cover photo or price-vs-thumbnail, not necessarily comps.
@@ -110,10 +113,18 @@ def _ctr(traffic: dict) -> float:
     return int(traffic.get("views") or 0) / impressions
 
 
-def _diagnose(traffic: dict, watchers: int | None, prev_watchers,
+def _diagnose(traffic: dict | None, watchers: int | None, prev_watchers,
               weeks_live: float | None, cumulative_views: int) -> str:
     if weeks_live is not None and weeks_live < REPRICE_MIN_WEEKS_LIVE:
         return "TOO_NEW"
+    if traffic is None:
+        # The traffic fetch failed for this listing. Every check below starts
+        # from impressions, and a missing number read as 0 lands on INVISIBLE —
+        # "nobody's finding it in search". That is what happened on 2026-08-17
+        # (every row 0 impressions, 71 INVISIBLE) and 2026-10-05 (97 INVISIBLE)
+        # while the watch counts beside them were fine. Same rule as
+        # NO_WATCH_DATA: absent evidence is not evidence of zero.
+        return "NO_TRAFFIC_DATA"
 
     impressions = traffic.get("impressions", 0)
     # Views over the listing's whole recorded life, not just this week. A single
@@ -208,20 +219,30 @@ def _traffic_for_all(items: list[dict], batch: int = 20) -> dict[str, dict]:
     diagnosis to "Too many requests", and no amount of backoff helps because it's
     a quota, not a burst. Batching turns the same run into ~6 calls.
 
-    A failed batch degrades to an empty map for those ids rather than taking the
-    run down — they simply read as zero traffic, which is what the old per-item
-    error path effectively did anyway."""
+    A failed batch doesn't take the run down, but its ids are mapped to None —
+    "no data" — not left out. Left out reads as zero traffic, and zero traffic
+    is INVISIBLE: on 2026-08-17 and 2026-10-05 a failed fetch put 71 and 97
+    listings in the digest as "nobody's finding it in search". A listing absent
+    from a batch that DID succeed is different: eBay omits listings it has no
+    traffic for, so that one is a genuine zero (evaluate_item's default).
+
+    Returns (traffic_map, {"batches": n, "failed": k})."""
     ids = [str((i.get("ebay") or {}).get("listing_id")) for i in items
            if (i.get("ebay") or {}).get("listing_id")]
-    out: dict[str, dict] = {}
+    out: dict[str, dict | None] = {}
+    batches = failed = 0
     for start in range(0, len(ids), batch):
         chunk = ids[start:start + batch]
+        batches += 1
         try:
             out.update(get_traffic_report(chunk))
         except Exception as e:
+            failed += 1
             print(f"traffic batch {start // batch + 1} failed ({type(e).__name__}) — "
-                  f"{len(chunk)} listing(s) will read as zero traffic")
-    return out
+                  f"{len(chunk)} listing(s) will be marked NO_TRAFFIC_DATA")
+            for listing_id in chunk:
+                out[listing_id] = None
+    return out, {"batches": batches, "failed": failed}
 
 
 def evaluate_item(item: dict, traffic_map: dict | None = None) -> dict | None:
@@ -254,43 +275,58 @@ def evaluate_item(item: dict, traffic_map: dict | None = None) -> dict | None:
 
     if traffic_map is None:                    # single-item call (e.g. a retry)
         traffic_map = get_traffic_report([listing_id])
-    traffic = traffic_map.get(listing_id, {"impressions": 0, "views": 0, "ctr": 0})
+    # Absent from the map = eBay had nothing to report = a real zero. Present as
+    # None = the fetch failed = unknown (see _traffic_for_all).
+    traffic = traffic_map.get(str(listing_id), {"impressions": 0, "views": 0, "ctr": 0})
     watchers = get_watch_count(listing_id)
     cumulative_views = (sum(int(h.get("views") or 0) for h in history)
-                        + int(traffic.get("views") or 0))
+                        + int((traffic or {}).get("views") or 0))
 
     current_price = (item.get("listing") or {}).get("price")
     weeks_live = _weeks_live(item)
     verdict = _diagnose(traffic, watchers, prev_watchers, weeks_live, cumulative_views)
     suggested, floor_note = _suggest_price(item, verdict, current_price, weeks_live)
 
+    # A failed fetch is stored as NULL impressions/views, never 0: listing_stats
+    # is history that later weeks sum over, and a fabricated zero would sit in it
+    # as if eBay had measured it. Readers already treat NULL as "nothing to add"
+    # (the cumulative-views sum above uses `or 0`).
     record_listing_stats(
         item["item_id"], week,
-        impressions=traffic.get("impressions"), views=traffic.get("views"),
+        impressions=(traffic or {}).get("impressions"), views=(traffic or {}).get("views"),
         watchers=watchers, price=current_price, verdict=verdict, suggested_price=suggested,
     )
 
     return {
         "item_id": item["item_id"], "verdict": verdict,
-        "impressions": traffic.get("impressions"), "views": traffic.get("views"),
+        "impressions": (traffic or {}).get("impressions"),
+        "views": (traffic or {}).get("views"),
         "cumulative_views": cumulative_views,
-        "ctr": _ctr(traffic), "watchers": watchers,
+        "ctr": _ctr(traffic) if traffic is not None else None, "watchers": watchers,
         "current_price": current_price, "suggested_price": suggested,
         "floor_note": floor_note,
         "weeks_live": weeks_live,
     }
 
 
-def run_weekly_check() -> list[dict]:
-    """Evaluate everything with stock live on eBay. Returns one dict per evaluated
-    item; a failure on an individual item is captured as its own ERROR entry
-    rather than aborting the whole run.
+def run_weekly_check() -> tuple[list[dict], dict]:
+    """Evaluate everything with stock live on eBay. Returns (results, health):
+    one dict per evaluated item — a failure on an individual item is captured as
+    its own ERROR entry rather than aborting the whole run — plus how much of the
+    eBay data actually arrived:
+
+      traffic_batches / traffic_failed — batched Analytics calls, and how many failed
+      watch_lookups / watch_failed     — per-listing watch-count calls that came back empty
+
+    The caller needs `health` to tell a complete run from one that was largely
+    "no data": the scheduler records a run with failed traffic batches as
+    partial rather than ok, so it is caught up instead of counted as done.
 
     Candidates are drawn from 'sold' as well as 'published' — evaluate_item does
     the real filtering — because a listing that sold one of its units keeps the
     'sold' status while the rest stays for sale."""
     candidates = list_items("published") + list_items("sold")
-    traffic_map = _traffic_for_all(candidates)   # ~6 batched calls, not one per item
+    traffic_map, traffic_health = _traffic_for_all(candidates)   # ~6 batched calls
     results = []
     for item in candidates:
         try:
@@ -300,4 +336,11 @@ def run_weekly_check() -> list[dict]:
             continue
         if result is not None:
             results.append(result)
-    return results
+    looked_up = [r for r in results if r["verdict"] != "ERROR"]
+    health = {
+        "traffic_batches": traffic_health["batches"],
+        "traffic_failed": traffic_health["failed"],
+        "watch_lookups": len(looked_up),
+        "watch_failed": sum(1 for r in looked_up if r.get("watchers") is None),
+    }
+    return results, health
