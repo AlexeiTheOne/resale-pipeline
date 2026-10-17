@@ -109,6 +109,28 @@ def create_tables() -> None:
             )
         """)
 
+        # One row per paid model call (Claude and Gemini), so spend is a query
+        # rather than a guess. The monthly Anthropic budget guard reads this; a
+        # refusal fallback writes one row per model that ran. cost_usd is NULL
+        # when the model has no price on file.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS llm_usage (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts                 TEXT NOT NULL,
+                provider           TEXT NOT NULL,
+                model              TEXT NOT NULL,
+                stage              TEXT,
+                item_id            TEXT,
+                input_tokens       INTEGER NOT NULL DEFAULT 0,
+                output_tokens      INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                web_searches       INTEGER NOT NULL DEFAULT 0,
+                cost_usd           REAL
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage (ts)")
+
 
 def create_item(photos: list[str]) -> str:
     item_id = str(uuid.uuid4())
@@ -242,5 +264,47 @@ def last_job_run(job: str) -> datetime | None:
     except ValueError:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def record_llm_usage(*, provider: str, model: str, stage: str | None = None,
+                     item_id: str | None = None, input_tokens: int = 0,
+                     output_tokens: int = 0, cache_read_tokens: int = 0,
+                     cache_write_tokens: int = 0, web_searches: int = 0,
+                     cost_usd: float | None = None, ts: str | None = None) -> None:
+    with _conn() as con:
+        con.execute(
+            "INSERT INTO llm_usage (ts, provider, model, stage, item_id, input_tokens, "
+            "output_tokens, cache_read_tokens, cache_write_tokens, web_searches, cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts or _now(), provider, model, stage, item_id, input_tokens, output_tokens,
+             cache_read_tokens, cache_write_tokens, web_searches, cost_usd),
+        )
+
+
+def llm_spend_since(since_iso: str, provider: str | None = None) -> float:
+    """Total logged cost (USD) from since_iso onward, optionally for one provider."""
+    sql = "SELECT COALESCE(SUM(cost_usd), 0) FROM llm_usage WHERE ts >= ?"
+    args: list = [since_iso]
+    if provider is not None:
+        sql += " AND provider = ?"
+        args.append(provider)
+    with _conn() as con:
+        return float(con.execute(sql, args).fetchone()[0])
+
+
+def llm_usage_breakdown(since_iso: str) -> list[dict]:
+    """Spend grouped by provider, model and stage from since_iso onward, dearest first."""
+    with _conn() as con:
+        cur = con.execute(
+            "SELECT provider, model, COALESCE(stage, '-') AS stage, COUNT(*) AS calls, "
+            "SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, "
+            "SUM(cache_read_tokens) AS cache_read_tokens, SUM(web_searches) AS web_searches, "
+            "SUM(cost_usd) AS cost_usd, SUM(cost_usd IS NULL) AS unpriced "
+            "FROM llm_usage WHERE ts >= ? GROUP BY provider, model, stage "
+            "ORDER BY COALESCE(SUM(cost_usd), 0) DESC",
+            (since_iso,),
+        )
+        keys = [d[0] for d in cur.description]
+        return [dict(zip(keys, row)) for row in cur.fetchall()]
 
 create_tables()

@@ -39,6 +39,7 @@ from db import (
     list_items, record_job_run, update_field, update_status, VALID_STATUSES,
 )
 from identify import identify_item
+import llm_usage
 from receipt import decode_barcode, detect_ross_tags, extract_receipt, is_dark_frame
 from pipeline.price import get_pricing
 from pipeline.draft import generate_draft, revise_draft, revise_identification
@@ -3931,6 +3932,7 @@ async def _run_sync_job(app: Application, *, catch_up: bool = False) -> None:
         _record_error("scheduled sync", e)
         return
     record_job_run(_JOB_SYNC, detail=f"{len(lines)} report line(s)")
+    await _send_budget_warning(app)
 
     notable = [ln for ln in lines[1:]
                if ln.strip() and ln.strip() not in _SYNC_QUIET_LINES]
@@ -3945,6 +3947,31 @@ async def _run_sync_job(app: Application, *, catch_up: bool = False) -> None:
             await _send_chunked_to(app.bot, uid, lines)
         except Exception as e:
             print(f"WARNING: sync digest to {uid} failed: {type(e).__name__}: {e}")
+
+
+async def _send_budget_warning(app: Application) -> None:
+    """Pass on the monthly Claude-spend warning, which llm_usage hands out at
+    most once per threshold per month. Rides on the daily sync so it needs no
+    timer of its own."""
+    try:
+        text = await asyncio.to_thread(llm_usage.budget_warning)
+    except Exception as e:
+        print(f"WARNING: budget check failed: {type(e).__name__}: {e}")
+        return
+    if not text:
+        return
+    print(text)
+    for uid in ALLOWED_USER_IDS:
+        try:
+            await app.bot.send_message(chat_id=uid, text=text)
+        except Exception as e:
+            print(f"WARNING: budget warning to {uid} failed: {type(e).__name__}: {e}")
+
+
+async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/usage: this month's model spend by provider, model and stage."""
+    lines = await asyncio.to_thread(llm_usage.usage_report)
+    await _send_chunked(update.message, lines)
 
 
 async def _daily_sync_loop(app: Application) -> None:
@@ -4269,6 +4296,7 @@ HELP_SECTIONS = [
     ("Admin", [
         ("/photocheck", "Verify every live listing still shows every photo we uploaded"),
         ("/health", "Check eBay token, business policies, ad scope, Cloudinary"),
+        ("/usage", "This month's Claude/Gemini spend by model and stage, against the Claude budget"),
         ("/auth [url]", "Re-consent eBay: no argument prints the consent URL; paste the redirect URL to finish"),
         ("/whoami", "Your Telegram user id (for TELEGRAM_ALLOWED_USER_IDS)"),
         ("/errors", "Recent errors (the server console isn't visible from the phone)"),
@@ -4425,6 +4453,7 @@ def main() -> None:
     app.add_handler(CommandHandler("retry", retry_command))
     app.add_handler(CommandHandler("photocheck", photocheck_command))
     app.add_handler(CommandHandler("health", health_command))
+    app.add_handler(CommandHandler("usage", usage_command))
     app.add_handler(CommandHandler("auth", auth_command))
     app.add_handler(CommandHandler("whoami", whoami_command))
     app.add_handler(CommandHandler("help", help_command))

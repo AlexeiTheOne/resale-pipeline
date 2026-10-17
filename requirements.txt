@@ -7,6 +7,9 @@
 # types.ThinkingConfig directly), and python-telegram-bot went through breaking
 # async rewrites. Bump deliberately, one at a time, and run tests/ after.
 google-genai==2.8.0
+# Last 0.x: still on httpx (the 1.x line moves to httpx2) and the first to type
+# the server-side refusal fallback's "default" form that claude_llm.py sends.
+anthropic==0.125.0
 httpx==0.28.1
 python-dotenv==1.1.1
 python-telegram-bot==22.8

@@ -332,7 +332,7 @@ def identify_item(image_paths: list[str], scan_paths: list[str] | None = None) -
     for attempt in range(1, RESEARCH_ATTEMPTS + 1):
         try:
             research = generate_with_retry(
-                client,
+                client, stage="identify_research",
                 model=GEMINI_MODEL,
                 contents=[*image_parts, types.Part.from_text(text=research_prompt)],
                 config=types.GenerateContentConfig(
@@ -400,7 +400,7 @@ def identify_item(image_paths: list[str], scan_paths: list[str] | None = None) -
     # so we don't re-send the images and pay for them again). thinking_budget caps
     # the reasoning tokens so the schema JSON always has room within max_output_tokens.
     formatted = generate_with_retry(
-        client,
+        client, stage="identify_format",
         model=GEMINI_FAST_MODEL,
         contents=types.Part.from_text(text=FORMAT_INSTRUCTIONS + report),
         config=types.GenerateContentConfig(

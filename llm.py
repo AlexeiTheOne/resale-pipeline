@@ -142,9 +142,14 @@ def describe_error(exc: "errors.APIError") -> str:
     return f"{head} {exc}".strip()[:400]
 
 
-def generate_with_retry(client, *, max_total_seconds: float | None = None, **kwargs):
+def generate_with_retry(client, *, max_total_seconds: float | None = None,
+                        stage: str | None = None, item_id: str | None = None, **kwargs):
     """client.models.generate_content(**kwargs) with backoff on rate limits and
     transient server errors.
+
+    Every successful response's token usage is logged to db.llm_usage (approximate
+    cost) under `stage` / `item_id`, both optional so existing callers keep
+    working; untagged calls show as stage "-" in /usage.
 
     max_total_seconds caps the wall-clock spent retrying. It exists for the slow
     grounded research call, which can sit at Google's ~180s deadline before 504'ing:
@@ -159,7 +164,7 @@ def generate_with_retry(client, *, max_total_seconds: float | None = None, **kwa
     while True:
         call_start = time.monotonic()
         try:
-            return client.models.generate_content(**kwargs)
+            response = client.models.generate_content(**kwargs)
         except httpx.TransportError as exc:
             # Covers ReadTimeout/ConnectTimeout/ConnectError/RemoteProtocolError.
             # Counted on its own budget so a request that keeps timing out at the
@@ -200,6 +205,11 @@ def generate_with_retry(client, *, max_total_seconds: float | None = None, **kwa
             print(f"Gemini {describe_error(exc)} — after {took:.0f}s, retrying in "
                   f"{delay:.0f}s (attempt {attempt}/{MAX_RETRIES}, {elapsed:.0f}s elapsed)")
             time.sleep(delay)
+        else:
+            # Imported here so llm.py stays importable without the DB layer.
+            from llm_usage import log_gemini
+            log_gemini(response, model=str(kwargs.get("model", "?")), stage=stage, item_id=item_id)
+            return response
 
 
 def response_text(response, stage: str) -> str:

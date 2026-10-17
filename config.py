@@ -304,3 +304,55 @@ FEEDBACK_HOUR_UTC = int(os.getenv("FEEDBACK_HOUR_UTC", "12"))
 FEEDBACK_COMMENT = os.getenv(
     "FEEDBACK_COMMENT",
     "Great buyer, fast payment. Thank you for your purchase! A+")
+
+# --- Claude (claude_llm.py) and LLM spend tracking (llm_usage table) ---
+# Sonnet is the everyday model; callers escalate to Opus for the hard cases and
+# drop to Haiku for cheap structuring. The owner's Anthropic credit is $100 a
+# MONTH, so every call is logged and the guard below steps models down as the
+# month's spend approaches it rather than letting a busy week eat the budget.
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+CLAUDE_STRONG_MODEL = os.getenv("CLAUDE_STRONG_MODEL", "claude-opus-5-5")
+CLAUDE_CHEAP_MODEL = os.getenv("CLAUDE_CHEAP_MODEL", "claude-haiku-5-5")
+# Per-attempt HTTP timeout and SDK retries (connection errors, 408/409/429/5xx).
+# Worst-case wall clock is timeout x (retries + 1), so keep both modest.
+CLAUDE_TIMEOUT_S = float(os.getenv("CLAUDE_TIMEOUT_S", "120"))
+CLAUDE_MAX_RETRIES = int(os.getenv("CLAUDE_MAX_RETRIES", "3"))
+# Server-side refusal fallback ("default" routing) on Opus/Sonnet: a request a
+# safety classifier declines is re-run on Anthropic's recommended model inside
+# the same call instead of failing the item. Product pricing should almost never
+# trip it; the fallback attempt is billed at that model's rates and logged.
+CLAUDE_REFUSAL_FALLBACK = _env_bool("CLAUDE_REFUSAL_FALLBACK", True)
+
+ANTHROPIC_MONTHLY_BUDGET = float(os.getenv("ANTHROPIC_MONTHLY_BUDGET", "100"))
+# Fractions of the budget, month to date (calendar month, UTC). At WARN the owner
+# gets one Telegram warning. At DOWNGRADE every Claude call steps down one tier
+# (opus -> sonnet -> haiku); at 100% everything runs on haiku.
+ANTHROPIC_BUDGET_WARN_PCT = float(os.getenv("ANTHROPIC_BUDGET_WARN_PCT", "0.80"))
+ANTHROPIC_BUDGET_DOWNGRADE_PCT = float(os.getenv("ANTHROPIC_BUDGET_DOWNGRADE_PCT", "0.95"))
+
+# USD per 1M tokens. "cache_read" / "cache_write" are the prompt-cache rates
+# (5-minute writes bill at 1.25x input). The fallback models are listed so a
+# refusal fallback is costed at its own rates. An unknown Claude model is costed
+# at the dearest row, so the budget guard can over-count but never under-count.
+ANTHROPIC_PRICES = {
+    "claude-opus-5-5":   {"in": 4.00, "out": 20.00, "cache_read": 0.20, "cache_write": 5.00},
+    "claude-sonnet-5-5": {"in": 2.00, "out": 10.00, "cache_read": 0.20, "cache_write": 2.50},
+    "claude-haiku-5-5":  {"in": 0.10, "out": 0.50, "cache_read": 0.01, "cache_write": 0.125,
+                          # Haiku 5.5 bills a prompt over 100K tokens at a higher rate.
+                          "long_threshold": 100_000, "long_in": 0.50, "long_out": 2.50},
+    "claude-opus-5":     {"in": 5.00, "out": 25.00, "cache_read": 0.50, "cache_write": 6.25},
+    "claude-sonnet-5":   {"in": 2.00, "out": 10.00, "cache_read": 0.20, "cache_write": 2.50},
+    "claude-opus-4-8":   {"in": 5.00, "out": 25.00, "cache_read": 0.50, "cache_write": 6.25},
+}
+ANTHROPIC_WEB_SEARCH_PER_1K = 10.00
+
+# Gemini rates: APPROXIMATE, for visibility only (Gemini isn't on the Anthropic
+# budget). Matched by regex on the model id, first match wins; an unmatched model
+# is logged with no cost. Thinking tokens bill as output. Cached prompt tokens
+# are charged at the full input rate, which slightly over-counts. Grounded
+# searches are free within the paid tier's monthly allowance, so they are counted
+# but not costed.
+GEMINI_PRICES = [
+    (r"^gemini-2\.5-flash$", {"in": 0.30, "out": 2.50}),
+    (r"^gemini-3(\.\d+)?-flash$", {"in": 0.75, "out": 3.75}),
+]
