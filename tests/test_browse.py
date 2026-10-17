@@ -76,6 +76,19 @@ def test_search_active_normalises_and_sends_marketplace():
     assert r["seller_feedback_pct"] == 99.5 and r["seller_feedback_score"] == 812
 
 
+def test_gtin_alone_is_a_valid_search():
+    calls = _stub([_resp(200, {"itemSummaries": []})])
+    browse.search_active(None, gtin=" 885919812544 ")
+    p = calls[0]["params"]
+    assert p["gtin"] == "885919812544" and "q" not in p
+    try:
+        browse.search_active("  ", gtin="")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("empty query and gtin must be refused")
+
+
 def test_unknown_shipping_is_none_not_zero():
     calc = dict(SUMMARY, shippingOptions=[{"shippingCostType": "CALCULATED"}])
     none = {k: v for k, v in SUMMARY.items() if k != "shippingOptions"}

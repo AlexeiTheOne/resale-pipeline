@@ -356,3 +356,44 @@ GEMINI_PRICES = [
     (r"^gemini-2\.5-flash$", {"in": 0.30, "out": 2.50}),
     (r"^gemini-3(\.\d+)?-flash$", {"in": 0.75, "out": 3.75}),
 ]
+
+# --- Pricing engine v2 (pipeline/pricing_v2.py, docs/pricing-design.md) ---------
+# "v1" is the live comps ladder in pipeline/price.py. "v2" pools sold + active
+# comps, has Claude judge which are the same item, and prices from those only.
+# v2 stays off until the backtest (scripts/backtest_pricing.py) shows it agrees
+# with the owner's own prices; flip it per run with PRICING_ENGINE=v2 in .env.
+PRICING_ENGINE = os.getenv("PRICING_ENGINE", "v1").strip().lower()
+PRICING_JUDGE_MODEL = os.getenv("PRICING_JUDGE_MODEL", "claude-sonnet-5-5")
+# Low, not medium: the judge's job is sorting 30-60 titles+thumbnails into four
+# buckets and naming a price, which is perception more than reasoning; low keeps
+# thinking to a few hundred tokens a call. The price itself is computed in code.
+# A low-confidence answer is re-asked on the strong model (below), which is
+# where extra reasoning is paid for only when it is needed.
+PRICING_JUDGE_EFFORT = os.getenv("PRICING_JUDGE_EFFORT", "low")
+PRICING_ESCALATE_MODEL = os.getenv("PRICING_ESCALATE_MODEL", CLAUDE_STRONG_MODEL)
+PRICING_ESCALATE_ON_LOW = _env_bool("PRICING_ESCALATE_ON_LOW", True)
+# v1 undercuts the sold median by 15% and then again under the cheapest active
+# listing, and the owner raised 54 of 101 machine prices. v2 starts at 5%; the
+# backtest is what sets it.
+UNDERCUT_V2_PCT = float(os.getenv("UNDERCUT_V2_PCT", "0.05"))
+# Rows per sold-comps query. The sold actor bills per result row ($0.004 on the
+# FREE Apify tier, plus $0.0001 per run start), and v2 runs up to 3 queries.
+PRICING_V2_SOLD_COUNT = int(os.getenv("PRICING_V2_SOLD_COUNT", "15"))
+PRICING_V2_ACTIVE_COUNT = int(os.getenv("PRICING_V2_ACTIVE_COUNT", "30"))
+PRICING_V2_IMAGE_COUNT = int(os.getenv("PRICING_V2_IMAGE_COUNT", "20"))
+# Most candidates sent to the judge in one call (sold kept first).
+PRICING_V2_MAX_CANDIDATES = int(os.getenv("PRICING_V2_MAX_CANDIDATES", "60"))
+# Buyer location for Browse shipping quotes: our own ship-from zip, so the quote
+# is what a nearby buyer would see. Without one ~38% of results have no cost.
+PRICING_V2_SHIP_TO_ZIP = os.getenv("PRICING_V2_SHIP_TO_ZIP", EBAY_SHIP_FROM_ADDRESS["postalCode"])
+# This account's eBay seller name(s): search results include our own listings
+# (image search ranks them first), which must never count as comps.
+OWN_SELLER_USERNAMES = tuple(
+    s.strip().lower() for s in os.getenv("OWN_SELLER_USERNAMES", "premium_designer_outlet").split(",")
+    if s.strip())
+PRICING_V2_CACHE_DIR = os.getenv("PRICING_V2_CACHE_DIR", "data/cache/pricing_v2")
+# Apify sold actor (oTtB3VgfuE9GtxQt2) pay-per-event rates, FREE tier, read from
+# the actor's pricingInfos on 17 Oct 2026. Used only to ESTIMATE spend; Apify's
+# own usage page is the bill.
+APIFY_SOLD_COST_PER_RESULT = float(os.getenv("APIFY_SOLD_COST_PER_RESULT", "0.004"))
+APIFY_RUN_START_COST = float(os.getenv("APIFY_RUN_START_COST", "0.0001"))

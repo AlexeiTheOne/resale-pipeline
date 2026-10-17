@@ -178,13 +178,21 @@ def _common_params(limit: int, category_ids) -> dict:
     return params
 
 
-def search_active(query: str, *, limit: int = 50, condition_ids=None,
-                  category_ids=None, ship_to_zip: str | None = None) -> list[dict]:
-    """Active listings matching a text query, best match first."""
-    if not query or not query.strip():
-        raise ValueError("search_active needs a non-empty query")
+def search_active(query: str | None, *, limit: int = 50, condition_ids=None,
+                  category_ids=None, ship_to_zip: str | None = None,
+                  gtin: str | None = None) -> list[dict]:
+    """Active listings matching a text query and/or a GTIN (UPC/EAN), best
+    match first. A GTIN alone is enough: eBay matches it against the product
+    identifier sellers filled in, which is exact where a title search is not."""
+    query = (query or "").strip()
+    gtin = (gtin or "").strip()
+    if not query and not gtin:
+        raise ValueError("search_active needs a non-empty query or a gtin")
     params = _common_params(limit, category_ids)
-    params["q"] = query.strip()
+    if query:
+        params["q"] = query
+    if gtin:
+        params["gtin"] = gtin
     if condition_ids:
         params["filter"] = "conditionIds:{" + "|".join(str(c) for c in condition_ids) + "}"
     body = _call("GET", SEARCH_PATH, params=params, ship_to_zip=ship_to_zip)

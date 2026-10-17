@@ -32,7 +32,7 @@ from config import (
     FEEDBACK_ENABLED, FEEDBACK_HOUR_UTC, FEEDBACK_COMMENT,
     OFFER_MIN_WATCHERS, OFFER_MIN_NET, OFFER_MIN_DAYS_LIVE,
     OFFER_DISCOUNT_SMALL, OFFER_DISCOUNT_LARGE,
-    OFFER_LARGE_THRESHOLD, OFFER_MESSAGE,
+    OFFER_LARGE_THRESHOLD, OFFER_MESSAGE, PRICING_ENGINE,
 )
 from db import (
     create_item, delete_item, get_item, job_run_status, last_job_run, latest_stats,
@@ -1642,7 +1642,15 @@ def _stage_price(item_id, notify=lambda _t: None) -> dict:
     ident = get_item(item_id)["identification"]
     notify("💰 Pricing...")
     t = time.perf_counter()
-    pricing = get_pricing(ident["search_query"], research=ident)
+    if PRICING_ENGINE == "v2":
+        # Off by default (config.PRICING_ENGINE): v2 is on trial until the
+        # backtest agrees with the owner. Same return shape as v1.
+        from pipeline.pricing_v2 import get_pricing_v2
+        item = get_item(item_id)
+        pricing = get_pricing_v2(ident, photo_paths=item.get("photos") or [],
+                                 receipt=item.get("receipt"), item_id=item_id)
+    else:
+        pricing = get_pricing(ident["search_query"], research=ident)
     print(f"✓ Priced in {time.perf_counter() - t:.0f}s:", pricing.get("suggested_price"),
           f"({pricing.get('confidence')})")
     update_field(item_id, "pricing", pricing)
