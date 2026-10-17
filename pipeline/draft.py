@@ -9,6 +9,7 @@ from google.genai import types
 
 from ebay.taxonomy import category_aspects, category_suggestions
 from llm import generate_with_retry, make_client, response_text
+from pipeline.title import TITLE_MAX_LEN, TITLE_RULES, ensure_title_fits
 
 load_dotenv()
 client = make_client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -70,7 +71,7 @@ def store_boilerplate(condition_id) -> str:
 SCHEMA_INSTRUCTIONS = """Generate an eBay listing as a valid JSON object matching this exact schema:
 
 {
-  "title": "string, MAX 80 characters, eBay SEO optimized. Lead with brand + product_name (the marketing/retail name from identification), then size/color. Use product_name rather than item_type whenever it is present; fall back to item_type only if product_name is null.",
+  "title": "string, AT MOST 80 characters including spaces, eBay SEO optimized. Lead with brand + product_name (the marketing/retail name from identification), then size/color. Use product_name rather than item_type whenever it is present; fall back to item_type only if product_name is null.",
   "description": "string, concise and scannable: short bullet sections, honest about any flaws (see structure below)",
   "category_id": "string, best-fit eBay category ID for this item",
   "item_specifics": {
@@ -88,7 +89,7 @@ SCHEMA_INSTRUCTIONS = """Generate an eBay listing as a valid JSON object matchin
 }
 
 Rules:
-- title MUST be under 80 characters. Count carefully. Never use ALL CAPS.
+- title: """ + TITLE_RULES + """
 - NEVER describe the item as "authentic", "100% authentic", "genuine article" or
   "guaranteed genuine", in the title or the description — not even as the opening
   adjective ("Authentic Michael Kors ..."). Claiming authenticity is what rights
@@ -209,6 +210,62 @@ def _aspect_hint_block(identification: dict) -> str | None:
     return "\n".join(lines)
 
 
+def _refit_title(title: str, identification: dict | None, specifics: dict | None) -> str | None:
+    """Ask the copywriter model once, with nothing but the title-fit job, to
+    bring an over-long title within eBay's limit. Returns its answer unchecked —
+    ensure_title_fits measures it and falls back to fit_title if it's still long.
+
+    This is the existing Gemini model on purpose: a dedicated (Claude-based)
+    fitter can replace it by passing a different `refit` to ensure_title_fits."""
+    ident = identification or {}
+    spec = specifics or {}
+    facts = {k: v for k, v in {
+        "brand": spec.get("Brand") or ident.get("brand"),
+        "item_type": ident.get("item_type"),
+        "model": spec.get("Model") or ident.get("model"),
+        "size": spec.get("Size") or ident.get("size"),
+        "color": spec.get("Color") or ident.get("color"),
+        "material": spec.get("Material"),
+        "department": spec.get("Department"),
+    }.items() if v}
+    user_message = (
+        f"This eBay title is {len(title)} characters; the limit is {TITLE_MAX_LEN}.\n"
+        f"TITLE: {title}\n"
+        f"ITEM FACTS: {json.dumps(facts, ensure_ascii=False)}\n\n"
+        f"Rewrite it to at most {TITLE_MAX_LEN} characters. {TITLE_RULES} "
+        "Do not add any word that is not already true of the item. "
+        "Reply with the new title only — no quotes, no JSON, no explanation."
+    )
+    response = generate_with_retry(
+        client,
+        model=MODEL,
+        contents=user_message,
+        config=types.GenerateContentConfig(
+            temperature=0,
+            max_output_tokens=2000,
+            thinking_config=types.ThinkingConfig(thinking_budget=512),
+        ),
+    )
+    text = response_text(response, "title refit").strip()
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return lines[0].strip().strip("\"'`") if lines else None
+
+
+def _fit_draft_title(draft: dict, identification: dict | None) -> None:
+    """Validate the parsed title and bring it within 80 characters in place:
+    one re-ask of the model, then the deterministic fit_title. Never truncates
+    off the end, which is where size and colour live."""
+    specifics = draft.get("item_specifics") or {}
+    original = draft.get("title") or ""
+    fitted, dropped, how = ensure_title_fits(
+        original, identification, specifics,
+        refit=lambda t: _refit_title(t, identification, specifics))
+    if how != "ok":
+        print(f"✂️ title was {len(original)} chars; {how} -> {len(fitted)}: {fitted!r}"
+              f" (dropped: {', '.join(dropped) or 'nothing'})")
+    draft["title"] = fitted
+
+
 def generate_draft(identification: dict, pricing: dict, examples: list | None = None) -> dict:
     suggested = pricing.get("suggested_price")
     reference = pricing.get("reference")
@@ -288,7 +345,9 @@ def generate_draft(identification: dict, pricing: dict, examples: list | None = 
     except json.JSONDecodeError:
         raise ValueError(raw)
 
-    draft["description"] = (draft["description"] + "\n\n"
+    _fit_draft_title(draft, identification)
+
+    draft["description"] =(draft["description"] + "\n\n"
                             + store_boilerplate(draft.get("condition_id")))
     draft["stock_image_url"] = stock_url
 
@@ -310,13 +369,15 @@ def generate_draft(identification: dict, pricing: dict, examples: list | None = 
     return draft
 
 
-def revise_draft(current_draft: dict, correction: str) -> dict:
+def revise_draft(current_draft: dict, correction: str,
+                 identification: dict | None = None) -> dict:
     system = (
         "You revise eBay listings based on a user's correction. "
         "Return the FULL updated listing as valid JSON only, no markdown. "
         "Apply the correction and keep everything else the same. "
         "Preserve the SHIPPING, RETURNS, and ABOUT US sections of the "
-        "description exactly as they are."
+        "description exactly as they are. "
+        "If the title changes: " + TITLE_RULES
     )
     user_message = (
         "CURRENT LISTING:\n" + json.dumps(current_draft, indent=2) +
@@ -349,6 +410,10 @@ def revise_draft(current_draft: dict, correction: str) -> dict:
         revised = json.loads(raw)
     except json.JSONDecodeError:
         raise ValueError(raw)
+
+    # A correction that lengthens the title ("add the colour") is exactly how a
+    # title goes over 80, so the revision is held to the same limit.
+    _fit_draft_title(revised, identification)
 
     # Same rule as generate_draft: a copy edit must not move the price. Rewording
     # a title should never quietly reprice a live listing — price changes go

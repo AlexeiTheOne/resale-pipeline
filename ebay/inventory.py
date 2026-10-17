@@ -26,6 +26,7 @@ from config import (
 from db import get_item, update_field
 from ebay.auth import get_access_token
 from ebay.taxonomy import InvalidCategoryError, category_aspects, category_name, resolve_valid_category
+from pipeline.title import TITLE_MAX_LEN, fit_title
 
 load_dotenv()
 
@@ -33,7 +34,6 @@ EBAY_API_BASE = "https://api.ebay.com"
 
 ASPECT_VALUE_MAX_LEN = 65
 ASPECT_MAX_VALUES = 10
-TITLE_MAX_LEN = 80
 
 GTIN_ASPECT_NAMES = {"upc", "ean", "isbn", "gtin"}
 
@@ -47,6 +47,35 @@ class MissingRequiredAspectsError(Exception):
         self.missing = missing
         names = ", ".join(m["name"] for m in missing)
         super().__init__(f"Category {category_id} requires aspects with no safe value: {names}")
+
+
+class TitleTooLongError(ValueError):
+    """A title over eBay's 80-character limit reached a write to eBay.
+
+    Raised instead of cutting it. The old behaviour trimmed the overflow off the
+    end at a word boundary, and the end of our titles is where size and colour
+    live — seven live listings lost "38/40/41mm Blush Pink", a model code, or a
+    colour that way, silently. A refused publish is visible and fixable; a
+    chopped title is neither. The message carries a fitted suggestion (from
+    pipeline/title.fit_title) so whoever sees the error has a ready answer."""
+
+    def __init__(self, title: str, identification: dict | None = None,
+                 specifics: dict | None = None):
+        self.title = title
+        self.suggestion, self.dropped = fit_title(title, identification, specifics)
+        super().__init__(
+            f"Title is {len(title)} characters; eBay's limit is {TITLE_MAX_LEN}. "
+            f"Nothing was sent to eBay. Suggested ({len(self.suggestion)} chars, "
+            f"drops {', '.join(self.dropped) or 'nothing'}): {self.suggestion}")
+
+
+def _checked_title(title: str, identification: dict | None = None,
+                   specifics: dict | None = None) -> str:
+    """The title to send, whitespace-normalised, or TitleTooLongError."""
+    title = " ".join((title or "").split())
+    if len(title) > TITLE_MAX_LEN:
+        raise TitleTooLongError(title, identification, specifics)
+    return title
 
 
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
@@ -366,9 +395,8 @@ def update_inventory_title(sku: str, title: str, known_images: int | None = None
     needless uploads across a catalogue and minutes of wall-clock, to change one
     string. This reads the item, swaps the title, and sends it back.
 
-    Returns the title eBay ended up with, which is not always the one passed:
-    eBay hard-caps titles at 80 characters and _truncate_title cuts at a word
-    boundary, so the caller can compare and notice if anything was lost.
+    Returns the title sent. A title over 80 characters raises TitleTooLongError
+    before anything is read or written — it is never cut to fit.
 
     IMAGES ARE NEVER TAKEN FROM eBay's RESPONSE. getInventoryItem returns a
     lossy projection of the record: it drops `product.description` on every
@@ -385,6 +413,7 @@ def update_inventory_title(sku: str, title: str, known_images: int | None = None
     the next title edit. That is recoverable in a way a listing stripped to one
     photo is not.
     """
+    title = _checked_title(title)
     current = _request("GET", f"/sell/inventory/v1/inventory_item/{sku}").json()
     body = {k: current[k] for k in _INVENTORY_UPDATABLE_FIELDS
             if current.get(k) is not None}
@@ -403,7 +432,7 @@ def update_inventory_title(sku: str, title: str, known_images: int | None = None
               f"restoring the stored {len(stored)} instead of echoing the loss")
         product["imageUrls"] = stored
 
-    product["title"] = _truncate_title(title)
+    product["title"] = title
     body["product"] = product
 
     # eBay hands back `{"weight": {"value": 0.0, "unit": "POUND"}}` on GET for any
@@ -563,10 +592,6 @@ def _truncate(text: str, limit: int) -> str:
 
 def _truncate_value(value) -> str:
     return _truncate(str(value), ASPECT_VALUE_MAX_LEN)
-
-
-def _truncate_title(title: str) -> str:
-    return _truncate(title, TITLE_MAX_LEN)
 
 
 def _dedup_preserve(items) -> list[str]:
@@ -872,7 +897,7 @@ def _html_description(text: str) -> str:
 def _build_product(listing: dict, image_urls: list[str], aspects: dict, description: str) -> dict:
     specifics = listing.get("item_specifics") or {}
     product = {
-        "title": _truncate_title(listing["title"]),
+        "title": _checked_title(listing["title"], None, specifics),
         "description": description,
         "aspects": aspects,
         "imageUrls": image_urls,
@@ -912,6 +937,11 @@ def create_draft_offer(item_id: str) -> dict:
     if not photos:
         raise ValueError(f"Item {item_id} has no photos to list")
     print(f"📤 Draft: {len(photos)} photo(s) in DB record for {item_id}")
+
+    # Before any upload or eBay call: an over-long title is refused here, cheaply,
+    # rather than after a minute of photo uploads.
+    _checked_title(listing["title"], item.get("identification"),
+                   listing.get("item_specifics"))
 
     original_category_id = str(listing["category_id"])
     item_type_hint = (item.get("identification") or {}).get("item_type")

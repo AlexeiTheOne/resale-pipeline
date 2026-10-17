@@ -62,6 +62,7 @@ from ebay.inventory import (
     update_offer_quantity,
     withdraw_offer,
     MissingRequiredAspectsError,
+    TitleTooLongError,
 )
 from ebay.marketing import promote_listing, marketing_status
 from ebay.negotiation import (
@@ -739,6 +740,22 @@ async def _finalize_append(user_id, item_id, update, context) -> None:
     await _resync_photos(item_id, update.message)
 
 
+def _title_too_long_text(e: TitleTooLongError, item_id: str) -> str:
+    """What to tell the owner when eBay would have received an over-long title.
+
+    Spelled out in full (not str(e)[:250]) because the useful part — the fitted
+    suggestion — is at the end of the message."""
+    return (
+        f"✂️ {item_id[:8]}: the title is {len(e.title)} characters and eBay's limit "
+        f"is 80. Nothing was sent to eBay — it is no longer cut to fit, because "
+        f"that chopped size and colour off the end.\n\n"
+        f"Now: {e.title}\n"
+        f"Suggested ({len(e.suggestion)}): {e.suggestion}\n"
+        f"Drops: {', '.join(e.dropped) or 'nothing'}\n\n"
+        f"/retry {item_id[:8]} to reopen the draft, then type a correction such as "
+        f"'title: {e.suggestion}' and approve again.")
+
+
 async def _resync_photos(item_id: str, message) -> None:
     """Push the item's current photo set to eBay. No-op for items that haven't
     been drafted on eBay yet — the new photos are simply picked up when the draft
@@ -755,6 +772,10 @@ async def _resync_photos(item_id: str, message) -> None:
     await _safe_reply(message, "🔄 Updating the eBay listing with the new photos...")
     try:
         result = await asyncio.to_thread(create_draft_offer, item_id)
+    except TitleTooLongError as e:
+        await _safe_reply(message, "Photos saved, but the eBay listing was not updated.\n"
+                          + _title_too_long_text(e, item_id))
+        return
     except Exception as e:
         traceback.print_exc()
         await _safe_reply(message,
@@ -1420,6 +1441,12 @@ async def _approve_item(item_id: str, message, context) -> None:
         lines.append("The item is saved as 'approved' — fix the listing and retry manually.")
         await _safe_reply(message, "\n".join(lines))
         return
+    except TitleTooLongError as e:
+        # Back to review, not left at 'approved': a title is fixed with a typed
+        # correction, and corrections only apply to a draft under review.
+        update_status(item_id, "review")
+        await _safe_reply(message, _title_too_long_text(e, item_id))
+        return
     except Exception as e:
         traceback.print_exc()
         await _safe_reply(message,
@@ -2042,7 +2069,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await _safe_reply(update.message, "✏️ Applying your correction...")
     try:
-        revised = await asyncio.to_thread(revise_draft, current, text)
+        revised = await asyncio.to_thread(revise_draft, current, text,
+                                            item.get("identification"))
     except Exception as e:
         await _safe_reply(update.message, f"⚠️ Could not revise: {e}")
         return
