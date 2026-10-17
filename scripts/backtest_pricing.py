@@ -21,6 +21,7 @@ rate, see config.APIFY_SOLD_COST_PER_RESULT).
 import argparse
 import csv
 import json
+import math
 import os
 import sqlite3
 import statistics
@@ -41,8 +42,9 @@ from pipeline import pricing_v2 as v2  # noqa: E402
 
 DB = ROOT / "data" / "ross.db"
 OUT_DIR = ROOT / "data" / "cache" / "backtest"
-# Worst case for one item: a Sonnet judge call plus an Opus escalation.
-CLAUDE_ITEM_WORST = 0.35
+# Headroom kept per item before the Claude cap: a Sonnet judge call plus an
+# Opus escalation measured $0.06-0.09 in the 17 Oct pilot.
+CLAUDE_ITEM_WORST = 0.15
 
 
 def load_items(prefixes, limit):
@@ -107,6 +109,9 @@ def main():
     ap.add_argument("--limit", type=int)
     ap.add_argument("--claude-cap", type=float, default=2.0)
     ap.add_argument("--apify-cap", type=float, default=2.0)
+    ap.add_argument("--one-sold-query", action="store_true",
+                    help="for items not already cached, send only the search_query "
+                         "sold query to Apify (cached queries are still used)")
     args = ap.parse_args()
     if not args.items and not args.limit:
         raise SystemExit("refusing to run every item: pass --items or --limit")
@@ -114,6 +119,8 @@ def main():
     prefixes = [p.strip() for p in (args.items or "").split(",") if p.strip()]
     items = load_items(prefixes, args.limit)
     v2.apify_cap_usd = args.apify_cap
+    if args.one_sold_query:
+        v2.uncached_sold_queries = {"search_query"}
     start = datetime.now(timezone.utc).isoformat()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -138,20 +145,24 @@ def main():
             r, err = {}, f"{type(e).__name__}: {str(e)[:200]}"
         cost, calls = claude_spend(start, it["item_id"])
         owner, sold = it["owner_price"], it["sold_price"]
+        price, formula = r.get("suggested_price"), r.get("formula_price")
         row = {
             "item": it["item_id"][:8], "status": it["status"], "category_id": it["category_id"],
             "brand": it["ident"].get("brand"), "type": it["ident"].get("item_type"),
             "candidates": r.get("candidate_count"),
             "same_sold": r.get("same_item_sold_count"), "same_active": r.get("same_item_active_count"),
             "own_dropped": (r.get("dropped") or {}).get("own"),
-            "evidence": r.get("evidence"),
-            "v1_price": it["v1_price"], "v2_price": r.get("suggested_price"),
-            "claude_price": r.get("claude_price"), "claude_conf": r.get("claude_confidence"),
+            "sold_queries": len(r.get("rungs_tried") or []),
+            # v2_price IS Claude's price now; formula_price is the cross-check.
+            "v1_price": it["v1_price"], "v2_price": price, "formula_price": formula,
+            "claude_conf": r.get("claude_confidence"),
+            "formula_disagrees": "formula_disagrees" in (r.get("review_flags") or []),
             "owner_price": owner, "sold_price": sold,
-            "v1_ratio": ratio(it["v1_price"], owner), "v2_ratio": ratio(r.get("suggested_price"), owner),
-            "claude_ratio": ratio(r.get("claude_price"), owner),
-            "v2_vs_sold": ratio(r.get("suggested_price"), sold),
-            "claude_vs_sold": ratio(r.get("claude_price"), sold),
+            "v1_ratio": ratio(it["v1_price"], owner), "v2_ratio": ratio(price, owner),
+            "formula_ratio": ratio(formula, owner),
+            "v2_vs_sold": ratio(price, sold), "formula_vs_sold": ratio(formula, sold),
+            "v1_vs_sold": ratio(it["v1_price"], sold),
+            "evidence_ids": " ".join((r.get("claude_evidence") or {}).get("ids") or []),
             "judge_model": r.get("judge_model"), "escalated": v2.judge_stats["escalations"] > esc_before,
             "thumbnails": r.get("thumbnails_used"), "claude_calls": calls,
             "claude_cost": round(cost, 4), "apify_cost_est": round(v2.apify_spend["usd"] - apify_before, 4),
@@ -165,7 +176,7 @@ def main():
         detail = OUT_DIR / f"{stamp}-{it['item_id'][:8]}.json"
         detail.write_text(json.dumps(r, indent=1, default=str), encoding="utf-8")
         print(f"{row['item']} {row['status']:9} cands={row['candidates']} same_sold={row['same_sold']} "
-              f"v1={row['v1_price']} v2={row['v2_price']} claude={row['claude_price']} "
+              f"v1={row['v1_price']} v2={row['v2_price']} formula={row['formula_price']} "
               f"owner={owner} sold={sold} ${cost:.3f} {err or ''}", flush=True)
 
     out = OUT_DIR / f"backtest-{stamp}.csv"
@@ -186,16 +197,39 @@ def main():
         "apify_calls": v2.apify_spend["calls"], "apify_rows": v2.apify_spend["rows"],
         "apify_cache_hits": v2.apify_spend["cache_hits"],
     }
-    for key in ("v1_ratio", "v2_ratio", "claude_ratio", "v2_vs_sold", "claude_vs_sold"):
-        vals = [r[key] for r in rows if r[key] is not None]
-        summary[key] = {
-            "n": len(vals), "median": round(statistics.median(vals), 3) if vals else None,
-            "within_10pct": within(rows, key, 0.10)[0], "within_20pct": within(rows, key, 0.20)[0]}
-    worst = sorted((r for r in rows if r["v2_ratio"] or r["claude_ratio"]),
-                   key=lambda r: -abs(__import__("math").log(r["v2_ratio"] or r["claude_ratio"])))[:10]
-    summary["worst_10"] = [{k: r[k] for k in ("item", "brand", "type", "v2_price", "claude_price",
-                                              "owner_price", "sold_price", "v2_ratio",
-                                              "claude_ratio", "same_sold")} for r in worst]
+    def stats(subset, key):
+        vals = [r[key] for r in subset if r[key] is not None]
+        return {"n": len(vals), "median": round(statistics.median(vals), 3) if vals else None,
+                "within_10pct": within(subset, key, 0.10)[0],
+                "within_20pct": within(subset, key, 0.20)[0]}
+
+    sold_rows = [r for r in rows if r["status"] == "sold"]
+    unsold_rows = [r for r in rows if r["status"] != "sold"]
+    summary["v2_vs_owner"] = {"all": stats(rows, "v2_ratio"), "sold": stats(sold_rows, "v2_ratio"),
+                              "unsold": stats(unsold_rows, "v2_ratio")}
+    summary["v2_vs_sold"] = stats(sold_rows, "v2_vs_sold")
+    summary["v1_vs_owner"] = stats(rows, "v1_ratio")
+    summary["v1_vs_sold"] = stats(sold_rows, "v1_vs_sold")
+    summary["formula"] = {"computed": sum(1 for r in rows if r["formula_price"]),
+                          "vs_owner": stats(rows, "formula_ratio"),
+                          "vs_sold": stats(sold_rows, "formula_vs_sold")}
+    fired = [r for r in rows if r["formula_disagrees"]]
+    closer = {"claude": 0, "formula": 0, "no_sale": 0}
+    for r in fired:
+        if not r["sold_price"]:
+            closer["no_sale"] += 1
+        else:
+            d_c = abs(r["v2_price"] - r["sold_price"])
+            d_f = abs(r["formula_price"] - r["sold_price"])
+            closer["claude" if d_c <= d_f else "formula"] += 1
+    summary["formula_disagrees"] = {"fired": len(fired), "closer_to_sold": closer,
+                                    "items": [r["item"] for r in fired]}
+    worst = sorted((r for r in rows if r["v2_ratio"]),
+                   key=lambda r: -abs(math.log(r["v2_ratio"])))[:10]
+    summary["worst_10"] = [{k: r[k] for k in ("item", "status", "brand", "type", "v2_price",
+                                              "formula_price", "owner_price", "sold_price",
+                                              "v2_ratio", "same_sold", "claude_conf", "reasoning")}
+                           for r in worst]
     (OUT_DIR / f"summary-{stamp}.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
     print(json.dumps(summary, indent=1))
 

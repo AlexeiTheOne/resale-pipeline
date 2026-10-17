@@ -1710,6 +1710,13 @@ def _short(text: str, n: int = 50) -> str:
     return text if len(text) <= n else text[:n - 1].rstrip() + "…"
 
 
+def _fmt_money(v) -> str:
+    try:
+        return f"{float(v):.2f}"
+    except (TypeError, ValueError):
+        return "?"
+
+
 def _format_pricing_v2(pricing: dict) -> str:
     """Pricing v2 (pipeline/pricing_v2.py): Claude's price leads, with the comps
     it leaned on, so the price can be checked from the phone in one glance."""
@@ -1725,7 +1732,7 @@ def _format_pricing_v2(pricing: dict) -> str:
         lines.append(f"  {ev['reason']}")
     for c in ev.get("comps") or []:
         kind = "sold" if c.get("source") == "sold" else "active"
-        line = f"  • ${c.get('price')} {kind} — {_short(c.get('title'))}"
+        line = f"  • ${_fmt_money(c.get('price'))} {kind} — {_short(c.get('title'))}"
         if c.get("url"):
             line += f"\n    {c['url'].split('?')[0]}"
         lines.append(line)

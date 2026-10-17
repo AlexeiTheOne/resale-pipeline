@@ -85,7 +85,7 @@ class ApifyBudgetExceeded(RuntimeError):
 _lock = threading.Lock()
 apify_spend = {"calls": 0, "rows": 0, "usd": 0.0, "cache_hits": 0}
 apify_cap_usd: float | None = None
-judge_stats = {"calls": 0, "escalations": 0, "thumbnail_fallbacks": 0}
+judge_stats = {"calls": 0, "escalations": 0, "thumbnail_fallbacks": 0, "zero_price_retries": 0}
 # Which sold queries (by name: "code", "search_query", "product") may go to
 # Apify when their result is not cached. None = all of them. The backtest
 # narrows it to keep a large run cheap; cached results are always used.
@@ -425,7 +425,8 @@ JUDGE_SCHEMA = {
             "type": "object", "additionalProperties": False,
             "properties": {"id": {"type": "string"}, "verdict": {"type": "string", "enum": list(VERDICTS)}},
             "required": ["id", "verdict"]}},
-        "claude_price": {"type": "number"},
+        "claude_price": {"type": "number",
+                         "description": "item price in USD excluding shipping; always > 0"},
         "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
         "evidence": {"type": "array", "items": {"type": "string"}},
         "reasoning": {"type": "string"},
@@ -497,8 +498,10 @@ def judge(identity, cands, photo, calibration, *, item_id=None, ask=None) -> dic
     import claude_llm
     ask = ask or claude_llm.ask
 
-    def call(model, thumbnails):
+    def call(model, thumbnails, note=None):
         system, content = build_judge_request(identity, cands, photo, calibration, thumbnails)
+        if note:
+            content.append({"type": "text", "text": note})
         judge_stats["calls"] += 1
         return ask(JUDGE_STAGE, [{"role": "user", "content": content}], model=model,
                    system=system, max_tokens=8000, effort=config.PRICING_JUDGE_EFFORT,
@@ -521,6 +524,12 @@ def judge(identity, cands, photo, calibration, *, item_id=None, ask=None) -> dic
         escalated = True
         model = config.PRICING_ESCALATE_MODEL
         out = call(model, thumbnails)
+    if not (v1._to_float(out.get("claude_price")) or 0) > 0:
+        # Seen twice in 40 backtest items: a sensible price in the reasoning
+        # and 0 in claude_price. Asked once more, saying so; still 0 -> no price.
+        judge_stats["zero_price_retries"] += 1
+        out = call(model, thumbnails, note="claude_price must be the positive item price you "
+                                           "would list at; a previous answer returned 0.")
     out.update(model=model, escalated=escalated, thumbnails_used=thumbnails)
     return out
 

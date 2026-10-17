@@ -267,6 +267,21 @@ def test_calibration_is_sold_items_at_sold_price_only():
         v2._db_rows = saved
 
 
+def test_zero_claude_price_is_asked_once_more():
+    answers = [{"judgments": [], "claude_price": 0, "confidence": "medium", "evidence": [],
+                "reasoning": "r", "disagreements": []},
+               {"judgments": [], "claude_price": 41.5, "confidence": "medium", "evidence": [],
+                "reasoning": "r", "disagreements": []}]
+    notes = []
+
+    def fake_ask(stage, messages, **kw):
+        notes.append(messages[0]["content"][-1]["text"])
+        return dict(answers.pop(0))
+
+    out = v2.judge({"brand": "x"}, [], None, [], ask=fake_ask)
+    assert out["claude_price"] == 41.5 and len(notes) == 2 and "previous answer" in notes[1]
+
+
 # --- review screen -------------------------------------------------------------
 
 def test_review_screen_shows_claude_price_reason_and_evidence():
@@ -275,7 +290,7 @@ def test_review_screen_shows_claude_price_reason_and_evidence():
     text = tb.format_pricing(r)
     assert text.startswith("💰 Suggested price: $44.99  (Claude, high confidence)")
     assert "one line" in text
-    assert "• $60.0 sold — Bag" in text
+    assert "• $60.00 sold — Bag" in text
     assert "\n    https://www.ebay.com/itm/100000001\n" in text   # query string dropped
     assert "active" in text and len(text.splitlines()) <= 10
     long = dict(r, claude_evidence={"reason": "x", "comps": [
