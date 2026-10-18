@@ -26,6 +26,7 @@ from config import (
 from db import get_item, update_field
 from ebay.auth import get_access_token
 from ebay.taxonomy import InvalidCategoryError, category_aspects, category_name, resolve_valid_category
+from pipeline.description_guard import sanitize_description
 from pipeline.gtin import product_gtin
 from pipeline.title import TITLE_MAX_LEN, fit_title
 
@@ -1002,7 +1003,13 @@ def create_draft_offer(item_id: str) -> dict:
     sku = item_id
     condition = CONDITION_MAP.get(str(listing.get("condition_id")), "USED_GOOD")
 
-    description_html = _html_description(listing["description"])
+    # Last line before publish: no authenticity claim, hashtag, keyword block or
+    # other store's name goes live, even from a draft stored before the guard.
+    description_text, _removed = sanitize_description(
+        listing["description"], (listing.get("item_specifics") or {}).get("Brand"))
+    for r in _removed:
+        print(f"🛡️ Draft: description guard removed {r}")
+    description_html = _html_description(description_text)
     product = _build_product(listing, image_urls, aspects, description_html)
     print(f"📤 Draft: {len(product['imageUrls'])} imageUrl(s) in the eBay inventory_item payload")
 

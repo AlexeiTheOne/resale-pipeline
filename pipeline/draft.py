@@ -10,6 +10,7 @@ from google.genai import types
 from ebay.taxonomy import category_aspects, category_suggestions
 from llm import generate_with_retry, make_client, response_text
 from pipeline.category import choose_category, department_of
+from pipeline.description_guard import sanitize_description
 from pipeline.gtin import product_gtin
 from pipeline.specifics import clean_specifics
 from pipeline.title import (TITLE_MAX_LEN, TITLE_RULES, enforce_band_for_device,
@@ -197,6 +198,17 @@ def _enforce_category(draft: dict, identification: dict | None,
         print(f"⚠️ no known or consistent category for item type "
               f"{(identification or {}).get('item_type')!r}; keeping the model's {model_id!r}"
               " — check it at review")
+
+
+def _guard_description(draft: dict, identification: dict | None) -> None:
+    """Strip authenticity claims, hashtags, keyword blocks and other stores'
+    names from the model's description, in place (pipeline/description_guard.py).
+    The prompt forbids them; this is what makes it true."""
+    brand = (draft.get("item_specifics") or {}).get("Brand") or (identification or {}).get("brand")
+    cleaned, removed = sanitize_description(draft.get("description") or "", brand)
+    for r in removed:
+        print(f"🛡️ description: removed {r}")
+    draft["description"] = cleaned
 
 
 def _clean_draft_specifics(draft: dict, identification: dict | None) -> None:
@@ -444,6 +456,7 @@ def generate_draft(identification: dict, pricing: dict, examples: list | None = 
     _enforce_category(draft, identification, category)
     _clean_draft_specifics(draft, identification)
 
+    _guard_description(draft, identification)
     draft["description"] =(draft["description"] + "\n\n"
                             + store_boilerplate(draft.get("condition_id")))
     draft["stock_image_url"] = stock_url
@@ -511,6 +524,7 @@ def revise_draft(current_draft: dict, correction: str,
     # A correction that lengthens the title ("add the colour") is exactly how a
     # title goes over 80, so the revision is held to the same limit.
     _fit_draft_title(revised, identification)
+    _guard_description(revised, identification)
 
     # A copy edit keeps the category unless it asks about the category: the
     # model otherwise re-picks the number freehand on every revision.
