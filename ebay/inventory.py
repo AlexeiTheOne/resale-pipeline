@@ -605,13 +605,34 @@ def _dedup_preserve(items) -> list[str]:
     return out
 
 
+def _fit_aspect_value(value) -> str | None:
+    """A value within eBay's 65-character aspect limit without cutting it: a
+    comma list keeps the whole items that fit; a single phrase that is too long
+    is dropped. Cutting it produced live values like "Apple Watch Series 1,
+    ..., Apple Watch Series" — a fragment that matches no buyer filter."""
+    text = " ".join(str(value).split())
+    if len(text) <= ASPECT_VALUE_MAX_LEN:
+        return text
+    if "," in text:
+        kept = []
+        for item in (t.strip() for t in text.split(",")):
+            if item and len(", ".join(kept + [item])) <= ASPECT_VALUE_MAX_LEN:
+                kept.append(item)
+        if kept:
+            return ", ".join(kept)
+    print(f"⚠️ Dropping aspect value over {ASPECT_VALUE_MAX_LEN} chars: {text!r}")
+    return None
+
+
 def _normalize_aspect_values(value) -> list[str]:
     values = value if isinstance(value, list) else [value]
     cleaned = []
     for v in values:
         if not _is_confirmed(v):
             continue
-        tv = _truncate_value(v)
+        tv = _fit_aspect_value(v)
+        if not tv:
+            continue
         # collapse a value that repeats comma-separated tokens, e.g.
         # "Travel, Casual, Travel, Casual" -> "Travel, Casual"
         if "," in tv:

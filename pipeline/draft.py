@@ -11,6 +11,7 @@ from ebay.taxonomy import category_aspects, category_suggestions
 from llm import generate_with_retry, make_client, response_text
 from pipeline.category import choose_category, department_of
 from pipeline.gtin import product_gtin
+from pipeline.specifics import clean_specifics
 from pipeline.title import TITLE_MAX_LEN, TITLE_RULES, ensure_title_fits
 
 load_dotenv()
@@ -128,8 +129,14 @@ identification.specifications with a generic catalog guess.
 Rules for item_specifics:
 - Fill every aspect you can confidently determine from the specifications;
   do not leave a field blank when the data clearly answers it.
-- For colors, list the actual colors broken out (e.g. "Black, Red, White"), not a
-  vague "Multicolor".
+- Each value is a short filter value (a word or two), never a sentence or a
+  comma-joined list. Color/Exterior Color: the one main colour (e.g. "Black");
+  "Multicolor" only when no single colour dominates. Pattern and Style: one
+  value.
+- Leave an aspect out when the identification does not answer it — a guessed
+  value is worse than none. Department only when the identification states it.
+  Pattern "Animal Print" only for an animal-skin print (leopard, cheetah, zebra,
+  snake, croc), never for a print that merely shows an animal.
 - Never invent condition details — only what the identification/photos report.
 - Never list the same value twice in one aspect.
 
@@ -191,6 +198,19 @@ def _enforce_category(draft: dict, identification: dict | None,
               " — check it at review")
 
 
+def _clean_draft_specifics(draft: dict, identification: dict | None) -> None:
+    """Hold item_specifics to filter-shaped values the identification supports
+    (pipeline/specifics.py), against the chosen category's aspect metadata."""
+    try:
+        meta = category_aspects(str(draft.get("category_id"))) if draft.get("category_id") else None
+    except Exception:
+        meta = None
+    cleaned, notes = clean_specifics(draft.get("item_specifics") or {}, identification, meta)
+    for note in notes:
+        print(f"🧹 specifics: {note}")
+    draft["item_specifics"] = cleaned
+
+
 def _aspect_hint_block(category: dict | None) -> str | None:
     """Best-effort guidance block listing every item specific eBay's catalog
     defines for the chosen category, not just the required ones, so Gemini
@@ -215,10 +235,10 @@ def _aspect_hint_block(category: dict | None) -> str | None:
     lines = [
         f"EBAY CATEGORY: use category_id {category_id} (chosen from the item type). "
         "Item specifics for that category:",
-        "Buyers filter and search by these. Fill in every REQUIRED and RECOMMENDED one "
-        "with a confident, accurate value from the photos or your search. Fill OPTIONAL "
-        "ones only if you're confident — never guess. Add everything you can to "
-        "item_specifics, beyond the fields already listed in the schema below.",
+        "Buyers filter and search by these. Fill one only when the identification or "
+        "photos clearly answer it, and leave it out otherwise — never pick a value just "
+        "because it is listed (the lists are alphabetical, not a default). Missing "
+        "required ones are filled safely at publish.",
         "",
     ]
     for spec in aspects:
@@ -412,6 +432,7 @@ def generate_draft(identification: dict, pricing: dict, examples: list | None = 
 
     _fit_draft_title(draft, identification)
     _enforce_category(draft, identification, category)
+    _clean_draft_specifics(draft, identification)
 
     draft["description"] =(draft["description"] + "\n\n"
                             + store_boilerplate(draft.get("condition_id")))
