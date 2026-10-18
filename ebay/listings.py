@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import re
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
 
 import httpx
 
@@ -162,6 +163,115 @@ def listing_picture_count(listing_id: str) -> int | None:
     if _text(root, "Ack") not in ("Success", "Warning"):
         return None
     return sum(1 for n in root.iter() if _strip_ns(n.tag) == "PictureURL")
+
+
+def _trading_call(call_name: str, inner_xml: str, timeout: int = 60):
+    """POST one Trading call and return (root, warnings). Raises on transport
+    failure or Ack=Failure, with eBay's long messages, so no caller can mistake
+    a refused revision for a done one."""
+    body = (f'<?xml version="1.0" encoding="utf-8"?>'
+            f'<{call_name}Request xmlns="urn:ebay:apis:eBLBaseComponents">'
+            f'{inner_xml}</{call_name}Request>')
+    r = httpx.post(TRADING_URL, headers=_headers(call_name),
+                   content=body.encode("utf-8"), timeout=timeout)
+    if r.status_code != 200:
+        raise RuntimeError(f"eBay Trading {call_name} failed [{r.status_code}]: {r.text[:300]}")
+    root = ET.fromstring(r.text)
+    errors = [n for n in root.iter() if _strip_ns(n.tag) == "Errors"]
+    messages = [(_text(e, "SeverityCode") or "", _text(e, "LongMessage") or _text(e, "ShortMessage") or "")
+                for e in errors]
+    if _text(root, "Ack") not in ("Success", "Warning"):
+        detail = " | ".join(m for s, m in messages if s != "Warning") or r.text[:300]
+        raise RuntimeError(f"eBay Trading {call_name} error: {detail}")
+    return root, [m for s, m in messages if s == "Warning"]
+
+
+def get_item_details(listing_id: str) -> dict:
+    """What a buyer sees on a live listing, read with GetItem: title, category,
+    item specifics, description HTML, photo count, price and stock.
+
+    This is the read-back for any listing edit, whichever API wrote it — the
+    Inventory API's own GETs are lossy (see listing_picture_count)."""
+    root, _ = _trading_call(
+        "GetItem",
+        f"<ItemID>{escape(str(listing_id))}</ItemID>"
+        "<DetailLevel>ReturnAll</DetailLevel>"
+        "<IncludeItemSpecifics>true</IncludeItemSpecifics>")
+    item = next(n for n in root.iter() if _strip_ns(n.tag) == "Item")
+
+    def child(node, tag):
+        return next((c for c in node if _strip_ns(c.tag) == tag), None)
+
+    specifics = {}
+    spec_node = child(item, "ItemSpecifics")
+    for nvl in (spec_node if spec_node is not None else []):
+        name = _text(nvl, "Name")
+        if name:
+            specifics[name] = [(v.text or "").strip() for v in nvl if _strip_ns(v.tag) == "Value"]
+
+    selling = child(item, "SellingStatus")
+    category = child(item, "PrimaryCategory")
+    qty = child(item, "Quantity")
+    total = int(qty.text) if qty is not None and (qty.text or "").strip().isdigit() else 0
+    sold = _int(selling, "QuantitySold", 0) if selling is not None else 0
+    pictures = child(item, "PictureDetails")
+    desc = child(item, "Description")
+    return {
+        "listing_id": str(listing_id),
+        "title": (child(item, "Title").text or "").strip(),
+        "sku": _text(item, "SKU") or None,
+        "category_id": _text(category, "CategoryID") if category is not None else None,
+        "item_specifics": specifics,
+        "description": (desc.text or "") if desc is not None else "",
+        "picture_count": sum(1 for n in (pictures if pictures is not None else [])
+                             if _strip_ns(n.tag) == "PictureURL"),
+        "price": _price(selling if selling is not None else item),
+        "quantity": max(total - sold, 0),
+        "condition_id": _text(item, "ConditionID"),
+        "listing_status": _text(selling, "ListingStatus") if selling is not None else None,
+    }
+
+
+def _cdata(text: str) -> str:
+    # "]]>" can't appear inside one CDATA section, so split it across two.
+    return "<![CDATA[" + text.replace("]]>", "]]]]><![CDATA[>") + "]]>"
+
+
+def revise_item(listing_id: str, *, title: str | None = None, description: str | None = None,
+                item_specifics: dict | None = None, category_id: str | None = None) -> list[str]:
+    """Revise a live listing that the Inventory API can't reach — one made in
+    Seller Hub, or relisted there so its Inventory offer no longer points at it.
+
+    Sends ONLY the fields given, so photos, price, quantity, shipping and Best
+    Offer are untouched. Two things to know:
+      * item_specifics REPLACES the listing's whole set — pass every aspect
+        the listing should keep, not just the changed ones.
+      * eBay refuses ReviseItem on a listing the Inventory API manages; use
+        ebay.inventory for those.
+
+    Returns eBay's warnings (Ack=Warning still means it was applied); raises on
+    failure."""
+    if title is None and description is None and item_specifics is None and category_id is None:
+        raise ValueError("revise_item: nothing to change")
+    if title is not None and len(title) > 80:
+        raise ValueError(f"revise_item: title is {len(title)} characters, over eBay's 80")
+    parts = [f"<ItemID>{escape(str(listing_id))}</ItemID>"]
+    if title is not None:
+        parts.append(f"<Title>{escape(title)}</Title>")
+    if description is not None:
+        parts.append(f"<Description>{_cdata(description)}</Description>")
+    if category_id is not None:
+        parts.append(f"<PrimaryCategory><CategoryID>{escape(str(category_id))}</CategoryID></PrimaryCategory>")
+    if item_specifics is not None:
+        lists = []
+        for name, values in item_specifics.items():
+            values = values if isinstance(values, list) else [values]
+            vals = "".join(f"<Value>{escape(str(v))}</Value>" for v in values if str(v).strip())
+            if vals:
+                lists.append(f"<NameValueList><Name>{escape(name)}</Name>{vals}</NameValueList>")
+        parts.append(f"<ItemSpecifics>{''.join(lists)}</ItemSpecifics>")
+    _, warnings = _trading_call("ReviseItem", f"<Item>{''.join(parts)}</Item>")
+    return warnings
 
 
 def audit_listing_photos(items: list[dict]) -> list[dict]:

@@ -398,6 +398,88 @@ def update_inventory_title(sku: str, title: str, known_images: int | None = None
     Returns the title sent. A title over 80 characters raises TitleTooLongError
     before anything is read or written — it is never cut to fit.
 
+    Images are repaired, never echoed — see _write_inventory_product."""
+    title = _checked_title(title)
+
+    def set_title(product: dict) -> None:
+        product["title"] = title
+
+    return _write_inventory_product(sku, set_title, known_images)["title"]
+
+
+# Aspects that eBay also keeps as top-level product identifier fields. Changing
+# the aspect alone leaves the identifier advertising the old value (and the
+# identifier is what Google Shopping and the catalog match read), so the two are
+# kept in step. GTINs are list-valued on the product; MPN and brand are strings.
+_GTIN_PRODUCT_FIELDS = {"upc": "upc", "ean": "ean", "isbn": "isbn"}
+
+
+def update_inventory_aspects(sku: str, set_aspects: dict | None = None,
+                             remove: list | tuple = (), known_images: int | None = None) -> dict:
+    """Change item specifics on an existing inventory item, live listing included,
+    leaving every other aspect, the title and the photos as they are.
+
+    `set_aspects` maps an aspect name to its new value (a string or a list);
+    it replaces that aspect's values entirely, matching the existing name
+    case-insensitively. `remove` lists aspect names to delete. A name in
+    `remove` that the item doesn't carry is an error — it almost always means a
+    typo, and a silent no-op would be reported as a fix.
+
+    UPC/EAN/ISBN, MPN and Brand are mirrored onto the product's identifier
+    fields. A GTIN that fails its check digit is refused rather than sent:
+    eBay rejects the whole PUT on one, and a wrong barcode is the very thing
+    this function exists to correct. Removing MPN falls back to "Does not
+    apply", the convention _build_product uses, because eBay treats Brand+MPN
+    as a required pair.
+
+    Returns the aspects sent. Same full-replace PUT and the same image repair
+    as update_inventory_title — see _write_inventory_product."""
+    wanted = {}
+    for name, value in (set_aspects or {}).items():
+        values = _normalize_aspect_values(value)
+        if not values:
+            raise ValueError(f"{sku}: no usable value for aspect {name!r}: {value!r}")
+        if name.lower() in _GTIN_PRODUCT_FIELDS and not all(_valid_gtin(v) for v in values):
+            raise ValueError(f"{sku}: {name} {values} fails the GTIN check digit")
+        wanted[name] = values
+    clash = {n.lower() for n in wanted} & {n.lower() for n in remove}
+    if clash:
+        raise ValueError(f"{sku}: aspect(s) both set and removed: {sorted(clash)}")
+
+    def edit(product: dict) -> None:
+        aspects = dict(product.get("aspects") or {})
+        existing = {k.lower(): k for k in aspects}
+        for name in remove:
+            key = existing.get(name.lower())
+            if key is None:
+                raise KeyError(f"{sku}: cannot remove aspect {name!r}, the item has no such aspect")
+            del aspects[key]
+        for name, values in wanted.items():
+            # Keep the listing's own spelling and position for an aspect it has.
+            aspects[existing.get(name.lower(), name)] = values
+        product["aspects"] = aspects
+
+        for name in remove:
+            low = name.lower()
+            if low in _GTIN_PRODUCT_FIELDS:
+                product.pop(_GTIN_PRODUCT_FIELDS[low], None)
+            elif low == "mpn":
+                product["mpn"] = "Does not apply"
+        for name, values in wanted.items():
+            low = name.lower()
+            if low in _GTIN_PRODUCT_FIELDS:
+                product[_GTIN_PRODUCT_FIELDS[low]] = values[:1]
+            elif low in ("mpn", "brand"):
+                product[low] = values[0]
+
+    return _write_inventory_product(sku, edit, known_images)["aspects"]
+
+
+def _write_inventory_product(sku: str, edit, known_images: int | None = None) -> dict:
+    """Read an inventory item, let `edit` change its product block in place,
+    and PUT it back. Returns the product sent. Shared by every partial edit so
+    the image repair and the weight workaround below exist exactly once.
+
     IMAGES ARE NEVER TAKEN FROM eBay's RESPONSE. getInventoryItem returns a
     lossy projection of the record: it drops `product.description` on every
     item, and on a substantial minority of them it returns `imageUrls` collapsed
@@ -410,11 +492,10 @@ def update_inventory_title(sku: str, title: str, known_images: int | None = None
     stored list wins and a short response is repaired, not propagated.
 
     The trade-off: a photo deliberately deleted in Seller Hub gets restored on
-    the next title edit. That is recoverable in a way a listing stripped to one
-    photo is not.
+    the next edit. That is recoverable in a way a listing stripped to one photo is
+    not.
     """
-    title = _checked_title(title)
-    current = _request("GET", f"/sell/inventory/v1/inventory_item/{sku}").json()
+    current =_request("GET", f"/sell/inventory/v1/inventory_item/{sku}").json()
     body = {k: current[k] for k in _INVENTORY_UPDATABLE_FIELDS
             if current.get(k) is not None}
     product = dict(body.get("product") or {})
@@ -432,7 +513,7 @@ def update_inventory_title(sku: str, title: str, known_images: int | None = None
               f"restoring the stored {len(stored)} instead of echoing the loss")
         product["imageUrls"] = stored
 
-    product["title"] = title
+    edit(product)
     body["product"] = product
 
     # eBay hands back `{"weight": {"value": 0.0, "unit": "POUND"}}` on GET for any
@@ -457,7 +538,7 @@ def update_inventory_title(sku: str, title: str, known_images: int | None = None
             body["packageWeightAndSize"] = pkg
 
     _request("PUT", f"/sell/inventory/v1/inventory_item/{sku}", json=body)
-    return product["title"]
+    return product
 
 
 def get_offer(offer_id: str) -> dict:
@@ -467,18 +548,46 @@ def get_offer(offer_id: str) -> dict:
     return _request("GET", f"/sell/inventory/v1/offer/{offer_id}").json()
 
 
-def _update_offer_description(offer_id: str, current: dict, description_html: str) -> None:
-    """Swap an existing offer's description, live listing included. Same full-PUT
-    replace as update_offer_price — and note pricingSummary is carried over
-    explicitly: it's excluded from _OFFER_UPDATABLE_FIELDS, so a PUT without it
-    would strip the price off the listing."""
+def _offer_round_trip(current: dict) -> dict:
+    """The body that re-sends an offer unchanged. updateOffer is a full PUT
+    replace, so everything worth keeping is carried over — and pricingSummary
+    explicitly: it's excluded from _OFFER_UPDATABLE_FIELDS (update_offer_price
+    builds its own), so a PUT without it would strip the price off the listing."""
     body = {k: current[k] for k in _OFFER_UPDATABLE_FIELDS if current.get(k) is not None}
-    body["listingDescription"] = description_html
     price = ((current.get("pricingSummary") or {}).get("price") or {})
     if price.get("value") is not None:
         body["pricingSummary"] = {"price": {"value": str(price["value"]),
                                             "currency": price.get("currency") or EBAY_CURRENCY}}
+    return body
+
+
+def _update_offer_description(offer_id: str, current: dict, description_html: str) -> None:
+    """Swap an existing offer's description, live listing included."""
+    body = _offer_round_trip(current)
+    body["listingDescription"] = description_html
     _request("PUT", f"/sell/inventory/v1/offer/{offer_id}", json=body)
+
+
+def update_offer_fields(offer_id: str, *, description_html: str | None = None,
+                        category_id: str | None = None) -> dict:
+    """Change an offer's description and/or category, live listing included,
+    leaving price, quantity and policies exactly as eBay holds them now.
+
+    Reads the offer fresh rather than taking one from the caller, so nothing
+    stale is written back. A category move only lands if the inventory item's
+    aspects already satisfy the new category's required aspects — set those
+    first with update_inventory_aspects; eBay rejects the PUT otherwise and
+    nothing changes. Returns the body sent."""
+    if description_html is None and category_id is None:
+        raise ValueError("update_offer_fields: nothing to change")
+    current = _request("GET", f"/sell/inventory/v1/offer/{offer_id}").json()
+    body = _offer_round_trip(current)
+    if description_html is not None:
+        body["listingDescription"] = description_html
+    if category_id is not None:
+        body["categoryId"] = str(category_id)
+    _request("PUT", f"/sell/inventory/v1/offer/{offer_id}", json=body)
+    return body
 
 
 def refresh_offer_description(item: dict, apply: bool = False, force: bool = False) -> str:
