@@ -224,5 +224,63 @@ def test_create_draft_offer_refuses_before_uploading(monkeypatch):
         inv.create_draft_offer("x")
 
 
+# --- "Band for Apple Watch" is enforced in code ---------------------------------
+
+from pipeline.title import enforce_band_for_device, is_smartwatch_band
+
+BAND = {"item_type": "Apple Watch Band", "brand": "Michael Kors"}
+
+
+@pytest.mark.parametrize("title, expected", [
+    # b50bd66b, live
+    ("Michael Kors Pave Rose Gold-Tone Apple Watch Band 38/40/41mm MKS8042 NWT",
+     "Michael Kors Pave Rose Gold-Tone Band for Apple Watch 38/40/41mm MKS8042 NWT"),
+    # 45654c28, live: the device phrase is kept as written
+    ("Kate Spade New York Silicone Band 38/40/41mm Apple/Galaxy Watch Leopard",
+     "Kate Spade New York Silicone Band for Apple/Galaxy Watch 38/40/41mm Leopard"),
+    # cbfaefec, live: "Strap Set"
+    ("kate spade new york Bumper & Strap Set 40mm Apple Watch Silver Glitter",
+     "kate spade new york Bumper & Strap Set for Apple Watch 40mm Silver Glitter"),
+    # no band noun at all: one goes in after the brand
+    ("Michael Kors Rose Gold Apple Watch 38mm", "Michael Kors Band for Apple Watch Rose Gold 38mm"),
+    # already compliant: untouched
+    ("Michael Kors Curb Chain Band for Apple Watch Rose Gold 38/40/41mm MKS8020",
+     "Michael Kors Curb Chain Band for Apple Watch Rose Gold 38/40/41mm MKS8020"),
+])
+def test_band_titles_say_for_apple_watch(title, expected):
+    assert enforce_band_for_device(title, BAND) == expected
+
+
+def test_watches_and_other_items_are_left_alone():
+    t = "Michael Kors Runway Black-Tone Watch 42mm"
+    assert enforce_band_for_device(t, {"item_type": "Wristwatch"}) == t
+    t = "Michael Kors Jet Set Tote Black"
+    assert enforce_band_for_device(t, {"item_type": "Tote Bag"}) == t
+    assert not is_smartwatch_band({"item_type": "Watch Band"}, {}, "Fossil Leather Watch Band 22mm")
+    assert is_smartwatch_band({"item_type": "Smartwatch Band"}, {}, "bebe Band 38mm")
+
+
+def test_draft_title_step_enforces_band_wording_within_80(monkeypatch):
+    import pipeline.draft as draft
+    monkeypatch.setattr(draft, "_refit_title", lambda t, i, s: pytest.fail("fits already"))
+    d = {"title": "Michael Kors Pave Rose Gold-Tone Apple Watch Band 38/40/41mm MKS8042 NWT",
+         "item_specifics": {"Brand": "Michael Kors"}}
+    draft._fit_draft_title(d, BAND)
+    assert "Band for Apple Watch" in d["title"]
+    assert len(d["title"]) <= TITLE_MAX_LEN
+
+
+def test_draft_title_step_keeps_band_wording_when_shortening(monkeypatch):
+    import pipeline.draft as draft
+    # A refit that drops the compliance wording is corrected after the fit.
+    monkeypatch.setattr(draft, "_refit_title",
+                        lambda t, i, s: "Michael Kors Pave Rose Gold-Tone Apple Watch Band 38/40/41mm")
+    d = {"title": "Michael Kors Access Pave Crystal Rose Gold-Tone Stainless Steel Apple Watch "
+                  "Band 38/40/41mm MKS8042 NWT", "item_specifics": {"Brand": "Michael Kors"}}
+    draft._fit_draft_title(d, BAND)
+    assert "Band for Apple Watch" in d["title"]
+    assert len(d["title"]) <= TITLE_MAX_LEN
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

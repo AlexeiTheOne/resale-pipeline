@@ -10,6 +10,7 @@ import httpx
 
 from config import EBAY_MARKETPLACE_ID
 from ebay.auth import get_app_access_token
+from pipeline.category import path_fits, suggestion_path
 
 TAXONOMY_API_BASE = "https://api.ebay.com/commerce/taxonomy/v1"
 
@@ -177,6 +178,11 @@ def resolve_valid_category(category_id: str, title: str) -> tuple[str, str | Non
         cat = suggestion.get("category") or {}
         suggested_id = cat.get("categoryId")
         if not suggested_id or suggested_id == category_id:
+            continue
+        # Only a category whose path has something in common with the title:
+        # the first suggestion that merely validates is how unrelated
+        # categories get picked (pipeline/category.py).
+        if not path_fits(suggestion_path(suggestion), title):
             continue
         try:
             category_aspects(suggested_id)

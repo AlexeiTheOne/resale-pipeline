@@ -317,3 +317,66 @@ def ensure_title_fits(title: str, identification: dict | None = None,
             return candidate, dropped, "refit"
     fitted, dropped = fit_title(title, identification, specifics)
     return fitted, dropped, "fallback"
+
+
+# --- "Band for Apple Watch" ----------------------------------------------------
+#
+# A band made to fit an Apple Watch must be titled "<Brand> ... Band for Apple
+# Watch ...", never "<Brand> Apple Watch Band": the second reads as an Apple
+# product made by Michael Kors / Kate Spade, which is brand misuse in eBay's
+# terms and a VeRO hook for Apple (playbook §1). The prompt says so, and 9 of 15
+# band titles in the catalogue still came back as "... Apple Watch Band ..."
+# (b50bd66b, 69881d8e, 00c8d805, dbc5c441, ...). So it is enforced here.
+
+_DEVICE = re.compile(
+    r"\b(?:Apple(?:\s*/\s*(?:Samsung\s+)?Galaxy)?|Samsung\s+Galaxy|Galaxy|Fitbit|Garmin)"
+    r"\s+Watch\b", re.I)
+_BAND_WORD = re.compile(r"\b(band|bands|strap|straps|bracelet)\b", re.I)
+_FOR_DEVICE = re.compile(r"\bfor\s+(?:an?\s+|the\s+)?" + _DEVICE.pattern, re.I)
+
+
+def is_smartwatch_band(identification: dict | None, specifics: dict | None = None,
+                       title: str | None = None) -> bool:
+    """A band/strap made for a smartwatch (Apple Watch above all), as opposed to
+    a watch, or a band for an ordinary watch."""
+    ident = identification or {}
+    spec = specifics or {}
+    kind = " ".join(str(v) for v in (ident.get("item_type"), ident.get("product_name"),
+                                     spec.get("Type")) if v)
+    if not _BAND_WORD.search(kind) and not re.search(r"\bband\b", str(title or ""), re.I):
+        return False
+    text = " ".join(str(v) for v in (kind, title, spec.get("Compatible Brand"),
+                                     spec.get("Compatible Model"), ident.get("search_query")) if v)
+    return bool(_DEVICE.search(text) or re.search(r"\bsmart\s*watch\b", kind, re.I))
+
+
+def enforce_band_for_device(title: str, identification: dict | None = None,
+                            specifics: dict | None = None) -> str:
+    """Rewrite '<Brand> Apple Watch Band ...' as '<Brand> Band for Apple Watch ...'.
+    A title that already says 'for Apple Watch', or an item that is not a
+    smartwatch band, is returned unchanged (whitespace-normalised). The result
+    may exceed 80 characters; the caller fits it afterwards."""
+    title = " ".join((title or "").split())
+    if not title or _FOR_DEVICE.search(title) or not is_smartwatch_band(identification, specifics, title):
+        return title
+    m = _DEVICE.search(title)
+    if m:
+        device = re.sub(r"\s+", " ", m.group(0))
+        rest = (title[:m.start()] + " " + title[m.end():])
+    else:
+        device = "Apple Watch"
+        rest = title
+    rest = " ".join(rest.split())
+    words = rest.split()
+    band_at = next((i for i, w in enumerate(words) if _BAND_WORD.fullmatch(w.strip(",.;:"))), None)
+    if band_at is None:
+        # No band noun at all: put "Band for <device>" after the brand.
+        brand = str((specifics or {}).get("Brand") or (identification or {}).get("brand") or "")
+        n = len(brand.split()) if brand and rest.lower().startswith(brand.lower()) else 0
+        words[n:n] = ["Band", "for", *device.split()]
+        return " ".join(words)
+    insert = band_at + 1
+    if insert < len(words) and words[insert].lower() == "set":
+        insert += 1
+    words[insert:insert] = ["for", *device.split()]
+    return " ".join(words)

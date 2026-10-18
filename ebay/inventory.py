@@ -26,6 +26,8 @@ from config import (
 from db import get_item, update_field
 from ebay.auth import get_access_token
 from ebay.taxonomy import InvalidCategoryError, category_aspects, category_name, resolve_valid_category
+from pipeline.description_guard import sanitize_description
+from pipeline.gtin import product_gtin
 from pipeline.title import TITLE_MAX_LEN, fit_title
 
 load_dotenv()
@@ -690,14 +692,12 @@ def _valid_gtin(value) -> bool:
     """True if value is a structurally valid GTIN (UPC-A/EAN-8/13/GTIN-14):
     right length and a correct check digit. The model frequently misreads a
     barcode off a photo, and eBay rejects the whole publish on a bad UPC — so we
-    validate and drop it (eBay lets the field be blank) rather than block listing."""
-    digits = re.sub(r"\D", "", str(value))
-    if len(digits) not in (8, 12, 13, 14):
-        return False
-    nums = [int(d) for d in digits]
-    body, check = nums[:-1], nums[-1]
-    total = sum(d * (3 if i % 2 == 0 else 1) for i, d in enumerate(reversed(body)))
-    return (10 - total % 10) % 10 == check
+    validate and drop it (eBay lets the field be blank) rather than block listing.
+
+    A store-internal number is refused too: the Ross tag's 400xxxxxxxxx item code
+    has a valid check digit and went out as the UPC on 8 live listings — see
+    pipeline/gtin.py. This is the last line; the draft step already drops it."""
+    return product_gtin(value) is not None
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -726,13 +726,34 @@ def _dedup_preserve(items) -> list[str]:
     return out
 
 
+def _fit_aspect_value(value) -> str | None:
+    """A value within eBay's 65-character aspect limit without cutting it: a
+    comma list keeps the whole items that fit; a single phrase that is too long
+    is dropped. Cutting it produced live values like "Apple Watch Series 1,
+    ..., Apple Watch Series" — a fragment that matches no buyer filter."""
+    text = " ".join(str(value).split())
+    if len(text) <= ASPECT_VALUE_MAX_LEN:
+        return text
+    if "," in text:
+        kept = []
+        for item in (t.strip() for t in text.split(",")):
+            if item and len(", ".join(kept + [item])) <= ASPECT_VALUE_MAX_LEN:
+                kept.append(item)
+        if kept:
+            return ", ".join(kept)
+    print(f"⚠️ Dropping aspect value over {ASPECT_VALUE_MAX_LEN} chars: {text!r}")
+    return None
+
+
 def _normalize_aspect_values(value) -> list[str]:
     values = value if isinstance(value, list) else [value]
     cleaned = []
     for v in values:
         if not _is_confirmed(v):
             continue
-        tv = _truncate_value(v)
+        tv = _fit_aspect_value(v)
+        if not tv:
+            continue
         # collapse a value that repeats comma-separated tokens, e.g.
         # "Travel, Casual, Travel, Casual" -> "Travel, Casual"
         if "," in tv:
@@ -1102,7 +1123,13 @@ def create_draft_offer(item_id: str) -> dict:
     sku = item_id
     condition = CONDITION_MAP.get(str(listing.get("condition_id")), "USED_GOOD")
 
-    description_html = _html_description(listing["description"])
+    # Last line before publish: no authenticity claim, hashtag, keyword block or
+    # other store's name goes live, even from a draft stored before the guard.
+    description_text, _removed = sanitize_description(
+        listing["description"], (listing.get("item_specifics") or {}).get("Brand"))
+    for r in _removed:
+        print(f"🛡️ Draft: description guard removed {r}")
+    description_html = _html_description(description_text)
     product = _build_product(listing, image_urls, aspects, description_html)
     print(f"📤 Draft: {len(product['imageUrls'])} imageUrl(s) in the eBay inventory_item payload")
 

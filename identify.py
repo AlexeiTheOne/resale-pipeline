@@ -15,6 +15,7 @@ from google.genai import errors, types
 
 from llm import error_code, generate_with_retry, make_client, response_text
 from config import GEMINI_MODEL, GEMINI_FAST_MODEL, GEMINI_RESEARCH_THINKING_LEVEL
+from pipeline.gtin import product_gtin
 from receipt import read_product_upcs, ocr_text
 
 load_dotenv()
@@ -117,7 +118,9 @@ RESEARCH_PROMPT = (
     "\n"
     "Do this:\n"
     "1. Read EVERY code printed on the tag/photos, exactly as written:\n"
-    "   - UPC / barcode number (the long digit string, e.g. '1 98928 67569 8')\n"
+    "   - UPC / barcode number (the long digit string, e.g. '1 98928 67569 8'). "
+    "The Ross price tag's 12-digit item code starting 400 is the STORE's code, "
+    "not the product's UPC: never report or search it as one.\n"
     "   - style / SKU number (e.g. 'XW08963')\n"
     "   - color code (often a 3-digit suffix after the style number, e.g. '971' = a "
     "specific color combo)\n"
@@ -179,7 +182,8 @@ FORMAT_INSTRUCTIONS = (
     '  "brand": "brand name or null",\n'
     '  "item_type": "e.g. handbag, sneakers, blanket, blouse",\n'
     '  "model": "style/SKU number if known or null",\n'
-    '  "upc": "UPC/barcode number read from the tag (digits only) or null",\n'
+    '  "upc": "manufacturer UPC/EAN from the product label (digits only) or null; '
+    'never the Ross price-tag code starting 400",\n'
     '  "product_name": "the real product-line / marketing name buyers search for, '
     "WITHOUT the brand prefix, e.g. 'Shopper Tote', 'Wawona Blanket', 'Wayfarer'. "
     'null only if truly unknown",\n'
@@ -420,6 +424,12 @@ def identify_item(image_paths: list[str], scan_paths: list[str] | None = None) -
     # The decoded barcode is exact — trust it over whatever digits the model read.
     if upcs:
         result["upc"] = upcs[0]
+    elif result.get("upc") and not product_gtin(result["upc"]):
+        # A model-read "UPC" that is really the Ross tag's 400xxxxxxxxx item code
+        # (8c4260b4, fe5be314) or a misread with a bad check digit. Downstream it
+        # becomes the listing's UPC and a pricing GTIN search, so drop it.
+        print(f"Dropping model-read UPC {result['upc']!r}: not a manufacturer UPC/EAN")
+        result["upc"] = None
     # Whether that UPC came off a barcode or out of the model's eyes. The two are
     # not remotely the same evidence: a decoded barcode is ground truth, while a
     # model-read one is the least reliable field on this whole object (long digit
