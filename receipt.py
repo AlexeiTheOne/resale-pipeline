@@ -22,6 +22,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from pipeline.gtin import product_gtin
+
 try:
     import pytesseract
     from PIL import Image, ImageOps
@@ -180,8 +182,9 @@ _PRODUCT_SYMBOLS = {"EAN13", "EAN8", "UPCA", "UPCE"}
 def read_product_upcs(image_path: str) -> list[str]:
     """Decode product UPC/EAN barcodes from a photo, returning the digit strings
     (deduped, in decode order). Best-effort: [] if none decode or pyzbar/Pillow
-    aren't installed. Excludes the Ross CODE128 store code and empty QR codes so
-    only real product identifiers come back."""
+    aren't installed. Excludes the Ross store code (in either symbology), codes
+    with a bad check digit and empty QR codes so only real product identifiers
+    come back."""
     if _zbar_decode is None or Image is None:
         return []
     try:
@@ -199,7 +202,12 @@ def read_product_upcs(image_path: str) -> list[str]:
             if res.type not in _PRODUCT_SYMBOLS:
                 continue
             digits = re.sub(r"\D", "", res.data.decode("utf-8", "ignore"))
-            if len(digits) >= 8 and digits not in found:
+            # The Ross tag also prints its 400xxxxxxxxx item code as a UPC-A
+            # symbol (number system 4 = in-store use, valid check digit), so the
+            # symbology alone does not make it a product barcode. Six live
+            # listings were identified, priced and published with that store
+            # code as their "UPC" (179def75, f68133f6, c57cb4cc, ...).
+            if product_gtin(digits) and digits not in found:
                 found.append(digits)
     return found
 

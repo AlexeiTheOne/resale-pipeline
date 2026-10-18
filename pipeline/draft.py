@@ -9,6 +9,7 @@ from google.genai import types
 
 from ebay.taxonomy import category_aspects, category_suggestions
 from llm import generate_with_retry, make_client, response_text
+from pipeline.gtin import product_gtin
 from pipeline.title import TITLE_MAX_LEN, TITLE_RULES, ensure_title_fits
 
 load_dotenv()
@@ -82,7 +83,7 @@ SCHEMA_INSTRUCTIONS = """Generate an eBay listing as a valid JSON object matchin
     "Material": "string or null",
     "Condition": "string",
     "MPN": "manufacturer part number from Google Search or null",
-    "UPC": "UPC or EAN barcode number from Google Search or null"
+    "UPC": "identification.upc copied exactly, or null (never a number from search or the Ross price tag)"
   },
   "price": 0.0,
   "condition_id": "string"
@@ -119,7 +120,8 @@ assumption. The identification's color/condition fields are likewise photo-verif
 
 SECONDARY SOURCE - YOUR OWN KNOWLEDGE:
 Use your general knowledge only to FILL GAPS the specifications don't cover (MPN,
-UPC, a missing category aspect, care instructions). Do not overwrite a value from
+a missing category aspect, care instructions). Never UPC: it comes only from
+identification.upc. Do not overwrite a value from
 identification.specifications with a generic catalog guess.
 
 Rules for item_specifics:
@@ -266,6 +268,31 @@ def _fit_draft_title(draft: dict, identification: dict | None) -> None:
     draft["title"] = fitted
 
 
+_GTIN_KEYS = {"upc", "ean", "gtin", "isbn"}
+
+
+def _clean_gtins(specifics: dict, label_upc=None, keep_valid: bool = False) -> None:
+    """Hold the UPC/EAN item specifics to a manufacturer barcode, in place.
+
+    The Ross tag's 400xxxxxxxxx item code reached the UPC field of 8 live
+    listings (5fdc486f, 8c4260b4, 179def75, fe5be314, f68133f6, c57cb4cc,
+    db2380ba, e5756e70): identification carried it as `upc`, and the copywriter,
+    told to fill UPC "from Google Search", copied it. A UPC is only worth
+    sending when it was read off the product's own barcode/label, so on a fresh
+    draft it comes from identification (`label_upc`) and nowhere else; on a
+    revision (`keep_valid`) a value already there survives only if it is a real
+    manufacturer GTIN (pipeline/gtin.py)."""
+    for key in [k for k in specifics if k.strip().lower() in _GTIN_KEYS]:
+        value = specifics.pop(key)
+        if keep_valid and product_gtin(value):
+            specifics[key] = product_gtin(value)
+        elif value not in (None, "", "null"):
+            print(f"⚠️ dropping {key} {value!r}: not a manufacturer UPC from the label")
+    upc = product_gtin(label_upc)
+    if upc and not any(k.strip().lower() in _GTIN_KEYS for k in specifics):
+        specifics["UPC"] = upc
+
+
 def generate_draft(identification: dict, pricing: dict, examples: list | None = None) -> dict:
     suggested = pricing.get("suggested_price")
     reference = pricing.get("reference")
@@ -345,6 +372,9 @@ def generate_draft(identification: dict, pricing: dict, examples: list | None = 
     except json.JSONDecodeError:
         raise ValueError(raw)
 
+    draft["item_specifics"] = draft.get("item_specifics") or {}
+    _clean_gtins(draft["item_specifics"], identification.get("upc"))
+
     _fit_draft_title(draft, identification)
 
     draft["description"] =(draft["description"] + "\n\n"
@@ -414,6 +444,8 @@ def revise_draft(current_draft: dict, correction: str,
     # A correction that lengthens the title ("add the colour") is exactly how a
     # title goes over 80, so the revision is held to the same limit.
     _fit_draft_title(revised, identification)
+    if isinstance(revised.get("item_specifics"), dict):
+        _clean_gtins(revised["item_specifics"], keep_valid=True)
 
     # Same rule as generate_draft: a copy edit must not move the price. Rewording
     # a title should never quietly reprice a live listing — price changes go

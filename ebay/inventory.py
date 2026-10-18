@@ -26,6 +26,7 @@ from config import (
 from db import get_item, update_field
 from ebay.auth import get_access_token
 from ebay.taxonomy import InvalidCategoryError, category_aspects, category_name, resolve_valid_category
+from pipeline.gtin import product_gtin
 from pipeline.title import TITLE_MAX_LEN, fit_title
 
 load_dotenv()
@@ -570,14 +571,12 @@ def _valid_gtin(value) -> bool:
     """True if value is a structurally valid GTIN (UPC-A/EAN-8/13/GTIN-14):
     right length and a correct check digit. The model frequently misreads a
     barcode off a photo, and eBay rejects the whole publish on a bad UPC — so we
-    validate and drop it (eBay lets the field be blank) rather than block listing."""
-    digits = re.sub(r"\D", "", str(value))
-    if len(digits) not in (8, 12, 13, 14):
-        return False
-    nums = [int(d) for d in digits]
-    body, check = nums[:-1], nums[-1]
-    total = sum(d * (3 if i % 2 == 0 else 1) for i, d in enumerate(reversed(body)))
-    return (10 - total % 10) % 10 == check
+    validate and drop it (eBay lets the field be blank) rather than block listing.
+
+    A store-internal number is refused too: the Ross tag's 400xxxxxxxxx item code
+    has a valid check digit and went out as the UPC on 8 live listings — see
+    pipeline/gtin.py. This is the last line; the draft step already drops it."""
+    return product_gtin(value) is not None
 
 
 def _truncate(text: str, limit: int) -> str:
