@@ -472,6 +472,17 @@ def update_inventory_aspects(sku: str, set_aspects: dict | None = None,
             elif low in ("mpn", "brand"):
                 product[low] = values[0]
 
+        # eBay validates Brand and MPN as a pair (errorId 25002, tag
+        # "BrandMPN"). Some records carry no top-level brand at all — fine
+        # while mpn is "Does not apply", rejected the moment a real MPN goes
+        # in. Worse, eBay saves the record before refusing to revise the
+        # listing, so the item and the live listing silently disagree.
+        # _build_product always sends brand; do the same from the aspect.
+        if product.get("mpn") not in (None, "", "Does not apply") and not product.get("brand"):
+            brand = (aspects.get("Brand") or [None])[0]
+            if brand:
+                product["brand"] = brand
+
     return _write_inventory_product(sku, edit, known_images)["aspects"]
 
 

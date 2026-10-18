@@ -87,6 +87,15 @@ def test_setting_upc_and_mpn_mirrors_identifiers():
     assert product["aspects"]["Model"] == ["EHH384-42-BMT"]
 
 
+def test_setting_mpn_fills_a_missing_brand_from_the_aspect():
+    """eBay refuses a real MPN without a top-level brand (BrandMPN, 25002)."""
+    item = _item(Brand=["Ed Hardy"], Model=["EHH38442-8MT"])
+    del item["product"]["brand"]
+    sent = _patch_inventory(item)
+    inv.update_inventory_aspects(SKU, {"MPN": "EHH384-42-BMT"})
+    assert sent["body"]["product"]["brand"] == "Ed Hardy"
+
+
 def test_bad_gtin_is_refused_before_any_write():
     sent = _patch_inventory(_item(UPC=["199341188802"]))
     try:
