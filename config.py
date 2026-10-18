@@ -128,6 +128,12 @@ EBAY_PROMOTED_CAMPAIGN_NAME = os.getenv("EBAY_PROMOTED_CAMPAIGN_NAME", "ross-aut
 # listing is promoted at this floor rate by default; bump an individual one with
 # /promote <id> <pct>. Set to 0 to disable auto-promotion. eBay accepts 2–100%.
 EBAY_DEFAULT_AD_RATE_PCT = float(os.getenv("EBAY_DEFAULT_AD_RATE_PCT", "4"))
+# Best Offer on every new listing. The auto-decline floor is the item's
+# break-even (profit.breakeven_price) rounded UP to a whole dollar, so no offer
+# that loses money even reaches you; there is no auto-accept. No floor is set
+# when the Ross cost is unknown, or when the floor would reach the list price
+# (that would decline every offer). Set to 0 to publish without Best Offer.
+BEST_OFFER_ENABLED = os.getenv("BEST_OFFER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
 EBAY_MERCHANT_LOCATION_KEY = "ross-resale-warehouse"
 EBAY_SHIP_FROM_ADDRESS = {
     "city": "Doral",

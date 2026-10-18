@@ -1,6 +1,7 @@
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import shutil
@@ -15,6 +16,7 @@ import httpx
 from dotenv import load_dotenv
 
 from config import (
+    BEST_OFFER_ENABLED,
     EBAY_CURRENCY,
     EBAY_FULFILLMENT_POLICY_ID,
     EBAY_MARKETPLACE_ID,
@@ -29,6 +31,7 @@ from ebay.taxonomy import InvalidCategoryError, category_aspects, category_name,
 from pipeline.description_guard import sanitize_description
 from pipeline.gtin import product_gtin
 from pipeline.title import TITLE_MAX_LEN, fit_title
+from profit import breakeven_price
 
 load_dotenv()
 
@@ -581,9 +584,37 @@ def _update_offer_description(offer_id: str, current: dict, description_html: st
     _request("PUT", f"/sell/inventory/v1/offer/{offer_id}", json=body)
 
 
+def auto_decline_price(item: dict, price) -> int | None:
+    """The Best Offer auto-decline floor for `item` listed at `price`: its
+    break-even rounded UP to the next whole dollar, so every offer that would
+    sell at a loss is declined and nothing else is.
+
+    None when there should be no floor: the Ross cost is unknown (a floor off a
+    guessed cost is a guess), or the floor would be at or above the price —
+    that would decline every offer the listing could get."""
+    breakeven = breakeven_price(item)
+    if breakeven is None or price is None:
+        return None
+    # Round to cents first so float noise (30.000000001) doesn't add a dollar.
+    floor = math.ceil(round(breakeven, 2))
+    return floor if floor < float(price) else None
+
+
+def best_offer_terms(item: dict, price) -> dict:
+    """listingPolicies.bestOfferTerms for an offer: Best Offer on, auto-decline
+    at auto_decline_price when there is one, and never an auto-accept."""
+    terms = {"bestOfferEnabled": True}
+    floor = auto_decline_price(item, price)
+    if floor is not None:
+        terms["autoDeclinePrice"] = {"value": f"{floor:.2f}", "currency": EBAY_CURRENCY}
+    return terms
+
+
 def update_offer_fields(offer_id: str, *, description_html: str | None = None,
-                        category_id: str | None = None) -> dict:
-    """Change an offer's description and/or category, live listing included,
+                        category_id: str | None = None,
+                        best_offer_terms: dict | None = None) -> dict:
+    """Change an offer's description, category and/or Best Offer terms, live
+    listing included,
     leaving price, quantity and policies exactly as eBay holds them now.
 
     Reads the offer fresh rather than taking one from the caller, so nothing
@@ -591,7 +622,7 @@ def update_offer_fields(offer_id: str, *, description_html: str | None = None,
     aspects already satisfy the new category's required aspects — set those
     first with update_inventory_aspects; eBay rejects the PUT otherwise and
     nothing changes. Returns the body sent."""
-    if description_html is None and category_id is None:
+    if description_html is None and category_id is None and best_offer_terms is None:
         raise ValueError("update_offer_fields: nothing to change")
     current = _request("GET", f"/sell/inventory/v1/offer/{offer_id}").json()
     body = _offer_round_trip(current)
@@ -599,6 +630,11 @@ def update_offer_fields(offer_id: str, *, description_html: str | None = None,
         body["listingDescription"] = description_html
     if category_id is not None:
         body["categoryId"] = str(category_id)
+    if best_offer_terms is not None:
+        # Replaces bestOfferTerms whole; the payment/return/fulfillment policy
+        # ids beside it in listingPolicies are carried over untouched.
+        body["listingPolicies"] = {**(body.get("listingPolicies") or {}),
+                                   "bestOfferTerms": best_offer_terms}
     _request("PUT", f"/sell/inventory/v1/offer/{offer_id}", json=body)
     return body
 
@@ -1171,6 +1207,8 @@ def create_draft_offer(item_id: str) -> dict:
         "pricingSummary": {"price": {"value": str(listing["price"]), "currency": EBAY_CURRENCY}},
         "merchantLocationKey": EBAY_MERCHANT_LOCATION_KEY,
     }
+    if BEST_OFFER_ENABLED:
+        offer["listingPolicies"]["bestOfferTerms"] = best_offer_terms(item, listing["price"])
     offer_id = _create_offer(offer)
 
     reselected = category_id != original_category_id
