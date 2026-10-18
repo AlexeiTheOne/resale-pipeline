@@ -12,7 +12,8 @@ from llm import generate_with_retry, make_client, response_text
 from pipeline.category import choose_category, department_of
 from pipeline.gtin import product_gtin
 from pipeline.specifics import clean_specifics
-from pipeline.title import TITLE_MAX_LEN, TITLE_RULES, ensure_title_fits
+from pipeline.title import (TITLE_MAX_LEN, TITLE_RULES, enforce_band_for_device,
+                            ensure_title_fits, fit_title)
 
 load_dotenv()
 client = make_client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -313,9 +314,18 @@ def _fit_draft_title(draft: dict, identification: dict | None) -> None:
     off the end, which is where size and colour live."""
     specifics = draft.get("item_specifics") or {}
     original = draft.get("title") or ""
+    # "<Brand> Apple Watch Band" -> "<Brand> Band for Apple Watch", before the
+    # fit (it adds a word) and again after it, since a model refit may undo it.
+    enforced = enforce_band_for_device(original, identification, specifics)
+    if enforced != " ".join(original.split()):
+        print(f"⌚ band title: {original!r} -> {enforced!r}")
     fitted, dropped, how = ensure_title_fits(
-        original, identification, specifics,
+        enforced, identification, specifics,
         refit=lambda t: _refit_title(t, identification, specifics))
+    again = enforce_band_for_device(fitted, identification, specifics)
+    if again != fitted:
+        fitted, more = fit_title(again, identification, specifics)
+        dropped, how = dropped + more, how + "+band"
     if how != "ok":
         print(f"✂️ title was {len(original)} chars; {how} -> {len(fitted)}: {fitted!r}"
               f" (dropped: {', '.join(dropped) or 'nothing'})")
