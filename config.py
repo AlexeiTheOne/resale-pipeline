@@ -400,3 +400,17 @@ PRICING_V2_CACHE_DIR = os.getenv("PRICING_V2_CACHE_DIR", "data/cache/pricing_v2"
 # own usage page is the bill.
 APIFY_SOLD_COST_PER_RESULT = float(os.getenv("APIFY_SOLD_COST_PER_RESULT", "0.004"))
 APIFY_RUN_START_COST = float(os.getenv("APIFY_RUN_START_COST", "0.0001"))
+
+# --- Final listing check (pipeline/listing_check.py) ----------------------------
+# One Claude call after the draft is written (and again after a correction that
+# rewrites it) that reads title, specifics, condition, description, price
+# evidence and 3 photos together and names concrete contradictions between them
+# on the review screen. Advisory only: it never blocks or edits anything, and a
+# failure shows as "not checked". About $0.02 an item.
+LISTING_CHECK_ENABLED = _env_bool("LISTING_CHECK_ENABLED", True)
+LISTING_CHECK_MODEL = os.getenv("LISTING_CHECK_MODEL", "claude-sonnet-5-5")
+LISTING_CHECK_EFFORT = os.getenv("LISTING_CHECK_EFFORT", "low")
+# Shorter than CLAUDE_TIMEOUT_S with one retry: this runs inline before the
+# review screen, and a check that holds the draft up for minutes isn't worth it.
+LISTING_CHECK_TIMEOUT_S = float(os.getenv("LISTING_CHECK_TIMEOUT_S", "60"))
+LISTING_CHECK_PHOTOS = int(os.getenv("LISTING_CHECK_PHOTOS", "3"))

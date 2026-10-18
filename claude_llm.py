@@ -101,7 +101,7 @@ def _build_messages(messages, images) -> list[dict]:
 def ask(stage: str, messages, *, model: str | None = None, system: str | None = None,
         max_tokens: int = 4096, effort: str | None = None, images=None,
         output_schema: dict | None = None, item_id: str | None = None,
-        client=None):
+        client=None, meta: dict | None = None):
     """One Claude request. Returns the answer text, or the parsed object when
     output_schema (a JSON Schema; objects need additionalProperties: false) is given.
 
@@ -112,6 +112,8 @@ def ask(stage: str, messages, *, model: str | None = None, system: str | None = 
     effort   "low" | "medium" | "high" | "xhigh" | "max", or None for the model's
              default (medium on Opus/Haiku 5.5, high on Sonnet 5.5).
     images   file paths, bytes, or (bytes, media_type), added to the last user turn.
+    meta     optional dict filled in with what the call cost (model, cost_usd and
+             token counts), even when the answer then raises.
 
     Raises ClaudeRefusal / ClaudeTruncated / ClaudeError (usage is logged first:
     those tokens were billed), or anthropic.APIError once the SDK's retries are spent.
@@ -136,6 +138,12 @@ def ask(stage: str, messages, *, model: str | None = None, system: str | None = 
     response = client.beta.messages.create(**params)
     cost = llm_usage.log_anthropic(response, stage=stage, item_id=item_id)
     served_by = getattr(response, "model", None) or chosen
+    if meta is not None:
+        usage = getattr(response, "usage", None)
+        meta.update(model=served_by, cost_usd=cost, **{
+            k: getattr(usage, k, 0) or 0 for k in (
+                "input_tokens", "output_tokens", "cache_read_input_tokens",
+                "cache_creation_input_tokens")})
 
     stop = response.stop_reason
     if stop == "refusal":

@@ -13,7 +13,7 @@ VALID_STATUSES = [
 
 VALID_FIELDS = [
     "identification", "pricing", "listing", "ebay", "photos", "processed",
-    "price_source_url", "receipt", "photo_layout",
+    "price_source_url", "receipt", "photo_layout", "listing_check",
 ]
 
 # Columns added after the initial schema shipped. Each is created with an
@@ -25,6 +25,9 @@ _MIGRATIONS = {
     # Without it the listing builder would keep applying its own reorder (tag
     # photo to the end) and quietly undo the arrangement on the next rebuild.
     "photo_layout": "TEXT",
+    # pipeline/listing_check.py's verdict on the current draft: {"issues": [...],
+    # "model", "cost_usd", "unchecked", "checked_at"}. Advisory, shown on review.
+    "listing_check": "TEXT",
 }
 
 
@@ -49,7 +52,8 @@ def _row_to_dict(row, cursor):
     keys = [d[0] for d in cursor.description]
     d = dict(zip(keys, row))
     for field in ("photos", "processed", "identification", "pricing", "listing",
-                  "ebay", "price_source_url", "receipt", "photo_layout"):
+                  "ebay", "price_source_url", "receipt", "photo_layout",
+                  "listing_check"):
         if d.get(field) is not None:
             d[field] = json.loads(d[field])
     return d

@@ -32,7 +32,7 @@ from config import (
     FEEDBACK_ENABLED, FEEDBACK_HOUR_UTC, FEEDBACK_COMMENT,
     OFFER_MIN_WATCHERS, OFFER_MIN_NET, OFFER_MIN_DAYS_LIVE,
     OFFER_DISCOUNT_SMALL, OFFER_DISCOUNT_LARGE,
-    OFFER_LARGE_THRESHOLD, OFFER_MESSAGE, PRICING_ENGINE,
+    OFFER_LARGE_THRESHOLD, OFFER_MESSAGE, PRICING_ENGINE, LISTING_CHECK_ENABLED,
 )
 from db import (
     create_item, delete_item, get_item, job_run_status, last_job_run, latest_stats,
@@ -43,6 +43,7 @@ import llm_usage
 from receipt import decode_barcode, detect_ross_tags, extract_receipt, is_dark_frame
 from pipeline.price import get_pricing
 from pipeline.draft import generate_draft, revise_draft, revise_identification
+from pipeline.listing_check import check_and_store as check_listing_and_store, format_check
 from pipeline.reprice import run_weekly_check
 from profit import breakeven_price, format_projection, project
 from ebay.auth import get_access_token
@@ -1096,7 +1097,7 @@ async def _show_review(user_id, item_id, message) -> None:
     review[user_id] = item_id
     last_item[user_id] = item_id
     result = {"identification": item["identification"], "pricing": item["pricing"],
-              "listing": item["listing"]}
+              "listing": item["listing"], "listing_check": item.get("listing_check")}
     # Lead with the id: during a haul several drafts sit on screen together, and
     # a typed correction has to be aimed at one of them.
     body = f"📄 Draft {item_id[:8]}\n" + format_draft(result)
@@ -1668,6 +1669,9 @@ def _stage_draft(item_id, notify=lambda _t: None) -> dict:
     print(f"✓ Draft generated in {time.perf_counter() - t:.0f}s")
     update_field(item_id, "listing", draft)
     update_status(item_id, "drafted")
+    if LISTING_CHECK_ENABLED:
+        notify("🔎 Checking the listing...")
+        check_listing_and_store(item_id)  # advisory; never raises
     update_status(item_id, "review")
     return draft
 
@@ -1903,6 +1907,10 @@ def format_draft(result) -> str:
     if pricing.get("price_source_url"):
         lines.append(f"  price source: {pricing['price_source_url']}")
 
+    check = format_check(result.get("listing_check"))
+    if check:
+        lines += ["", check]
+
     lines += [
         "",
         "DESCRIPTION:",
@@ -2134,10 +2142,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     update_field(item_id, "listing", revised)
+    # The correction changed the draft, so the old check no longer describes it.
+    check = (await asyncio.to_thread(check_listing_and_store, item_id)
+             if LISTING_CHECK_ENABLED else None)
     result = {
         "identification": item["identification"],
         "pricing": item["pricing"],
         "listing": revised,
+        "listing_check": check,
     }
     await _safe_reply(update.message, format_draft(result), reply_markup=_review_markup(item_id))
 
@@ -2981,6 +2993,7 @@ async def listing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "identification": item.get("identification") or {},
         "pricing": item.get("pricing") or {},
         "listing": item["listing"],
+        "listing_check": item.get("listing_check"),
     }
     # Offer Approve/Reject only while the item is still awaiting review.
     markup = _review_markup(item_id) if item["status"] in ("review", "drafted") else None
