@@ -9,6 +9,7 @@ from google.genai import types
 
 from ebay.taxonomy import category_aspects, category_suggestions
 from llm import generate_with_retry, make_client, response_text
+from pipeline.category import choose_category, department_of
 from pipeline.gtin import product_gtin
 from pipeline.title import TITLE_MAX_LEN, TITLE_RULES, ensure_title_fits
 
@@ -74,7 +75,7 @@ SCHEMA_INSTRUCTIONS = """Generate an eBay listing as a valid JSON object matchin
 {
   "title": "string, AT MOST 80 characters including spaces, eBay SEO optimized. Lead with brand + product_name (the marketing/retail name from identification), then size/color. Use product_name rather than item_type whenever it is present; fall back to item_type only if product_name is null.",
   "description": "string, concise and scannable: short bullet sections, honest about any flaws (see structure below)",
-  "category_id": "string, best-fit eBay category ID for this item",
+  "category_id": "string: the category_id given under EBAY CATEGORY above; only if none is given, the best-fit eBay category ID (it is checked against the item type in code)",
   "item_specifics": {
     "Brand": "string",
     "Model": "string or null",
@@ -153,23 +154,57 @@ marketing fluff. Use this structure:
   images, list them. Do not invent packaging that isn't shown."""
 
 
-def _aspect_hint_block(identification: dict) -> str | None:
-    """Best-effort guidance block listing every item specific eBay's catalog
-    defines for a best-guess category, not just the required ones, so Gemini
-    can fill in the ones buyers actually filter/search by. Never blocks draft
-    generation — publish-time validation in ebay/inventory.py is the real
-    safety net if this lookup fails or guesses the wrong category."""
-    query = identification.get("search_query") or identification.get("item_type")
-    if not query:
+def _choose_category(identification: dict | None, specifics: dict | None = None,
+                     title: str | None = None) -> dict | None:
+    """pipeline/category.py's choice, with the live Taxonomy suggestions as its
+    fallback source. Never raises."""
+    try:
+        return choose_category(identification, specifics, title, suggest=category_suggestions)
+    except Exception as e:
+        print(f"⚠️ category choice failed ({type(e).__name__}: {e})")
         return None
 
+
+def _enforce_category(draft: dict, identification: dict | None,
+                      chosen: dict | None = None) -> None:
+    """Put the code-chosen category on the draft, in place.
+
+    The model used to pick category_id freehand, and nothing but "does eBay
+    accept the number" checked it: a duffel went out under Underwater Cameras
+    (a8ad7eba), an Apple Watch band under Canes & Walking Sticks (b50bd66b),
+    sunglasses under Eyeglass Frames (8a66a4b0), a men's messenger under Women's
+    Bags (94c8a02f). The draft's Department/title can reveal a department the
+    identification did not state, so the choice is redone when they do."""
+    specifics = draft.get("item_specifics") or {}
+    title = draft.get("title")
+    if not chosen or department_of(identification, specifics, title) != chosen.get("department"):
+        chosen = _choose_category(identification, specifics, title)
+    model_id = str(draft.get("category_id") or "")
+    if chosen:
+        if chosen["category_id"] != model_id:
+            print(f"🗂️ category {model_id or '(none)'} -> {chosen['category_id']} "
+                  f"({chosen['source']}{': ' + chosen['name'] if chosen.get('name') else ''})")
+        draft["category_id"] = chosen["category_id"]
+    else:
+        print(f"⚠️ no known or consistent category for item type "
+              f"{(identification or {}).get('item_type')!r}; keeping the model's {model_id!r}"
+              " — check it at review")
+
+
+def _aspect_hint_block(category: dict | None) -> str | None:
+    """Best-effort guidance block listing every item specific eBay's catalog
+    defines for the chosen category, not just the required ones, so Gemini
+    can fill in the ones buyers actually filter/search by. Never blocks draft
+    generation — publish-time validation in ebay/inventory.py is the real
+    safety net if this lookup fails.
+
+    It used to describe the first raw Taxonomy suggestion for the search query,
+    a category nothing else used and nothing checked (180000 Underwater Cameras
+    for a duffel), which is how camera aspects end up in a bag prompt."""
+    category_id = (category or {}).get("category_id")
+    if not category_id:
+        return None
     try:
-        suggestions = category_suggestions(query)
-        if not suggestions:
-            return None
-        category_id = (suggestions[0].get("category") or {}).get("categoryId")
-        if not category_id:
-            return None
         aspects = category_aspects(category_id)
     except Exception:
         return None
@@ -178,9 +213,8 @@ def _aspect_hint_block(identification: dict) -> str | None:
         return None
 
     lines = [
-        f"EBAY ITEM SPECIFICS FOR THIS CATEGORY (best-guess category {category_id} — "
-        "use a different category_id yourself if you find a better fit; this list is "
-        "guidance, not a constraint on that choice):",
+        f"EBAY CATEGORY: use category_id {category_id} (chosen from the item type). "
+        "Item specifics for that category:",
         "Buyers filter and search by these. Fill in every REQUIRED and RECOMMENDED one "
         "with a confident, accurate value from the photos or your search. Fill OPTIONAL "
         "ones only if you're confident — never guess. Add everything you can to "
@@ -325,7 +359,8 @@ def generate_draft(identification: dict, pricing: dict, examples: list | None = 
         parts.append("")
 
     print("  draft: fetching eBay aspect hints...", flush=True)
-    aspect_hints = _aspect_hint_block(identification)
+    category = _choose_category(identification)
+    aspect_hints = _aspect_hint_block(category)
     if aspect_hints:
         parts.append(aspect_hints)
         parts.append("")
@@ -376,6 +411,7 @@ def generate_draft(identification: dict, pricing: dict, examples: list | None = 
     _clean_gtins(draft["item_specifics"], identification.get("upc"))
 
     _fit_draft_title(draft, identification)
+    _enforce_category(draft, identification, category)
 
     draft["description"] =(draft["description"] + "\n\n"
                             + store_boilerplate(draft.get("condition_id")))
@@ -444,6 +480,11 @@ def revise_draft(current_draft: dict, correction: str,
     # A correction that lengthens the title ("add the colour") is exactly how a
     # title goes over 80, so the revision is held to the same limit.
     _fit_draft_title(revised, identification)
+
+    # A copy edit keeps the category unless it asks about the category: the
+    # model otherwise re-picks the number freehand on every revision.
+    if "categor" not in correction.lower() and current_draft.get("category_id"):
+        revised["category_id"] = current_draft["category_id"]
     if isinstance(revised.get("item_specifics"), dict):
         _clean_gtins(revised["item_specifics"], keep_valid=True)
 
