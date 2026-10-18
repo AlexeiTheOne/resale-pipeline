@@ -38,6 +38,15 @@ def test_no_floor_when_it_would_decline_every_offer():
     assert inv.auto_decline_price(COSTED, floor + 0.01) == floor
 
 
+def test_no_floor_when_breakeven_is_under_a_dollar():
+    # 905ea463, live: a $0.49 receipt puts break-even below zero, and eBay
+    # rejected the resulting $0 floor (errorId 25016).
+    cheap = {"receipt": {"reduced_price": 0.49}, "listing": {"price": 39.99}}
+    assert breakeven_price(cheap) < 1
+    assert inv.auto_decline_price(cheap, 39.99) is None
+    assert inv.best_offer_terms(cheap, 39.99) == {"bestOfferEnabled": True}
+
+
 def test_terms_never_auto_accept():
     terms = inv.best_offer_terms(COSTED, 129.99)
     floor = inv.auto_decline_price(COSTED, 129.99)

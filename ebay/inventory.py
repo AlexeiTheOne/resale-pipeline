@@ -591,13 +591,15 @@ def auto_decline_price(item: dict, price) -> int | None:
 
     None when there should be no floor: the Ross cost is unknown (a floor off a
     guessed cost is a guess), or the floor would be at or above the price —
-    that would decline every offer the listing could get."""
+    that would decline every offer the listing could get. Also None when the
+    break-even is under a dollar (a very cheap Ross buy can even make it
+    negative): eBay rejects a $0 floor, and a floor that low declines nothing."""
     breakeven = breakeven_price(item)
     if breakeven is None or price is None:
         return None
     # Round to cents first so float noise (30.000000001) doesn't add a dollar.
     floor = math.ceil(round(breakeven, 2))
-    return floor if floor < float(price) else None
+    return floor if 1 <= floor < float(price) else None
 
 
 def best_offer_terms(item: dict, price) -> dict:
