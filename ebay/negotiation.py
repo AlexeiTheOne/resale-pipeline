@@ -37,7 +37,9 @@ _PAGE = 200
 # eBay rejects a token gesture: an offer must undercut the listing by at least
 # this much to be worth a buyer's attention (and to pass validation).
 MIN_DISCOUNT_PCT = 5.0
-# How long the buyer has to accept. eBay accepts 1-2 days on seller offers.
+# How long the buyer has to accept. Requested as 2 days, but eBay sets the term
+# itself: the live offers sent 19 Oct 2026 came back with offerDuration 4 DAY.
+# So never quote a duration in the buyer-facing message.
 OFFER_DURATION_DAYS = 2
 
 
@@ -98,7 +100,7 @@ def send_offer(listing_id: str, price, message: str | None = None) -> dict:
         "offerDuration": {"unit": "DAY", "value": str(OFFER_DURATION_DAYS)},
     }
     if message:
-        # eBay caps the buyer-facing note at 250 characters.
+        # eBay's spec allows 2,000 characters; 250 keeps the note readable.
         body["message"] = message[:250]
 
     r = httpx.post(f"{BASE}/send_offer_to_interested_buyers", headers=_headers(),
