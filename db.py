@@ -124,6 +124,17 @@ def create_tables() -> None:
             )
         """)
 
+        # Pairs the owner confirmed are different physical items even though
+        # they share a UPC/model (e.g. two Ed Hardy bags whose print sits in a
+        # different place). The duplicate warning skips them. Stored a<b.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS not_duplicates (
+                a TEXT NOT NULL,
+                b TEXT NOT NULL,
+                PRIMARY KEY (a, b)
+            )
+        """)
+
         # One row per paid model call (Claude and Gemini), so spend is a query
         # rather than a guess. The monthly Anthropic budget guard reads this; a
         # refusal fallback writes one row per model that ran. cost_usd is NULL
@@ -270,6 +281,17 @@ def record_feedback_failure(order_line: str, error: str) -> None:
 def clear_feedback_failure(order_line: str) -> None:
     with _conn() as con:
         con.execute("DELETE FROM feedback_failures WHERE order_line = ?", (order_line,))
+
+
+def mark_not_duplicate(item_a: str, item_b: str) -> None:
+    a, b = sorted((item_a, item_b))
+    with _conn() as con:
+        con.execute("INSERT OR IGNORE INTO not_duplicates (a, b) VALUES (?, ?)", (a, b))
+
+
+def not_duplicate_pairs() -> set[tuple[str, str]]:
+    with _conn() as con:
+        return {(a, b) for a, b in con.execute("SELECT a, b FROM not_duplicates")}
 
 
 def job_run_status(job: str) -> str | None:

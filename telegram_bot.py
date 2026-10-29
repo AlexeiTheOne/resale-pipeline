@@ -37,6 +37,7 @@ from config import (
 from db import (
     clear_feedback_failure, create_item, delete_item, get_item, job_run_status,
     known_feedback_failures, last_job_run, latest_stats, list_items,
+    mark_not_duplicate, not_duplicate_pairs,
     record_feedback_failure, record_job_run, update_field, update_status, VALID_STATUSES,
 )
 from identify import identify_item
@@ -1674,8 +1675,11 @@ def _duplicate_warnings(item_id: str) -> list[str]:
     if not mine:
         return []
     lines = []
+    confirmed_different = not_duplicate_pairs()
     for other in list_items():
         if other["item_id"] == item_id or other.get("status") in ("rejected", "failed"):
+            continue
+        if tuple(sorted((item_id, other["item_id"]))) in confirmed_different:
             continue
         shared = mine & _same_item_keys(other)
         if not shared:
@@ -1688,7 +1692,8 @@ def _duplicate_warnings(item_id: str) -> list[str]:
                      f"({other.get('status')}): {title} {url}".rstrip())
     if lines:
         lines.append("If it's a second unit, carry on (or bump that listing's quantity "
-                     f"instead). Otherwise /delete {item_id[:8]}.")
+                     f"instead); if it's a different item, /notdup {item_id[:8]} <other id>. "
+                     f"Otherwise /delete {item_id[:8]}.")
     return lines
 
 
@@ -3211,6 +3216,29 @@ async def receipt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _safe_reply(update.message, f"🧾 Saved for {item_id[:8]}: paid ${price:.2f} · code {code}{tag}")
 
 
+async def notdup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/notdup <id> <id> — these two are different physical items (same UPC or
+    model, but e.g. the print sits differently), so stop warning about them."""
+    user_id = update.effective_user.id
+    args = context.args or []
+    if len(args) != 2:
+        await _safe_reply(update.message, "Usage: /notdup <id> <id>  (8-char ids are fine)")
+        return
+    ids = []
+    for arg in args:
+        item_id, err = _resolve_item_id(user_id, [arg])
+        if err:
+            await _safe_reply(update.message, f"⚠️ {err}")
+            return
+        ids.append(item_id)
+    if ids[0] == ids[1]:
+        await _safe_reply(update.message, "⚠️ That's the same item twice.")
+        return
+    mark_not_duplicate(*ids)
+    await _safe_reply(update.message, f"👍 Noted: {ids[0][:8]} and {ids[1][:8]} are different "
+                                      "items. No more duplicate warnings for that pair.")
+
+
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     item_id, err = _resolve_item_id(user_id, context.args)
@@ -4521,6 +4549,7 @@ HELP_SECTIONS = [
                                 "Dry run without 'apply'; add a number for a flat $ off"),
         ("/retry [id]", "Re-run the current pipeline step for an item"),
         ("/delete [id]", "Delete the item, its photos, and its eBay offer"),
+        ("/notdup <id> <id>", "Two look-alikes are different items: stop the duplicate warning"),
     ]),
     ("Money", [
         ("/sold [id] [price]", "Mark an item sold and record the sale price; replies with profit"),
@@ -4671,6 +4700,7 @@ def main() -> None:
     app.add_handler(CommandHandler("receipt", receipt_command))
     app.add_handler(CommandHandler("addphotos", addphotos_command))
     app.add_handler(CommandHandler("delete", delete_command))
+    app.add_handler(CommandHandler("notdup", notdup_command))
     app.add_handler(CommandHandler("end", end_command))
     app.add_handler(CommandHandler("refreshdesc", refreshdesc_command))
     app.add_handler(CommandHandler("photos", photos_command))

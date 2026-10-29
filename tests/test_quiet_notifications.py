@@ -169,6 +169,15 @@ def test_rejected_items_are_not_duplicates():
     assert tb._duplicate_warnings(fresh) == []
 
 
+def test_look_alikes_marked_different_stop_warning():
+    # Two Ed Hardy cheetah bags, same UPC, skull printed in a different spot.
+    one = _item({"brand": "Ed Hardy", "upc": "199347090093"})
+    two = _item({"brand": "Ed Hardy", "upc": "199347090093"})
+    assert tb._duplicate_warnings(two)
+    db.mark_not_duplicate(two, one)
+    assert tb._duplicate_warnings(two) == [] and tb._duplicate_warnings(one) == []
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
