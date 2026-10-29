@@ -51,6 +51,8 @@ def get_client() -> anthropic.Anthropic:
     SDK's usual way (ANTHROPIC_API_KEY from .env / the environment)."""
     global _client
     if _client is None:
+        from dotenv import load_dotenv
+        load_dotenv()   # scripts that import this directly never loaded .env
         _client = anthropic.Anthropic(timeout=config.CLAUDE_TIMEOUT_S,
                                       max_retries=config.CLAUDE_MAX_RETRIES)
     return _client

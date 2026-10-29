@@ -117,6 +117,7 @@ gate = {}           # user_id -> {item_id, stage}  paused at "identify"/"price" 
 gate_queue = {}     # user_id -> [{item_id, stage, reason}]  gates waiting their turn (a /haul runs many
                     # items at once, and only one can hold the single gate slot; the rest queue here
                     # instead of overwriting each other and getting lost)
+find_mode = set()   # user_ids in /find: each photo is looked up, not listed
 haul_mode = set()   # user_ids whose next photo batch is a multi-item haul to be split on Ross tags
 # message_id of a gate/draft the bot sent -> the item it was about. A haul puts
 # several drafts on screen at once, so "which item did you mean?" can't be
@@ -394,6 +395,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     f = await context.bot.get_file(photo.file_id)
     data = await f.download_as_bytearray()
 
+    if user_id in find_mode:
+        await _find_one(update.message, bytes(data), mid)
+        return
+
     async with _lock_for(user_id):
         target = awaiting_photos.get(user_id)
         if target is not None:
@@ -663,6 +668,41 @@ def _haul_digest(item_ids, user_id) -> str:
         lines.append(f"\n{waiting} item(s) still need a decision from you — "
                      f"answer the prompt above and the next one follows.")
     return "\n".join(lines)
+
+
+_FIND_DIR = Path("data") / "cache" / "find"
+
+
+async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Turn on lookup mode: every photo is checked against what's listed."""
+    find_mode.add(update.effective_user.id)
+    await _safe_reply(update.message,
+        "🔎 Find mode on. Send a photo of an item (hang tag or front works best) "
+        "and I'll say if it's posted and how many eBay shows.\n/done when finished.")
+
+
+async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id in find_mode:
+        find_mode.discard(user_id)
+        await _safe_reply(update.message, "👍 Find mode off. Photos start new listings again.")
+    else:
+        await _safe_reply(update.message, "Nothing to finish.")
+
+
+async def _find_one(message, data: bytes, mid: int) -> None:
+    from pipeline.stock_lookup import format_answer, lookup
+    _FIND_DIR.mkdir(parents=True, exist_ok=True)
+    path = _FIND_DIR / f"find_{mid}.jpg"
+    path.write_bytes(data)
+    try:
+        res = await asyncio.to_thread(lookup, str(path))
+        await _safe_reply(message, format_answer(res))
+    except Exception as e:
+        traceback.print_exc()
+        await _safe_reply(message, f"⚠️ Lookup failed: {type(e).__name__}: {str(e)[:200]}")
+    finally:
+        path.unlink(missing_ok=True)
 
 
 async def haul_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4614,6 +4654,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     was_gated = gate.pop(user_id, None) is not None
     was_hauling = user_id in haul_mode
     haul_mode.discard(user_id)
+    find_mode.discard(user_id)
     # Only drop the queue when a gate was actually what got cancelled. Popping it
     # unconditionally meant cancelling an unrelated photo capture silently threw
     # away every queued haul gate and said nothing about it.
@@ -4687,6 +4728,7 @@ HELP_SECTIONS = [
                                 "Dry run without 'apply'; add a number for a flat $ off"),
         ("/retry [id]", "Re-run the current pipeline step for an item"),
         ("/delete [id]", "Delete the item, its photos, and its eBay offer"),
+        ("/find", "Photo an item: is it posted, and how many does eBay show? /done to stop"),
         ("/notdup <id> <id>", "Two look-alikes are different items: stop the duplicate warning"),
     ]),
     ("Money", [
@@ -4829,6 +4871,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
     app.add_handler(CallbackQueryHandler(reprice_callback, pattern=r"^reprice:"))
     app.add_handler(CommandHandler("haul", haul_command))
+    app.add_handler(CommandHandler("find", find_command))
+    app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("ross", ross_command))
     app.add_handler(CommandHandler("errors", errors_command))

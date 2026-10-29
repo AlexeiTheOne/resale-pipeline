@@ -354,6 +354,9 @@ FEEDBACK_COMMENT = os.getenv(
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
 CLAUDE_STRONG_MODEL = os.getenv("CLAUDE_STRONG_MODEL", "claude-opus-5-5")
 CLAUDE_CHEAP_MODEL = os.getenv("CLAUDE_CHEAP_MODEL", "claude-haiku-5-5")
+# /find: which listed item is in this photo. Sonnet reads prints and tags well
+# enough; about 2 cents a photo with the whole shop as the item list.
+FIND_MODEL = os.getenv("FIND_MODEL", CLAUDE_MODEL)
 # Per-attempt HTTP timeout and SDK retries (connection errors, 408/409/429/5xx).
 # Worst-case wall clock is timeout x (retries + 1), so keep both modest.
 CLAUDE_TIMEOUT_S = float(os.getenv("CLAUDE_TIMEOUT_S", "120"))
