@@ -362,7 +362,10 @@ def _clean_gtins(specifics: dict, label_upc=None, keep_valid: bool = False) -> N
         value = specifics.pop(key)
         if keep_valid and product_gtin(value):
             specifics[key] = product_gtin(value)
-        elif value not in (None, "", "null"):
+        elif value not in (None, "", "null") and product_gtin(value) != product_gtin(label_upc):
+            # Only worth saying when something is actually lost — the label's
+            # own UPC is put straight back below, and warning about it read as
+            # if the real barcode had been thrown away.
             print(f"⚠️ dropping {key} {value!r}: not a manufacturer UPC from the label")
     upc = product_gtin(label_upc)
     if upc and not any(k.strip().lower() in _GTIN_KEYS for k in specifics):

@@ -35,8 +35,9 @@ from config import (
     OFFER_LARGE_THRESHOLD, OFFER_MESSAGE, PRICING_ENGINE, LISTING_CHECK_ENABLED,
 )
 from db import (
-    create_item, delete_item, get_item, job_run_status, last_job_run, latest_stats,
-    list_items, record_job_run, update_field, update_status, VALID_STATUSES,
+    clear_feedback_failure, create_item, delete_item, get_item, job_run_status,
+    known_feedback_failures, last_job_run, latest_stats, list_items,
+    record_feedback_failure, record_job_run, update_field, update_status, VALID_STATUSES,
 )
 from identify import identify_item
 import llm_usage
@@ -56,6 +57,7 @@ from ebay.inventory import (
     delete_offer,
     get_offer,
     get_policy_id,
+    _order_is_fixed,
     listing_photo_order,
     publish_offer,
     refresh_offer_description,
@@ -841,7 +843,7 @@ async def _send_photo_index(item: dict, message) -> None:
              "  #1 is the gallery cover (the thumbnail buyers see in search)."]
     if missing:
         lines.append(f"  ⚠️ {missing} file(s) missing from disk and skipped.")
-    if not (item.get("photo_layout") or {}).get("manual"):
+    if not _order_is_fixed(item):
         lines.append("  Order is automatic: your 2nd photo (the tag) is moved to the end.")
     lines += ["", "  /cover <n> — make photo n the cover",
               "  /arrange <order> — reorder, e.g. /arrange 3,1,2"]
@@ -1234,8 +1236,8 @@ async def _advance_one(user_id, item_id, message, context) -> None:
                 return
             await _safe_reply(
                 message,
-                f"✅ ${pricing.get('suggested_price')} from {pricing.get('sold_count')} solid "
-                f"comps — writing the listing...")
+                f"✅ ${pricing.get('suggested_price')} — {_price_evidence_line(pricing)} "
+                f"— writing the listing...")
 
         elif status == "priced":
             # An item can sit at 'priced' with no price: pricing found no usable
@@ -1598,6 +1600,11 @@ def _split_receipt(item_id, paths, notify=lambda _t: None) -> list[str]:
     data["peeled"] = True
     update_field(item_id, "photos", listing_photos)
     update_field(item_id, "receipt", data)
+    if tag_idx == 1 and not (item.get("photo_layout") or {}).get("manual"):
+        # The 2nd photo was the Ross tag, not a brand-tag close-up. Without this
+        # the listing builder still moves "the 2nd photo" to the back — which is
+        # now whatever product shot slid into that slot.
+        update_field(item_id, "photo_layout", {"as_sent": True})
     if data.get("code") and data.get("reduced_price") is not None:
         orig = f" (orig ${data['original_price']})" if data.get("original_price") else ""
         notify(f"🧾 Receipt: paid ${data['reduced_price']}{orig} · code {data['code']}")
@@ -1879,6 +1886,23 @@ def _parse_price_override(text: str) -> float | None:
     return _charm_price(value) if value > 0 else None
 
 
+def _price_evidence_line(pricing: dict) -> str:
+    """What a price rests on, in one line. v2 prices come from the Claude judge
+    over same-item comps and have no sold median, so the v1 wording ("from 5
+    solid comps", "sold median: $None") misdescribed them — a price built on one
+    sale was announced as solid."""
+    if pricing.get("engine") == "v2":
+        sold, active = pricing.get("sold_count") or 0, pricing.get("active_count") or 0
+        who = (f"set by hand (Claude said ${pricing.get('machine_price')})"
+               if pricing.get("manual_price") is not None
+               else f"Claude, {pricing.get('confidence')} confidence")
+        return (f"{who} · "
+                f"{sold} same-item sale(s), {active} active")
+    return (f"sold median: ${pricing.get('sold_median')} | active floor: "
+            f"${pricing.get('active_floor')} | {pricing.get('confidence')} "
+            f"({pricing.get('sold_count')} comps)")
+
+
 def format_draft(result) -> str:
     ident = result["identification"]
     pricing = result["pricing"]
@@ -1901,7 +1925,7 @@ def format_draft(result) -> str:
         listing["title"],
         "",
         f"PRICE: ${listing['price']}",
-        f"  sold median: ${pricing.get('sold_median')} | active floor: ${pricing.get('active_floor')} | {pricing.get('confidence')}",
+        "  " + _price_evidence_line(pricing),
     ]
 
     if pricing.get("price_source_url"):
@@ -2143,15 +2167,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     update_field(item_id, "listing", revised)
     # The correction changed the draft, so the old check no longer describes it.
-    check = (await asyncio.to_thread(check_listing_and_store, item_id)
-             if LISTING_CHECK_ENABLED else None)
-    result = {
-        "identification": item["identification"],
-        "pricing": item["pricing"],
-        "listing": revised,
-        "listing_check": check,
-    }
-    await _safe_reply(update.message, format_draft(result), reply_markup=_review_markup(item_id))
+    if LISTING_CHECK_ENABLED:
+        await asyncio.to_thread(check_listing_and_store, item_id)
+    # Through _show_review, so the revised draft carries its id header and is
+    # registered as a reply target like the first one — a haul correction made
+    # by replying to it used to land on nothing.
+    await _show_review(user_id, item_id, update.message)
 
 
 # How many items /status lists by default. The full inventory is ~90 items and
@@ -2567,9 +2588,15 @@ def _sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
             update_field(item_id, "pricing", pricing)
             changes.append(f"price ${old_price}→${new_price}")
 
+    listing_info = offer.get("listing") or {}
+    listing_status = listing_info.get("listingStatus")
+
     # Quantity: default assumption is 1 (what every listing is created with).
+    # Not from an ENDED listing: its offer still carries the old stock count, so
+    # copying it in and then zeroing it below flipped the same items 0→1→0 and
+    # reported them on every daily sync.
     ebay_qty = offer.get("availableQuantity")
-    if ebay_qty is not None:
+    if ebay_qty is not None and listing_status != "ENDED":
         old_qty = ebay.get("quantity", 1)
         if int(old_qty) != int(ebay_qty):
             ebay["quantity"] = int(ebay_qty)
@@ -2614,14 +2641,22 @@ def _sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
     # in hand is a subset, not an update.
     incoming = set((sale or {}).get("order_ids") or [])
     missing_from_window = (known - incoming) if sale is not None else set()
-    if missing_from_window:
+    # Only worth saying when there's a NEW order the window can't fold in. With
+    # nothing new, the stored figures are already complete and the warning just
+    # repeated itself every day.
+    if missing_from_window and new_orders:
         changes.append(
             f"⚠️ sale figures NOT updated — this look-back sees {len(incoming)} of "
             f"its {len(known | incoming)} orders, so writing them would erase "
             f"${ebay.get('sale_price', 0)} already recorded. Re-run /sync with a "
             f"wider window (e.g. /sync 365) to fold in the newer ones.")
 
-    if sale is not None and not missing_from_window and (item["status"] != "sold" or new_orders):
+    # Only on an order we haven't recorded. It used to also fire whenever the
+    # status wasn't 'sold' — but a multi-quantity or relisted item with stock
+    # left is put back to 'published' by the live-listing pass below, so every
+    # daily sync re-marked it sold and the next pass un-marked it again.
+    new_sale = None
+    if sale is not None and not missing_from_window and new_orders:
         ebay["sale_price"] = sale["sale_price"]
         ebay["shipping_collected"] = sale["shipping_collected"]
         ebay["ebay_fees"] = sale["ebay_fees"]
@@ -2637,6 +2672,7 @@ def _sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
         ebay["fees_known"] = sale["fees_known"]
         update_field(item_id, "ebay", ebay)
         net = sale["net_proceeds"] if sale["fees_known"] else None
+        new_sale = {"orders": len(new_orders), "total": sale["sale_price"], "net": net}
         if item["status"] != "sold":
             update_status(item_id, "sold")
             auto_sold = True
@@ -2645,8 +2681,6 @@ def _sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
             changes.append(f"+{len(new_orders)} later sale(s) → {ebay['units_sold']} unit(s) "
                            f"total ${sale['sale_price']}" + (f" · net ${net}" if net is not None else ""))
 
-    listing_info = offer.get("listing") or {}
-    listing_status = listing_info.get("listingStatus")
     try:
         sold_qty = int(listing_info.get("soldQuantity") or 0)
     except (TypeError, ValueError):
@@ -2670,6 +2704,7 @@ def _sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
     likely_sold = ended and sold_qty > 0
     ended_unsold = ended and sold_qty == 0
     return {"item_id": item_id, "changes": changes, "auto_sold": auto_sold,
+            "new_sale": new_sale,
             "likely_sold": likely_sold, "ended_unsold": ended_unsold,
             "listing_status": listing_status}
 
@@ -2716,7 +2751,7 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     async def _ping(text: str) -> None:
         await _safe_reply(update.message, text)
 
-    lines = await _run_sync(days, on_progress=_ping)
+    lines, _ = await _run_sync(days, on_progress=_ping)
     await _send_chunked(update.message, lines)
 
 
@@ -2737,7 +2772,7 @@ def _sync_days(args) -> int:
 _sync_lock = asyncio.Lock()
 
 
-async def _run_sync(days: int, on_progress=None) -> list[str]:
+async def _run_sync(days: int, on_progress=None) -> tuple[list[str], list[str]]:
     """The whole /sync reconciliation, as a function that RETURNS its report
     lines instead of replying to a chat.
 
@@ -2745,6 +2780,10 @@ async def _run_sync(days: int, on_progress=None) -> list[str]:
     the same reconciliation the manual command does, rather than a second,
     drifting copy of it. `on_progress` is an optional async callback for the
     interactive path's status ping; the scheduled path passes none.
+
+    Returns (full report, brief). The brief is what the scheduled run posts:
+    new sales and things that need a decision, nothing else — empty when there's
+    nothing worth a notification. /sync shows the full report.
 
     Serialized on _sync_lock: a second caller waits rather than running a
     concurrent pass over the same items."""
@@ -2754,14 +2793,14 @@ async def _run_sync(days: int, on_progress=None) -> list[str]:
         return await _run_sync_locked(days, on_progress)
 
 
-async def _run_sync_locked(days: int, on_progress=None) -> list[str]:
+async def _run_sync_locked(days: int, on_progress=None) -> tuple[list[str], list[str]]:
     items = [
         i for i in list_items()
         if (i.get("ebay") or {}).get("offer_id")
         and i["status"] in ("ebay_draft", "published", "sold")
     ]
     if not items:
-        return ["Nothing to sync — no items have an eBay offer yet."]
+        return ["Nothing to sync — no items have an eBay offer yet."], []
 
     if on_progress:
         await on_progress(f"🔄 Syncing {len(items)} item(s) from eBay...")
@@ -2778,6 +2817,7 @@ async def _run_sync_locked(days: int, on_progress=None) -> list[str]:
         sold_map_err = f"{type(e).__name__}: {str(e)[:150]}"
 
     updated, auto_sold, sold_flags, errors, ended_flags = [], [], [], [], []
+    new_sales = []   # (item, new_sale) — for the scheduled brief
     for item in items:
         try:
             result = await asyncio.to_thread(_sync_one, item, sold_map)
@@ -2786,6 +2826,8 @@ async def _run_sync_locked(days: int, on_progress=None) -> list[str]:
             _record_error(f"sync ({item['item_id'][:8]})", e)
             errors.append(f"{item['item_id'][:8]}: {type(e).__name__}: {str(e)[:120]}")
             continue
+        if result.get("new_sale"):
+            new_sales.append((item, result["new_sale"]))
         if result["auto_sold"]:
             auto_sold.append(f"{result['item_id'][:8]}: {', '.join(result['changes'])}")
         elif result["changes"]:
@@ -2932,7 +2974,28 @@ async def _run_sync_locked(days: int, on_progress=None) -> list[str]:
                   "sell.fulfillment.readonly + sell.finances."]
     if errors:
         lines += ["", f"⚠️ Couldn't read ({len(errors)}):"] + [f"  {e}" for e in errors]
-    return lines
+
+    brief = []
+    for item, sale in new_sales:
+        title = ((item.get("listing") or {}).get("title") or "(untitled)")[:45]
+        net = f" · net ${sale['net']}" if sale.get("net") is not None else ""
+        brief.append(f"💰 Sold: {title} — ${sale['total']}{net}")
+    todo = []
+    if ended_flags:
+        todo.append(f"🔁 {len(ended_flags)} ended without selling — relist with /activate: "
+                    + ", ".join(sid[:8] for sid in ended_flags))
+    if sold_flags:
+        todo.append(f"🛒 {len(sold_flags)} look sold but no order matched — /sold <id> <price>: "
+                    + ", ".join(sid[:8] for sid in sold_flags))
+    if live_mismatch:
+        todo.append(f"❓ {len(live_mismatch)} live on eBay but not 'published' here — see /sync")
+    if adopted:
+        todo.append(f"🆕 Picked up {len(adopted)} listing(s) made in Seller Hub — see /sync")
+    if errors or discover_err or sold_map_err:
+        todo.append("⚠️ Some eBay data couldn't be read — run /sync for details")
+    if todo:
+        brief += ([""] if brief else []) + todo
+    return lines, brief
 
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3754,6 +3817,23 @@ def _format_reprice_line(r: dict) -> str:
     return line
 
 
+def _format_reprice_short(r: dict) -> str:
+    """One line per listing for the grouped digest: id, title, price, and the
+    numbers that matter (impressions / views / watchers)."""
+    item = get_item(r["item_id"])
+    title = ((item or {}).get("listing") or {}).get("title") or "(untitled)"
+    if r["verdict"] == "ERROR":
+        return f"• {r['item_id'][:8]} {title[:32]} — {str(r.get('error', ''))[:60]}"
+    impr = r.get("impressions")
+    views = r.get("cumulative_views")
+    if views is None:
+        views = r.get("views")
+    watchers = r.get("watchers")
+    q = lambda v: "?" if v is None else v
+    return (f"• {r['item_id'][:8]} {title[:32]} ${r.get('current_price')} · "
+            f"{q(impr)} impr · {q(views)} views · {q(watchers)} watch")
+
+
 def _reprice_health_line(health: dict | None) -> str | None:
     """One line saying how much of eBay's data actually arrived. Without it a
     run whose traffic fetch failed looked exactly like a week where nothing was
@@ -3801,12 +3881,37 @@ async def _send_reprice_digest(bot, chat_id, results: list[dict],
         print(f"WARNING: reprice digest header failed: {type(e).__name__}: {e}")
         return
 
+    # Only a suggested price earns its own message, because its Apply button has
+    # to sit under it. Everything else is grouped by verdict into one compact
+    # list with the advice said once — one message per listing was 50+ phone
+    # notifications a week that nobody read.
+    actionable = [r for r in flagged if r.get("suggested_price")]
+    grouped: dict[str, list[dict]] = {}
     for r in flagged:
-        text = _format_reprice_line(r)
-        markup = (_reprice_markup(r["item_id"], r["suggested_price"])
-                  if r.get("suggested_price") else None)
+        if not r.get("suggested_price"):
+            grouped.setdefault(r["verdict"], []).append(r)
+
+    lines = []
+    for verdict, rows in grouped.items():
+        if lines:
+            lines.append("")
+        lines.append(f"{_VERDICT_LABEL.get(verdict, verdict)} ({len(rows)})")
+        advice = _VERDICT_ADVICE.get(verdict)
+        if advice:
+            lines.append(f"💡 {advice}")
+        for r in rows:
+            lines.append(_format_reprice_short(r))
+    if lines:
         try:
-            await bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+            for chunk in _chunk_lines(lines):
+                await bot.send_message(chat_id=chat_id, text=chunk)
+        except Exception as e:
+            print(f"WARNING: reprice digest list failed: {type(e).__name__}: {e}")
+
+    for r in actionable:
+        try:
+            await bot.send_message(chat_id=chat_id, text=_format_reprice_line(r),
+                                   reply_markup=_reprice_markup(r["item_id"], r["suggested_price"]))
         except Exception as e:
             print(f"WARNING: reprice digest item failed: {type(e).__name__}: {e}")
 
@@ -3988,17 +4093,12 @@ async def _weekly_reprice_loop(app: Application) -> None:
         await _run_reprice_job(app)
 
 
-# A sync whose only news is "nothing changed" is not worth a phone notification;
-# anything else in the report is.
-_SYNC_QUIET_LINES = {"No price/quantity changes found."}
-
-
 async def _run_sync_job(app: Application, *, catch_up: bool = False) -> None:
     """One scheduled reconciliation with eBay, using the same _run_sync the
     manual /sync calls. Posts the report only when it actually says something."""
     print(f"🔄 Running {'catch-up' if catch_up else 'scheduled'} eBay sync...")
     try:
-        lines = await _run_sync(SYNC_DAYS)
+        lines, brief = await _run_sync(SYNC_DAYS)
     except Exception as e:
         traceback.print_exc()
         _record_error("scheduled sync", e)
@@ -4006,17 +4106,14 @@ async def _run_sync_job(app: Application, *, catch_up: bool = False) -> None:
     record_job_run(_JOB_SYNC, detail=f"{len(lines)} report line(s)")
     await _send_budget_warning(app)
 
-    notable = [ln for ln in lines[1:]
-               if ln.strip() and ln.strip() not in _SYNC_QUIET_LINES]
-    if not notable:
-        print("   sync: nothing changed, staying quiet.")
+    # Bookkeeping (price/qty corrections, status fixes) happens silently; the
+    # phone only hears about new sales and things that need a decision.
+    if not brief:
+        print("   sync: nothing new to report, staying quiet.")
         return
-    header = "⏰ Catch-up sync (the bot missed its slot):" if catch_up else None
     for uid in ALLOWED_USER_IDS:
         try:
-            if header:
-                await app.bot.send_message(chat_id=uid, text=header)
-            await _send_chunked_to(app.bot, uid, lines)
+            await _send_chunked_to(app.bot, uid, brief)
         except Exception as e:
             print(f"WARNING: sync digest to {uid} failed: {type(e).__name__}: {e}")
 
@@ -4069,16 +4166,36 @@ def _feedback_report(result: dict) -> list[str]:
     left, skipped, errors = result["left"], result["skipped"], result["errors"]
     if not (left or skipped or errors):
         return []
-    lines = [f"⭐ Left positive feedback for {len(left)} buyer(s)."]
+    lines = [f"⭐ Left positive feedback for {len(left)} buyer(s)."] if left else []
     for e in left:
         lines.append(f"  {e['buyer']}: {e['title'][:50]}")
     if skipped:
-        lines += ["", f"Skipped ({len(skipped)}):"] + [
+        lines += ([""] if lines else []) + [f"Skipped ({len(skipped)}):"] + [
             f"  {e['item_id']} {e['title'][:40]}: {why}" for e, why in skipped]
     if errors:
-        lines += ["", f"⚠️ Failed ({len(errors)}):"] + [
+        lines += ([""] if lines else []) + [
+            f"⚠️ Couldn't leave feedback ({len(errors)}) — eBay refused:"] + [
             f"  {e['item_id']} {e['title'][:40]}: {msg}" for e, msg in errors]
     return lines
+
+
+def _only_new_feedback_problems(result: dict) -> dict:
+    """Drop failures and skips already reported on an earlier run. eBay keeps
+    listing a sale it won't take feedback on until the 60-day window closes, so
+    without this the same 13 errors were posted every single day. Each one is
+    still retried every run; it's just reported once. /feedback shows them all."""
+    seen = known_feedback_failures()
+    for e in result["left"]:
+        if e.get("order_line") in seen:
+            clear_feedback_failure(e["order_line"])
+    fresh = {"left": result["left"], "skipped": [], "errors": []}
+    for kind in ("skipped", "errors"):
+        for e, why in result[kind]:
+            key = e.get("order_line") or f"{e['item_id']}-{e['transaction_id']}"
+            if key not in seen:
+                fresh[kind].append((e, why))
+            record_feedback_failure(key, str(why)[:200])
+    return fresh
 
 
 async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4107,7 +4224,7 @@ async def _run_feedback_job(app: Application) -> None:
         _record_error("scheduled feedback", e)
         return
     record_job_run(_JOB_FEEDBACK, detail=f"{len(result['left'])} left")
-    lines = _feedback_report(result)
+    lines = _feedback_report(_only_new_feedback_problems(result))
     if not lines:
         return
     for uid in ALLOWED_USER_IDS:

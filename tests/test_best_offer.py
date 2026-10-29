@@ -1,11 +1,12 @@
 """Best Offer on new listings, and on live offers via update_offer_fields.
 
-The auto-decline floor is the break-even rounded UP to a whole dollar; there is
-never an auto-accept; and no floor is set when the cost is unknown or the floor
-would reach the price (it would decline every offer).
+The auto-decline floor is the higher of BEST_OFFER_MIN_PCT of the price and the
+break-even, rounded UP to a whole dollar; there is never an auto-accept; and no
+floor is set when it would reach the price (it would decline every offer).
 
 Run with `python tests/test_best_offer.py` or `pytest tests/`.
 """
+import math
 import sys
 from pathlib import Path
 
@@ -20,22 +21,62 @@ NO_RECEIPT = {"listing": {"price": 59.99}}
 
 # --- the floor ----------------------------------------------------------------
 
+def _pct(value):
+    saved = inv.BEST_OFFER_MIN_PCT
+    inv.BEST_OFFER_MIN_PCT = value
+    return saved
+
+
 def test_floor_is_breakeven_rounded_up_to_a_dollar():
-    be = breakeven_price(COSTED)
-    floor = inv.auto_decline_price(COSTED, 129.99)
-    assert isinstance(floor, int)
-    assert be <= floor < be + 1
+    saved = _pct(0)
+    try:
+        be = breakeven_price(COSTED)
+        floor = inv.auto_decline_price(COSTED, 129.99)
+        assert isinstance(floor, int)
+        assert be <= floor < be + 1
+    finally:
+        _pct(saved)
 
 
-def test_no_floor_without_a_known_cost():
-    assert inv.auto_decline_price(NO_RECEIPT, 59.99) is None
+def test_lowballs_above_breakeven_are_declined_too():
+    # db2380ba, live: $44.99, $9.99 cost — a $20 offer cleared the break-even
+    # floor (~$13). At 70% the floor is $32.
+    item = {"receipt": {"reduced_price": 9.99}, "listing": {"price": 44.99}}
+    saved = _pct(70)
+    try:
+        assert inv.auto_decline_price(item, 44.99) == 32
+    finally:
+        _pct(saved)
+
+
+def test_breakeven_wins_when_it_is_higher():
+    item = {"receipt": {"reduced_price": 30.0}, "listing": {"price": 44.99}}
+    saved = _pct(50)
+    try:
+        assert inv.auto_decline_price(item, 44.99) == math.ceil(round(breakeven_price(item), 2))
+    finally:
+        _pct(saved)
+
+
+def test_unknown_cost_still_gets_the_percentage_floor():
+    saved = _pct(70)
+    try:
+        assert inv.auto_decline_price(NO_RECEIPT, 59.99) == 42
+        _pct(0)
+        assert inv.auto_decline_price(NO_RECEIPT, 59.99) is None
+    finally:
+        _pct(saved)
 
 
 def test_no_floor_when_it_would_decline_every_offer():
-    floor = inv.auto_decline_price(COSTED, 129.99)
-    assert inv.auto_decline_price(COSTED, floor) is None
-    assert inv.auto_decline_price(COSTED, floor - 0.01) is None
-    assert inv.auto_decline_price(COSTED, floor + 0.01) == floor
+    saved = _pct(0)
+    try:
+        floor = inv.auto_decline_price(COSTED, 129.99)
+        assert inv.auto_decline_price(COSTED, floor) is None
+        assert inv.auto_decline_price(COSTED, floor - 0.01) is None
+        assert inv.auto_decline_price(COSTED, floor + 0.01) == floor
+    finally:
+        _pct(saved)
 
 
 def test_no_floor_when_breakeven_is_under_a_dollar():
@@ -43,8 +84,12 @@ def test_no_floor_when_breakeven_is_under_a_dollar():
     # rejected the resulting $0 floor (errorId 25016).
     cheap = {"receipt": {"reduced_price": 0.49}, "listing": {"price": 39.99}}
     assert breakeven_price(cheap) < 1
-    assert inv.auto_decline_price(cheap, 39.99) is None
-    assert inv.best_offer_terms(cheap, 39.99) == {"bestOfferEnabled": True}
+    saved = _pct(0)
+    try:
+        assert inv.auto_decline_price(cheap, 39.99) is None
+        assert inv.best_offer_terms(cheap, 39.99) == {"bestOfferEnabled": True}
+    finally:
+        _pct(saved)
 
 
 def test_terms_never_auto_accept():
@@ -52,7 +97,7 @@ def test_terms_never_auto_accept():
     floor = inv.auto_decline_price(COSTED, 129.99)
     assert terms == {"bestOfferEnabled": True,
                      "autoDeclinePrice": {"value": f"{floor}.00", "currency": "USD"}}
-    assert inv.best_offer_terms(NO_RECEIPT, 59.99) == {"bestOfferEnabled": True}
+    assert "autoAcceptPrice" not in inv.best_offer_terms(NO_RECEIPT, 59.99)
 
 
 # --- live offers --------------------------------------------------------------
@@ -138,10 +183,12 @@ def test_new_listing_publishes_with_best_offer_and_floor(monkeypatch):
     assert created["offer"]["listingPolicies"]["fulfillmentPolicyId"] == "f"
 
 
-def test_new_listing_without_cost_gets_best_offer_but_no_floor(monkeypatch):
+def test_new_listing_without_cost_gets_the_percentage_floor(monkeypatch):
+    monkeypatch.setattr(inv, "BEST_OFFER_MIN_PCT", 70)
     created = _stub_draft(monkeypatch, _item(59.99, receipt=False))
     inv.create_draft_offer("x")
-    assert created["offer"]["listingPolicies"]["bestOfferTerms"] == {"bestOfferEnabled": True}
+    assert created["offer"]["listingPolicies"]["bestOfferTerms"] == {
+        "bestOfferEnabled": True, "autoDeclinePrice": {"value": "42.00", "currency": "USD"}}
 
 
 def test_best_offer_can_be_switched_off(monkeypatch):

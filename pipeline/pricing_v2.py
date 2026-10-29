@@ -730,6 +730,13 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
     if j and p and not sold_judged:
         flags.append("priced_from_asks")
         warnings.append("no sales found, priced from asking prices")
+    elif j and p and len(sold_judged) < config.PRICE_V2_MIN_SOLD_TO_AUTO:
+        # Owner's call, 2026-10-27: a price resting on a single sale waits for a
+        # look rather than clearing the gate on the judge's "medium". The
+        # Luv Betsey backpack went through at $54.99 off one $55.50 sale while
+        # the same bag sat at $39 and $47.59 in active listings.
+        flags.append("few_sales")
+        warnings.append(f"only {len(sold_judged)} matching sale(s) behind this price")
     lo, hi = (store or {}).get("range_low"), (store or {}).get("range_high")
     if p and lo and hi and (store.get("n") or 0) >= STORE_RANGE_MIN_N \
             and not store.get("msrp_flags") \

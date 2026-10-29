@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 from config import (
     BEST_OFFER_ENABLED,
+    BEST_OFFER_MIN_PCT,
     EBAY_CURRENCY,
     EBAY_FULFILLMENT_POLICY_ID,
     EBAY_MARKETPLACE_ID,
@@ -134,7 +135,9 @@ def _reorder_for_listing(paths: list[str], manual: bool = False) -> list[str]:
     `manual` turns this off: once /cover or /arrange has set the order by hand,
     the stored list IS the intended order, and the "2nd photo is the tag"
     assumption no longer holds — applying it anyway would move whichever photo
-    the user deliberately put second to the back of the listing."""
+    the user deliberately put second to the back of the listing. The same goes
+    when the 2nd photo sent was the Ross tag itself (see _split_receipt's
+    "as_sent"): it's already peeled, and what slid into 2nd is a product shot."""
     if manual or len(paths) < 2:
         return paths
     return paths[:1] + paths[2:] + [paths[1]]
@@ -146,7 +149,14 @@ def listing_photo_order(item: dict) -> list[str]:
     so the bot's /photos numbering and the published listing can't disagree."""
     return _reorder_for_listing(
         list(item.get("photos") or []),
-        manual=bool((item.get("photo_layout") or {}).get("manual")))
+        manual=_order_is_fixed(item))
+
+
+def _order_is_fixed(item: dict) -> bool:
+    """True when the stored photo order is the listing order as-is: set by hand,
+    or there was no tag close-up in the 2nd slot to move."""
+    layout = item.get("photo_layout") or {}
+    return bool(layout.get("manual") or layout.get("as_sent"))
 
 
 def _download_brand_image(url, item_id: str) -> str | None:
@@ -585,20 +595,27 @@ def _update_offer_description(offer_id: str, current: dict, description_html: st
 
 
 def auto_decline_price(item: dict, price) -> int | None:
-    """The Best Offer auto-decline floor for `item` listed at `price`: its
-    break-even rounded UP to the next whole dollar, so every offer that would
-    sell at a loss is declined and nothing else is.
+    """The Best Offer auto-decline floor for `item` listed at `price`: the
+    higher of BEST_OFFER_MIN_PCT of the price and the break-even, each rounded
+    UP to a whole dollar. So an offer that would sell at a loss is declined,
+    and so is a lowball that would merely break even — at break-even alone a
+    $20 offer on a $44.99 bag reached the seller.
 
-    None when there should be no floor: the Ross cost is unknown (a floor off a
-    guessed cost is a guess), or the floor would be at or above the price —
-    that would decline every offer the listing could get. Also None when the
-    break-even is under a dollar (a very cheap Ross buy can even make it
-    negative): eBay rejects a $0 floor, and a floor that low declines nothing."""
-    breakeven = breakeven_price(item)
-    if breakeven is None or price is None:
+    An unknown Ross cost leaves only the percentage floor. None when the floor
+    would be at or above the price (it would decline every offer), or under a
+    dollar (eBay rejects a $0 floor, errorId 25016)."""
+    if price is None:
         return None
-    # Round to cents first so float noise (30.000000001) doesn't add a dollar.
-    floor = math.ceil(round(breakeven, 2))
+    candidates = []
+    breakeven = breakeven_price(item)
+    if breakeven is not None:
+        # Round to cents first so float noise (30.000000001) doesn't add a dollar.
+        candidates.append(math.ceil(round(breakeven, 2)))
+    if BEST_OFFER_MIN_PCT > 0:
+        candidates.append(math.ceil(round(float(price) * BEST_OFFER_MIN_PCT / 100, 2)))
+    if not candidates:
+        return None
+    floor = max(candidates)
     return floor if 1 <= floor < float(price) else None
 
 

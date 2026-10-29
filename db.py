@@ -113,6 +113,17 @@ def create_tables() -> None:
             )
         """)
 
+        # Feedback attempts that eBay rejected, keyed by order line. The daily
+        # feedback job retries them quietly but reports each one only once, so a
+        # sale eBay won't take feedback on doesn't re-post the same error daily.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS feedback_failures (
+                order_line   TEXT PRIMARY KEY,
+                first_failed TEXT NOT NULL,
+                last_error   TEXT
+            )
+        """)
+
         # One row per paid model call (Claude and Gemini), so spend is a query
         # rather than a guess. The monthly Anthropic budget guard reads this; a
         # refusal fallback writes one row per model that ran. cost_usd is NULL
@@ -240,6 +251,25 @@ def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> N
             "status=excluded.status, detail=excluded.detail",
             (job, _now(), status, detail),
         )
+
+
+def known_feedback_failures() -> set[str]:
+    """Order lines whose feedback failure has already been reported."""
+    with _conn() as con:
+        return {r[0] for r in con.execute("SELECT order_line FROM feedback_failures")}
+
+
+def record_feedback_failure(order_line: str, error: str) -> None:
+    with _conn() as con:
+        con.execute(
+            "INSERT INTO feedback_failures (order_line, first_failed, last_error) "
+            "VALUES (?, ?, ?) ON CONFLICT(order_line) DO UPDATE SET last_error=excluded.last_error",
+            (order_line, _now(), error))
+
+
+def clear_feedback_failure(order_line: str) -> None:
+    with _conn() as con:
+        con.execute("DELETE FROM feedback_failures WHERE order_line = ?", (order_line,))
 
 
 def job_run_status(job: str) -> str | None:

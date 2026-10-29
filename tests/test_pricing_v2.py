@@ -386,6 +386,13 @@ def test_review_screen_v1_unchanged_and_manual_override_named():
     assert "(typed; Claude said $44.99, high)" in tb.format_pricing(typed)
 
 
+def test_a_price_on_one_sale_waits_for_review():
+    r, _ = _run(45.2, confidence="medium", same=("S1", "A1"), other="wrong")
+    assert "few_sales" in r["review_flags"] and r["needs_review"]
+    r, _ = _run(45.2, confidence="medium", same=("S1", "S2", "A1"), other="wrong")
+    assert "few_sales" not in r["review_flags"]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

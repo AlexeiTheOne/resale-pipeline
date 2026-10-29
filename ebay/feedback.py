@@ -75,6 +75,8 @@ def awaiting_buyer_feedback() -> list[dict]:
             out.append({
                 "item_id": item_id,
                 "transaction_id": transaction_id,
+                "order_line": (_text(tx, "OrderLineItemID")
+                               or f"{item_id}-{transaction_id}"),
                 "buyer": buyer,
                 "title": _text(tx, "Title") or "",
             })
@@ -101,15 +103,34 @@ def paid_sales(days: int = 90) -> set[tuple[str, str]]:
     return paid
 
 
-def leave_positive(item_id: str, transaction_id: str, buyer: str, comment: str) -> None:
-    """Leave Positive feedback on one sale. Raises with eBay's message on failure."""
-    _trading(
-        "LeaveFeedback",
-        f"<ItemID>{escape(item_id)}</ItemID>"
-        f"<TransactionID>{escape(transaction_id)}</TransactionID>"
-        f"<TargetUser>{escape(buyer)}</TargetUser>"
-        "<CommentType>Positive</CommentType>"
-        f"<CommentText>{escape(comment[:COMMENT_MAX])}</CommentText>")
+def leave_positive(item_id: str, transaction_id: str, buyer: str, comment: str,
+                   order_line: str | None = None) -> None:
+    """Leave Positive feedback on one sale. Raises with eBay's message on failure.
+
+    Identifies the sale by OrderLineItemID, eBay's preferred key. Every
+    ItemID + TransactionID call has failed with "the item number you entered
+    does not exist or you have not completed a transaction" (0 left as of
+    2026-10-26), so that form is now only the fallback."""
+    tail = ("<CommentType>Positive</CommentType>"
+            f"<CommentText>{escape(comment[:COMMENT_MAX])}</CommentText>"
+            f"<TargetUser>{escape(buyer)}</TargetUser>")
+    if order_line:
+        try:
+            _trading("LeaveFeedback",
+                     f"<OrderLineItemID>{escape(order_line)}</OrderLineItemID>" + tail)
+            return
+        except RuntimeError as e:
+            first_err = e
+    else:
+        first_err = None
+    try:
+        _trading("LeaveFeedback",
+                 f"<ItemID>{escape(item_id)}</ItemID>"
+                 f"<TransactionID>{escape(transaction_id)}</TransactionID>" + tail)
+    except RuntimeError:
+        if first_err is not None:
+            raise first_err
+        raise
 
 
 def leave_all_pending(comment: str) -> dict:
@@ -127,7 +148,8 @@ def leave_all_pending(comment: str) -> dict:
             result["skipped"].append((entry, "no paid order found (cancelled or unpaid?)"))
             continue
         try:
-            leave_positive(entry["item_id"], entry["transaction_id"], entry["buyer"], comment)
+            leave_positive(entry["item_id"], entry["transaction_id"], entry["buyer"], comment,
+                           order_line=entry.get("order_line"))
             result["left"].append(entry)
         except Exception as e:
             result["errors"].append((entry, str(e)[:150]))

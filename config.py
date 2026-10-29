@@ -128,11 +128,14 @@ EBAY_PROMOTED_CAMPAIGN_NAME = os.getenv("EBAY_PROMOTED_CAMPAIGN_NAME", "ross-aut
 # listing is promoted at this floor rate by default; bump an individual one with
 # /promote <id> <pct>. Set to 0 to disable auto-promotion. eBay accepts 2–100%.
 EBAY_DEFAULT_AD_RATE_PCT = float(os.getenv("EBAY_DEFAULT_AD_RATE_PCT", "4"))
-# Best Offer on every new listing. The auto-decline floor is the item's
-# break-even (profit.breakeven_price) rounded UP to a whole dollar, so no offer
-# that loses money even reaches you; there is no auto-accept. No floor is set
-# when the Ross cost is unknown, or when the floor would reach the list price
-# (that would decline every offer). Set to 0 to publish without Best Offer.
+# Best Offer on every new listing. The auto-decline floor is the HIGHER of
+# BEST_OFFER_MIN_PCT of the list price and the break-even
+# (profit.breakeven_price), each rounded UP to a whole dollar; there is no
+# auto-accept. Break-even alone let $15-$25 offers on $30-$50 bags through
+# (44-50% of price, Oct 2026), while every offer that became a sale was 83-88%.
+# No floor when it would reach the list price (that declines every offer).
+# Set BEST_OFFER_ENABLED=0 to publish without Best Offer.
+BEST_OFFER_MIN_PCT = float(os.getenv("BEST_OFFER_MIN_PCT", "75"))   # owner picked 75, 2026-10-28
 BEST_OFFER_ENABLED = os.getenv("BEST_OFFER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
 EBAY_MERCHANT_LOCATION_KEY = "ross-resale-warehouse"
 EBAY_SHIP_FROM_ADDRESS = {
@@ -282,6 +285,10 @@ ASSUMED_COST_RATIO = float(os.getenv("ASSUMED_COST_RATIO", "0.29"))
 REPRICE_MIN_MARGIN_DOLLARS = float(os.getenv("REPRICE_MIN_MARGIN_DOLLARS", "5"))
 # When the automatic weekly digest runs, in UTC. Default: Monday 14:00 UTC
 # (~9-10am US Eastern/Central).
+# v2 pricing: a price backed by fewer matching SOLD comps than this stops at the
+# price gate instead of auto-confirming (flag "few_sales").
+PRICE_V2_MIN_SOLD_TO_AUTO = int(os.getenv("PRICE_V2_MIN_SOLD_TO_AUTO", "2"))
+
 REPRICE_WEEKDAY = int(os.getenv("REPRICE_WEEKDAY", "0"))  # 0 = Monday
 REPRICE_HOUR_UTC = int(os.getenv("REPRICE_HOUR_UTC", "14"))
 
