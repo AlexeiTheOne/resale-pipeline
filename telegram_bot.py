@@ -118,6 +118,9 @@ gate_queue = {}     # user_id -> [{item_id, stage, reason}]  gates waiting their
                     # items at once, and only one can hold the single gate slot; the rest queue here
                     # instead of overwriting each other and getting lost)
 find_mode = set()   # user_ids in /find: each photo is looked up, not listed
+find_loc = {}       # user_id -> box/location typed with /find (e.g. "G3")
+last_find_photo = {}  # user_id -> path of the latest /find photo (seeds Quick add)
+quick_add = {}      # user_id -> {"photos": [...], "task": timer, "loc": str|None}
 haul_mode = set()   # user_ids whose next photo batch is a multi-item haul to be split on Ross tags
 # message_id of a gate/draft the bot sent -> the item it was about. A haul puts
 # several drafts on screen at once, so "which item did you mean?" can't be
@@ -395,8 +398,11 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     f = await context.bot.get_file(photo.file_id)
     data = await f.download_as_bytearray()
 
+    if user_id in quick_add:
+        await _quick_add_photo(user_id, update.message, bytes(data), mid)
+        return
     if user_id in find_mode:
-        await _find_one(update.message, bytes(data), mid)
+        await _find_one(user_id, update.message, bytes(data), mid)
         return
 
     async with _lock_for(user_id):
@@ -674,35 +680,241 @@ _FIND_DIR = Path("data") / "cache" / "find"
 
 
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Turn on lookup mode: every photo is checked against what's listed."""
-    find_mode.add(update.effective_user.id)
+    """Turn on lookup mode: every photo is checked against what's listed.
+    /find G3 also files everything scanned under that box."""
+    user_id = update.effective_user.id
+    find_mode.add(user_id)
+    loc = " ".join(context.args or []).strip().upper() or None
+    if loc:
+        find_loc[user_id] = loc
+    else:
+        find_loc.pop(user_id, None)
+    where = f" Box: {loc}." if loc else ""
     await _safe_reply(update.message,
-        "🔎 Find mode on. Send a photo of an item (hang tag or front works best) "
-        "and I'll say if it's posted and how many eBay shows.\n/done when finished.")
+        f"🔎 Find mode on.{where} Send a photo of an item (hang tag or front works best) "
+        "and I'll say if it's posted and how many eBay shows.\n"
+        "/find G3 to set the box · /done when finished.")
 
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id in find_mode:
-        find_mode.discard(user_id)
+        _end_find(user_id)
         await _safe_reply(update.message, "👍 Find mode off. Photos start new listings again.")
     else:
         await _safe_reply(update.message, "Nothing to finish.")
 
 
-async def _find_one(message, data: bytes, mid: int) -> None:
+def _end_find(user_id: int) -> None:
+    find_mode.discard(user_id)
+    find_loc.pop(user_id, None)
+    old = last_find_photo.pop(user_id, None)
+    if old:
+        Path(old).unlink(missing_ok=True)
+    qa = quick_add.pop(user_id, None)
+    if qa and qa.get("task"):
+        qa["task"].cancel()
+
+
+def _set_location(item_id: str, loc: str | None) -> None:
+    if not loc:
+        return
+    item = get_item(item_id) or {}
+    stock = dict(item.get("stock") or {})
+    stock["location"] = loc
+    update_field(item_id, "stock", stock)
+
+
+async def _find_one(user_id: int, message, data: bytes, mid: int) -> None:
     from pipeline.stock_lookup import format_answer, lookup
     _FIND_DIR.mkdir(parents=True, exist_ok=True)
     path = _FIND_DIR / f"find_{mid}.jpg"
     path.write_bytes(data)
+    old = last_find_photo.get(user_id)
+    if old and old != str(path):
+        Path(old).unlink(missing_ok=True)
+    last_find_photo[user_id] = str(path)
+    loc = find_loc.get(user_id)
     try:
         res = await asyncio.to_thread(lookup, str(path))
-        await _safe_reply(message, format_answer(res))
     except Exception as e:
         traceback.print_exc()
         await _safe_reply(message, f"⚠️ Lookup failed: {type(e).__name__}: {str(e)[:200]}")
-    finally:
-        path.unlink(missing_ok=True)
+        return
+    text = format_answer(res)
+    if res["item"] is not None:
+        _set_location(res["item"]["item_id"], loc)
+        if loc:
+            text += f"\n📦 Filed under {loc}"
+        await _safe_reply(message, text)
+        return
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton(
+        "⚡ Quick add", callback_data="qa:start")]])
+    await _safe_reply(message, text, reply_markup=markup)
+
+
+_QUICK_ADD_WAIT_FIRST = 45   # seconds to wait for extra photos after the tap
+_QUICK_ADD_WAIT_NEXT = 6     # seconds after the last photo
+
+
+async def quick_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    seed = last_find_photo.pop(user_id, None)
+    old = quick_add.pop(user_id, None)
+    if old and old.get("task"):
+        old["task"].cancel()
+    qa = quick_add[user_id] = {"photos": [seed] if seed and Path(seed).exists() else [],
+                               "task": None, "loc": find_loc.get(user_id)}
+    await _safe_reply(query.message,
+        "📸 Send 1–2 more photos: front, brand or hang tag, and the Ross tag if it's still on. "
+        f"I'll start {_QUICK_ADD_WAIT_NEXT}s after the last one (or in "
+        f"{_QUICK_ADD_WAIT_FIRST}s with just the photo you sent).")
+    qa["task"] = asyncio.create_task(
+        _quick_add_timer(user_id, query.message, _QUICK_ADD_WAIT_FIRST))
+
+
+async def _quick_add_photo(user_id: int, message, data: bytes, mid: int) -> None:
+    qa = quick_add[user_id]
+    _FIND_DIR.mkdir(parents=True, exist_ok=True)
+    path = _FIND_DIR / f"qa_{mid}.jpg"
+    path.write_bytes(data)
+    qa["photos"].append(str(path))
+    if qa.get("task"):
+        qa["task"].cancel()
+    qa["task"] = asyncio.create_task(_quick_add_timer(user_id, message, _QUICK_ADD_WAIT_NEXT))
+
+
+async def _quick_add_timer(user_id: int, message, wait: int) -> None:
+    try:
+        await asyncio.sleep(wait)
+    except asyncio.CancelledError:
+        return
+    qa = quick_add.pop(user_id, None)
+    if not qa or not qa["photos"]:
+        await _safe_reply(message, "No photos for Quick add, so nothing saved.")
+        return
+    await _safe_reply(message, f"⚡ Identifying and pricing ({len(qa['photos'])} photo(s))...")
+    try:
+        item_id = await asyncio.to_thread(_quick_add_item, qa["photos"], qa["loc"])
+    except Exception as e:
+        traceback.print_exc()
+        _record_error("quick add", e)
+        await _safe_reply(message, f"⚠️ Quick add failed: {type(e).__name__}: {str(e)[:200]}")
+        return
+    lines = [_stock_line(get_item(item_id), detail=True)]
+    lines += _duplicate_warnings(item_id) + _brand_warnings(item_id)
+    lines.append(f"/list {item_id[:8]} when you're ready to post it.")
+    await _safe_reply(message, "\n".join(lines))
+
+
+def _quick_add_item(paths: list[str], loc: str | None) -> str:
+    """Photos -> a 'stocked' item: identified and quick-priced, not listed.
+    The Ross tag is only peeled when it's actually recognised; Quick add has
+    no 'tag is the last photo' convention to fall back on."""
+    from pipeline.quick_price import quick_price
+    item_id = create_item([])
+    folder = INBOX / item_id
+    folder.mkdir(parents=True, exist_ok=True)
+    photos = []
+    for n, p in enumerate(paths):
+        dst = folder / f"{item_id}_{n}.jpg"
+        shutil.move(p, dst)
+        photos.append(str(dst))
+    receipt = None
+    found = _find_tag_photo(photos) if len(photos) >= 2 else None
+    if found:
+        tag = photos.pop(found[0])
+        receipt = extract_receipt(tag)
+        receipt["peeled"] = True
+        receipt["photo"] = tag
+        update_field(item_id, "receipt", receipt)
+    update_field(item_id, "photos", photos)
+    ident = identify_item(photos[:GEMINI_PHOTO_LIMIT], scan_paths=photos)
+    update_field(item_id, "identification", ident)
+    priced = quick_price(ident, photos[0], receipt, item_id=item_id)
+    update_field(item_id, "stock", {"location": loc, "quick_price": priced,
+                                    "added_at": datetime.now(timezone.utc).isoformat()})
+    update_status(item_id, "stocked")
+    return item_id
+
+
+def _stock_line(item: dict, detail: bool = False) -> str:
+    ident = item.get("identification") or {}
+    stock = item.get("stock") or {}
+    qp = stock.get("quick_price") or {}
+    name = " ".join(str(x) for x in (ident.get("brand"), ident.get("product_name")
+                                    or ident.get("item_type")) if x)[:55]
+    cost = (item.get("receipt") or {}).get("reduced_price")
+    bits = [f"${qp.get('price')}" if qp.get("price") else "no price"]
+    if cost:
+        bits.append(f"cost ${cost}")
+    if stock.get("location"):
+        bits.append(stock["location"])
+    line = f"📦 {item['item_id'][:8]} {name} · " + " · ".join(bits)
+    if detail and qp.get("reasoning"):
+        line = "✅ Saved, not posted.\n" + line + f"\n💡 {qp['reasoning']}"
+    return line
+
+
+async def stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Everything quick-added but not posted yet, best to list first."""
+    items = list_items("stocked")
+    if not items:
+        await _safe_reply(update.message, "Nothing waiting. Use /find, then ⚡ Quick add on "
+                                          "anything that isn't posted.")
+        return
+    verdicts = {}
+    norm = lambda b: b  # noqa: E731
+    try:
+        from pipeline.scoreboard import load, normalize_brand
+        verdicts = {g["name"]: g["verdict"] for g in load()["brands"]}
+        norm = normalize_brand
+    except Exception as e:
+        print(f"WARNING: scoreboard unavailable for /stock: {e}")
+    rank = {"buy more": 0, "ok": 1, "pause": 2, "stop": 3}
+
+    def verdict_of(it):
+        return verdicts.get(norm((it.get("identification") or {}).get("brand")))
+
+    def price_of(it):
+        return ((it.get("stock") or {}).get("quick_price") or {}).get("price") or 0
+
+    items.sort(key=lambda it: (rank.get(verdict_of(it) or "ok", 1), -price_of(it)))
+    total = sum(price_of(i) for i in items)
+    cost = sum((i.get("receipt") or {}).get("reduced_price") or 0 for i in items)
+    lines = [f"📦 Not posted: {len(items)} item(s), worth ~${total:,.0f} (cost ${cost:,.0f})",
+             "List from the top: best sellers first.", ""]
+    for it in items:
+        v = verdict_of(it)
+        flag = f" ⚠️{v}" if v in ("pause", "stop") else ""
+        lines.append(_stock_line(it) + flag)
+    lines += ["", "/list <id> to post one."]
+    await _send_chunked(update.message, lines)
+
+
+async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Turn a quick-added item into a real listing: full pricing, draft, review."""
+    user_id = update.effective_user.id
+    item_id, err = _resolve_item_id(user_id, context.args or [])
+    if err:
+        await _safe_reply(update.message, f"⚠️ {err}")
+        return
+    item = get_item(item_id)
+    if item["status"] != "stocked":
+        await _safe_reply(update.message,
+                          f"{item_id[:8]} is '{item['status']}', not waiting stock.")
+        return
+    update_status(item_id, "identified")
+    await _safe_reply(update.message,
+        f"🚀 Listing {item_id[:8]}. Full pricing next, then the draft for review.\n"
+        f"Want more photos on the listing? /addphotos {item_id[:8]} any time before you approve.")
+    await advance(user_id, item_id, update.message, context)
 
 
 async def haul_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4654,7 +4866,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     was_gated = gate.pop(user_id, None) is not None
     was_hauling = user_id in haul_mode
     haul_mode.discard(user_id)
-    find_mode.discard(user_id)
+    _end_find(user_id)
     # Only drop the queue when a gate was actually what got cancelled. Popping it
     # unconditionally meant cancelling an unrelated photo capture silently threw
     # away every queued haul gate and said nothing about it.
@@ -4728,7 +4940,9 @@ HELP_SECTIONS = [
                                 "Dry run without 'apply'; add a number for a flat $ off"),
         ("/retry [id]", "Re-run the current pipeline step for an item"),
         ("/delete [id]", "Delete the item, its photos, and its eBay offer"),
-        ("/find", "Photo an item: is it posted, and how many does eBay show? /done to stop"),
+        ("/find [box]", "Photo an item: posted or not? Quick add what isn't. /done to stop"),
+        ("/stock", "Items quick-added but not posted, best to list first"),
+        ("/list <id>", "Post a quick-added item: full pricing, draft, review"),
         ("/notdup <id> <id>", "Two look-alikes are different items: stop the duplicate warning"),
     ]),
     ("Money", [
@@ -4870,9 +5084,12 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern=r"^confirm:"))
     app.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
     app.add_handler(CallbackQueryHandler(reprice_callback, pattern=r"^reprice:"))
+    app.add_handler(CallbackQueryHandler(quick_add_callback, pattern=r"^qa:"))
     app.add_handler(CommandHandler("haul", haul_command))
     app.add_handler(CommandHandler("find", find_command))
     app.add_handler(CommandHandler("done", done_command))
+    app.add_handler(CommandHandler("stock", stock_command))
+    app.add_handler(CommandHandler("list", list_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("ross", ross_command))
     app.add_handler(CommandHandler("errors", errors_command))

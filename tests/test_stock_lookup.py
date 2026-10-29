@@ -93,3 +93,13 @@ def test_an_inside_shot_is_not_called_not_posted():
                                                   "reason": "just lining",
                                                   "photo_shows_enough": False})
     assert "Can't tell" in sl.format_answer(res)
+
+
+def test_stocked_items_keep_their_location_and_quick_price():
+    iid = _item("stocked", "Betsey backpack")
+    db.update_field(iid, "stock", {"location": "G3", "quick_price": {"price": 44.99}})
+    item = db.get_item(iid)
+    assert item["stock"]["location"] == "G3"
+    import telegram_bot as tb
+    line = tb._stock_line(item)
+    assert "$44.99" in line and "G3" in line

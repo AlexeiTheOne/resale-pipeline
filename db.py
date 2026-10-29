@@ -8,12 +8,13 @@ DB_PATH = "data/ross.db"
 
 VALID_STATUSES = [
     "captured", "identified", "priced", "drafted",
-    "review", "approved", "ebay_draft", "published", "sold", "rejected"
+    "review", "approved", "ebay_draft", "published", "sold", "rejected",
+    "stocked",  # quick-added from /find: identified + priced, not listed yet
 ]
 
 VALID_FIELDS = [
     "identification", "pricing", "listing", "ebay", "photos", "processed",
-    "price_source_url", "receipt", "photo_layout", "listing_check",
+    "price_source_url", "receipt", "photo_layout", "listing_check", "stock",
 ]
 
 # Columns added after the initial schema shipped. Each is created with an
@@ -28,6 +29,8 @@ _MIGRATIONS = {
     # pipeline/listing_check.py's verdict on the current draft: {"issues": [...],
     # "model", "cost_usd", "unchecked", "checked_at"}. Advisory, shown on review.
     "listing_check": "TEXT",
+    # Physical stock: {"location": "G3", "quick_price": {...}, "added_at"}.
+    "stock": "TEXT",
 }
 
 # listing_stats columns added after it shipped (same pattern as _MIGRATIONS).
@@ -59,7 +62,7 @@ def _row_to_dict(row, cursor):
     d = dict(zip(keys, row))
     for field in ("photos", "processed", "identification", "pricing", "listing",
                   "ebay", "price_source_url", "receipt", "photo_layout",
-                  "listing_check"):
+                  "listing_check", "stock"):
         if d.get(field) is not None:
             d[field] = json.loads(d[field])
     return d

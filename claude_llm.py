@@ -103,7 +103,7 @@ def _build_messages(messages, images) -> list[dict]:
 def ask(stage: str, messages, *, model: str | None = None, system: str | None = None,
         max_tokens: int = 4096, effort: str | None = None, images=None,
         output_schema: dict | None = None, item_id: str | None = None,
-        client=None, meta: dict | None = None):
+        client=None, meta: dict | None = None, tools: list | None = None):
     """One Claude request. Returns the answer text, or the parsed object when
     output_schema (a JSON Schema; objects need additionalProperties: false) is given.
 
@@ -116,6 +116,7 @@ def ask(stage: str, messages, *, model: str | None = None, system: str | None = 
     images   file paths, bytes, or (bytes, media_type), added to the last user turn.
     meta     optional dict filled in with what the call cost (model, cost_usd and
              token counts), even when the answer then raises.
+    tools    server tools only (e.g. web search); a paused turn is resumed.
 
     Raises ClaudeRefusal / ClaudeTruncated / ClaudeError (usage is logged first:
     those tokens were billed), or anthropic.APIError once the SDK's retries are spent.
@@ -136,9 +137,19 @@ def ask(stage: str, messages, *, model: str | None = None, system: str | None = 
         params["betas"] = [_FALLBACK_BETA]
         params["fallbacks"] = "default"
 
+    if tools:
+        params["tools"] = tools
     client = client or get_client()
     response = client.beta.messages.create(**params)
     cost = llm_usage.log_anthropic(response, stage=stage, item_id=item_id)
+    # A server tool (web search) can pause a long turn; send it back to finish.
+    for _ in range(3):
+        if response.stop_reason != "pause_turn":
+            break
+        params["messages"] = params["messages"] + [
+            {"role": "assistant", "content": response.content}]
+        response = client.beta.messages.create(**params)
+        cost += llm_usage.log_anthropic(response, stage=stage, item_id=item_id)
     served_by = getattr(response, "model", None) or chosen
     if meta is not None:
         usage = getattr(response, "usage", None)
@@ -166,4 +177,10 @@ def ask(stage: str, messages, *, model: str | None = None, system: str | None = 
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
+        # With tools, text before a search can precede the JSON answer.
+        last = next((b.text for b in reversed(response.content) if b.type == "text"), "")
+        try:
+            return json.loads(last.strip())
+        except json.JSONDecodeError:
+            pass
         raise ClaudeError(f"{stage}: {served_by} returned invalid JSON: {e}: {text[:200]}") from e
