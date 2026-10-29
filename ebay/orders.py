@@ -10,20 +10,19 @@ Two APIs, because neither alone has the whole picture:
     `legacyItemId` = the listing id we store on publish, so an order maps straight
     back to a DB row. Needs the `sell.fulfillment.readonly` scope.
   - Sell Finances API (`getTransactions`) — the money ledger: the exact eBay fee
-    total per order (`totalFeeAmount` on the SALE transaction) plus any
-    eBay-bought shipping-label charges. Needs the `sell.finances` scope. NOTE:
+    total per order (`totalFeeAmount` on the SALE transaction), eBay-bought
+    shipping labels, Promoted Listings ad fees (NON_SALE_CHARGE, tied to the
+    order through references[ORDER_ID]) and refunds. Needs the `sell.finances`
+    scope. NOTE:
     the Finances API lives on a DIFFERENT host — apiz.ebay.com, not api.ebay.com.
 
 Degrades gracefully: if the finances scope isn't granted, sales_by_item still
 returns the gross sale price and shipping from getOrders, just with fees unknown
 (net == gross) — /profit then shows a gross number and hints to re-consent.
 
-NOTE: like ebay/analytics.py, the field names below follow eBay's published
-schema and haven't been confirmed against a live response from this account yet
-(getOrders' pricingSummary/lineItem paths, the Finances transactionType values
-and totalFeeAmount). Run /health (checks both scopes) and /sync, then eyeball the
-first real order — if a number looks off, log the raw JSON and fix the mapping
-here, the same way pipeline/price.py's Apify mapping was pinned down.
+Checked 2026-10-29 against this account's live data (86 orders, 266
+transactions): the per-order net from sales_by_item matches an independent cash
+ledger built from the same two APIs to the cent ($5,303.76).
 """
 import sys
 from pathlib import Path
@@ -116,196 +115,241 @@ def get_transactions(days: int = 90) -> list[dict]:
     return txns
 
 
+def _order_ref(t: dict) -> str | None:
+    """The order a finance transaction belongs to. SALE / REFUND / SHIPPING_LABEL
+    carry a top-level `orderId`; a Promoted Listings fee (NON_SALE_CHARGE) does
+    NOT, but it lists the order under references[referenceType == ORDER_ID]."""
+    if t.get("orderId"):
+        return t["orderId"]
+    for ref in t.get("references") or []:
+        if (ref or {}).get("referenceType") == "ORDER_ID" and ref.get("referenceId"):
+            return ref["referenceId"]
+    return None
+
+
+def _signed_cost(t: dict) -> float:
+    """A cost-type amount, positive when it's money out (DEBIT) and negative when
+    eBay gives it back (CREDIT, e.g. a voided label or a reversed ad fee). eBay
+    sends the magnitude in `amount` and the direction in `bookingEntry`; an
+    absent bookingEntry is treated as the usual debit."""
+    amount = abs(_money(t.get("amount")))
+    return -amount if (t.get("bookingEntry") or "").upper() == "CREDIT" else amount
+
+
+def _is_ad_fee(t: dict) -> bool:
+    return ((t.get("feeType") or "").upper() == "AD_FEE"
+            or "promoted" in (t.get("transactionMemo") or "").lower())
+
+
 def _fees_by_order(transactions: list[dict]) -> dict[str, dict]:
-    """Collapse the finance ledger to per-order money eBay took: {orderId:
-    {"fees": <sum of SALE totalFeeAmount>, "label_cost": <sum of eBay-bought
-    shipping labels>}}. Both are seller costs, subtracted from the net."""
+    """Collapse the finance ledger to per-order money: {orderId: {
+        "fees":       final value fee kept by eBay (SALE totalFeeAmount minus any
+                      fee eBay returned on a refund, plus other order-level charges),
+        "label_cost": eBay-bought labels, incl. return labels and underpaid-postage
+                      surcharges (net of voids),
+        "ad_fees":    Promoted Listings fees charged on this order (net of credits),
+        "refunded":   GROSS money returned to the buyer,
+    }}.
+
+    How eBay books a refund (checked against this account's three returns): a
+    REFUND debit whose `amount` is the refund NET of the fee eBay hands back, with
+    that fee credit in `totalFeeAmount` ($83.75 + $16.23 = the $99.98 the buyer
+    paid). So gross refund = amount + totalFeeAmount, and the fee credit comes off
+    `fees`. The DISPUTE debit and the matching CREDIT that accompany a return are
+    a hold and its release; they cancel and are ignored here. TRANSFER is the
+    owner's own top-up and has no order."""
     by_order: dict[str, dict] = {}
     for t in transactions:
-        order_id = t.get("orderId")
+        order_id = _order_ref(t)
         if not order_id:
             continue
         ttype = t.get("transactionType")
         bucket = by_order.setdefault(
-            order_id, {"fees": 0.0, "label_cost": 0.0, "refunded": 0.0})
+            order_id, {"fees": 0.0, "label_cost": 0.0, "ad_fees": 0.0, "refunded": 0.0})
         if ttype == "SALE":
             bucket["fees"] += _money(t.get("totalFeeAmount"))
         elif ttype == "SHIPPING_LABEL":
-            # A label bought through eBay is a debit against the seller; its amount
-            # is the postage cost we can net out exactly. Labels bought elsewhere
-            # never appear here, so postage is simply 0 for those (handled offline).
-            bucket["label_cost"] += _money(t.get("amount"))
+            # Labels bought elsewhere never appear here, so postage is 0 for those.
+            bucket["label_cost"] += _signed_cost(t)
         elif ttype == "REFUND":
-            # Money going back out. getOrders still returns a refunded order, so
-            # without this the sale stays booked at full value forever — there is
-            # no other path in the tree that reduces it, and no command that can.
-            # eBay also credits the fee back; that arrives as its own
-            # CREDIT/NON_SALE_CHARGE transaction, so only the principal is
-            # tracked here and the fee credit is picked up below.
-            bucket["refunded"] += abs(_money(t.get("amount")))
-        elif ttype in ("CREDIT", "NON_SALE_CHARGE"):
-            # A fee credit reduces what eBay kept. Negative amounts are already
-            # signed as credits by the API, so subtract the magnitude.
+            fee_back = abs(_money(t.get("totalFeeAmount")))
+            bucket["refunded"] += abs(_money(t.get("amount"))) + fee_back
+            bucket["fees"] -= fee_back
+        elif ttype == "NON_SALE_CHARGE":
+            if _is_ad_fee(t):
+                bucket["ad_fees"] += _signed_cost(t)
+            else:
+                bucket["fees"] += _signed_cost(t)
+        elif ttype == "CREDIT":
+            # A dispute-hold release carries no fee; a standalone fee credit does.
             bucket["fees"] -= abs(_money(t.get("totalFeeAmount")))
-    return {oid: v for oid, v in by_order.items()
-            if v["fees"] or v["label_cost"] or v["refunded"]}
+    return {oid: {k: round(v, 2) for k, v in b.items()}
+            for oid, b in by_order.items() if any(b.values())}
 
 
-def sales_by_item(days: int = 90) -> dict[str, dict]:
-    """Map each sold item to its real economics, keyed by BOTH the line item's
-    `sku` (== our item_id) and its `legacyItemId` (== our stored listing_id), so a
-    caller can look up by whichever it holds. Each record:
+def totals_from_sales(sales: list[dict]) -> dict:
+    """Fold per-order sale records (see sales_by_item) into the item-level totals
+    every reader uses. Pure, so /sync can fold a stored history with a fresh
+    window's records and get the same numbers sales_by_item would.
 
-        sale_price          item price actually paid (excl. shipping & tax)
-        shipping_collected  what the buyer paid for shipping
-        ebay_fees           eBay's cut for this line (order fee, apportioned)
-        shipping_label_cost eBay-bought postage for this line (0 if bought elsewhere)
-        net_proceeds        sale_price + shipping_collected − ebay_fees − label_cost
-        units               how many units these sales covered
-        order_ids           every order behind the figures, oldest first
-        order_id, sold_at   the most recent one, for provenance
-        fees_known          False if the finances scope was missing (net == gross)
-
-    Fees and labels are order-level; when an order bundles several of our items
-    they're apportioned by each line's share of the order subtotal (a no-op for
-    the usual single-item order, share == 1).
-
-    The money figures ACCUMULATE across every order for that key. A key is not one
-    sale: a multi-quantity listing sells a unit at a time, and a relist can sell
-    again under the same sku. This used to keep only the last order it happened to
-    see, so every earlier sale of the same item silently vanished — and since a
-    partially-sold listing stays live to sell the rest, that's the normal case for
-    multi-quantity stock, not an edge case."""
-    orders = get_orders(days)
-
-    # Finances is a separate scope; if it isn't granted, don't fail the whole
-    # sync/report — fall back to gross numbers with fees flagged unknown.
-    try:
-        fees_by_order = _fees_by_order(get_transactions(days))
-        fees_known = True
-    except RuntimeError:
-        fees_by_order, fees_known = {}, False
-
-    def merge(existing: dict | None, record: dict) -> dict:
-        """Fold one line item into whatever this key already has. Money adds up;
-        provenance keeps the newest sale but remembers every order id."""
-        if existing is None:
-            return dict(record)
-        for field in ("sale_price", "shipping_collected", "ebay_fees",
-                      "shipping_label_cost", "net_proceeds"):
-            existing[field] = round(existing[field] + record[field], 2)
-        existing["units"] += record["units"]
-        for oid in record["order_ids"]:
-            if oid not in existing["order_ids"]:
-                existing["order_ids"].append(oid)
-        if (record["sold_at"] or "") > (existing["sold_at"] or ""):
-            existing["sold_at"] = record["sold_at"]
-            existing["order_id"] = record["order_id"]
-        existing["fees_known"] = existing["fees_known"] and record["fees_known"]
-        return existing
-
-    out: dict[str, dict] = {}
-    for order in orders:
-        order_id = order.get("orderId")
-
-        # A cancelled order is not a sale. getOrders returns it under a
-        # creationdate-only filter like any other, so counting it books revenue
-        # that never arrived — and nothing downstream ever un-books it.
-        cancel_state = ((order.get("cancelStatus") or {}).get("cancelState") or "").upper()
-        if cancel_state in ("CANCELED", "CANCELLED", "CANCEL_CLOSED"):
-            continue
-
-        summary = order.get("pricingSummary") or {}
-        order_subtotal = _money(summary.get("priceSubtotal"))
-        order_ship = _money(summary.get("deliveryCost"))
-        order_costs = fees_by_order.get(
-            order_id, {"fees": 0.0, "label_cost": 0.0, "refunded": 0.0})
-        sold_at = order.get("creationDate")
-
-        for li in order.get("lineItems") or []:
-            sku = li.get("sku")
-            listing_id = li.get("legacyItemId")
-            # lineItemCost, NOT total: eBay's `total` is the item cost PLUS
-            # shipping ($119.99 + $14.99 = $134.98 on a real order here). Reading
-            # `total` as the sale price and then adding shipping_collected on top
-            # counted the buyer's postage twice — inflating both the recorded sale
-            # price and the net, and (because the share below is measured against a
-            # subtotal that excludes shipping) over-apportioning the fees by the
-            # same ratio.
-            sale_price = _money(li.get("lineItemCost")) or _money(li.get("total"))
-
-            # Apportion order-level eBay costs by this line's share of the order
-            # subtotal. Both sides now exclude shipping, so share == 1 for a
-            # single-line order instead of 1.125.
-            share = (sale_price / order_subtotal) if order_subtotal else 1.0
-            # The line carries its own shipping when eBay breaks it out; fall back
-            # to apportioning the order-level figure.
-            line_ship = _money((li.get("deliveryCost") or {}).get("shippingCost"))
-            shipping = line_ship if line_ship else round(order_ship * share, 2)
-            fees = round(order_costs["fees"] * share, 2)
-            label = round(order_costs["label_cost"] * share, 2)
-            # Money refunded to the buyer comes back off this line's revenue.
-            # A full refund leaves sale_price at 0 rather than at the amount the
-            # buyer briefly paid; the postage and any fee eBay kept stay charged,
-            # which is what a return actually costs.
-            refunded = round(order_costs.get("refunded", 0.0) * share, 2)
-            sale_price = max(round(sale_price - refunded, 2), 0.0)
-            net = round(sale_price + shipping - fees - label, 2)
-
-            try:
-                units = max(int(li.get("quantity") or 1), 1)
-            except (TypeError, ValueError):
-                units = 1
-
-            record = {
-                "order_id": order_id,
-                "order_ids": [order_id] if order_id else [],
-                "sold_at": sold_at,
-                "sale_price": round(sale_price, 2),
-                "shipping_collected": shipping,
-                "ebay_fees": fees,
-                "shipping_label_cost": label,
-                "net_proceeds": net,
-                "units": units,
-                "listing_id": str(listing_id) if listing_id else None,
-                "fees_known": fees_known,
-            }
-            # Keyed twice, but folded separately: the same record object must not
-            # be shared between the sku and listing_id keys, or a later merge
-            # would double-count it through the alias.
-            if sku:
-                out[sku] = merge(out.get(sku), record)
-            if listing_id:
-                key = str(listing_id)
-                out[key] = merge(out.get(key), dict(record, order_ids=list(record["order_ids"])))
+        sale_price          item money KEPT: gross item price minus refunds
+                            (floored at 0 per order)
+        gross_sale_price    item price before refunds
+        shipping_collected  shipping kept (a refund larger than the item price
+                            comes off shipping next)
+        ebay_fees           FVF + other order charges, net of fee credits
+        shipping_label_cost eBay-bought postage
+        ad_fees             Promoted Listings fees attributed to these orders
+        refunded            gross refunds
+        net_proceeds        sum of each order's net (sale + ship - refund - fees
+                            - labels - ads)
+        units               units ordered (refunded ones included: they left the
+                            shelf, and whether they came back is not in eBay data)
+        order_ids           oldest first; order_id / sold_at = the newest,
+                            first_sold_at = the oldest
+        sales               the per-order records, oldest first. Use these, not
+                            sold_at, to put money in the month it was earned."""
+    recs = sorted((dict(r) for r in sales),
+                  key=lambda r: (r.get("sold_at") or "", r.get("order_id") or ""))
+    tot = {k: 0.0 for k in ("sale_price", "gross_sale_price", "shipping_collected", "ebay_fees",
+                            "shipping_label_cost", "ad_fees", "refunded", "net_proceeds")}
+    units = 0
+    for r in recs:
+        refund = r.get("refund") or 0.0
+        tot["sale_price"] += max(r["sale"] - refund, 0.0)
+        tot["gross_sale_price"] += r["sale"]
+        tot["shipping_collected"] += max(r["shipping"] - max(refund - r["sale"], 0.0), 0.0)
+        tot["ebay_fees"] += r["fees"]
+        tot["shipping_label_cost"] += r["label"]
+        tot["ad_fees"] += r.get("ad_fee") or 0.0
+        tot["refunded"] += refund
+        tot["net_proceeds"] += r["net"]
+        units += r.get("units") or 1
+    out = {k: round(v, 2) for k, v in tot.items()}
+    newest = recs[-1] if recs else {}
+    out.update({
+        "units": units,
+        "order_ids": [r["order_id"] for r in recs if r.get("order_id")],
+        "order_id": newest.get("order_id"),
+        "sold_at": newest.get("sold_at"),
+        "first_sold_at": recs[0].get("sold_at") if recs else None,
+        "listing_id": newest.get("listing_id"),
+        "fees_known": all(r.get("fees_known", True) for r in recs),
+        "sales": recs,
+    })
     return out
 
 
+def _order_records(order: dict, ledger: dict, fees_known: bool) -> list[tuple[str | None, dict]]:
+    """[(sku, per-order record)] for each line item of one getOrders order."""
+    order_id = order.get("orderId")
+    summary = order.get("pricingSummary") or {}
+    order_subtotal = _money(summary.get("priceSubtotal"))
+    # deliveryDiscount is a negative amount (a combined-shipping discount, -$7 on
+    # two orders here); what the buyer actually paid for shipping is cost + it.
+    order_ship = _money(summary.get("deliveryCost")) - abs(_money(summary.get("deliveryDiscount")))
+    costs = ledger.get(order_id) or {}
+    lines = order.get("lineItems") or []
+    out = []
+    for li in lines:
+        # lineItemCost, NOT total: `total` is item cost PLUS shipping, which used
+        # to count the buyer's postage twice.
+        sale = _money(li.get("lineItemCost")) or _money(li.get("total"))
+        share = (sale / order_subtotal) if (order_subtotal and len(lines) > 1) else 1.0
+        shipping = round(max(order_ship, 0.0) * share, 2)
+        fees = round(costs.get("fees", 0.0) * share, 2)
+        label = round(costs.get("label_cost", 0.0) * share, 2)
+        ad_fee = round(costs.get("ad_fees", 0.0) * share, 2)
+        refund = round(costs.get("refunded", 0.0) * share, 2)
+        try:
+            units = max(int(li.get("quantity") or 1), 1)
+        except (TypeError, ValueError):
+            units = 1
+        listing_id = li.get("legacyItemId")
+        out.append((li.get("sku"), {
+            "order_id": order_id,
+            "sold_at": order.get("creationDate"),
+            "units": units,
+            "sale": round(sale, 2),
+            "shipping": shipping,
+            "fees": fees,
+            "label": label,
+            "ad_fee": ad_fee,
+            "refund": refund,
+            "net": round(sale + shipping - refund - fees - label - ad_fee, 2),
+            "listing_id": str(listing_id) if listing_id else None,
+            "fees_known": fees_known,
+        }))
+    return out
+
+
+def sales_by_item(days: int = 90, *, orders: list[dict] | None = None,
+                  transactions: list[dict] | None = None) -> dict[str, dict]:
+    """Map each sold item to its real economics, keyed by BOTH the line item's
+    `sku` (== our item_id) and its `legacyItemId` (== our stored listing_id).
+    Each value is totals_from_sales() over that key's orders: the item totals
+    plus `sales`, one record per order:
+
+        {order_id, sold_at, units, sale, shipping, fees, label, ad_fee, refund,
+         net, listing_id, fees_known}
+
+    A key is not one sale: a multi-quantity listing sells a unit at a time and a
+    relist sells again under the same sku, so money accumulates across orders.
+    Order-level costs are split across line items by subtotal share (a no-op for
+    the usual single-line order).
+
+    `orders` / `transactions` may be passed in (already fetched) instead of
+    calling eBay. Degrades if the finances scope is missing: gross figures,
+    fees_known False."""
+    if orders is None:
+        orders = get_orders(days)
+    try:
+        ledger = _fees_by_order(transactions if transactions is not None
+                                else get_transactions(days))
+        fees_known = True
+    except RuntimeError:
+        ledger, fees_known = {}, False
+
+    by_key: dict[str, list[dict]] = {}
+    for order in orders:
+        # A cancelled order is not a sale.
+        cancel_state = ((order.get("cancelStatus") or {}).get("cancelState") or "").upper()
+        if cancel_state in ("CANCELED", "CANCELLED", "CANCEL_CLOSED"):
+            continue
+        for sku, rec in _order_records(order, ledger, fees_known):
+            # Separate copies per alias, so nothing is shared between the keys.
+            if sku:
+                by_key.setdefault(sku, []).append(dict(rec))
+            if rec["listing_id"]:
+                by_key.setdefault(rec["listing_id"], []).append(dict(rec))
+    return {key: totals_from_sales(recs) for key, recs in by_key.items()}
+
+
 def account_charges(days: int = 90) -> dict:
-    """Charges eBay bills to the account rather than to an order.
+    """Charges eBay billed as NON_SALE_CHARGE (Promoted Listings, mostly).
 
-    Promoted Listings is the big one, and it is invisible to per-item accounting:
-    eBay posts it as periodic NON_SALE_CHARGE transactions with NO orderId, so
-    there is nothing to attribute a share of to any line item. Over a recent
-    120-day window that was $53.17 across 14 charges — real money that the
-    per-order maths (_fees_by_order, which only reads SALE and SHIPPING_LABEL)
-    counts nowhere.
+    Each Promoted Listings fee DOES name its order (references[ORDER_ID]), and
+    sales_by_item books those per order as `ad_fees`. This total is kept for the
+    report's reconciliation: `attributed` is the part tied to an order,
+    `unattributed` the rest (true account-level charges). Credits net off.
 
-    Returns {"total": float, "count": int, "by_memo": {memo: {"total", "count"}}}
-    so a report can reconcile the assumed ad rate against what was actually
-    billed. Raises like the other calls if the finances scope is missing."""
-    out = {"total": 0.0, "count": 0, "by_memo": {}}
+    Returns {"total", "count", "attributed", "unattributed",
+             "by_memo": {memo: {"total", "count"}}}. Raises like the other calls
+    if the finances scope is missing."""
+    out = {"total": 0.0, "count": 0, "attributed": 0.0, "unattributed": 0.0, "by_memo": {}}
     for txn in get_transactions(days):
         if txn.get("transactionType") != "NON_SALE_CHARGE":
             continue
-        amount = _money(txn.get("amount"))
+        amount = _signed_cost(txn)
         memo = (txn.get("transactionMemo") or "other charge").strip()
         out["total"] += amount
         out["count"] += 1
+        out["attributed" if _order_ref(txn) else "unattributed"] += amount
         bucket = out["by_memo"].setdefault(memo, {"total": 0.0, "count": 0})
         bucket["total"] += amount
         bucket["count"] += 1
-    out["total"] = round(out["total"], 2)
+    for k in ("total", "attributed", "unattributed"):
+        out[k] = round(out[k], 2)
     for bucket in out["by_memo"].values():
         bucket["total"] = round(bucket["total"], 2)
     return out
@@ -332,3 +376,40 @@ def finances_status() -> str:
     if r.status_code >= 400:
         raise RuntimeError(f"eBay error [{r.status_code}]: {r.text[:200]}")
     return "OK"
+
+
+# The item-row keys a recorded sale owns, as /sync writes them into items.ebay.
+# `units` is stored as `units_sold`; everything else keeps its name.
+SALE_DB_FIELDS = ("sale_price", "gross_sale_price", "shipping_collected", "ebay_fees",
+                  "shipping_label_cost", "ad_fees", "refunded", "net_proceeds",
+                  "units_sold", "order_id", "order_ids", "sold_at", "first_sold_at",
+                  "fees_known", "sales")
+# The money-bearing subset, for "did the figures change" comparisons.
+SALE_MONEY_FIELDS = ("sale_price", "shipping_collected", "ebay_fees", "shipping_label_cost",
+                     "ad_fees", "refunded", "net_proceeds", "units_sold")
+
+
+def sale_db_fields(totals: dict) -> dict:
+    """totals_from_sales() output as the items.ebay keys to write. Keys the totals
+    don't carry are left out rather than written as None, and `sales` is only
+    written when there are per-order records: an empty list would claim the
+    row's history is known to be empty."""
+    out = {k: totals[k] for k in SALE_DB_FIELDS
+           if k not in ("units_sold", "sales") and totals.get(k) is not None}
+    out["units_sold"] = totals.get("units") or 1
+    out["order_ids"] = list(totals.get("order_ids") or [])
+    if totals.get("sales") is not None:
+        out["sales"] = [dict(r) for r in totals["sales"]]
+    return out
+
+
+def fold_sales(stored: list[dict] | None, incoming: list[dict]) -> list[dict]:
+    """Stored per-order records with a fresh window's records laid over them, by
+    order id. The window wins for any order it can see (a refund or a late ad fee
+    changes that order's figures); orders that have aged out of the window keep
+    their stored record instead of being erased."""
+    merged = {r["order_id"]: dict(r) for r in stored or [] if r.get("order_id")}
+    for r in incoming:
+        if r.get("order_id"):
+            merged[r["order_id"]] = dict(r)
+    return list(merged.values())

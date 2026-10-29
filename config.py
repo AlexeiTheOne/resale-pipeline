@@ -180,34 +180,52 @@ OFFER_MESSAGE = os.getenv(
     "OFFER_MESSAGE",
     "Thanks for watching! Here's a discount to save you a few dollars. "
     "Ships within 1 business day.")
+# The weekly digest's watcher-offer plan (pipeline/reprice.plan_watcher_offers,
+# sent only when the owner taps its button). A percentage rather than /offers'
+# $5/$10, per the 29 Oct review: listings with 3+ watchers sold ~50% of the time
+# and 4 recent sales came from watcher offers, while public cuts sold nothing.
+# The offer is never under the listing's Best Offer auto-decline floor
+# (ebay.inventory.auto_decline_price) or the repricer's cost floor. Uses
+# OFFER_MIN_WATCHERS and OFFER_MIN_DAYS_LIVE above.
+WATCHER_OFFER_PCT = float(os.getenv("WATCHER_OFFER_PCT", "10"))
+# Don't re-offer a listing within this many days of the last offer sent on it
+# (db.offer_sends). eBay's own eligibility already blocks one still outstanding.
+WATCHER_OFFER_COOLDOWN_DAYS = int(os.getenv("WATCHER_OFFER_COOLDOWN_DAYS", "7"))
+# A digest's "Send offers" button stops working after this many days: its
+# prices were worked out against that week's list prices.
+WATCHER_OFFER_PLAN_MAX_AGE_DAYS = int(os.getenv("WATCHER_OFFER_PLAN_MAX_AGE_DAYS", "7"))
 
 # --- Weekly repricing (pipeline/reprice.py) ---
 # A listing needs at least this many weeks of eBay search exposure before its
 # traffic numbers are trusted for a diagnosis; a brand-new listing just hasn't
 # had a chance to be seen yet.
 REPRICE_MIN_WEEKS_LIVE = int(os.getenv("REPRICE_MIN_WEEKS_LIVE", "1"))
-# Below this many impressions in the trailing week, the listing isn't being
-# surfaced in eBay search at all — a visibility problem, not a price problem.
+# Below this many TOTAL impressions (promoted + organic, eBay's
+# TOTAL_IMPRESSION_TOTAL) in the trailing week, the listing isn't being shown —
+# a visibility problem, not a price problem.
 #
-# Kept at 50 against 194 measured weekly snapshots of this account: impressions
-# run a median of 185/week (p25 87, p90 627), so 50 fails only the bottom ~12%,
-# which is the intended rate. (docs/ebay-playbook.md proposes lowering this to
-# 23 on an assumed ~600 impressions/month; this account measures roughly 800, so
-# that recommendation doesn't apply here. Re-derive before changing it.)
-REPRICE_MIN_IMPRESSIONS = int(os.getenv("REPRICE_MIN_IMPRESSIONS", "50"))
-# Below this click-through rate, buyers see it in search results but aren't
-# clicking — points at the thumbnail/title/price, not comps.
+# Re-derived 2026-10-29 from a live 7-day traffic_report over 115 live listings:
+# total impressions run p10 144 / p25 257 / median 566 / p90 3,169 a week. 150
+# fails the bottom ~10% (11 listings), the rate this rule was always meant to
+# fire at. It was 50 against LISTING_IMPRESSION_TOTAL, which is organic search
+# only (~7-9% of the total on this all-promoted account; median 56/week), so it
+# had drifted to flagging 53 of 115 listings as INVISIBLE while they were
+# actually being shown ~500 times a week.
+REPRICE_MIN_IMPRESSIONS = int(os.getenv("REPRICE_MIN_IMPRESSIONS", "150"))
+# Below this click-through rate (views from every source / total impressions,
+# same population on both sides), buyers are shown it and aren't clicking —
+# points at the thumbnail/title/price, not comps.
 #
-# 0.0075 = half this account's own measured median CTR of 1.49% (179 snapshots,
-# p25 0.53% / p75 2.75%). An absolute benchmark borrowed from an SEO blog is the
-# wrong shape when the spread is that wide; half your own median is a listing
-# genuinely underperforming ITS catalogue.
-#
-# Was 0.01, and reprice.py compared it against eBay's own CLICK_THROUGH_RATE
-# field, which does NOT equal the views/impressions returned beside it — LOW_CTR
-# fired on listings measuring 3.4%, 3.6% and 4.6%. reprice.py now computes the
-# ratio itself from the two integers, so this threshold means what it says.
-REPRICE_MIN_CTR = float(os.getenv("REPRICE_MIN_CTR", "0.0075"))
+# 0.0014 = half this account's measured median all-source CTR of 0.28% (same
+# 2026-10-29 sample; p25 0.12%). The old 0.0075 was half the median of
+# views / ORGANIC impressions — a ratio with all-source views over a search-only
+# denominator, which is meaningless now the denominator is the total.
+REPRICE_MIN_CTR = float(os.getenv("REPRICE_MIN_CTR", "0.0014"))
+# ...and LOW_CTR is only judged once a week's impressions are big enough for a
+# low view count to mean anything. Weekly views run a median of 2, so at a few
+# hundred impressions 0 views is chance, not a verdict; at 1,000 the median CTR
+# predicts ~3 views. With both gates, 8 of 101 listings fired on the sample.
+REPRICE_MIN_IMPRESSIONS_FOR_CTR = int(os.getenv("REPRICE_MIN_IMPRESSIONS_FOR_CTR", "1000"))
 # Minimum CUMULATIVE views before "zero watchers" is trusted as evidence the
 # price itself is the problem, rather than just low traffic.
 #
@@ -283,6 +301,16 @@ ASSUMED_COST_RATIO = float(os.getenv("ASSUMED_COST_RATIO", "0.29"))
 # Smallest NET margin (after eBay fees, ad rate, and shipping) a repricing
 # suggestion may land on — never suggest a cut that sells at a loss.
 REPRICE_MIN_MARGIN_DOLLARS = float(os.getenv("REPRICE_MIN_MARGIN_DOLLARS", "5"))
+# Largest single public cut a suggestion may make, as a fraction of the current
+# price. The owner prefers gentle cuts plus monitoring (and offers to watchers
+# over deep cuts): the 19-26 Oct cuts of 20-33% sold nothing, and the one earlier
+# deep cut that sold (Vera Bradley 79.99 -> 39.99) later re-sold at $54.99.
+REPRICE_MAX_CUT_PCT = float(os.getenv("REPRICE_MAX_CUT_PCT", "0.12"))
+# Most re-pricing calls (pipeline.pricing_v2: Claude + Apify comps) one weekly
+# run may make. Only listings that already cleared every cheap gate for a cut
+# reach a call, so this is a ceiling on a bad week, not the usual count. Apify's
+# free credits are the tight budget here, not Claude.
+REPRICE_PRICING_MAX_CALLS = int(os.getenv("REPRICE_PRICING_MAX_CALLS", "15"))
 # When the automatic weekly digest runs, in UTC. Default: Monday 14:00 UTC
 # (~9-10am US Eastern/Central).
 # v2 pricing: a price backed by fewer matching SOLD comps than this stops at the
@@ -377,7 +405,7 @@ GEMINI_PRICES = [
 # from cache on 33 items: 18/32 outcome hits and a median 1.00x the sold price,
 # against v1's 11/32 and 0.74x. "v1" is the old comps ladder in
 # pipeline/price.py; PRICING_ENGINE=v1 in .env goes back. The weekly repricer
-# always uses v1.
+# follows this setting too (since 29 Oct 2026; it used to always use v1).
 PRICING_ENGINE = os.getenv("PRICING_ENGINE", "v2").strip().lower()
 PRICING_JUDGE_MODEL = os.getenv("PRICING_JUDGE_MODEL", "claude-sonnet-5-5")
 # Low, not medium: the judge's job is sorting 30-60 titles+thumbnails into four

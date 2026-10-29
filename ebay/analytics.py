@@ -10,11 +10,9 @@ APIs at all:
     count on. Uses the same OAuth user token, passed as the legacy IAF header
     instead of a Bearer header.
 
-NOTE: this hasn't been exercised against a live eBay account yet — the field
-names below (metricKey values, WatchCount's XML path) are per eBay's published
-schema, not confirmed against a real response the way pipeline/price.py's Apify
-mapping was. Run /health and /pricecheck after deploying and check the raw
-response if a listing's numbers look wrong or missing.
+The traffic metric keys below were confirmed against a live (GET-only)
+traffic_report response on 2026-10-29. WatchCount's XML path is per eBay's
+published schema.
 """
 import sys
 from pathlib import Path
@@ -42,10 +40,40 @@ def _headers() -> dict:
     }
 
 
+# What is fetched, and why TOTAL_IMPRESSION_TOTAL is the headline number.
+#
+# This used to ask only for LISTING_IMPRESSION_TOTAL, and stored it as "the"
+# impressions. That metric is SEARCH-RESULTS + STORE impressions only (on this
+# account it equals LISTING_IMPRESSION_SEARCH_RESULTS_PAGE exactly; the store
+# contributes 0). Every listing is promoted, and promoted / recommendation
+# placements are most of the exposure: a live GET on 2026-10-29 over the
+# trailing 7 days, 115 live listings, returned 145,104 TOTAL_IMPRESSION_TOTAL
+# against 10,218 LISTING_IMPRESSION_TOTAL — organic was 7% of the total (8.9%
+# over 90 days). Median per listing: 566 total vs 56 organic. Read as total,
+# the old "organic < 50/week" INVISIBLE rule was flagging 53 of 115 listings
+# that were in fact being shown ~500 times a week.
+#
+# The response orders header.metrics in eBay's own order, NOT the order asked
+# for, so values are always looked up by key (see _num).
+TRAFFIC_METRICS = (
+    "TOTAL_IMPRESSION_TOTAL",                     # every placement, promoted included
+    "LISTING_IMPRESSION_TOTAL",                   # organic: search results + store
+    "LISTING_VIEWS_TOTAL",                        # views from every source
+    "LISTING_VIEWS_SOURCE_SEARCH_RESULTS_PAGE",   # views that came from search
+    "CLICK_THROUGH_RATE",
+)
+
+
 def get_traffic_report(listing_ids: list[str], days: int = 7) -> dict[str, dict]:
-    """Impressions/views/CTR per listing over the trailing `days`. Returns
-    {listing_id: {"impressions": int, "views": int, "ctr": float}}; a listing
-    eBay has no traffic to report for is simply omitted from the result."""
+    """Impressions/views per listing over the trailing `days`. Returns
+    {listing_id: {"impressions": int (TOTAL, promoted included),
+    "organic_impressions": int (search + store), "views": int (all sources),
+    "search_views": int, "ctr": float (eBay's own field, not used for verdicts)}}.
+    A listing eBay has no traffic to report for is simply omitted.
+
+    Raises if the response has records but no TOTAL_IMPRESSION_TOTAL column: a
+    silent 0 there would read as "nobody sees it" (INVISIBLE), so the caller's
+    failed-batch path (NO_TRAFFIC_DATA) is the right outcome instead."""
     if not listing_ids:
         return {}
 
@@ -61,7 +89,7 @@ def get_traffic_report(listing_ids: list[str], days: int = 7) -> dict[str, dict]
     params = {
         "dimension": "LISTING",
         "filter": filter_str,
-        "metric": "LISTING_IMPRESSION_TOTAL,LISTING_VIEWS_TOTAL,CLICK_THROUGH_RATE",
+        "metric": ",".join(TRAFFIC_METRICS),
     }
     # eBay rate-limits this endpoint, and a weekly run makes one call per listing —
     # at ~110 listings the tail of the run reliably 429s (4 items lost their whole
@@ -96,16 +124,23 @@ def get_traffic_report(listing_ids: list[str], days: int = 7) -> dict[str, dict]
         cell = metric_values[metric_keys.index(key)]
         return cell.get("value") or 0
 
+    records = body.get("records") or []
+    if records and "TOTAL_IMPRESSION_TOTAL" not in metric_keys:
+        raise RuntimeError("eBay traffic_report came back without TOTAL_IMPRESSION_TOTAL "
+                           f"(metrics: {metric_keys})")
+
     out = {}
-    for record in body.get("records", []):
+    for record in records:
         dims = record.get("dimensionValues") or []
         listing_id = dims[0].get("value") if dims else None
         if not listing_id:
             continue
         values = record.get("metricValues") or []
         out[listing_id] = {
-            "impressions": int(float(_num(values, "LISTING_IMPRESSION_TOTAL"))),
+            "impressions": int(float(_num(values, "TOTAL_IMPRESSION_TOTAL"))),
+            "organic_impressions": int(float(_num(values, "LISTING_IMPRESSION_TOTAL"))),
             "views": int(float(_num(values, "LISTING_VIEWS_TOTAL"))),
+            "search_views": int(float(_num(values, "LISTING_VIEWS_SOURCE_SEARCH_RESULTS_PAGE"))),
             "ctr": float(_num(values, "CLICK_THROUGH_RATE")),
         }
     return out
@@ -160,7 +195,7 @@ def traffic_status() -> str:
         "filter": (f"marketplace_ids:{{{EBAY_MARKETPLACE_ID}}},"
                    f"listing_ids:{{000000000000}},"
                    f"date_range:[{yesterday.strftime('%Y%m%d')}..{today.strftime('%Y%m%d')}]"),
-        "metric": "LISTING_IMPRESSION_TOTAL",
+        "metric": "TOTAL_IMPRESSION_TOTAL",
     }
     r = httpx.get(f"{EBAY_API_BASE}/sell/analytics/v1/traffic_report",
                    headers=_headers(), params=params, timeout=30)

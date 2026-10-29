@@ -153,6 +153,48 @@ def _expand_partially_sold(items: list[dict]) -> list[dict]:
     return out
 
 
+def _scoreboard_sheet(wb, bold, header_fill) -> None:
+    """A "What to buy" sheet: pipeline/scoreboard.py's per-category and
+    per-brand numbers and verdicts, for planning the next Ross trip."""
+    from pipeline import scoreboard
+
+    board = scoreboard.build(list_items())
+    ws = wb.create_sheet("What to buy")
+    ws["A1"] = "What to buy — scoreboard"
+    ws["A1"].font = Font(bold=True, size=14)
+    r = 3
+    for line in scoreboard.summary_lines(board):
+        ws.cell(row=r, column=1, value=line)
+        r += 1
+    headers = ["Group", "Verdict", "Why", "Live listings", "Live units", "Units bought",
+               "Units sold", "Sell-through", "Sales / 100 listing-days", "Median days to sell",
+               "Ross cost tied up", "Profit to date"]
+    for title, groups in (("By category", board["categories"]), ("By brand", board["brands"])):
+        r += 1
+        ws.cell(row=r, column=1, value=title).font = bold
+        r += 1
+        for col, h in enumerate(headers, start=1):
+            c = ws.cell(row=r, column=col, value=h)
+            c.font = bold
+            c.fill = header_fill
+        for g in groups:
+            r += 1
+            values = [g["name"], g["verdict"], g["why"], g["live"], g["live_units"], g["bought"],
+                      g["sold"], g["sell_through"], g["per100"], g["median_days"], g["tied_up"],
+                      g["profit"] if g["profit_items"] else None]
+            for col, v in enumerate(values, start=1):
+                c = ws.cell(row=r, column=col, value=round(v, 2) if isinstance(v, float) else v)
+                if col == 8:
+                    c.number_format = "0%"
+                elif col in (11, 12):
+                    c.number_format = MONEY
+        r += 1
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["C"].width = 22
+    for col in "DEFGHIJKL":
+        ws.column_dimensions[col].width = 12
+
+
 def build_report(path: str, ad_days: int = 90) -> str:
     """`ad_days` is the look-back for the account-level charge reconciliation
     printed under the table (Promoted Listings, which eBay bills without an
@@ -399,6 +441,12 @@ def build_report(path: str, ad_days: int = 90) -> str:
                   "from the list price (see the assumption above) — type the real amount to replace it.  ·  "
                   "'Net / unit' is the profit ONE unit makes; the money columns are line totals (per-unit x qty).")
     ws.cell(row=note_row, column=2).font = Font(italic=True, color="808080")
+
+    try:
+        _scoreboard_sheet(wb, bold, header_fill)
+    except Exception as e:
+        # Advisory extra; the profit sheet is the report.
+        print(f"WARNING: scoreboard sheet skipped: {type(e).__name__}: {e}")
 
     wb.save(path)
     return path

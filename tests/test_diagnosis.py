@@ -226,10 +226,12 @@ def test_run_reports_how_much_data_arrived():
         db.create_tables()
         with _Patch(rp, list_items=lambda s: items if s == "published" else [],
                     get_traffic_report=_flaky_report({"224"}),
-                    get_watch_count=watch):
+                    get_watch_count=watch, eligible_listing_ids=lambda: set()):
             results, health = rp.run_weekly_check()
-    assert health == {"traffic_batches": 2, "traffic_failed": 1,
-                      "watch_lookups": 25, "watch_failed": 1}
+    assert {k: health[k] for k in ("traffic_batches", "traffic_failed",
+                                   "watch_lookups", "watch_failed")} == {
+        "traffic_batches": 2, "traffic_failed": 1, "watch_lookups": 25, "watch_failed": 1}
+    assert health["offers"]["rows"] == [] and health["pricing_calls"] == 0
     verdicts = [r["verdict"] for r in results]
     assert verdicts.count("NO_TRAFFIC_DATA") == 5        # the failed batch of 5
     assert "INVISIBLE" in verdicts                       # 200/210: genuine zeros

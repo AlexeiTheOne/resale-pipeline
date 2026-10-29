@@ -30,6 +30,12 @@ _MIGRATIONS = {
     "listing_check": "TEXT",
 }
 
+# listing_stats columns added after it shipped (same pattern as _MIGRATIONS).
+_LISTING_STATS_MIGRATIONS = {
+    "total_impressions": "INTEGER",   # TOTAL_IMPRESSION_TOTAL, promoted included
+    "search_views": "INTEGER",        # LISTING_VIEWS_SOURCE_SEARCH_RESULTS_PAGE
+}
+
 
 def _conn():
     Path("data").mkdir(exist_ok=True)
@@ -96,6 +102,41 @@ def create_tables() -> None:
                 suggested_price REAL,
                 created_at      TEXT NOT NULL,
                 PRIMARY KEY (item_id, week)
+            )
+        """)
+        # Added 2026-10-29. `impressions` keeps its historical meaning — eBay's
+        # LISTING_IMPRESSION_TOTAL, organic search + store only — so older rows
+        # stay comparable. total_impressions is TOTAL_IMPRESSION_TOTAL (promoted
+        # placements included, ~11-14x organic on this account) and is what the
+        # verdicts are judged on now; NULL on rows written before it existed.
+        stats_cols = {row[1] for row in con.execute("PRAGMA table_info(listing_stats)")}
+        for column, coltype in _LISTING_STATS_MIGRATIONS.items():
+            if column not in stats_cols:
+                con.execute(f"ALTER TABLE listing_stats ADD COLUMN {column} {coltype}")
+
+        # Offers to watchers that were actually sent (the weekly digest's
+        # button and /offers apply), so a listing isn't re-offered every week.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS offer_sends (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id      TEXT,
+                listing_id   TEXT NOT NULL,
+                list_price   REAL,
+                offer_price  REAL NOT NULL,
+                source       TEXT,
+                sent_at      TEXT NOT NULL
+            )
+        """)
+        # A weekly digest's watcher-offer plan, kept until its one button is
+        # tapped: Telegram's 64-byte callback can't carry a dozen prices, and
+        # the stored rows are the record of what the tap authorised. used_at is
+        # set once, so a second tap (or a second chat) can't send twice.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS offer_plans (
+                plan_id      TEXT PRIMARY KEY,
+                rows         TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                used_at      TEXT
             )
         """)
 
@@ -214,20 +255,70 @@ def delete_item(item_id: str) -> None:
 
 
 def record_listing_stats(item_id: str, week: str, *, impressions=None, views=None,
-                          watchers=None, price=None, verdict=None, suggested_price=None) -> None:
+                          watchers=None, price=None, verdict=None, suggested_price=None,
+                          total_impressions=None, search_views=None) -> None:
     """Upsert this week's traffic/watch snapshot for an item (see listing_stats
     in create_tables). Re-running the weekly check the same week overwrites the
-    existing row instead of adding a duplicate."""
+    existing row instead of adding a duplicate.
+
+    `impressions` is ORGANIC (search + store), its historical meaning;
+    `total_impressions` includes promoted placements."""
     with _conn() as con:
         con.execute(
             "INSERT INTO listing_stats (item_id, week, impressions, views, watchers, "
-            "price, verdict, suggested_price, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "price, verdict, suggested_price, created_at, total_impressions, search_views) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(item_id, week) DO UPDATE SET "
             "impressions=excluded.impressions, views=excluded.views, watchers=excluded.watchers, "
             "price=excluded.price, verdict=excluded.verdict, "
-            "suggested_price=excluded.suggested_price, created_at=excluded.created_at",
-            (item_id, week, impressions, views, watchers, price, verdict, suggested_price, _now()),
+            "suggested_price=excluded.suggested_price, created_at=excluded.created_at, "
+            "total_impressions=excluded.total_impressions, search_views=excluded.search_views",
+            (item_id, week, impressions, views, watchers, price, verdict, suggested_price, _now(),
+             total_impressions, search_views),
         )
+
+
+def record_offer_sent(listing_id: str, offer_price: float, *, item_id: str | None = None,
+                      list_price: float | None = None, source: str | None = None) -> None:
+    """Note that an offer to watchers went out (see offer_sends)."""
+    with _conn() as con:
+        con.execute(
+            "INSERT INTO offer_sends (item_id, listing_id, list_price, offer_price, source, "
+            "sent_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (item_id, str(listing_id), list_price, offer_price, source, _now()))
+
+
+def offers_sent_since(since_iso: str) -> set[str]:
+    """Listing ids that had an offer to watchers sent at or after `since_iso`."""
+    with _conn() as con:
+        return {row[0] for row in con.execute(
+            "SELECT DISTINCT listing_id FROM offer_sends WHERE sent_at >= ?", (since_iso,))}
+
+
+def save_offer_plan(rows: list[dict]) -> str:
+    plan_id = str(uuid.uuid4())
+    with _conn() as con:
+        con.execute("INSERT INTO offer_plans (plan_id, rows, created_at) VALUES (?, ?, ?)",
+                    (plan_id, json.dumps(rows), _now()))
+    return plan_id
+
+
+def get_offer_plan(plan_id: str) -> dict | None:
+    with _conn() as con:
+        row = con.execute("SELECT rows, created_at, used_at FROM offer_plans WHERE plan_id = ?",
+                          (plan_id,)).fetchone()
+    if row is None:
+        return None
+    return {"plan_id": plan_id, "rows": json.loads(row[0]), "created_at": row[1],
+            "used_at": row[2]}
+
+
+def claim_offer_plan(plan_id: str) -> bool:
+    """Mark a plan used. True only for the one caller that got there first."""
+    with _conn() as con:
+        cur = con.execute("UPDATE offer_plans SET used_at = ? WHERE plan_id = ? "
+                          "AND used_at IS NULL", (_now(), plan_id))
+        return cur.rowcount == 1
 
 
 def stats_history(item_id: str, limit: int = 8) -> list[dict]:

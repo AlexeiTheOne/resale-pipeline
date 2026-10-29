@@ -15,9 +15,9 @@ cost floor, which now calls in here rather than keeping a second copy.
 Everything is a projection built on measured averages (see the rate comments in
 config.py) EXCEPT a sold item that /sync has pulled real figures for: there the
 shipping collected, the eBay fees and the postage actually paid are used, and
-`actual` comes back True. Ad spend is always the assumption — eBay bills
-Promoted Listings as account-level charges with no order id, so no single item
-can ever be told what its share was.
+`actual` comes back True. The ad fee is real too when /sync recorded one
+(`ad_fees`); otherwise it is the assumed rate. Refunds are already netted out of
+the stored sale_price and shipping_collected.
 """
 from config import (
     ASSUMED_COST_RATIO, EBAY_AD_FEE_PCT, EBAY_FIXED_FEE, EBAY_FVF_PCT,
@@ -177,7 +177,13 @@ def project(item: dict, price: float | None = None, qty: int | None = None) -> d
         # FVF applies to item + shipping charged; the fixed fee is per unit sold.
         ebay_fee = EBAY_FVF_PCT * (revenue + ship_charged) + EBAY_FIXED_FEE * qty
         ship_cost = EBAY_SHIP_COST * qty
-    ad_fee = EBAY_AD_FEE_PCT * revenue
+    # The Promoted Listings fee eBay actually charged on the order(s), when /sync
+    # recorded one (ebay/orders.py attributes each ad fee to its order). Rows
+    # recorded before that existed have no `ad_fees` and stay on the assumption.
+    if actual and ebay.get("ad_fees") is not None:
+        ad_fee = round(float(ebay["ad_fees"]), 2)
+    else:
+        ad_fee = EBAY_AD_FEE_PCT * revenue
 
     cost_per_unit, cost_estimated = unit_cost(item)
     # unit_cost returns None when there is neither a receipt nor a list price to

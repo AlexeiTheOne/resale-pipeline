@@ -33,12 +33,14 @@ from config import (
     OFFER_MIN_WATCHERS, OFFER_MIN_NET, OFFER_MIN_DAYS_LIVE,
     OFFER_DISCOUNT_SMALL, OFFER_DISCOUNT_LARGE,
     OFFER_LARGE_THRESHOLD, OFFER_MESSAGE, PRICING_ENGINE, LISTING_CHECK_ENABLED,
+    WATCHER_OFFER_PCT,
 )
 from db import (
     clear_feedback_failure, create_item, delete_item, get_item, job_run_status,
     known_feedback_failures, last_job_run, latest_stats, list_items,
     mark_not_duplicate, not_duplicate_pairs,
     record_feedback_failure, record_job_run, update_field, update_status, VALID_STATUSES,
+    record_offer_sent,
 )
 from identify import identify_item
 import llm_usage
@@ -47,11 +49,14 @@ from pipeline.price import get_pricing
 from pipeline.draft import generate_draft, revise_draft, revise_identification
 from pipeline.gtin import product_gtin
 from pipeline.listing_check import check_and_store as check_listing_and_store, format_check
-from pipeline.reprice import run_weekly_check
+from pipeline.reprice import run_weekly_check, send_planned_offers
 from profit import breakeven_price, format_projection, project
 from ebay.auth import get_access_token
 from ebay.analytics import get_watch_count, traffic_status
-from ebay.orders import finances_status, orders_status, sales_by_item
+from ebay.orders import (
+    SALE_MONEY_FIELDS, finances_status, fold_sales, orders_status, sale_db_fields,
+    sales_by_item, totals_from_sales,
+)
 from ebay.feedback import leave_all_pending
 from ebay.listings import audit_listing_photos, get_active_listings, listings_status
 from ebay.inventory import (
@@ -1645,9 +1650,22 @@ def _stage_identify(item_id, paths, notify=lambda _t: None) -> dict:
           ident.get("product_name") or ident.get("item_type"))
     update_field(item_id, "identification", ident)
     update_status(item_id, "identified")
-    for line in _duplicate_warnings(item_id):
+    for line in _duplicate_warnings(item_id) + _brand_warnings(item_id):
         notify(line)
     return ident
+
+
+def _brand_warnings(item_id: str) -> list[str]:
+    """At most one line: this brand is already backed up (more than 8 live) or
+    scores pause/stop on the scoreboard. Ed Hardy kept getting bought in
+    October with 40 listings already sitting. Advisory only; never raises."""
+    try:
+        from pipeline.scoreboard import saturation_warning
+        line = saturation_warning(get_item(item_id) or {})
+    except Exception as e:
+        print(f"WARNING: brand scoreboard check failed: {type(e).__name__}: {e}")
+        return []
+    return [line] if line else []
 
 
 def _same_item_keys(item: dict) -> set[tuple[str, str]]:
@@ -2505,7 +2523,8 @@ async def sold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # modelled rates until the next /sync supplies real ones.
         for derived in ("net_proceeds", "ebay_fees", "shipping_collected",
                         "shipping_label_cost", "units_sold", "order_id",
-                        "order_ids", "fees_known"):
+                        "order_ids", "fees_known", "ad_fees", "refunded",
+                        "gross_sale_price", "first_sold_at", "sales"):
             ebay.pop(derived, None)
         update_field(item_id, "ebay", ebay)
     update_status(item_id, "sold")
@@ -2605,6 +2624,13 @@ async def profit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _send_chunked(update.message, lines)
 
 
+def _differs(a, b) -> bool:
+    """Whether two stored sale values differ, to the cent for numbers."""
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(a - b) > 0.005
+    return a != b
+
+
 def _sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
     """Pull one item's live eBay state (price, quantity, listing status) and write
     any changes into the local DB. Runs in a worker thread (blocking eBay call).
@@ -2673,25 +2699,28 @@ def _sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
             sale = sold_map.get(str(ebay["listing_id"]))
 
     new_orders = []
+    known: set = set()
     if sale is not None:
         known = set(ebay.get("order_ids") or [])
         if not known and ebay.get("order_id"):
             known = {ebay["order_id"]}   # recorded before order_ids existed
         new_orders = [oid for oid in (sale.get("order_ids") or []) if oid not in known]
 
-    # `sales_by_item(days)` only aggregates orders INSIDE the look-back window,
-    # and the block below replaces the stored figures wholesale. So an order that
-    # has aged out of the window is erased along with the money it brought in —
-    # a `/sync 7` on an item that sold months ago rewrites its lifetime revenue
-    # down to whatever the last week happens to contain.
-    #
-    # Until sales_by_item can return a per-order breakdown to fold in additively,
-    # refuse any write that would shrink the record: the stored order ids must
-    # all still be present in the incoming set. `known - incoming` being
-    # non-empty means the window can't see the whole history, so the aggregate
-    # in hand is a subset, not an update.
+    # `sales_by_item(days)` only sees orders INSIDE the look-back window. A row
+    # that stores its per-order records (`sales`) can be folded additively: the
+    # window's records replace those orders, older ones keep their stored record.
+    # A row from before per-order records existed can't be, so a window that
+    # doesn't cover all of its orders would erase money already recorded; refuse
+    # that write, as before.
     incoming = set((sale or {}).get("order_ids") or [])
-    missing_from_window = (known - incoming) if sale is not None else set()
+    stored_sales = ebay.get("sales")
+    totals = sale
+    if sale is not None and sale.get("sales") is not None and (
+            stored_sales is not None or not (known - incoming)):
+        totals = totals_from_sales(fold_sales(stored_sales, sale["sales"]))
+        missing_from_window = set()
+    else:
+        missing_from_window = (known - incoming) if sale is not None else set()
     # Only worth saying when there's a NEW order the window can't fold in. With
     # nothing new, the stored figures are already complete and the warning just
     # repeated itself every day.
@@ -2707,30 +2736,34 @@ def _sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
     # left is put back to 'published' by the live-listing pass below, so every
     # daily sync re-marked it sold and the next pass un-marked it again.
     new_sale = None
-    if sale is not None and not missing_from_window and new_orders:
-        ebay["sale_price"] = sale["sale_price"]
-        ebay["shipping_collected"] = sale["shipping_collected"]
-        ebay["ebay_fees"] = sale["ebay_fees"]
-        ebay["shipping_label_cost"] = sale["shipping_label_cost"]
-        ebay["net_proceeds"] = sale["net_proceeds"]
-        ebay["order_id"] = sale["order_id"]
-        ebay["order_ids"] = list(sale.get("order_ids") or [])
-        # How many units the money above covers. The report needs it to charge the
-        # Ross cost per unit sold: one order took 2 units of the same item, and
-        # costing that sale once understated what it took to make.
-        ebay["units_sold"] = sale.get("units") or 1
-        ebay["sold_at"] = sale["sold_at"]
-        ebay["fees_known"] = sale["fees_known"]
+    if totals is not None and not missing_from_window and new_orders:
+        # How many units the money covers (units_sold): the report charges the
+        # Ross cost per unit sold.
+        ebay.update(sale_db_fields(totals))
         update_field(item_id, "ebay", ebay)
-        net = sale["net_proceeds"] if sale["fees_known"] else None
-        new_sale = {"orders": len(new_orders), "total": sale["sale_price"], "net": net}
+        net = totals["net_proceeds"] if totals["fees_known"] else None
+        new_sale = {"orders": len(new_orders), "total": totals["sale_price"], "net": net}
         if item["status"] != "sold":
             update_status(item_id, "sold")
             auto_sold = True
-            changes.append(f"SOLD ${sale['sale_price']}" + (f" · net ${net}" if net is not None else ""))
+            changes.append(f"SOLD ${totals['sale_price']}" + (f" · net ${net}" if net is not None else ""))
         else:
             changes.append(f"+{len(new_orders)} later sale(s) → {ebay['units_sold']} unit(s) "
-                           f"total ${sale['sale_price']}" + (f" · net ${net}" if net is not None else ""))
+                           f"total ${totals['sale_price']}" + (f" · net ${net}" if net is not None else ""))
+    elif (totals is not None and not missing_from_window and totals.get("fees_known")
+          and ebay.get("sale_price") is not None):
+        # No new order, but the money on orders already recorded can still move:
+        # a refund, or a Promoted Listings fee, posts days after the sale. Update
+        # the figures quietly. This is not a new sale: no status change, nothing
+        # for the scheduled brief, just a line in the full /sync report.
+        fresh = sale_db_fields(totals)
+        if any(_differs(ebay.get(k), fresh.get(k)) for k in SALE_MONEY_FIELDS):
+            old_net, old_refund = ebay.get("net_proceeds"), ebay.get("refunded") or 0
+            ebay.update(fresh)
+            update_field(item_id, "ebay", ebay)
+            note = (f"refund ${round(fresh['refunded'] - old_refund, 2)} · "
+                    if (fresh.get("refunded") or 0) > old_refund + 0.005 else "")
+            changes.append(f"{note}sale figures updated, net ${old_net}→${fresh['net_proceeds']}")
 
     try:
         sold_qty = int(listing_info.get("soldQuantity") or 0)
@@ -3216,6 +3249,20 @@ async def receipt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _safe_reply(update.message, f"🧾 Saved for {item_id[:8]}: paid ${price:.2f} · code {code}{tag}")
 
 
+async def scoreboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """What to buy: per brand and category sell-through, speed, capital tied up
+    and a buy more / ok / pause / stop verdict. Local data only."""
+    from pipeline import scoreboard
+    try:
+        lines = scoreboard.format_scoreboard(await asyncio.to_thread(scoreboard.load))
+    except Exception as e:
+        traceback.print_exc()
+        _record_error("scoreboard", e)
+        await _safe_reply(update.message, f"⚠️ Scoreboard failed: {type(e).__name__}: {str(e)[:200]}")
+        return
+    await _send_chunked(update.message, lines)
+
+
 async def notdup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/notdup <id> <id> — these two are different physical items (same UPC or
     model, but e.g. the print sits differently), so stop warning about them."""
@@ -3513,6 +3560,13 @@ async def offers_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception as e:
                 _record_error(f"offer ({row['item_id'][:8]})", e)
                 failed.append((row, f"{type(e).__name__}: {str(e)[:90]}"))
+                continue
+            try:
+                # So the weekly digest's offer plan doesn't re-offer it next week.
+                record_offer_sent(row["listing_id"], row["offer_price"], item_id=row["item_id"],
+                                  list_price=row["price"], source="/offers")
+            except Exception as e:
+                print(f"WARNING: couldn't record offer sent: {type(e).__name__}: {e}")
 
     verb = "Sent" if apply else "Would send"
     lines = [f"💌 Offers to watchers — {verb.lower()} {len(sent) if apply else len(send)} offer(s).", ""]
@@ -3824,8 +3878,31 @@ def _reprice_markup(item_id: str, price: float) -> InlineKeyboardMarkup:
     ]])
 
 
+def _offers_markup(plan_id: str, n: int) -> InlineKeyboardMarkup:
+    """The digest's ONE button for the whole watcher-offer plan. The plan's rows
+    live in db.offer_plans (64 bytes can't carry a dozen prices); the tap sends
+    exactly those, via pipeline.reprice.send_planned_offers. 53 bytes."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        f"📨 Send offers to {n} watched listing{'s' if n != 1 else ''}",
+        callback_data=f"reprice:offers:-:{plan_id}")]])
+
+
+def _offer_plan_lines(offers: dict | None) -> list[str]:
+    """The digest's offer section: one line per planned listing, said once."""
+    rows = (offers or {}).get("rows") or []
+    if not rows:
+        return []
+    lines = [f"📨 Offers to watchers ready ({len(rows)}) — ~{WATCHER_OFFER_PCT:.0f}% off, never "
+             f"under the Best Offer auto-decline or cost floor. A private offer beats a "
+             f"public cut. Nothing is sent until you tap the button."]
+    for row in rows:
+        lines.append(f"• {row['item_id'][:8]} {row['title'][:30]} ${row['price']:.2f} → "
+                     f"${row['offer_price']:.2f} (−{row['pct']:.0f}%) · {row['watchers']} watch")
+    return lines
+
+
 _VERDICT_LABEL = {
-    "INVISIBLE": "🙈 Not being found in search",
+    "INVISIBLE": "🙈 Barely shown on eBay (promoted included)",
     "LOW_CTR": "😐 Seen but not clicked",
     "OVERPRICED": "💸 Views but no watchers — likely overpriced",
     "SEND_OFFERS": "👀 Watchers building — consider a private offer before cutting",
@@ -3842,8 +3919,9 @@ _VERDICT_LABEL = {
 # price (pipeline/reprice.py only prices OVERPRICED and STALE), so without this
 # they'd arrive as a diagnosis with no next step.
 _VERDICT_ADVICE = {
-    "INVISIBLE": "Fix findability: title keywords, category, item specifics. "
-                 "/promote to buy impressions.",
+    "INVISIBLE": "Under the weekly impressions floor even with promotion. Check the "
+                 "category and item specifics, or /end and relist to refresh it. "
+                 "Not a price cut.",
     "LOW_CTR": "They see it and scroll past: cover photo first, then title. "
                "Not a price cut.",
     "STALE_UNSEEN": "Too few views to blame the price. Rework the title/keywords "
@@ -3877,7 +3955,12 @@ def _format_reprice_line(r: dict) -> str:
     if cum is not None and cum != r.get("views"):
         views += f" ({cum} total)"
     ctr = r.get("ctr")
-    line += (f"\n  {impr if impr is not None else '?'} impr · {views} · "
+    # impressions = total (promoted included), the number verdicts use.
+    organic = r.get("organic_impressions")
+    impr_text = f"{impr if impr is not None else '?'} impr"
+    if impr is not None and organic is not None:
+        impr_text += f" ({organic} organic)"
+    line += (f"\n  {impr_text} · {views} · "
              + (f"{ctr * 100:.2f}% CTR · " if ctr else "")
              + f"{watchers if watchers is not None else '?'} watchers · ${r.get('current_price')}")
     if r.get("suggested_price"):
@@ -3922,9 +4005,10 @@ def _reprice_health_line(health: dict | None) -> str | None:
 async def _send_reprice_digest(bot, chat_id, results: list[dict],
                                health: dict | None = None,
                                incomplete_note: str | None = None) -> None:
-    """Post a weekly price-check digest: one summary header, then one message per
-    flagged item (with an Apply/Skip button when a suggested price exists) so
-    each can be actioned independently. Healthy/too-new items are just counted in
+    """Post a weekly price-check digest: one summary header, one grouped list of
+    flagged listings, one watcher-offer message with a single "Send offers"
+    button (health["offers"], when there's a plan), and one message per
+    suggested price with its Apply/Skip button. Healthy/too-new items are just counted in
     the header, not spelled out individually — and so are NO_TRAFFIC_DATA ones:
     a failed traffic fetch covers whole batches, there is nothing to act on per
     listing, and 97 "couldn't load" messages would bury the real flags.
@@ -3949,6 +4033,10 @@ async def _send_reprice_digest(bot, chat_id, results: list[dict],
         header += ("\n⚠️ Incomplete: listings without traffic data were NOT diagnosed "
                    "as invisible — the numbers are missing, not zero."
                    + (f" {incomplete_note}" if incomplete_note else ""))
+    offers = (health or {}).get("offers") or {}
+    if offers.get("error"):
+        header += (f"\n⚠️ Offers to watchers not planned: couldn't read eBay's eligible "
+                   f"listings ({offers['error'][:80]}). /offers to retry.")
     try:
         await bot.send_message(chat_id=chat_id, text=header)
     except Exception as e:
@@ -3958,12 +4046,18 @@ async def _send_reprice_digest(bot, chat_id, results: list[dict],
     # Only a suggested price earns its own message, because its Apply button has
     # to sit under it. Everything else is grouped by verdict into one compact
     # list with the advice said once — one message per listing was 50+ phone
-    # notifications a week that nobody read.
+    # notifications a week that nobody read. The watcher-offer plan is one more
+    # grouped message with one button for all of it; a listing in that plan
+    # isn't listed again under SEND_OFFERS.
+    planned = {row["item_id"] for row in offers.get("rows") or []}
     actionable = [r for r in flagged if r.get("suggested_price")]
     grouped: dict[str, list[dict]] = {}
     for r in flagged:
-        if not r.get("suggested_price"):
-            grouped.setdefault(r["verdict"], []).append(r)
+        if r.get("suggested_price"):
+            continue
+        if r["verdict"] == "SEND_OFFERS" and r["item_id"] in planned:
+            continue
+        grouped.setdefault(r["verdict"], []).append(r)
 
     lines = []
     for verdict, rows in grouped.items():
@@ -3981,6 +4075,17 @@ async def _send_reprice_digest(bot, chat_id, results: list[dict],
                 await bot.send_message(chat_id=chat_id, text=chunk)
         except Exception as e:
             print(f"WARNING: reprice digest list failed: {type(e).__name__}: {e}")
+
+    offer_lines = _offer_plan_lines(offers)
+    if offer_lines and offers.get("plan_id"):
+        chunks = _chunk_lines(offer_lines)
+        try:
+            for i, chunk in enumerate(chunks):
+                markup = (_offers_markup(offers["plan_id"], len(offers["rows"]))
+                          if i == len(chunks) - 1 else None)
+                await bot.send_message(chat_id=chat_id, text=chunk, reply_markup=markup)
+        except Exception as e:
+            print(f"WARNING: reprice digest offers failed: {type(e).__name__}: {e}")
 
     for r in actionable:
         try:
@@ -4010,8 +4115,37 @@ async def pricecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                                incomplete_note="Re-run /pricecheck later.")
 
 
+async def _send_offer_plan(message, plan_id: str) -> None:
+    """Send a digest's saved watcher-offer plan (the owner tapped its button)
+    and report what happened to each listing."""
+    await _safe_reply(message, "📨 Sending offers to watchers...")
+    try:
+        res = await asyncio.to_thread(send_planned_offers, plan_id)
+    except Exception as e:
+        traceback.print_exc()
+        _record_error("digest offers", e)
+        await _safe_reply(message, f"⚠️ Offers failed: {type(e).__name__}: {str(e)[:200]}")
+        return
+    if res.get("error"):
+        await _safe_reply(message, f"⚠️ No offers sent: {res['error']}")
+        return
+    for row, why in res["failed"]:
+        _record_error(f"offer ({row['item_id'][:8]})", RuntimeError(why))
+    lines = [f"📨 Sent {len(res['sent'])} offer(s) to watchers."]
+    lines += [f"• {r['item_id'][:8]} ${r['price']:.2f} → ${r['offer_price']:.2f} · "
+              f"{r['watchers']} watch · {r['title'][:30]}" for r in res["sent"]]
+    if res["failed"]:
+        lines += ["", f"⚠️ Failed ({len(res['failed'])}):"]
+        lines += [f"• {r['item_id'][:8]}: {why}" for r, why in res["failed"]]
+    if res["skipped"]:
+        lines += ["", f"Skipped {len(res['skipped'])}:"]
+        lines += [f"• {r['item_id'][:8]}: {why}" for r, why in res["skipped"]]
+    await _send_chunked(message, lines)
+
+
 async def reprice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the per-item Apply/Skip buttons on a weekly price-check digest."""
+    """Handle the buttons on a weekly price-check digest: per-item Apply/Skip,
+    and the one "Send offers" button for the watcher-offer plan."""
     query = update.callback_query
     await query.answer()
     try:
@@ -4024,6 +4158,10 @@ async def reprice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pass
 
     if action == "skip":
+        return
+    if action == "offers":
+        # The digest's one "Send offers" button; the last field is the plan id.
+        await _send_offer_plan(query.message, item_id)
         return
 
     item = get_item(item_id)
@@ -4556,6 +4694,8 @@ HELP_SECTIONS = [
         ("/profit [id]", "Profit per sold item: paid → sold → fees → net → margin (real fees after "
                          "/sync). With an id: that one item's full breakdown"),
         ("/report", "Excel report: photos, prices, fees, and profit"),
+        ("/scoreboard", "What to buy: sell-through, speed and cash tied up per brand and "
+                        "category, with buy more / pause / stop"),
     ]),
     ("Admin", [
         ("/photocheck", "Verify every live listing still shows every photo we uploaded"),
@@ -4696,6 +4836,7 @@ def main() -> None:
     app.add_handler(CommandHandler("sold", sold_command))
     app.add_handler(CommandHandler("profit", profit_command))
     app.add_handler(CommandHandler("report", report_command))
+    app.add_handler(CommandHandler("scoreboard", scoreboard_command))
     app.add_handler(CommandHandler("listing", listing_command))
     app.add_handler(CommandHandler("receipt", receipt_command))
     app.add_handler(CommandHandler("addphotos", addphotos_command))
