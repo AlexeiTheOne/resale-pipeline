@@ -29,6 +29,7 @@ from config import (
     GEMINI_PHOTO_LIMIT, MAX_CONCURRENT_LISTINGS, EBAY_DEFAULT_AD_RATE_PCT,
     REPRICE_WEEKDAY, REPRICE_HOUR_UTC,
     SYNC_ENABLED, SYNC_HOUR_UTC, SYNC_DAYS, JOB_CATCHUP_GRACE_HOURS,
+    SOLD_ALERTS_ENABLED, SOLD_ALERT_MINUTES,
     FEEDBACK_ENABLED, FEEDBACK_HOUR_UTC, FEEDBACK_COMMENT,
     OFFER_MIN_WATCHERS, OFFER_MIN_NET, OFFER_MIN_DAYS_LIVE,
     OFFER_DISCOUNT_SMALL, OFFER_DISCOUNT_LARGE,
@@ -121,6 +122,9 @@ find_mode = set()   # user_ids in /find: each photo is looked up, not listed
 find_loc = {}       # user_id -> box/location typed with /find (e.g. "G3")
 last_find_photo = {}  # user_id -> path of the latest /find photo (seeds Quick add)
 quick_add = {}      # user_id -> {"photos": [...], "task": timer, "loc": str|None}
+inv_box = {}        # user_id -> current box in inventory mode (/inv G3)
+inv_session = {}    # user_id -> piece codes captured this session (for the summary)
+list_after_photos = {}  # user_id -> item_id: /list waiting for real listing photos
 haul_mode = set()   # user_ids whose next photo batch is a multi-item haul to be split on Ross tags
 # message_id of a gate/draft the bot sent -> the item it was about. A haul puts
 # several drafts on screen at once, so "which item did you mean?" can't be
@@ -398,6 +402,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     f = await context.bot.get_file(photo.file_id)
     data = await f.download_as_bytearray()
 
+    if user_id in inv_box:
+        await _inv_photo(user_id, update.message, bytes(data), mid)
+        return
     if user_id in quick_add:
         await _quick_add_photo(user_id, update.message, bytes(data), mid)
         return
@@ -698,6 +705,9 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+    if user_id in inv_box:
+        await _inv_done(user_id, update.message)
+        return
     if user_id in find_mode:
         _end_find(user_id)
         await _safe_reply(update.message, "👍 Find mode off. Photos start new listings again.")
@@ -898,6 +908,179 @@ async def stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _send_chunked(update.message, lines)
 
 
+def db_next_piece_code(box: str) -> str:
+    from db import next_piece_code
+    return next_piece_code(box)
+
+
+def _match_quantity_to_pieces(item_id: str) -> None:
+    """Before a stocked item is drafted, list as many as were found at home."""
+    from db import list_pieces
+    n = len(list_pieces(item_id=item_id, status="home"))
+    if n > 1:
+        item = get_item(item_id) or {}
+        update_field(item_id, "ebay", {**(item.get("ebay") or {}), "quantity": n})
+
+
+_PIECES_DIR = Path("data") / "pieces"
+_inv_sem = None
+
+
+def _inv_semaphore() -> asyncio.Semaphore:
+    global _inv_sem
+    if _inv_sem is None:
+        _inv_sem = asyncio.Semaphore(3)
+    return _inv_sem
+
+
+async def inv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inventory mode: /inv G3, then one photo per item with the tag showing."""
+    from pipeline.inventory import BOX_RE
+    user_id = update.effective_user.id
+    box = " ".join(context.args or []).strip().upper()
+    if not box or not BOX_RE.match(box):
+        await _safe_reply(update.message,
+            "Usage: /inv G3 — then one photo per item, tag showing.\n"
+            "Boxes: G garage, O office, S small bedroom, R full room (G1, O2, R-SHELF1).")
+        return
+    _end_find(user_id)
+    inv_box[user_id] = box
+    inv_session.setdefault(user_id, [])
+    await _safe_reply(update.message,
+        f"📦 Inventory mode: {box}. Send one photo per item with the tag showing; "
+        f"each gets the next code ({db_next_piece_code(box)} first). Type another box "
+        "code (e.g. G4) to switch. /done for the summary.")
+
+
+async def _inv_photo(user_id: int, message, data: bytes, mid: int) -> None:
+    from db import add_piece, update_piece
+    box = inv_box[user_id]
+    _PIECES_DIR.mkdir(parents=True, exist_ok=True)
+    code = add_piece(box)
+    path = _PIECES_DIR / f"{code}.jpg"
+    path.write_bytes(data)
+    update_piece(code, photo=str(path))
+    inv_session.setdefault(user_id, []).append(code)
+    sent = await _safe_reply(message, f"{code} ✓")
+    asyncio.create_task(_inv_process(code, sent))
+
+
+async def _inv_process(code: str, sent) -> None:
+    from pipeline.inventory import describe, process_piece
+    async with _inv_semaphore():
+        try:
+            res = await asyncio.to_thread(process_piece, code)
+            text = describe(res)
+        except Exception as e:
+            traceback.print_exc()
+            _record_error(f"inventory {code}", e)
+            text = f"{code} ✓ saved, but reading it failed ({type(e).__name__}). /where {code}"
+    if sent is not None:
+        try:
+            await sent.edit_text(_scrub(text))
+            return
+        except Exception as e:
+            print(f"WARNING: couldn't edit {code} reply: {e}")
+
+
+async def _inv_done(user_id: int, message) -> None:
+    from pipeline.inventory import box_summary
+    codes = inv_session.pop(user_id, [])
+    inv_box.pop(user_id, None)
+    # Give pieces still being read a moment to finish.
+    from db import get_piece
+    for _ in range(30):
+        if all((get_piece(c) or {}).get("item_id") for c in codes):
+            break
+        await asyncio.sleep(2)
+    await _send_chunked(message, box_summary(codes) + ["", "/stock for what to list · /ghosts after the whole house"])
+
+
+async def where_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/where G3-07 · /where G3 · /where oakley · /where 198190095323"""
+    from pipeline.inventory import piece_line, search
+    q = " ".join(context.args or []).strip()
+    if not q:
+        await _safe_reply(update.message, "Usage: /where G3-07 · /where G3 · /where oakley · /where <UPC>")
+        return
+    found = await asyncio.to_thread(search, q)
+    if not found:
+        await _safe_reply(update.message, f"Nothing found for '{q}'.")
+        return
+    items = {i["item_id"]: i for i in list_items()}
+    lines = [f"🔎 {len(found)} piece(s) for '{q}':"] + [piece_line(p, items) for p in found[:40]]
+    if len(found) > 40:
+        lines.append(f"... and {len(found) - 40} more")
+    await _send_chunked(update.message, lines)
+
+
+async def move_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/move G3-07 R2 — the code stays, the location changes."""
+    from db import get_piece, update_piece
+    from pipeline.inventory import BOX_RE
+    args = [a.upper() for a in (context.args or [])]
+    if len(args) != 2 or not BOX_RE.match(args[1]):
+        await _safe_reply(update.message, "Usage: /move G3-07 R2")
+        return
+    p = get_piece(args[0])
+    if not p:
+        await _safe_reply(update.message, f"No piece {args[0]}.")
+        return
+    update_piece(p["code"], box=args[1])
+    await _safe_reply(update.message, f"👍 {p['code']} is now in {args[1]} (its code stays {p['code']}).")
+
+
+async def mark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/mark G3-07 lot|donated|home|sold"""
+    from db import PIECE_STATUSES, get_piece, update_piece
+    args = context.args or []
+    if len(args) != 2 or args[1].lower() not in PIECE_STATUSES:
+        await _safe_reply(update.message, "Usage: /mark G3-07 lot  (lot, donated, home, sold)")
+        return
+    p = get_piece(args[0])
+    if not p:
+        await _safe_reply(update.message, f"No piece {args[0].upper()}.")
+        return
+    update_piece(p["code"], status=args[1].lower())
+    await _safe_reply(update.message, f"👍 {p['code']} marked {args[1].lower()}.")
+
+
+async def ghosts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Live listings vs pieces found at home. Meaningful after the whole house."""
+    from pipeline.inventory import ghost_report
+    await _safe_reply(update.message, "🔎 Checking every live listing against what's at home...")
+    lines = await asyncio.to_thread(ghost_report)
+    await _send_chunked(update.message, lines)
+
+
+async def _sold_alert_loop(app: Application) -> None:
+    """Every SOLD_ALERT_MINUTES: announce new orders with where to pull them."""
+    from db import mark_orders_seen, seen_order_ids
+    from ebay.orders import get_orders
+    from pipeline.inventory import order_alerts
+    first = True
+    while True:
+        try:
+            orders = await asyncio.to_thread(get_orders, 3 if not first else 30)
+            seen = seen_order_ids()
+            if first and not seen:
+                # First run ever: everything before today is history, not news.
+                mark_orders_seen([o.get("orderId") for o in orders if o.get("orderId")])
+            else:
+                lines, handled = await asyncio.to_thread(order_alerts, orders, seen)
+                mark_orders_seen(handled)
+                for uid in ALLOWED_USER_IDS:
+                    for line in lines:
+                        try:
+                            await app.bot.send_message(uid, _scrub(line))
+                        except Exception as e:
+                            print(f"WARNING: sold alert to {uid} failed: {e}")
+        except Exception as e:
+            print(f"WARNING: sold-alert poll failed: {type(e).__name__}: {e}")
+        first = False
+        await asyncio.sleep(SOLD_ALERT_MINUTES * 60)
+
+
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Turn a quick-added item into a real listing: full pricing, draft, review."""
     user_id = update.effective_user.id
@@ -909,6 +1092,22 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if item["status"] != "stocked":
         await _safe_reply(update.message,
                           f"{item_id[:8]} is '{item['status']}', not waiting stock.")
+        return
+    _match_quantity_to_pieces(item_id)
+    if (item.get("stock") or {}).get("source") == "inventory":
+        # The inventory photo shows the Ross tag (our price): never list it.
+        # Take real listing photos, peel the tag off those, then carry on.
+        async with _lock_for(user_id):
+            awaiting_photos[user_id] = item_id
+            appending.pop(user_id, None)
+            list_after_photos[user_id] = item_id
+        stock = dict(item.get("stock") or {})
+        stock["inventory_photo"] = (item.get("photos") or [None])[0]
+        update_field(item_id, "stock", stock)
+        update_field(item_id, "photos", [])
+        await _safe_reply(update.message,
+            f"📸 Send the listing photos for {item_id[:8]} now, Ross tag last as usual. "
+            "I'll price and draft it once they stop arriving.")
         return
     update_status(item_id, "identified")
     await _safe_reply(update.message,
@@ -999,6 +1198,14 @@ async def _finalize_append(user_id, item_id, update, context) -> None:
     last_item[user_id] = item_id
     added = len(new_sorted)
     print(f"📷 Append: committed {added} photo(s) to item {item_id}, {len(photos)} total")
+    if list_after_photos.get(user_id) == item_id:
+        list_after_photos.pop(user_id, None)
+        await asyncio.to_thread(_split_receipt, item_id, photos,
+                                lambda t: None)
+        update_status(item_id, "identified")
+        await _safe_reply(update.message, f"🚀 Got {added} photo(s). Pricing {item_id[:8]}...")
+        await advance(user_id, item_id, update.message, context)
+        return
     await _safe_reply(update.message, f"➕ Added {added} photo(s) to {item_id[:8]} ({len(photos)} total).")
     await _resync_photos(item_id, update.message)
 
@@ -2395,6 +2602,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
     text = update.message.text.strip()
     low = text.lower()
+
+    if user_id in inv_box:
+        from pipeline.inventory import BOX_RE
+        if BOX_RE.match(text.upper()):
+            inv_box[user_id] = text.upper()
+            await _safe_reply(update.message, f"📦 Now in {text.upper()}. Next code: "
+                              f"{db_next_piece_code(text.upper())}")
+            return
 
     if low in ("wait", "hold", "hold on", "⏳"):
         capture_window[user_id] = EXTENDED_CAPTURE_WINDOW
@@ -4572,6 +4787,9 @@ async def _run_sync_job(app: Application, *, catch_up: bool = False) -> None:
 
     # Bookkeeping (price/qty corrections, status fixes) happens silently; the
     # phone only hears about new sales and things that need a decision.
+    if SOLD_ALERTS_ENABLED:
+        # The 15-minute sold alert already announced each sale with its box.
+        brief = [l for l in brief if not l.startswith("💰 Sold")]
     if not brief:
         print("   sync: nothing new to report, staying quiet.")
         return
@@ -4867,6 +5085,9 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     was_hauling = user_id in haul_mode
     haul_mode.discard(user_id)
     _end_find(user_id)
+    inv_box.pop(user_id, None)
+    inv_session.pop(user_id, None)
+    list_after_photos.pop(user_id, None)
     # Only drop the queue when a gate was actually what got cancelled. Popping it
     # unconditionally meant cancelling an unrelated photo capture silently threw
     # away every queued haul gate and said nothing about it.
@@ -4942,6 +5163,11 @@ HELP_SECTIONS = [
         ("/delete [id]", "Delete the item, its photos, and its eBay offer"),
         ("/find [box]", "Photo an item: posted or not? Quick add what isn't. /done to stop"),
         ("/stock", "Items quick-added but not posted, best to list first"),
+        ("/inv <box>", "Inventory mode: one photo per item, each gets a code (G3-07)"),
+        ("/where <q>", "Find pieces by code, box, brand, text or UPC"),
+        ("/move <code> <box>", "Piece moved to another box (code stays)"),
+        ("/mark <code> <status>", "Mark a piece lot, donated, home or sold"),
+        ("/ghosts", "Live listings vs what's actually at home"),
         ("/list <id>", "Post a quick-added item: full pricing, draft, review"),
         ("/notdup <id> <id>", "Two look-alikes are different items: stop the duplicate warning"),
     ]),
@@ -5005,6 +5231,9 @@ async def _post_init(app: Application) -> None:
     # is a DB that matches eBay, which every money figure reads. The digest is
     # just the by-product, so this is deliberately NOT inside the allowlist check
     # above.
+    if SOLD_ALERTS_ENABLED:
+        app.create_task(_sold_alert_loop(app))
+        print(f"Sold alerts every {SOLD_ALERT_MINUTES} min.")
     if SYNC_ENABLED:
         app.create_task(_daily_sync_loop(app))
         print(f"Daily eBay sync scheduled: hour={SYNC_HOUR_UTC} UTC "
@@ -5090,6 +5319,11 @@ def main() -> None:
     app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("stock", stock_command))
     app.add_handler(CommandHandler("list", list_command))
+    app.add_handler(CommandHandler("inv", inv_command))
+    app.add_handler(CommandHandler("where", where_command))
+    app.add_handler(CommandHandler("move", move_command))
+    app.add_handler(CommandHandler("mark", mark_command))
+    app.add_handler(CommandHandler("ghosts", ghosts_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("ross", ross_command))
     app.add_handler(CommandHandler("errors", errors_command))

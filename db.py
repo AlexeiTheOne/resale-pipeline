@@ -179,6 +179,37 @@ def create_tables() -> None:
             )
         """)
 
+        # One row per physical piece at home (inventory mode). The code
+        # (G3-07) never changes, even when the piece moves; `box` is where it
+        # is now. item_id links it to the product/listing row in `items`.
+        # status: home | sold | lot | donated ("listed" is derived from the
+        # linked item being published).
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS pieces (
+                code        TEXT PRIMARY KEY,
+                box         TEXT NOT NULL,
+                item_id     TEXT,
+                status      TEXT NOT NULL DEFAULT 'home',
+                photo       TEXT,
+                info        TEXT,
+                value       REAL,
+                cost        REAL,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                sold_at     TEXT,
+                order_id    TEXT
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS pieces_item ON pieces(item_id)")
+
+        # Orders the sold-alert poll has already announced.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS seen_orders (
+                order_id TEXT PRIMARY KEY,
+                seen_at  TEXT NOT NULL
+            )
+        """)
+
         # One row per paid model call (Claude and Gemini), so spend is a query
         # rather than a guess. The monthly Anthropic budget guard reads this; a
         # refusal fallback writes one row per model that ran. cost_usd is NULL
@@ -386,6 +417,93 @@ def mark_not_duplicate(item_a: str, item_b: str) -> None:
 def not_duplicate_pairs() -> set[tuple[str, str]]:
     with _conn() as con:
         return {(a, b) for a, b in con.execute("SELECT a, b FROM not_duplicates")}
+
+
+# --- pieces (physical stock) -------------------------------------------------
+
+PIECE_STATUSES = ("home", "sold", "lot", "donated")
+
+
+def _piece_row(row, cursor) -> dict:
+    d = dict(zip([c[0] for c in cursor.description], row))
+    d["info"] = json.loads(d["info"]) if d.get("info") else {}
+    return d
+
+
+def next_piece_code(box: str) -> str:
+    """G3 -> G3-01, G3-02, ... Numbering follows the code prefix, so a piece
+    that moved out of G3 still holds its number."""
+    prefix = f"{box}-"
+    with _conn() as con:
+        codes = [r[0] for r in con.execute(
+            "SELECT code FROM pieces WHERE code LIKE ?", (prefix + "%",))]
+    nums = [int(c[len(prefix):]) for c in codes if c[len(prefix):].isdigit()]
+    return f"{prefix}{(max(nums) + 1) if nums else 1:02d}"
+
+
+def add_piece(box: str, photo: str | None = None) -> str:
+    """Reserve the next code in `box` and store the piece. Retries if two
+    photos race for the same number."""
+    for _ in range(5):
+        code = next_piece_code(box)
+        try:
+            with _conn() as con:
+                con.execute(
+                    "INSERT INTO pieces (code, box, photo, info, created_at, updated_at) "
+                    "VALUES (?, ?, ?, '{}', ?, ?)", (code, box, photo, _now(), _now()))
+            return code
+        except sqlite3.IntegrityError:
+            continue
+    raise RuntimeError(f"couldn't reserve a code in {box}")
+
+
+_PIECE_COLUMNS = {"box", "item_id", "status", "photo", "info", "value", "cost",
+                  "sold_at", "order_id"}
+
+
+def update_piece(code: str, **fields) -> None:
+    bad = set(fields) - _PIECE_COLUMNS
+    if bad:
+        raise ValueError(f"unknown piece field(s): {bad}")
+    if "status" in fields and fields["status"] not in PIECE_STATUSES:
+        raise ValueError(f"bad piece status {fields['status']!r}")
+    if "info" in fields:
+        fields["info"] = json.dumps(fields["info"])
+    sets = ", ".join(f"{k} = ?" for k in fields) + ", updated_at = ?"
+    with _conn() as con:
+        con.execute(f"UPDATE pieces SET {sets} WHERE code = ?",
+                    (*fields.values(), _now(), code))
+
+
+def get_piece(code: str) -> dict | None:
+    with _conn() as con:
+        cur = con.execute("SELECT * FROM pieces WHERE code = ?", (code.upper(),))
+        row = cur.fetchone()
+        return _piece_row(row, cur) if row else None
+
+
+def list_pieces(*, box: str | None = None, item_id: str | None = None,
+                status: str | None = None) -> list[dict]:
+    where, args = [], []
+    for col, val in (("box", box), ("item_id", item_id), ("status", status)):
+        if val is not None:
+            where.append(f"{col} = ?")
+            args.append(val)
+    sql = "SELECT * FROM pieces" + (" WHERE " + " AND ".join(where) if where else "")
+    with _conn() as con:
+        cur = con.execute(sql + " ORDER BY code", args)
+        return [_piece_row(r, cur) for r in cur.fetchall()]
+
+
+def seen_order_ids() -> set[str]:
+    with _conn() as con:
+        return {r[0] for r in con.execute("SELECT order_id FROM seen_orders")}
+
+
+def mark_orders_seen(order_ids) -> None:
+    with _conn() as con:
+        con.executemany("INSERT OR IGNORE INTO seen_orders (order_id, seen_at) VALUES (?, ?)",
+                        [(o, _now()) for o in order_ids])
 
 
 def job_run_status(job: str) -> str | None:

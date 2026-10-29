@@ -327,6 +327,9 @@ REPRICE_HOUR_UTC = int(os.getenv("REPRICE_HOUR_UTC", "14"))
 # Daily rather than weekly because the reprice digest reads price/quantity that
 # a sale changes, and it should not run on a week-old picture of the account.
 SYNC_ENABLED = os.getenv("SYNC_ENABLED", "1") not in ("0", "false", "False")
+# Poll orders this often and announce each sale with the box to pull it from.
+SOLD_ALERTS_ENABLED = os.getenv("SOLD_ALERTS_ENABLED", "1") not in ("0", "false", "False")
+SOLD_ALERT_MINUTES = int(os.getenv("SOLD_ALERT_MINUTES", "15"))
 SYNC_HOUR_UTC = int(os.getenv("SYNC_HOUR_UTC", "11"))   # 3 hours before the digest
 # Order look-back per run. Matches /sync's own default; a window comfortably
 # wider than the sync interval means a run that gets missed loses nothing.
