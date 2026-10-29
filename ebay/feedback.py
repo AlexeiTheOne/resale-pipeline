@@ -53,9 +53,16 @@ def _trading(call_name: str, inner: str) -> ET.Element:
 def awaiting_buyer_feedback() -> list[dict]:
     """Sales where this seller still owes the buyer feedback.
 
-    Returns dicts of {item_id, transaction_id, buyer, title}. An entry with no
-    Buyer element is the other direction (we left ours, the buyer hasn't left
-    theirs) and is skipped."""
+    Returns dicts of {item_id, transaction_id, order_line, buyer, title}.
+
+    GetItemsAwaitingFeedback lists a sale until BOTH sides have left feedback,
+    so it also returns sales where we already left ours and only the buyer's is
+    outstanding. Those carry a <FeedbackLeft> element (the feedback we left) and
+    are dropped here. Retrying them is what made LeaveFeedback fail with "either
+    the item number you entered does not exist or you have not completed a
+    transaction with this user" every day (12 sales on 2026-10-29, all of them
+    already rated Positive by an earlier run). The Buyer element is present in
+    both cases, so it can't tell them apart."""
     out, page = [], 1
     while page <= _MAX_PAGES:
         root = _trading(
@@ -67,6 +74,8 @@ def awaiting_buyer_feedback() -> list[dict]:
             buyer_node = next((c for c in tx if _strip_ns(c.tag) == "Buyer"), None)
             if buyer_node is None:
                 continue
+            if any(_strip_ns(c.tag) == "FeedbackLeft" for c in tx):
+                continue  # we already rated this buyer; they owe us, not the reverse
             buyer = _text(buyer_node, "UserID")
             item_id = _text(tx, "ItemID")
             transaction_id = _text(tx, "TransactionID")
@@ -107,10 +116,11 @@ def leave_positive(item_id: str, transaction_id: str, buyer: str, comment: str,
                    order_line: str | None = None) -> None:
     """Leave Positive feedback on one sale. Raises with eBay's message on failure.
 
-    Identifies the sale by OrderLineItemID, eBay's preferred key. Every
-    ItemID + TransactionID call has failed with "the item number you entered
-    does not exist or you have not completed a transaction" (0 left as of
-    2026-10-26), so that form is now only the fallback."""
+    Identifies the sale by OrderLineItemID, eBay's preferred key, falling back
+    to ItemID + TransactionID. eBay answers a repeat attempt on a sale that
+    already has our feedback with "the item number you entered does not exist
+    or you have not completed a transaction", which awaiting_buyer_feedback
+    now avoids by dropping those sales."""
     tail = ("<CommentType>Positive</CommentType>"
             f"<CommentText>{escape(comment[:COMMENT_MAX])}</CommentText>"
             f"<TargetUser>{escape(buyer)}</TargetUser>")
