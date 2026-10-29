@@ -44,6 +44,7 @@ import llm_usage
 from receipt import decode_barcode, detect_ross_tags, extract_receipt, is_dark_frame
 from pipeline.price import get_pricing
 from pipeline.draft import generate_draft, revise_draft, revise_identification
+from pipeline.gtin import product_gtin
 from pipeline.listing_check import check_and_store as check_listing_and_store, format_check
 from pipeline.reprice import run_weekly_check
 from profit import breakeven_price, format_projection, project
@@ -1643,7 +1644,52 @@ def _stage_identify(item_id, paths, notify=lambda _t: None) -> dict:
           ident.get("product_name") or ident.get("item_type"))
     update_field(item_id, "identification", ident)
     update_status(item_id, "identified")
+    for line in _duplicate_warnings(item_id):
+        notify(line)
     return ident
+
+
+def _same_item_keys(item: dict) -> set[tuple[str, str]]:
+    """What makes two items the same product: the UPC, or brand + model.
+    Not the Ross tag code — Ross reuses one code across different products
+    (two different Michael Kors watch bands share one), so it false-alarms."""
+    keys = set()
+    ident = item.get("identification") or {}
+    gtin = product_gtin(ident.get("upc"))
+    if gtin:
+        keys.add(("UPC", gtin))
+    brand = re.sub(r"\W", "", str(ident.get("brand") or "")).lower()
+    model = re.sub(r"\W", "", str(ident.get("model") or "")).lower()
+    if brand and len(model) >= 4:
+        keys.add(("model", f"{brand}:{model}"))
+    return keys
+
+
+def _duplicate_warnings(item_id: str) -> list[str]:
+    """Warn — never block — when this item matches one already in the shop.
+    Buying two of the same thing is fine; listing one bag twice is not, and on
+    2026-10-27 a haul nearly did exactly that with a Luv Betsey backpack."""
+    item = get_item(item_id) or {}
+    mine = _same_item_keys(item)
+    if not mine:
+        return []
+    lines = []
+    for other in list_items():
+        if other["item_id"] == item_id or other.get("status") in ("rejected", "failed"):
+            continue
+        shared = mine & _same_item_keys(other)
+        if not shared:
+            continue
+        how = ", ".join(sorted(k for k, _ in shared))
+        title = ((other.get("listing") or {}).get("title")
+                 or (other.get("identification") or {}).get("product_name") or "")[:60]
+        url = (other.get("ebay") or {}).get("view_item_url") or ""
+        lines.append(f"⚠️ Possible duplicate — same {how} as {other['item_id'][:8]} "
+                     f"({other.get('status')}): {title} {url}".rstrip())
+    if lines:
+        lines.append("If it's a second unit, carry on (or bump that listing's quantity "
+                     f"instead). Otherwise /delete {item_id[:8]}.")
+    return lines
 
 
 def _stage_price(item_id, notify=lambda _t: None) -> dict:

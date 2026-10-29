@@ -138,6 +138,37 @@ def test_v2_price_line_does_not_call_one_sale_solid():
     assert "set by hand" in manual and "54.99" in manual
 
 
+def _item(ident, status="published", code=None):
+    iid = db.create_item([])
+    db.update_field(iid, "identification", ident)
+    if code:
+        db.update_field(iid, "receipt", {"code": code, "reduced_price": 9.99})
+    db.update_status(iid, status)
+    return iid
+
+
+def test_same_upc_warns_about_a_duplicate():
+    first = _item({"brand": "Lauren", "upc": "886087411348"})
+    second = _item({"brand": "Lauren", "upc": "886087411348"}, status="identified")
+    warnings = tb._duplicate_warnings(second)
+    assert warnings and first[:8] in warnings[0] and "UPC" in warnings[0]
+    assert f"/delete {second[:8]}" in warnings[-1]
+
+
+def test_shared_ross_code_alone_is_not_a_duplicate():
+    # Ross reuses a code across different products (two Michael Kors bands).
+    _item({"brand": "Michael Kors", "model": "MKS8000"}, code="400290277601")
+    other = _item({"brand": "Michael Kors", "model": "MKS8111"}, code="400290277601",
+                  status="identified")
+    assert tb._duplicate_warnings(other) == []
+
+
+def test_rejected_items_are_not_duplicates():
+    _item({"brand": "Ed Hardy", "model": "EHH46242003"}, status="rejected")
+    fresh = _item({"brand": "Ed Hardy", "model": "EHH-46242003"}, status="identified")
+    assert tb._duplicate_warnings(fresh) == []
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
