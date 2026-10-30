@@ -168,7 +168,8 @@ def test_menu_lists_only_registered_commands(registered):
 
     mp = pytest.MonkeyPatch()
     try:
-        mp.setattr(tb, "ALLOWED_USER_IDS", [])  # skip background loops
+        from bot import util
+        mp.setattr(util, "ALLOWED_USER_IDS", [])  # skip background loops
         asyncio.run(tb._post_init(_App()))
     finally:
         mp.undo()
@@ -299,13 +300,17 @@ def test_loop(monkeypatch):
 
 
 def test_patch_scan_finds_names():
-    # The scanner itself, on every patch form it claims to understand. (Most
-    # tests now patch the module that owns a name, not telegram_bot, so a count
-    # of real telegram_bot patches no longer says whether the scanner works.)
+    # The scanner itself, on every patch form it claims to understand. (Since
+    # step 4b no test patches telegram_bot at all, so an empty result on the
+    # real tests is correct and says nothing about whether the scanner works.)
     assert set(_patched_names([("sample.py", _SCAN_SAMPLE)])) == {
         "by_setattr", "by_dotted_string", "by_assign", "by_augassign", "by_patch",
         "by_patch_object", "by_loop_one", "by_loop_two"}, "scanner is broken"
-    assert _patched_names(), "AST scan of the real tests found nothing; scanner is broken"
+    # ...and it really walks the real tests: they import telegram_bot, so a
+    # telegram_bot patch added to any of them would be seen.
+    importing = [f for f, text in _test_sources()
+                 if _module_aliases(ast.parse(text)) - {"telegram_bot"}]
+    assert len(importing) >= 5, f"scan saw too few tests importing telegram_bot: {importing}"
 
 
 def test_patched_names_exist_and_take_effect():

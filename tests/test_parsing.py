@@ -82,12 +82,10 @@ DECOY_500_ID = "500eeeee-0000-0000-0000-000000000000"
 class _FakeDB:
     """A tiny in-memory stand-in for db.py, keyed like the real table.
 
-    telegram_bot.py calls get_item/list_items/update_field/update_status as
-    plain module-level names (imported with `from db import ...`), while the
-    helpers split out into bot/ call them through the module (`db.get_item`).
-    Patching those names on both tb and db keeps every command under test
-    from touching the real data/ross.db — no sqlite file, no network, nothing
-    left behind."""
+    The commands under test live in bot/ and call get_item/list_items/
+    update_field/update_status through the db module (`db.get_item`), so
+    patching those names on db keeps every command from touching the real
+    data/ross.db — no sqlite file, no network, nothing left behind."""
 
     def __init__(self, items):
         self.items = {i["item_id"]: dict(i) for i in items}
@@ -126,7 +124,7 @@ class _FakeContext:
 
 
 class _patched_db:
-    """Swap tb's db functions for a _FakeDB for the duration of a `with` block,
+    """Swap db's functions for a _FakeDB for the duration of a `with` block,
     and always put the real ones back — these are shared module globals, so a
     test that raised partway through must not leave the next test talking to a
     stub."""
@@ -136,7 +134,7 @@ class _patched_db:
         self._saved = {}
 
     def __enter__(self):
-        for mod in (tb, db_module):
+        for mod in (db_module,):
             for name in ("get_item", "list_items", "update_field", "update_status"):
                 self._saved[(mod, name)] = getattr(mod, name)
                 setattr(mod, name, getattr(self.db, name))

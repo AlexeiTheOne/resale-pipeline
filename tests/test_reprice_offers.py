@@ -504,8 +504,8 @@ def test_offers_button_sends_through_the_plan():
     async def fake_chunked(_msg, lines):
         replies.append("\n".join(lines))
 
-    with _Patch(tb, send_planned_offers=fake_plan_send, _safe_reply=fake_reply,
-                _send_chunked=fake_chunked):
+    from bot import util
+    with _Patch(rp, send_planned_offers=fake_plan_send),             _Patch(util, _safe_reply=fake_reply, _send_chunked=fake_chunked):
         asyncio.run(tb.reprice_callback(_Update(), None))
     assert calls == ["q" * 36]
     assert any("Sent 1 offer" in r for r in replies)

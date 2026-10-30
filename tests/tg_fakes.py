@@ -483,15 +483,17 @@ def reset_bot_state(tb) -> None:
 
 @contextmanager
 def allowed_users(tb, *user_ids: int):
-    """Set tb.ALLOWED_USER_IDS for the block (default: just DEFAULT_USER_ID).
+    """Set bot.util.ALLOWED_USER_IDS for the block (default: just DEFAULT_USER_ID).
     Only _auth_guard (handler group -1) reads it for gating; the handlers
-    themselves don't, so tests calling a handler directly needn't use this."""
-    saved = tb.ALLOWED_USER_IDS
-    tb.ALLOWED_USER_IDS = set(user_ids or (DEFAULT_USER_ID,))
+    themselves don't, so tests calling a handler directly needn't use this.
+    (The scheduled jobs and /whoami read it too.)"""
+    from bot import util
+    saved = util.ALLOWED_USER_IDS
+    util.ALLOWED_USER_IDS = set(user_ids or (DEFAULT_USER_ID,))
     try:
-        yield tb.ALLOWED_USER_IDS
+        yield util.ALLOWED_USER_IDS
     finally:
-        tb.ALLOWED_USER_IDS = saved
+        util.ALLOWED_USER_IDS = saved
 
 
 @contextmanager

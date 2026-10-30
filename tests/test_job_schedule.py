@@ -187,15 +187,18 @@ class _FakeApp:
 def _run_job_with(results, health):
     import asyncio
 
-    saved = (tb.run_weekly_check, tb.ALLOWED_USER_IDS)
-    tb.run_weekly_check = lambda: (results, health)
-    tb.ALLOWED_USER_IDS = [1]
+    import pipeline.reprice as rp
+    from bot import util
+
+    saved = (rp.run_weekly_check, util.ALLOWED_USER_IDS)
+    rp.run_weekly_check = lambda: (results, health)
+    util.ALLOWED_USER_IDS = [1]
     try:
         app = _FakeApp()
         asyncio.run(tb._run_reprice_job(app))
         return app.bot.sent
     finally:
-        tb.run_weekly_check, tb.ALLOWED_USER_IDS = saved
+        rp.run_weekly_check, util.ALLOWED_USER_IDS = saved
 
 
 _NO_TRAFFIC = {"item_id": "x" * 36, "verdict": "NO_TRAFFIC_DATA", "impressions": None,

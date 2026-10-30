@@ -19,6 +19,12 @@ def _parse_allowed_ids(raw: str | None) -> set[int]:
     return ids
 
 
+# Telegram user ids allowed to drive the bot. telegram_bot parses it into here at
+# import, after load_dotenv() (see the comment there). Read it as
+# util.ALLOWED_USER_IDS, never import the name: startup and tests rebind it.
+ALLOWED_USER_IDS: set[int] = set()
+
+
 def _remember_target(sent, item_id: str) -> None:
     """Tie a message the bot just sent to the item it's about, so a reply to it
     is unambiguous even with a dozen drafts on screen."""
