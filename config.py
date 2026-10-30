@@ -264,7 +264,10 @@ REPRICE_STALE_WEEKS = int(os.getenv("REPRICE_STALE_WEEKS", "4"))
 # Re-derive these from your own orders any time with `python -m ebay.orders`.
 EBAY_FVF_PCT = float(os.getenv("EBAY_FVF_PCT", "0.155"))
 EBAY_FIXED_FEE = float(os.getenv("EBAY_FIXED_FEE", "0.40"))
-EBAY_AD_FEE_PCT = float(os.getenv("EBAY_AD_FEE_PCT", "0.05"))
+# Re-measured 2026-10-30 from the per-order ledger (ebay.ad_fees on 44 sold
+# items): $258 of ad fees on item sales = 4.6% (4.3% of item + shipping, since
+# eBay charges the ad rate on shipping too). Was 5.0% from the older estimate.
+EBAY_AD_FEE_PCT = float(os.getenv("EBAY_AD_FEE_PCT", "0.046"))
 # SET THESE TO YOUR REAL NUMBERS if your shipping differs — and if you ship free
 # (charge 0, pay postage), EBAY_SHIP_CHARGED must be 0 or the floor is wrong by
 # the full postage.

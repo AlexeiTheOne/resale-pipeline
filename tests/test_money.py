@@ -104,7 +104,7 @@ def test_report_and_profit_agree_on_the_same_sale():
 
     p = profit.project(item)
     assert abs(report_net - p["net"]) < CENT, (report_net, p["net"])
-    assert abs(p["net"] - 35.54) < CENT, p["net"]
+    assert abs(p["net"] - 35.83) < CENT, p["net"]  # at the 4.6% ad rate
     assert p["cost"] == 24.00, "two units sold means two units of Ross cost"
     assert p["actual"] is True
 
