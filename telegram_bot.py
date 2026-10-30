@@ -1,5 +1,5 @@
 import os, sys, re, uuid, asyncio, shutil, tempfile, time, traceback
-from collections import Counter, OrderedDict, deque
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -49,7 +49,7 @@ from receipt import decode_barcode, detect_ross_tags, extract_receipt, is_dark_f
 from pipeline.price import get_pricing
 from pipeline.draft import generate_draft, revise_draft, revise_identification
 from pipeline.gtin import product_gtin
-from pipeline.listing_check import check_and_store as check_listing_and_store, format_check
+from pipeline.listing_check import check_and_store as check_listing_and_store
 from pipeline.reprice import run_weekly_check, send_planned_offers
 from profit import breakeven_price, format_projection, project
 from ebay.auth import get_access_token
@@ -81,18 +81,29 @@ from ebay.negotiation import (
     MIN_DISCOUNT_PCT, eligible_listing_ids, negotiation_status, send_offer,
 )
 
+# Split-out modules (docs/cleanup-plan.md Phase 2). The state names are imported
+# directly for now; they are the same dict/set objects as bot.state's, mutated in
+# place, never rebound. Names unused here are re-exported for the tests (tb.<name>).
+from bot.state import (  # noqa: F401  (re-export for tests)
+    pending, review, locks, last_item, capture_window, staging, awaiting_photos,
+    appending, gate, gate_queue, find_mode, find_loc, last_find_photo, quick_add,
+    inv_box, inv_session, list_after_photos, haul_mode, msg_target, MSG_TARGET_MAX,
+    _in_flight,
+)
+from bot.util import (  # noqa: F401  (re-export for tests)
+    _parse_allowed_ids, _remember_target, _replied_item, _lock_for, _secrets, _scrub,
+    _safe_reply, TELEGRAM_MAX_CHARS, _send_chunked, _chunk_lines, _send_chunked_to,
+    _recent_errors, _record_error, _resolve_item_id, _ITEM_ID_PREFIX_LEN,
+    _names_an_item, _claim, _release,
+)
+from bot.formatting import (  # noqa: F401  (re-export for tests)
+    _title_too_long_text, _fmt, format_identification, _EVIDENCE_LABEL, _short,
+    _fmt_money, _format_pricing_v2, format_pricing, _price_evidence_line, format_draft,
+)
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 INBOX = DATA_DIR / "inbox"
 INBOX.mkdir(parents=True, exist_ok=True)
-
-
-def _parse_allowed_ids(raw: str | None) -> set[int]:
-    ids = set()
-    for tok in (raw or "").replace(";", ",").split(","):
-        tok = tok.strip()
-        if tok.isdigit():
-            ids.add(int(tok))
-    return ids
 
 
 # Whitelist of Telegram user IDs allowed to drive the bot. This gates a LIVE eBay
@@ -106,102 +117,6 @@ DEFAULT_CAPTURE_WINDOW = 5    # seconds to wait for more photos before processin
 EXTENDED_CAPTURE_WINDOW = 30  # after the user types "wait" — for forwarding big batches
 WAIT_EXTENSION = 15           # seconds the inline "Wait" button waits for more photos
 
-pending = {}        # user_id -> {"files": [bytearray,...], "task": asyncio.Task}
-review = {}         # user_id -> item_id  (item currently awaiting this user's reply)
-locks = {}          # user_id -> asyncio.Lock guarding pending[user_id]
-last_item = {}      # user_id -> item_id  (last-touched item, survives past the review window)
-capture_window = {} # user_id -> seconds to batch photos (default DEFAULT_CAPTURE_WINDOW)
-staging = {}        # user_id -> {item_id, folder, paths, chat_id, task} awaiting Start/Wait/Cancel
-awaiting_photos = {}# user_id -> item_id  (photos should attach to this existing item, set by /addphotos)
-appending = {}      # user_id -> {item_id, folder, base, new, chat_id, task} while an append batch is collected
-gate = {}           # user_id -> {item_id, stage}  paused at "identify"/"price" awaiting confirm/correction
-gate_queue = {}     # user_id -> [{item_id, stage, reason}]  gates waiting their turn (a /haul runs many
-                    # items at once, and only one can hold the single gate slot; the rest queue here
-                    # instead of overwriting each other and getting lost)
-find_mode = set()   # user_ids in /find: each photo is looked up, not listed
-find_loc = {}       # user_id -> box/location typed with /find (e.g. "G3")
-last_find_photo = {}  # user_id -> path of the latest /find photo (seeds Quick add)
-quick_add = {}      # user_id -> {"photos": [...], "task": timer, "loc": str|None}
-inv_box = {}        # user_id -> current box in inventory mode (/inv G3)
-inv_session = {}    # user_id -> piece codes captured this session (for the summary)
-list_after_photos = {}  # user_id -> item_id: /list waiting for real listing photos
-haul_mode = set()   # user_ids whose next photo batch is a multi-item haul to be split on Ross tags
-# message_id of a gate/draft the bot sent -> the item it was about. A haul puts
-# several drafts on screen at once, so "which item did you mean?" can't be
-# answered by a single most-recent pointer: replying to a specific message is how
-# the user says which one. Bounded so a long session can't grow it forever.
-msg_target: "OrderedDict[int, str]" = OrderedDict()
-MSG_TARGET_MAX = 400
-
-
-def _remember_target(sent, item_id: str) -> None:
-    """Tie a message the bot just sent to the item it's about, so a reply to it
-    is unambiguous even with a dozen drafts on screen."""
-    if sent is None or not getattr(sent, "message_id", None):
-        return
-    msg_target[sent.message_id] = item_id
-    while len(msg_target) > MSG_TARGET_MAX:
-        msg_target.popitem(last=False)
-
-
-def _replied_item(update) -> str | None:
-    """The item the user is replying to, if they replied to one of our messages."""
-    replied = getattr(update.message, "reply_to_message", None)
-    if replied is None:
-        return None
-    item_id = msg_target.get(replied.message_id)
-    return item_id if item_id and get_item(item_id) else None
-
-
-def _lock_for(user_id):
-    if user_id not in locks:
-        locks[user_id] = asyncio.Lock()
-    return locks[user_id]
-
-
-# Every secret this process holds, longest first so an overlapping value can't
-# leave a fragment behind. Read once at import: these come from the environment
-# and don't change while the bot runs.
-_SECRETS = sorted(
-    (v for v in (os.getenv(k) for k in (
-        "APIFY_TOKEN", "APIFY_TOKEN_BACKUP", "TELEGRAM_TOKEN",
-        "GEMINI_API_KEY", "GOOGLE_API_KEY",
-        "EBAY_CLIENT_SECRET", "EBAY_CLIENT_ID", "EBAY_REFRESH_TOKEN",
-        "CLOUDINARY_API_SECRET", "CLOUDINARY_API_KEY", "CLOUDINARY_URL",
-    )) if v and len(v) >= 8),
-    key=len, reverse=True)
-
-
-def _scrub(text: str) -> str:
-    """Replace any credential that made it into an outbound string.
-
-    Belt and braces, not the primary defence — the real fix is not putting
-    secrets somewhere they can be formatted into a message (see pipeline/price.py's
-    _call). But error text reaches Telegram through several paths, str(e) on a
-    third-party exception can embed anything, and a chat log is forever. Cheap
-    insurance against the next library that decides to be helpful."""
-    if not text:
-        return text
-    for secret in _SECRETS:
-        if secret in text:
-            text = text.replace(secret, "***REDACTED***")
-    return text
-
-
-async def _safe_reply(message, text: str, **kwargs):
-    """Best-effort status ping. A transient network failure sending this
-    message must never abort the actual work that follows it. Returns the sent
-    Message (or None if it failed) so callers can tie it to an item — see
-    _remember_target."""
-    try:
-        return await message.reply_text(_scrub(text), **kwargs)
-    except Exception as e:
-        print(f"WARNING: reply_text failed (continuing anyway): {type(e).__name__}: {e}")
-        return None
-
-
-TELEGRAM_MAX_CHARS = 3900  # under the 4096 hard limit, leaving headroom
-
 # Upper bound on a hand-typed /setqty. Ross stock is near-always single units and
 # the largest real listing so far held 5, so anything past this is a typo or a
 # mis-parsed item id rather than an inventory decision.
@@ -210,59 +125,6 @@ _MAX_SANE_QTY = 500
 # five figures is not a decision anyone makes by typing into a chat window — it's
 # an item id, a barcode, or a slipped decimal point.
 _MAX_SANE_PRICE = 10_000.0
-
-
-async def _send_chunked(message, lines: list[str]) -> None:
-    """Send a list of lines as one or more messages, each under Telegram's 4096-char
-    cap. /status and /comps can outgrow a single message as the item count grows."""
-    buf, size = [], 0
-    for line in lines:
-        if buf and size + len(line) + 1 > TELEGRAM_MAX_CHARS:
-            await _safe_reply(message, "\n".join(buf))
-            buf, size = [], 0
-        buf.append(line)
-        size += len(line) + 1
-    if buf:
-        await _safe_reply(message, "\n".join(buf))
-
-
-
-def _chunk_lines(lines: list[str]) -> list[str]:
-    """Group lines into messages that each fit under Telegram's cap."""
-    out, buf, size = [], [], 0
-    for line in lines:
-        if buf and size + len(line) + 1 > TELEGRAM_MAX_CHARS:
-            out.append("\n".join(buf))
-            buf, size = [], 0
-        buf.append(line)
-        size += len(line) + 1
-    if buf:
-        out.append("\n".join(buf))
-    return out
-
-
-async def _send_chunked_to(bot, chat_id, lines: list[str]) -> None:
-    """_send_chunked for an unprompted message — the scheduled jobs post to a
-    chat id rather than replying to an update, so there is no Message to reply
-    to. Same chunking, same best-effort behaviour."""
-    for chunk in _chunk_lines(lines):
-        try:
-            await bot.send_message(chat_id=chat_id, text=_scrub(chunk))
-        except Exception as e:
-            print(f"WARNING: send_message failed (continuing anyway): {type(e).__name__}: {e}")
-
-
-# Ring buffer of recent errors, dumped by /errors. The console isn't visible from
-# the phone, so failures that only print a traceback there are otherwise invisible.
-_recent_errors: deque = deque(maxlen=10)
-
-
-def _record_error(where: str, exc: BaseException) -> None:
-    ts = datetime.now(timezone.utc).strftime("%m-%d %H:%M:%SZ")
-    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    # Scrubbed at capture, not at display: /errors is one reader of this buffer
-    # and a traceback holds request URLs, headers and locals.
-    _recent_errors.append((ts, where, _scrub(tb.strip())))
 
 
 async def _auth_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -328,66 +190,6 @@ async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         state = "restricted; you are NOT on the allowlist."
     await _safe_reply(update.message, f"Your Telegram user id: {user.id}\nBot access: {state}")
-
-
-def _resolve_item_id(user_id: int, args: list[str]) -> tuple[str | None, str | None]:
-    """Resolve an item_id from a command's args (full id or unique prefix),
-    falling back to last_item[user_id] when no arg is given. Returns
-    (item_id, error_message) — exactly one of which is None."""
-    if args:
-        arg = args[0]
-        if get_item(arg) is not None:
-            return arg, None
-        matches = [i["item_id"] for i in list_items() if i["item_id"].startswith(arg)]
-        if len(matches) == 1:
-            return matches[0], None
-        if len(matches) > 1:
-            return None, f"'{arg}' matches {len(matches)} items — use a longer prefix."
-        return None, f"No item found matching '{arg}'."
-
-    item_id = last_item.get(user_id)
-    if item_id is None:
-        return None, "No item specified and no recent item to fall back to. Provide an item_id."
-    return item_id, None
-
-
-# Every id shown back to the user — /status, /photos, error messages, all of
-# it — is item_id[:8]. That's the shortest prefix anyone actually types or
-# pastes, so it's also the shortest prefix _names_an_item should ever credit as
-# "the user meant an id". See its docstring for why a shorter floor breaks it.
-_ITEM_ID_PREFIX_LEN = 8
-
-
-def _names_an_item(token: str) -> bool:
-    """Whether this token identifies an existing item (full id or prefix).
-
-    Commands that take an optional trailing number — /sold, /setqty, /setprice —
-    must ask this BEFORE trying to parse one. Item ids are uuid4 hex, so roughly
-    2.3% of the 8-char prefixes /status prints are all digits: `/sold 40286146`
-    parsed as a $40,286,146 sale price, then fell through to `last_item` and
-    booked it against whatever item was touched last.
-
-    Getting it wrong in this direction is cheap (the arg resolves to an item and
-    no value is set — visible immediately); getting it wrong the other way
-    writes nonsense to an item the user never named.
-
-    The prefix check below only fires past _ITEM_ID_PREFIX_LEN characters. Below
-    that, hex digits and decimal digits are the same alphabet and there simply
-    isn't enough token left to tell "item id" from "quantity" apart: with ~90
-    items in the store, a plain "2" is a startswith-prefix of *some* uuid4 far
-    more often than not, so every single-digit /setqty and every two-digit
-    /sold price was being misread as the id — in both cases the number the user
-    typed, not any id, and both directions of `/setqty <id> <n>` broke because
-    of it. No real quantity or sane price (see _MAX_SANE_QTY/_MAX_SANE_PRICE)
-    is long enough to reach the floor, so genuine short values never get
-    swept up here — only the 8+-char strings this bot actually calls an id."""
-    if not token:
-        return False
-    if get_item(token) is not None:
-        return True
-    if len(token) < _ITEM_ID_PREFIX_LEN:
-        return False
-    return any(i["item_id"].startswith(token) for i in list_items())
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1210,22 +1012,6 @@ async def _finalize_append(user_id, item_id, update, context) -> None:
     await _resync_photos(item_id, update.message)
 
 
-def _title_too_long_text(e: TitleTooLongError, item_id: str) -> str:
-    """What to tell the owner when eBay would have received an over-long title.
-
-    Spelled out in full (not str(e)[:250]) because the useful part — the fitted
-    suggestion — is at the end of the message."""
-    return (
-        f"✂️ {item_id[:8]}: the title is {len(e.title)} characters and eBay's limit "
-        f"is 80. Nothing was sent to eBay — it is no longer cut to fit, because "
-        f"that chopped size and colour off the end.\n\n"
-        f"Now: {e.title}\n"
-        f"Suggested ({len(e.suggestion)}): {e.suggestion}\n"
-        f"Drops: {', '.join(e.dropped) or 'nothing'}\n\n"
-        f"/retry {item_id[:8]} to reopen the draft, then type a correction such as "
-        f"'title: {e.suggestion}' and approve again.")
-
-
 async def _resync_photos(item_id: str, message) -> None:
     """Push the item's current photo set to eBay. No-op for items that haven't
     been drafted on eBay yet — the new photos are simply picked up when the draft
@@ -1581,26 +1367,6 @@ async def _show_review(user_id, item_id, message) -> None:
     sent = await _safe_reply(message, body, parse_mode=None,
                              reply_markup=_review_markup(item_id))
     _remember_target(sent, item_id)
-
-
-# (kind, item_id) pairs with work in flight. The app runs with
-# concurrent_updates(True), so two taps / two commands for the same item are
-# handled at once; a status check followed by an await lets both through.
-# _claim must be called with no await between the status check and it.
-_in_flight: set[tuple[str, str]] = set()
-
-
-def _claim(kind: str, item_id: str) -> bool:
-    """Claim (kind, item_id) synchronously. False if someone else holds it."""
-    key = (kind, item_id)
-    if key in _in_flight:
-        return False
-    _in_flight.add(key)
-    return True
-
-
-def _release(kind: str, item_id: str) -> None:
-    _in_flight.discard((kind, item_id))
 
 
 async def _publish_and_report(item_id, message) -> None:
@@ -2277,119 +2043,6 @@ def _stage_draft(item_id, notify=lambda _t: None) -> dict:
     return draft
 
 
-def _fmt(value) -> str:
-    return "—" if value in (None, "", []) else str(value)
-
-
-def format_identification(ident: dict) -> str:
-    lines = [
-        "🔍 Identified:",
-        f"Brand: {_fmt(ident.get('brand'))}",
-        f"Type: {_fmt(ident.get('item_type'))}",
-        f"Product: {_fmt(ident.get('product_name'))}",
-        f"Model/SKU: {_fmt(ident.get('model'))}",
-        f"Color: {_fmt(ident.get('color'))}",
-        f"Size: {_fmt(ident.get('size'))}",
-        f"Condition: {_fmt(ident.get('condition'))}",
-        f"Confidence: {_fmt(ident.get('confidence'))}",
-    ]
-    if ident.get("upc"):
-        lines.append(f"UPC: {ident['upc']}")
-    if ident.get("condition_flags"):
-        lines.append(f"⚠️ Flags: {', '.join(ident['condition_flags'])}")
-    if not ident.get("brand") and not ident.get("product_name"):
-        lines.append("⚠️ Item is unconfirmed — please correct it before pricing.")
-    return "\n".join(lines)
-
-
-# How much the comps behind a price can be trusted (pipeline/price.py's tiers).
-_EVIDENCE_LABEL = {
-    "solid": "✅ solid comps",
-    "thin": "🟡 thin comps — worth a look",
-    "none": "❌ no usable comps",
-}
-
-
-def _short(text: str, n: int = 50) -> str:
-    text = " ".join((text or "").split())
-    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
-
-
-def _fmt_money(v) -> str:
-    try:
-        return f"{float(v):.2f}"
-    except (TypeError, ValueError):
-        return "?"
-
-
-def _format_pricing_v2(pricing: dict) -> str:
-    """Pricing v2 (pipeline/pricing_v2.py): Claude's price leads, with the comps
-    it leaned on, so the price can be checked from the phone in one glance."""
-    sp = pricing.get("suggested_price")
-    head = f"💰 Suggested price: ${sp}" if sp is not None else "💰 Price: none — type one"
-    conf = pricing.get("claude_confidence") or "none"
-    if pricing.get("price_basis") == "manual":
-        lines = [f"{head}  (typed; Claude said ${_fmt(pricing.get('claude_price'))}, {conf})"]
-    else:
-        lines = [f"{head}  (Claude, {conf} confidence)"]
-    if "priced_from_asks" in (pricing.get("review_flags") or []):
-        lines.append("  ⚠️ no sales found, priced from asking prices")
-    ev = pricing.get("claude_evidence") or {}
-    if ev.get("reason"):
-        lines.append(f"  {ev['reason']}")
-    for c in ev.get("comps") or []:
-        kind = "sold" if c.get("source") == "sold" else "active"
-        line = f"  • ${_fmt_money(c.get('price'))} {kind} — {_short(c.get('title'))}"
-        if c.get("url"):
-            line += f"\n    {c['url'].split('?')[0]}"
-        lines.append(line)
-    n_same = pricing.get("same_item_sold_count") or 0
-    tail = f"  {n_same} same-item sale(s) of {pricing.get('candidate_count') or 0} comps"
-    if pricing.get("formula_price"):
-        tail += f"; formula ${pricing['formula_price']}"
-    lines.append(tail + " (comp prices include shipping)")
-    warning = pricing.get("comp_warning")
-    if warning:   # the asks line above already says this part
-        warning = "; ".join(w for w in warning.split("; ")
-                            if w != "no sales found, priced from asking prices")
-    if warning:
-        lines.append(f"  ⚠️ {warning}")
-    return "\n".join(lines)
-
-
-def format_pricing(pricing: dict) -> str:
-    if pricing.get("engine") == "v2":
-        return _format_pricing_v2(pricing)
-    sp = pricing.get("suggested_price")
-    head = f"💰 Suggested price: ${sp}" if sp is not None else "💰 Price: none — type one"
-    lines = [head]
-
-    evidence = pricing.get("evidence")
-    if evidence:
-        n, disp = pricing.get("sold_count"), pricing.get("dispersion")
-        detail = f"{n} sold comp(s)"
-        if disp:
-            detail += f", {disp}x spread"
-        if pricing.get("query_rung") and pricing["query_rung"] != "exact":
-            detail += f", matched on '{pricing.get('query_used')}'"
-        lines.append(f"  {_EVIDENCE_LABEL.get(evidence, evidence)} — {detail}")
-
-    lines.append(
-        f"  sold median: ${_fmt(pricing.get('sold_median'))} | "
-        f"active floor: ${_fmt(pricing.get('active_floor'))} | {_fmt(pricing.get('confidence'))}")
-
-    # Only useful when there's no comp-backed price to compare it against —
-    # otherwise it invites pricing off an LLM estimate, which is exactly what
-    # the evidence tiers exist to stop.
-    if sp is None and pricing.get("research_resale"):
-        lines.append(f"  research estimate (not a comp): ${pricing['research_resale']}")
-    if pricing.get("price_source_url"):
-        lines.append(f"  source: {pricing['price_source_url']}")
-    if pricing.get("comp_warning"):
-        lines.append(f"  ⚠️ {pricing['comp_warning']}")
-    return "\n".join(lines)
-
-
 # A typed correction that is really a price instruction: "159.99", "price 159.99",
 # "make it $159.99", "sell for 160". Deliberately narrow — it must not fire on
 # ordinary copy edits that happen to contain a number ("size 10 not 8", "2 front
@@ -2478,66 +2131,6 @@ def _parse_price_override(text: str) -> float | None:
         return None
     # A free item is never what someone meant to type.
     return _charm_price(value) if value > 0 else None
-
-
-def _price_evidence_line(pricing: dict) -> str:
-    """What a price rests on, in one line. v2 prices come from the Claude judge
-    over same-item comps and have no sold median, so the v1 wording ("from 5
-    solid comps", "sold median: $None") misdescribed them — a price built on one
-    sale was announced as solid."""
-    if pricing.get("engine") == "v2":
-        sold, active = pricing.get("sold_count") or 0, pricing.get("active_count") or 0
-        who = (f"set by hand (Claude said ${pricing.get('machine_price')})"
-               if pricing.get("manual_price") is not None
-               else f"Claude, {pricing.get('confidence')} confidence")
-        return (f"{who} · "
-                f"{sold} same-item sale(s), {active} active")
-    return (f"sold median: ${pricing.get('sold_median')} | active floor: "
-            f"${pricing.get('active_floor')} | {pricing.get('confidence')} "
-            f"({pricing.get('sold_count')} comps)")
-
-
-def format_draft(result) -> str:
-    ident = result["identification"]
-    pricing = result["pricing"]
-    listing = result["listing"]
-
-    desc = listing.get("description", "")
-    short_desc = desc[:300] + ("..." if len(desc) > 300 else "")
-
-    lines = [
-        f"✓ {ident['brand']} {ident['model']}",
-        f"Confidence: {ident['confidence']}",
-    ]
-
-    if ident.get("condition_flags"):
-        lines.append(f"⚠️ FLAGS: {ident['condition_flags']}")
-
-    lines += [
-        "",
-        f"TITLE ({len(listing['title'])} chars):",
-        listing["title"],
-        "",
-        f"PRICE: ${listing['price']}",
-        "  " + _price_evidence_line(pricing),
-    ]
-
-    if pricing.get("price_source_url"):
-        lines.append(f"  price source: {pricing['price_source_url']}")
-
-    check = format_check(result.get("listing_check"))
-    if check:
-        lines += ["", check]
-
-    lines += [
-        "",
-        "DESCRIPTION:",
-        short_desc,
-        "",
-        "Tap Approve / Reject below, or type a correction (e.g. 'color is yellow not orange').",
-    ]
-
-    return "\n".join(lines)
 
 
 _CONFIRM_WORDS = ("confirm", "yes", "ok", "okay", "y", "✅", "👍")

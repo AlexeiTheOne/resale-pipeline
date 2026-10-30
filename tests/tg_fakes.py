@@ -463,12 +463,20 @@ BOT_STATE_NAMES = (
 
 
 def reset_bot_state(tb) -> None:
-    """Empty every per-user dict/set in telegram_bot (and the /errors buffer)."""
+    """Empty every per-user dict/set in bot.state (and the /errors buffer).
+
+    Reads bot.state / bot.util first, the modules that own the objects;
+    telegram_bot re-exports the same objects, so it is only the fallback."""
+    from bot import state, util
     for name in BOT_STATE_NAMES:
-        obj = getattr(tb, name, None)
+        obj = getattr(state, name, None)
+        if obj is None:
+            obj = getattr(tb, name, None)
         if obj is not None:
             obj.clear()
-    errs = getattr(tb, "_recent_errors", None)
+    errs = getattr(util, "_recent_errors", None)
+    if errs is None:
+        errs = getattr(tb, "_recent_errors", None)
     if errs is not None:
         errs.clear()
 

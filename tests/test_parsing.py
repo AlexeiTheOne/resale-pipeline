@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import telegram_bot as tb
+import db as db_module
 
 
 def test_an_item_id_is_never_read_as_a_price():
@@ -82,8 +83,9 @@ class _FakeDB:
     """A tiny in-memory stand-in for db.py, keyed like the real table.
 
     telegram_bot.py calls get_item/list_items/update_field/update_status as
-    plain module-level names (imported with `from db import ...`), so patching
-    those names on the tb module is enough to keep every command under test
+    plain module-level names (imported with `from db import ...`), while the
+    helpers split out into bot/ call them through the module (`db.get_item`).
+    Patching those names on both tb and db keeps every command under test
     from touching the real data/ross.db — no sqlite file, no network, nothing
     left behind."""
 
@@ -134,14 +136,15 @@ class _patched_db:
         self._saved = {}
 
     def __enter__(self):
-        for name in ("get_item", "list_items", "update_field", "update_status"):
-            self._saved[name] = getattr(tb, name)
-            setattr(tb, name, getattr(self.db, name))
+        for mod in (tb, db_module):
+            for name in ("get_item", "list_items", "update_field", "update_status"):
+                self._saved[(mod, name)] = getattr(mod, name)
+                setattr(mod, name, getattr(self.db, name))
         return self.db
 
     def __exit__(self, *exc):
-        for name, fn in self._saved.items():
-            setattr(tb, name, fn)
+        for (mod, name), fn in self._saved.items():
+            setattr(mod, name, fn)
         tb.last_item.pop(FAKE_USER_ID, None)
 
 
