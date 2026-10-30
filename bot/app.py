@@ -145,6 +145,8 @@ async def _post_init(app: Application) -> None:
         write_heartbeat()
     except OSError as e:
         print(f"WARNING: could not write heartbeat (non-fatal): {e}")
+    # Nothing is in flight yet, so this removes a busy.json left by a crash.
+    util.write_busy()
     commands = [
         BotCommand(cmd.lstrip("/").split()[0], desc[:256])
         for _, entries in ops_cmds.HELP_SECTIONS

@@ -1,11 +1,14 @@
 """Generic Telegram helpers (replies, chunking, error buffer, item-id
 resolution, in-flight claims). No feature logic."""
 import asyncio
+import json
 import os
 import traceback
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 
+import config
 import db
 from bot import state
 
@@ -216,12 +219,43 @@ def _names_an_item(token: str) -> bool:
 
 def _claim(kind: str, item_id: str) -> bool:
     """Claim (kind, item_id) synchronously. False if someone else holds it."""
+    global _busy_since
     key = (kind, item_id)
     if key in state._in_flight:
         return False
+    if not state._in_flight:
+        _busy_since = datetime.now(timezone.utc).isoformat(timespec="seconds")
     state._in_flight.add(key)
+    write_busy()
     return True
 
 
 def _release(kind: str, item_id: str) -> None:
     state._in_flight.discard((kind, item_id))
+    write_busy()
+
+
+# When _in_flight last went from empty to non-empty (UTC ISO).
+_busy_since = ""
+
+
+def write_busy() -> None:
+    """Mirror _in_flight into logs/busy.json for the deploy script: the file
+    exists only while work is in flight, and is removed when idle. Temp file +
+    replace, like the heartbeat. A file error never breaks a claim/release."""
+    path = Path(config.LOG_DIR) / "busy.json"
+    try:
+        if not state._in_flight:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "pid": os.getpid(),
+            "since": _busy_since,
+            "work": sorted(f"{k}:{i}" for k, i in state._in_flight),
+        }
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"WARNING: could not update busy.json (non-fatal): {e}")
