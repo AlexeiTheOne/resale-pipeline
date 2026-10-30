@@ -191,15 +191,16 @@ function Test-InStaging([string]$Sha) {
 
     $probe = Invoke-Native $Python @('-c', 'import pytest')
     if ($probe.Code -ne 0) {
-        throw "pytest is not installed in $Python. Install it once by hand: venv\Scripts\python.exe -m pip install pytest"
+        throw "pytest is not installed in $Python. Install it once by hand: venv\Scripts\python.exe -m pip install -r requirements-dev.txt"
     }
 
-    # Dummy keys for the test process only; restored afterwards.
+    # No API keys in the test process, so a test can never call a real API.
+    # Tests need none (clients are created on first use). Restored afterwards.
     $keys = 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'ANTHROPIC_API_KEY'
     $saved = @{}
     foreach ($k in $keys) {
         $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
-        [Environment]::SetEnvironmentVariable($k, 'dummy', 'Process')
+        [Environment]::SetEnvironmentVariable($k, $null, 'Process')
     }
     $outFile = Join-Path $LogDir 'deploy-pytest.out'
     $errFile = Join-Path $LogDir 'deploy-pytest.err'
@@ -224,7 +225,7 @@ function Test-InStaging([string]$Sha) {
 
 function Invoke-Backup {
     Push-Location $RepoPath
-    try { $r = Invoke-Native $Python @('backup.py') } finally { Pop-Location }
+    try { $r = Invoke-Native $Python @('backup.py', '--db-only') } finally { Pop-Location }
     return $r
 }
 
@@ -245,8 +246,12 @@ function Wait-Idle {
 }
 
 function Install-Requirements {
+    # requirements-dev.txt = requirements.txt + pytest. Older commits (a
+    # rollback target) may not have it.
+    $reqFile = 'requirements-dev.txt'
+    if (-not (Test-Path (Join-Path $RepoPath $reqFile))) { $reqFile = 'requirements.txt' }
     Push-Location $RepoPath
-    try { $r = Invoke-Native $Python @('-m', 'pip', 'install', '-q', '-r', 'requirements.txt') } finally { Pop-Location }
+    try { $r = Invoke-Native $Python @('-m', 'pip', 'install', '-q', '-r', $reqFile) } finally { Pop-Location }
     if ($r.Code -ne 0) { Write-Log "pip install failed: $(Get-Tail $r.Out 10)" }
     return ($r.Code -eq 0)
 }
@@ -333,7 +338,7 @@ function Invoke-Deploy {
 
     $subjects = Git-Must @('log', '--format=%h %s', '--max-count=10', "$old..$new")
     $count = [int](Git-Must @('rev-list', '--count', "$old..$new"))
-    $reqChanged = (Invoke-Git @('diff', '--quiet', $old, $new, '--', 'requirements.txt')).Code -ne 0
+    $reqChanged = (Invoke-Git @('diff', '--quiet', $old, $new, '--', 'requirements.txt', 'requirements-dev.txt')).Code -ne 0
 
     if ($DryRun) {
         Write-Log "would deploy $count commit(s), requirements changed: $reqChanged`n$subjects"

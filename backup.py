@@ -90,12 +90,20 @@ def prune(dest: Path, prefix: str, keep: int) -> None:
         old.unlink()
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    """Back up the DB and the inbox. With --db-only (used by scripts/deploy.ps1
+    before each deploy) only the DB: the inbox zip is ~200 MB and only the
+    nightly run needs it."""
+    db_only = "--db-only" in (sys.argv[1:] if argv is None else argv)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     _sweep_partials(BACKUP_DIR)
 
     db_out = backup_db(BACKUP_DIR)
     print(f"[ok] DB backed up  -> {db_out} ({db_out.stat().st_size / 1024:.0f} KB)")
+    if db_only:
+        prune(BACKUP_DIR, "ross-", KEEP)
+        print(f"[--] DB only. Kept the {KEEP} most recent DB backups in {BACKUP_DIR}.")
+        return
 
     inbox_out = backup_inbox(BACKUP_DIR)
     if inbox_out:
