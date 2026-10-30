@@ -12,8 +12,8 @@ Several updates in one scenario (a photo batch, then a button tap) share a
 context: pass `context=ctx` to the builders. Handlers that start background
 work do it with context.application.create_task; `run()` awaits those tasks
 (and any they spawn) before returning, so a debounce timer such as
-finalize_capture finishes inside the call — set tb.DEFAULT_CAPTURE_WINDOW (or
-tb.capture_window[user_id]) to 0 with monkeypatch so it doesn't really sleep.
+finalize_capture finishes inside the call — set bot.intake.DEFAULT_CAPTURE_WINDOW
+(or state.capture_window[user_id]) to 0 with monkeypatch so it doesn't really sleep.
 
 Module-level state in telegram_bot (pending, staging, review, gate, ...)
 outlives a test; call reset_bot_state(tb) before and after (see bot_state()).

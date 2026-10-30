@@ -12,7 +12,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import config  # noqa: E402
 import telegram_bot as tb  # noqa: E402
+from bot import formatting  # noqa: E402
+from ebay import inventory  # noqa: E402
+from pipeline import draft, listing_check  # noqa: E402
 from tg_fakes import (  # noqa: E402
     DEFAULT_USER_ID as UID, FakeMessage, bot_state, last_markup_buttons,
     make_callback_update, make_text_update, run, run_steps, sent_texts, tiny_jpeg,
@@ -42,9 +46,10 @@ def bot(monkeypatch):
             def f(*a, **k):
                 raise AssertionError(f"unstubbed call: {name}")
             return f
-        for name in ("revise_draft", "revise_identification", "create_draft_offer"):
-            monkeypatch.setattr(tb, name, forbidden(name))
-        monkeypatch.setattr(tb, "check_listing_and_store", lambda item_id: None)
+        for mod, name in ((draft, "revise_draft"), (draft, "revise_identification"),
+                          (inventory, "create_draft_offer")):
+            monkeypatch.setattr(mod, name, forbidden(name))
+        monkeypatch.setattr(listing_check, "check_and_store", lambda item_id: None)
         yield tb
 
 
@@ -89,7 +94,7 @@ def stub_ebay_ok(monkeypatch, seen):
     def create(item_id):
         seen.append(item_id)
         return {"sku": "SKU1", "offer_id": "OFF1"}
-    monkeypatch.setattr(tb, "create_draft_offer", create)
+    monkeypatch.setattr(inventory, "create_draft_offer", create)
 
 
 # --- the review message ----------------------------------------------------
@@ -114,7 +119,7 @@ def test_review_message_shows_title_price_and_buttons(bot):
 
 def test_typed_correction_revises_and_reshows(bot, monkeypatch):
     calls = []
-    monkeypatch.setattr(tb, "revise_draft", fake_revise(calls))
+    monkeypatch.setattr(draft, "revise_draft", fake_revise(calls))
     item_id = seed("review")
     tb.review[UID] = item_id
 
@@ -136,7 +141,7 @@ def test_typed_correction_revises_and_reshows(bot, monkeypatch):
 
 def test_two_corrections_build_on_each_other(bot, monkeypatch):
     calls = []
-    monkeypatch.setattr(tb, "revise_draft", fake_revise(calls))
+    monkeypatch.setattr(draft, "revise_draft", fake_revise(calls))
     item_id = seed()
     tb.review[UID] = item_id
 
@@ -152,9 +157,9 @@ def test_two_corrections_build_on_each_other(bot, monkeypatch):
 
 def test_correction_reruns_listing_check_when_enabled(bot, monkeypatch):
     checked = []
-    monkeypatch.setattr(tb, "revise_draft", fake_revise([]))
-    monkeypatch.setattr(tb, "LISTING_CHECK_ENABLED", True)
-    monkeypatch.setattr(tb, "check_listing_and_store", checked.append)
+    monkeypatch.setattr(draft, "revise_draft", fake_revise([]))
+    monkeypatch.setattr(config, "LISTING_CHECK_ENABLED", True)
+    monkeypatch.setattr(listing_check, "check_and_store", checked.append)
     item_id = seed()
     tb.review[UID] = item_id
     update, ctx = make_text_update("fix it")
@@ -181,7 +186,7 @@ def test_price_correction_skips_revise_draft_and_records_manual_price(bot):
 def test_revise_failure_reports_error_and_leaves_draft_unchanged(bot, monkeypatch):
     def broken(*a, **k):
         raise RuntimeError("model exploded")
-    monkeypatch.setattr(tb, "revise_draft", broken)
+    monkeypatch.setattr(draft, "revise_draft", broken)
     item_id = seed()
     tb.review[UID] = item_id
     before = tb.get_item(item_id)["listing"]
@@ -204,7 +209,7 @@ def test_text_outside_review_does_not_revise(bot):
 def test_reply_to_draft_message_targets_that_item(bot, monkeypatch):
     """With draft B active, replying to draft A's message revises A."""
     calls = []
-    monkeypatch.setattr(tb, "revise_draft", fake_revise(calls))
+    monkeypatch.setattr(draft, "revise_draft", fake_revise(calls))
     a = seed(title="Item A title")
     b = seed(title="Item B title")
     ctx = show(a)
@@ -249,7 +254,7 @@ def test_approve_button_creates_ebay_draft(bot, monkeypatch):
 def test_approve_button_ebay_failure_leaves_item_approved(bot, monkeypatch):
     def fail(item_id):
         raise RuntimeError("ebay down")
-    monkeypatch.setattr(tb, "create_draft_offer", fail)
+    monkeypatch.setattr(inventory, "create_draft_offer", fail)
     item_id = seed()
     tap, ctx = make_callback_update(f"review:approve:{item_id}")
     run(tb.review_callback, tap, ctx)
@@ -262,8 +267,8 @@ def test_title_too_long_sends_item_back_to_review(bot, monkeypatch):
 
     def raiser(item_id):
         raise err
-    monkeypatch.setattr(tb, "create_draft_offer", raiser)
-    monkeypatch.setattr(tb, "_title_too_long_text", lambda e, i: "TITLE TOO LONG")
+    monkeypatch.setattr(inventory, "create_draft_offer", raiser)
+    monkeypatch.setattr(formatting, "_title_too_long_text", lambda e, i: "TITLE TOO LONG")
     item_id = seed()
     tap, ctx = make_callback_update(f"review:approve:{item_id}")
     run(tb.review_callback, tap, ctx)
@@ -355,13 +360,13 @@ def test_typed_reject(bot, word):
 
 
 def test_correct_then_approve_publishes_revised_listing(bot, monkeypatch):
-    monkeypatch.setattr(tb, "revise_draft", fake_revise([]))
+    monkeypatch.setattr(draft, "revise_draft", fake_revise([]))
     seen = []
 
     def create(item_id):
         seen.append(tb.get_item(item_id)["listing"]["title"])
         return {"sku": "S", "offer_id": "O"}
-    monkeypatch.setattr(tb, "create_draft_offer", create)
+    monkeypatch.setattr(inventory, "create_draft_offer", create)
     item_id = seed()
     ctx = show(item_id)
     u1, _ = make_text_update("navy", context=ctx)
@@ -380,7 +385,7 @@ def test_identify_gate_correction_uses_revise_identification(bot, monkeypatch):
     def revise_ident(ident, text):
         calls.append((dict(ident), text))
         return {**ident, "brand": "Adidas"}
-    monkeypatch.setattr(tb, "revise_identification", revise_ident)
+    monkeypatch.setattr(draft, "revise_identification", revise_ident)
     item_id = seed("identified")
     tb.gate[UID] = {"item_id": item_id, "stage": "identify"}
 
@@ -398,7 +403,7 @@ def test_identify_gate_correction_uses_revise_identification(bot, monkeypatch):
 def test_identify_gate_revise_failure_keeps_identification(bot, monkeypatch):
     def broken(ident, text):
         raise ValueError("bad json")
-    monkeypatch.setattr(tb, "revise_identification", broken)
+    monkeypatch.setattr(draft, "revise_identification", broken)
     item_id = seed("identified")
     tb.gate[UID] = {"item_id": item_id, "stage": "identify"}
     update, ctx = make_text_update("brand is Adidas")

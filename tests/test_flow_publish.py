@@ -39,6 +39,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import claude_llm  # noqa: E402
+import config  # noqa: E402
 import retry_publish  # noqa: E402
 import telegram_bot as tb  # noqa: E402
 from ebay import inventory, marketing, taxonomy  # noqa: E402
@@ -422,8 +423,8 @@ def test_best_offer_off_sends_no_terms(bot, http, monkeypatch):
 @pytest.mark.parametrize("rate", [None, 7.5, 0])
 def test_ad_rate_after_publish_follows_config(bot, http, monkeypatch, rate):
     if rate is not None:
-        monkeypatch.setattr(tb, "EBAY_DEFAULT_AD_RATE_PCT", rate)
-    rate = tb.EBAY_DEFAULT_AD_RATE_PCT
+        monkeypatch.setattr(config, "EBAY_DEFAULT_AD_RATE_PCT", rate)
+    rate = config.EBAY_DEFAULT_AD_RATE_PCT
     item_id = seed_review_item()
     ctx = approve(item_id)
     activate(item_id, ctx)
@@ -442,7 +443,7 @@ def test_ad_rate_after_publish_follows_config(bot, http, monkeypatch, rate):
 
 
 def test_ad_rate_failure_still_reports_listing_as_published(bot, http, monkeypatch):
-    monkeypatch.setattr(tb, "EBAY_DEFAULT_AD_RATE_PCT", 5)
+    monkeypatch.setattr(config, "EBAY_DEFAULT_AD_RATE_PCT", 5)
     http.fail["create_ad"] = FakeResp(500, {"errors": [{"message": "boom"}]})
     item_id = seed_review_item()
     ctx = approve(item_id)
@@ -520,7 +521,7 @@ def test_concurrent_double_activate_publishes_and_promotes_once(bot, http, monke
     """Two overlapping /activate (concurrent_updates=True) for one item: the
     first claims it before the worker-thread publish, the second is told it's
     already publishing."""
-    monkeypatch.setattr(tb, "EBAY_DEFAULT_AD_RATE_PCT", 5)
+    monkeypatch.setattr(config, "EBAY_DEFAULT_AD_RATE_PCT", 5)
     item_id = seed_review_item()
     ctx = approve(item_id)
     http.publish_gate = threading.Event()
@@ -545,7 +546,7 @@ def test_concurrent_double_activate_publishes_and_promotes_once(bot, http, monke
 # --------------------------------------------------------------------------- #
 
 def test_publish_error_leaves_item_unlisted_and_retry_publishes(bot, http, monkeypatch):
-    monkeypatch.setattr(tb, "EBAY_DEFAULT_AD_RATE_PCT", 5)
+    monkeypatch.setattr(config, "EBAY_DEFAULT_AD_RATE_PCT", 5)
     item_id = seed_review_item()
     ctx = approve(item_id)
     http.fail["publish"] = FakeResp(500, {"errors": [{"message": "System error"}]})

@@ -201,18 +201,24 @@ def _str(node):
     return None
 
 
-def _patched_names():
-    """{name: [files]} of telegram_bot attributes the tests patch."""
+def _test_sources():
+    for path in sorted(TESTS_DIR.glob("*.py")):
+        if path.name == Path(__file__).name:
+            continue
+        yield path.name, path.read_text(encoding="utf-8")
+
+
+def _patched_names(sources=None):
+    """{name: [files]} of telegram_bot attributes the tests patch.
+    `sources` is (file name, text) pairs; default: every test file but this one."""
     found = {}
 
     def add(name, f):
         if name:
             found.setdefault(name, set()).add(f)
 
-    for path in sorted(TESTS_DIR.glob("*.py")):
-        if path.name == Path(__file__).name:
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    for fname_, text in (_test_sources() if sources is None else sources):
+        tree = ast.parse(text)
         al = _module_aliases(tree)
 
         def is_mod(n):
@@ -227,7 +233,7 @@ def _patched_names():
             for t in targets:
                 for leaf in (t.elts if isinstance(t, (ast.Tuple, ast.List)) else [t]):
                     if isinstance(leaf, ast.Attribute) and is_mod(leaf.value):
-                        add(leaf.attr, path.name)
+                        add(leaf.attr, fname_)
             if isinstance(node, ast.Call):
                 fn = node.func
                 fname = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
@@ -236,10 +242,10 @@ def _patched_names():
                     continue
                 first = _str(args[0])
                 if fname in ("setattr", "patch") and first and first.startswith("telegram_bot."):
-                    add(first.split(".")[1], path.name)
+                    add(first.split(".")[1], fname_)
                 elif fname in ("setattr", "object") and is_mod(args[0]) and len(args) > 1:
                     if _str(args[1]):
-                        add(_str(args[1]), path.name)
+                        add(_str(args[1]), fname_)
                     elif fname == "setattr":
                         # setattr(tb, name, ...) in a loop: take the string
                         # literals of tuples/lists in the enclosing function.
@@ -249,7 +255,7 @@ def _patched_names():
                                     if isinstance(seq, (ast.Tuple, ast.List)):
                                         for e in seq.elts:
                                             if _str(e) and _str(e).isidentifier():
-                                                add(_str(e), path.name)
+                                                add(_str(e), fname_)
     return {k: sorted(v) for k, v in found.items()}
 
 
@@ -274,8 +280,32 @@ def _names_read_by_telegram_bot():
     return seen
 
 
+_SCAN_SAMPLE = '''
+import telegram_bot as tb
+from unittest import mock
+
+def test_a(monkeypatch):
+    monkeypatch.setattr(tb, "by_setattr", 1)
+    monkeypatch.setattr("telegram_bot.by_dotted_string", 1)
+    tb.by_assign = 1
+    tb.by_augassign += 1
+    mock.patch("telegram_bot.by_patch")
+    mock.patch.object(tb, "by_patch_object")
+
+def test_loop(monkeypatch):
+    for name in ("by_loop_one", "by_loop_two"):
+        monkeypatch.setattr(tb, name, None)
+'''
+
+
 def test_patch_scan_finds_names():
-    assert len(_patched_names()) > 5, "AST scan found almost nothing; scanner is broken"
+    # The scanner itself, on every patch form it claims to understand. (Most
+    # tests now patch the module that owns a name, not telegram_bot, so a count
+    # of real telegram_bot patches no longer says whether the scanner works.)
+    assert set(_patched_names([("sample.py", _SCAN_SAMPLE)])) == {
+        "by_setattr", "by_dotted_string", "by_assign", "by_augassign", "by_patch",
+        "by_patch_object", "by_loop_one", "by_loop_two"}, "scanner is broken"
+    assert _patched_names(), "AST scan of the real tests found nothing; scanner is broken"
 
 
 def test_patched_names_exist_and_take_effect():

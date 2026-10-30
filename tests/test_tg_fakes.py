@@ -7,6 +7,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import telegram_bot as tb  # noqa: E402
+from bot import intake  # noqa: E402
 from telegram.ext import ApplicationHandlerStop  # noqa: E402
 from tg_fakes import (  # noqa: E402
     DEFAULT_USER_ID, bot_state, last_markup_buttons, make_callback_update,
@@ -55,7 +56,7 @@ def test_command_args_are_split_like_ptb():
 def test_photo_batch_then_cancel_button(bot, monkeypatch):
     """Two photos debounce into one staged item with Start/Wait/Cancel buttons;
     Cancel deletes it. Exercises get_file, create_task and drain()."""
-    monkeypatch.setattr(tb, "DEFAULT_CAPTURE_WINDOW", 0)
+    monkeypatch.setattr(intake, "DEFAULT_CAPTURE_WINDOW", 0)
     p1, ctx = make_photo_update()
     p2, _ = make_photo_update(context=ctx)
     # Both photos on one loop: the second cancels the first's finalize timer.

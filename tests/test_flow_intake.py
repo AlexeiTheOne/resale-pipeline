@@ -33,6 +33,7 @@ import db  # noqa: E402
 import identify  # noqa: E402
 import ross_tag  # noqa: E402
 import telegram_bot as tb  # noqa: E402
+from bot import intake  # noqa: E402
 import pipeline.draft as draft  # noqa: E402
 import pipeline.listing_check as listing_check  # noqa: E402
 import pipeline.pricing_v2 as pricing_v2  # noqa: E402
@@ -79,8 +80,8 @@ def no_network(monkeypatch):
 @pytest.fixture
 def bot(monkeypatch):
     with bot_state(tb):
-        monkeypatch.setattr(tb, "DEFAULT_CAPTURE_WINDOW", 0)
-        monkeypatch.setattr(tb, "WAIT_EXTENSION", 0)
+        monkeypatch.setattr(intake, "DEFAULT_CAPTURE_WINDOW", 0)
+        monkeypatch.setattr(intake, "WAIT_EXTENSION", 0)
         yield tb
 
 
@@ -101,13 +102,13 @@ class Pipeline:
         self.receipt_photo = None
         self.current_item = None
 
-        monkeypatch.setattr(tb, "AUTO_CONFIRM", True)
-        monkeypatch.setattr(tb, "AUTO_CONFIRM_MIN_IDENT_CONFIDENCE", 0.8)
-        monkeypatch.setattr(tb, "AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC", 0.6)
+        monkeypatch.setattr(config, "AUTO_CONFIRM", True)
+        monkeypatch.setattr(config, "AUTO_CONFIRM_MIN_IDENT_CONFIDENCE", 0.8)
+        monkeypatch.setattr(config, "AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC", 0.6)
         # Read by pipeline/stages.py through `config.`, so patched there.
         monkeypatch.setattr(config, "PRICING_ENGINE", "v2")
         monkeypatch.setattr(config, "LISTING_CHECK_ENABLED", True)
-        monkeypatch.setattr(tb, "EBAY_DEFAULT_AD_RATE_PCT", 0)
+        monkeypatch.setattr(config, "EBAY_DEFAULT_AD_RATE_PCT", 0)
         monkeypatch.setattr(ross_tag, "decode_barcode", lambda path: None)
         monkeypatch.setattr(ross_tag, "detect_ross_tags", lambda paths: set())
         monkeypatch.setattr(ross_tag, "extract_receipt", self._extract_receipt)
@@ -368,7 +369,7 @@ def test_start_runs_through_to_review_when_gates_clear(bot, monkeypatch):
 ])
 def test_start_stops_at_identify_gate(bot, monkeypatch, auto_confirm, confidence, reason):
     pipe = Pipeline(monkeypatch, confidence=confidence)
-    monkeypatch.setattr(tb, "AUTO_CONFIRM", auto_confirm)
+    monkeypatch.setattr(config, "AUTO_CONFIRM", auto_confirm)
     ctx, item_id, _ = send_batch(1)
     pipe.current_item = item_id
 
@@ -400,7 +401,7 @@ def test_typed_confirm_at_identify_gate_continues_to_review(bot, monkeypatch):
     """The gate -> 'confirm' -> price -> draft hop, so the whole intake path is
     covered with the gate on."""
     pipe = Pipeline(monkeypatch)
-    monkeypatch.setattr(tb, "AUTO_CONFIRM", False)
+    monkeypatch.setattr(config, "AUTO_CONFIRM", False)
     ctx, item_id, _ = send_batch(1)
     pipe.current_item = item_id
     tap(ctx, f"confirm:start:{item_id}")

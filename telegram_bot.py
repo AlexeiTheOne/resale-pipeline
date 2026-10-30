@@ -1,4 +1,4 @@
-import os, sys, re, uuid, asyncio, shutil, tempfile, time, traceback
+import os, sys, re, asyncio, shutil, tempfile, time, traceback
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,14 +24,12 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import (
-    AUTO_CONFIRM, AUTO_CONFIRM_MIN_IDENT_CONFIDENCE, DATA_DIR, LOG_DIR,
-    AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC,
-    GEMINI_PHOTO_LIMIT, MAX_CONCURRENT_LISTINGS, EBAY_DEFAULT_AD_RATE_PCT,
+    DATA_DIR, LOG_DIR, GEMINI_PHOTO_LIMIT,
     REPRICE_WEEKDAY, REPRICE_HOUR_UTC,
     SYNC_ENABLED, SYNC_HOUR_UTC, SYNC_DAYS, JOB_CATCHUP_GRACE_HOURS,
     SOLD_ALERTS_ENABLED, SOLD_ALERT_MINUTES,
     FEEDBACK_ENABLED, FEEDBACK_HOUR_UTC, FEEDBACK_COMMENT,
-    OFFER_MESSAGE, LISTING_CHECK_ENABLED,
+    OFFER_MESSAGE,
     WATCHER_OFFER_PCT,
 )
 import db
@@ -44,10 +42,8 @@ from db import (
 import identify
 import llm_usage
 import ross_tag
-from pipeline.draft import revise_draft, revise_identification
-from pipeline.listing_check import check_and_store as check_listing_and_store
 from pipeline.reprice import run_weekly_check, send_planned_offers
-from profit import breakeven_price, format_projection, project
+from profit import format_projection, project
 from ebay.auth import get_access_token
 from ebay.analytics import traffic_status
 from ebay.orders import (
@@ -67,10 +63,9 @@ from ebay.inventory import (
     update_offer_price,
     update_offer_quantity,
     withdraw_offer,
-    MissingRequiredAspectsError,
     TitleTooLongError,
 )
-from ebay.marketing import promote_listing, marketing_status
+from ebay.marketing import marketing_status
 from ebay.negotiation import (
     negotiation_status, send_offer,
 )
@@ -111,9 +106,28 @@ from db import (  # noqa: F401  (re-export)
     next_receipt_code as _next_receipt_code, set_location as _set_location,
 )
 
+from bot import flow, intake, text_router
+from bot.intake import (  # noqa: F401  (re-export)
+    INBOX, DEFAULT_CAPTURE_WINDOW, EXTENDED_CAPTURE_WINDOW, WAIT_EXTENSION,
+    finalize_capture, _is_ross_tag, _split_haul, _run_haul, _haul_digest, haul_command,
+    _confirmation_markup, _send_confirmation, _await_more_photos, _finalize_append,
+    addphotos_command,
+)
+from bot.flow import (  # noqa: F401  (re-export)
+    _pipeline_semaphore, _review_markup, _notifier, _run_stage, _retry_markup,
+    _show_review, _publish_and_report, _publish_and_report_claimed,
+    _identify_gate_reason, _price_gate_reason, advance, _advance_one, _gate_is_busy,
+    _enqueue_gate, _activate_next_gate, _show_identify_gate, _show_price_gate,
+    confirm_callback, _approve_item, review_callback, _activate_item, _promote_item,
+    _retry_item,
+)
+from bot.text_router import (  # noqa: F401  (re-export)
+    _PRICE_CORRECTION, _price_from_correction, _apply_manual_price, _charm_price,
+    _parse_price_override, _CONFIRM_WORDS, _explicit_target, _handle_targeted,
+    _handle_gate, text_handler, _floor_refusal,
+)
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-INBOX = DATA_DIR / "inbox"
-INBOX.mkdir(parents=True, exist_ok=True)
 
 
 # Whitelist of Telegram user IDs allowed to drive the bot. This gates a LIVE eBay
@@ -122,10 +136,6 @@ INBOX.mkdir(parents=True, exist_ok=True)
 # existing install isn't bricked on upgrade) but prints a loud startup warning;
 # use /whoami to get your id, then set TELEGRAM_ALLOWED_USER_IDS in .env.
 ALLOWED_USER_IDS = _parse_allowed_ids(os.getenv("TELEGRAM_ALLOWED_USER_IDS"))
-
-DEFAULT_CAPTURE_WINDOW = 5    # seconds to wait for more photos before processing
-EXTENDED_CAPTURE_WINDOW = 30  # after the user types "wait" — for forwarding big batches
-WAIT_EXTENSION = 15           # seconds the inline "Wait" button waits for more photos
 
 # Upper bound on a hand-typed /setqty. Ross stock is near-always single units and
 # the largest real listing so far held 5, so anything past this is a typo or a
@@ -251,7 +261,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if ap["task"] is not None:
                 ap["task"].cancel()
             ap["task"] = context.application.create_task(
-                _finalize_append(user_id, target, update, context)
+                intake._finalize_append(user_id, target, update, context, _resync_photos)
             )
             count = len(ap["new"])
             print(f"📷 Append: {count} new photo(s) buffered for item {target[:8]}")
@@ -270,7 +280,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if st["task"] is not None:
                 st["task"].cancel()
             st["task"] = context.application.create_task(
-                _await_more_photos(user_id, st["item_id"], context, WAIT_EXTENSION)
+                intake._await_more_photos(user_id, st["item_id"], context, intake.WAIT_EXTENSION)
             )
             count = len(st["paths"])
         else:
@@ -283,216 +293,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 pending[user_id]["task"].cancel()
 
             pending[user_id]["task"] = context.application.create_task(
-                finalize_capture(user_id, update, context)
+                intake.finalize_capture(user_id, update, context)
             )
     print(f"📷 Capture: photo appended, {count} buffered for user {user_id}")
-
-
-async def finalize_capture(user_id, update, context):
-    window = capture_window.get(user_id, DEFAULT_CAPTURE_WINDOW)
-    await asyncio.sleep(window)
-    async with _lock_for(user_id):
-        files = pending.pop(user_id)["files"]
-        capture_window.pop(user_id, None)  # reset to default for the next batch
-    # Order by message_id (your send order), not the order downloads finished.
-    files.sort(key=lambda md: md[0])
-    print(f"📷 Capture: {len(files)} photo(s) collected from buffer (window {window}s)")
-
-    staging_id = str(uuid.uuid4())
-    folder = INBOX / staging_id
-    folder.mkdir(parents=True, exist_ok=True)
-
-    paths = []
-    photos = []  # (message_id, path) kept so later-added photos stay ordered
-    for mid, b in files:
-        p = folder / f"{staging_id}_{mid}.jpg"
-        p.write_bytes(b)
-        paths.append(str(p))
-        photos.append((mid, str(p)))
-    print(f"📷 Capture: {len(paths)} photo(s) written to disk in {folder}")
-
-    if user_id in haul_mode:
-        # Haul mode stays armed until /cancel, as the /haul message promises.
-        # Consuming it on the first batch meant a pause longer than the capture
-        # window silently dropped back to single-item mode, and the next armful
-        # of photos became ONE item containing several products and their tags.
-        # Keep the long window armed for the next armful too; finalize_capture
-        # resets it to the default after every batch.
-        capture_window[user_id] = EXTENDED_CAPTURE_WINDOW
-        groups, separators, tags = await asyncio.to_thread(_split_haul, paths)
-        if not groups:
-            await _safe_reply(
-                update.message,
-                "📦 Haul: those were all blackout frames — no item photos among them. "
-                "Send the items, or /cancel to leave haul mode.")
-            return
-        if len(groups) == 1 and separators == 0 and tags == 0:
-            # Nothing divided anything: no blackout, no barcode, no recognised
-            # tag. Listing several products as a single item is much worse than
-            # asking, so refuse rather than guess.
-            await _safe_reply(
-                update.message,
-                f"📦 Haul: {len(paths)} photo(s), but I couldn't find a single Ross tag "
-                f"or blackout frame, so I can't tell where one item ends and the next "
-                f"begins.\n\nEither end each item with a photo of its Ross tag, or take "
-                f"one dark photo (cover the lens) between items. If this really is a "
-                f"single item, /cancel and send it normally.")
-            return
-        if tags:
-            await _safe_reply(
-                update.message,
-                f"🏷️ Spotted {tags} Ross tag(s) — using them to split the haul.")
-        await _run_haul(user_id, groups, update, context)
-        return
-
-    item_id = create_item(paths)
-    print(f"📷 Capture: item {item_id} created with {len(paths)} photo path(s) in DB")
-
-    # Don't auto-run. Hold the item and ask the user what to do with it.
-    chat_id = update.effective_chat.id
-    async with _lock_for(user_id):
-        staging[user_id] = {
-            "item_id": item_id, "folder": folder, "paths": paths, "photos": photos,
-            "chat_id": chat_id, "task": None,
-        }
-    await _send_confirmation(context, chat_id, item_id, len(paths))
-
-
-def _is_ross_tag(path: str) -> bool:
-    """Does this photo carry a Ross price tag's CODE128 barcode?
-
-    Measured over the real photo library this fires on only 41% of tag photos —
-    glare, angle and focus defeat the rest — so it is a bonus boundary, never the
-    one a haul depends on. See _split_haul."""
-    try:
-        digits = ross_tag.decode_barcode(path)
-    except Exception:
-        return False
-    return bool(digits) and len(digits) == 18
-
-
-def _split_haul(paths: list[str]) -> tuple[list[list[str]], int, int]:
-    """Split one photo dump into per-item groups.
-    Returns (groups, separators_seen, tags_detected).
-
-    The boundary is a **blackout frame** — a deliberately dark photo (cover the
-    lens) between items. Automatic tag detection was tried first and measured on
-    the real library: an 18-digit barcode decodes on 41% of tag photos, any
-    barcode on 39%, OCR finding Ross wording on 23% — 44% for all three combined.
-    A boundary detector that misses over half the time is worse than none,
-    because every miss silently welds two items into one.
-
-    A blackout frame is unambiguous: across 401 real photos the darkest averaged
-    56/255, while a covered lens lands near zero, so the threshold has room to
-    spare and merchandise can never trip it.
-
-    Two cheaper boundaries are tried first, so in practice you rarely need to
-    shoot a blackout at all:
-
-      * a Ross tag whose barcode decodes (free, local, never wrong when it fires)
-      * a Ross tag RECOGNISED by the vision model. Recognising a tag is far
-        easier than reading one — 21 of 21 real tags detected, 0 false positives
-        across 6 merchandise sets — so it works on the tags whose barcode won't
-        decode, which is most of them. One call per haul, not per photo.
-
-    The blackout frame stays the guaranteed override: it needs no network, no
-    model, and can't be argued with. Separator frames are dropped (they're not
-    photos of anything); trailing photos after the last separator are the final
-    item, since a separator delimits items and the last needs no terminator."""
-    tag_indices = ross_tag.detect_ross_tags(paths)
-
-    groups, current, separators = [], [], 0
-    for idx, path in enumerate(paths):
-        if ross_tag.is_dark_frame(path):
-            separators += 1
-            if current:
-                groups.append(current)
-                current = []
-            continue
-        is_tag = idx in tag_indices or _is_ross_tag(path)
-        # Two tags in a row — a double-stickered item photographed twice, or a
-        # re-shoot of an unreadable tag — would otherwise close a group whose
-        # only member is the second tag. _split_receipt returns early on a
-        # single-photo group without peeling, so that phantom item's ONE photo
-        # is the Ross tag itself, and it goes to eBay showing what you paid.
-        # A tag closes the group it belongs to; it never opens one.
-        if is_tag and not current:
-            if groups:
-                groups[-1].append(path)   # belongs to the item just closed
-            else:
-                current.append(path)      # haul opens on a tag; it'll be peeled
-            continue
-        current.append(path)
-        if is_tag:
-            groups.append(current)
-            current = []
-    if current:
-        groups.append(current)
-    return groups, separators, len(tag_indices)
-
-
-async def _run_haul(user_id, groups, update, context) -> None:
-    """Create an item per photo group and run them all through the pipeline.
-
-    The pipeline semaphore (MAX_CONCURRENT_LISTINGS) caps how many actually
-    compute at once; gates queue via gate_queue, so the user is asked about one
-    item at a time even though many are running."""
-    message = update.message
-    item_ids = []
-    for group in groups:
-        staging_id = str(uuid.uuid4())
-        folder = INBOX / staging_id
-        folder.mkdir(parents=True, exist_ok=True)
-        paths = []
-        for src in group:
-            dest = folder / Path(src).name
-            dest.write_bytes(Path(src).read_bytes())
-            paths.append(str(dest))
-        item_ids.append(create_item(paths))
-
-    await _safe_reply(
-        message,
-        f"📦 Haul: {len(item_ids)} item(s) split off the Ross tags. Running them now — "
-        f"I'll only stop for the ones that need you.")
-
-    results = await asyncio.gather(
-        *(advance(user_id, iid, message, context) for iid in item_ids),
-        return_exceptions=True)
-    for iid, outcome in zip(item_ids, results):
-        if isinstance(outcome, Exception):
-            print(f"HAUL ERROR {iid[:8]}:", outcome)
-            _record_error(f"haul ({iid[:8]})", outcome)
-
-    await _safe_reply(message, _haul_digest(item_ids, user_id))
-
-
-def _haul_digest(item_ids, user_id) -> str:
-    """One summary of where a haul landed, so the user sees the whole batch at a
-    glance instead of reconstructing it from a stream of per-item messages."""
-    buckets = {}
-    for iid in item_ids:
-        item = get_item(iid)
-        status = item["status"] if item else "deleted"
-        buckets.setdefault(status, []).append(iid)
-
-    waiting = len(gate_queue.get(user_id) or []) + (1 if gate.get(user_id) else 0)
-    labels = {
-        "review": "✅ drafted, waiting on your approve",
-        "identified": "💬 needs you at the identify gate",
-        "priced": "✅ priced, drafting",
-        "captured": "⚠️ stalled before identification",
-        "ebay_draft": "✅ pushed to eBay as a draft",
-        "published": "🎉 live on eBay",
-        "rejected": "❌ rejected",
-    }
-    lines = [f"📦 Haul done — {len(item_ids)} item(s):"]
-    for status, ids in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
-        lines.append(f"  {labels.get(status, status)}: {len(ids)}")
-        lines.append(f"    {', '.join(i[:8] for i in ids)}")
-    if waiting:
-        lines.append(f"\n{waiting} item(s) still need a decision from you — "
-                     f"answer the prompt above and the next one follows.")
-    return "\n".join(lines)
 
 
 _FIND_DIR = DATA_DIR / "cache" / "find"
@@ -902,101 +705,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _safe_reply(update.message,
         f"🚀 Listing {item_id[:8]}. Full pricing next, then the draft for review.\n"
         f"Want more photos on the listing? /addphotos {item_id[:8]} any time before you approve.")
-    await advance(user_id, item_id, update.message, context)
-
-
-async def haul_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Arm multi-item capture: the next photo dump is split into one item per
-    Ross tag instead of becoming a single item."""
-    user_id = update.effective_user.id
-    haul_mode.add(user_id)
-    capture_window[user_id] = EXTENDED_CAPTURE_WINDOW
-    await _safe_reply(
-        update.message,
-        f"📦 Haul mode on.\n\n"
-        f"Shoot each item as usual (ending with its Ross tag), then **take one dark "
-        f"photo with the lens covered** before starting the next item. That blackout "
-        f"frame is the divider — it's the only thing I need to tell items apart, and "
-        f"it never fails the way reading the tag barcode does (that works on about 4 "
-        f"tags in 10).\n\n"
-        f"No blackout needed after the last item. If a tag barcode does decode, it "
-        f"ends that item too, so a clean shot needs no divider.\n\n"
-        f"I'll wait {EXTENDED_CAPTURE_WINDOW}s after the last photo, then run them all. "
-        f"Items with solid comps go straight to a draft; I'll only ask about the rest.\n\n"
-        f"/cancel to drop out.")
-
-
-def _confirmation_markup(item_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Start", callback_data=f"confirm:start:{item_id}"),
-        InlineKeyboardButton("Wait", callback_data=f"confirm:wait:{item_id}"),
-        InlineKeyboardButton("Cancel", callback_data=f"confirm:cancel:{item_id}"),
-    ]])
-
-
-async def _send_confirmation(context, chat_id, item_id, count) -> None:
-    text = f"{count} photo(s) buffered. Start the listing, wait for more photos, or cancel?"
-    try:
-        await context.bot.send_message(
-            chat_id=chat_id, text=text, reply_markup=_confirmation_markup(item_id)
-        )
-    except Exception as e:
-        print(f"WARNING: send confirmation failed: {type(e).__name__}: {e}")
-
-
-async def _await_more_photos(user_id, item_id, context, delay) -> None:
-    """After the Wait window, re-show the confirmation if the item is still staged
-    and no newer photo restarted the timer."""
-    await asyncio.sleep(delay)
-    async with _lock_for(user_id):
-        st = staging.get(user_id)
-        if st is None or st["item_id"] != item_id:
-            return
-        st["task"] = None
-        count, chat_id = len(st["paths"]), st["chat_id"]
-    await _send_confirmation(context, chat_id, item_id, count)
-
-
-async def _finalize_append(user_id, item_id, update, context) -> None:
-    """After photos stop arriving in /addphotos mode, commit the new photos onto
-    the item (existing photos first, new ones appended in send order) and, if the
-    item already has an eBay offer, push the updated photo set to eBay."""
-    window = capture_window.get(user_id, DEFAULT_CAPTURE_WINDOW)
-    await asyncio.sleep(window)
-    async with _lock_for(user_id):
-        ap = appending.get(user_id)
-        if ap is None or ap["item_id"] != item_id:
-            return  # a newer batch or a cancel superseded this one
-        appending.pop(user_id, None)
-        awaiting_photos.pop(user_id, None)
-        capture_window.pop(user_id, None)
-        # Order the newly-added photos by message_id (send order), then append them
-        # after the item's original photos so the gallery cover/tag order is kept.
-        new_sorted = [path for _, path in sorted(ap["new"], key=lambda mp: mp[0])]
-        # Re-read rather than trusting ap["base"], the snapshot taken when the
-        # first append photo arrived. Minutes can pass between that snapshot and
-        # this commit, and the pipeline may well have run in between — writing
-        # the stale list back resurrects the peeled Ross price tag and drops
-        # whatever else was written meanwhile. Fall back to the snapshot only if
-        # the item has vanished.
-        current = (get_item(item_id) or {}).get("photos")
-        base = current if current is not None else ap["base"]
-        photos = list(base) + [p for p in new_sorted if p not in base]
-
-    update_field(item_id, "photos", photos)
-    last_item[user_id] = item_id
-    added = len(new_sorted)
-    print(f"📷 Append: committed {added} photo(s) to item {item_id}, {len(photos)} total")
-    if list_after_photos.get(user_id) == item_id:
-        list_after_photos.pop(user_id, None)
-        await asyncio.to_thread(_split_receipt, item_id, photos,
-                                lambda t: None)
-        update_status(item_id, "identified")
-        await _safe_reply(update.message, f"🚀 Got {added} photo(s). Pricing {item_id[:8]}...")
-        await advance(user_id, item_id, update.message, context)
-        return
-    await _safe_reply(update.message, f"➕ Added {added} photo(s) to {item_id[:8]} ({len(photos)} total).")
-    await _resync_photos(item_id, update.message)
+    await flow.advance(user_id, item_id, update.message, context)
 
 
 async def _resync_photos(item_id: str, message) -> None:
@@ -1259,872 +968,6 @@ async def stockphoto_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"🖼️ Added as photo #2 of {n} for {item_id[:8]}. /photos to see them, "
         "/arrange to move it.")
     await _resync_photos(item_id, update.message)
-
-
-async def addphotos_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Attach more photos to an existing item. Usage: /addphotos <id> then send the
-    photos. Applies to the most recent item when no id is given."""
-    user_id = update.effective_user.id
-    item_id, err = _resolve_item_id(user_id, context.args)
-    if err:
-        await _safe_reply(update.message, f"⚠️ {err}")
-        return
-
-    async with _lock_for(user_id):
-        awaiting_photos[user_id] = item_id
-        appending.pop(user_id, None)  # drop any half-collected batch for a different item
-    last_item[user_id] = item_id
-    window = capture_window.get(user_id, DEFAULT_CAPTURE_WINDOW)
-    await _safe_reply(update.message,
-        f"📎 Send the photos to add to {item_id[:8]} now. "
-        f"I'll attach them once they stop arriving (~{window}s). /cancel to abort."
-    )
-
-
-_pipeline_sem = None
-
-
-def _pipeline_semaphore() -> asyncio.Semaphore:
-    """Cap how many item pipelines run concurrently (MAX_CONCURRENT_LISTINGS).
-    Created lazily so it binds to the running event loop; extra Starts queue on
-    it rather than firing a swarm of parallel Gemini/Apify calls."""
-    global _pipeline_sem
-    if _pipeline_sem is None:
-        _pipeline_sem = asyncio.Semaphore(MAX_CONCURRENT_LISTINGS)
-    return _pipeline_sem
-
-
-def _review_markup(item_id: str) -> InlineKeyboardMarkup:
-    """Approve/Reject buttons carrying the item id, so a finished draft can be
-    acted on unambiguously even when several are pending at once."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"review:approve:{item_id}"),
-        InlineKeyboardButton("❌ Reject", callback_data=f"review:reject:{item_id}"),
-    ]])
-
-
-def _notifier(message):
-    """A thread-safe progress pinger: worker-thread stages call it to post status
-    back onto the bot's event loop (identify/pricing each take a minute or more)."""
-    loop = asyncio.get_running_loop()
-
-    def notify(text: str) -> None:
-        asyncio.run_coroutine_threadsafe(_safe_reply(message, text), loop)
-    return notify
-
-
-async def _run_stage(item_id, message, stage_fn, *args):
-    """Run one blocking pipeline stage in a worker thread, holding the concurrency
-    semaphore only for the duration of the actual work (so an item waiting at a
-    confirm gate never ties up a slot). Returns (result, None) or (None, error)."""
-    notify = _notifier(message)
-    try:
-        async with _pipeline_semaphore():
-            result = await asyncio.to_thread(stage_fn, item_id, *args, notify)
-        return result, None
-    except Exception as e:
-        print("PIPELINE ERROR:", traceback.format_exc())
-        _record_error(f"{stage_fn.__name__} ({item_id[:8]})", e)
-        # The item stays at the status it failed from, so the Retry button just
-        # re-runs advance() for it (same path as /retry).
-        await _safe_reply(message, f"⚠️ {stage_fn.__name__} failed: {type(e).__name__}: {str(e)[:200]}",
-                          reply_markup=_retry_markup(item_id))
-        return None, e
-
-
-def _retry_markup(item_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔁 Retry", callback_data=f"confirm:retry:{item_id}"),
-    ]])
-
-
-async def _show_review(user_id, item_id, message) -> None:
-    """Show a finished draft with Approve/Reject and mark it this user's active
-    review target, so a typed correction / approve applies to it. The per-draft
-    buttons carry the item id explicitly, so approving is unambiguous regardless
-    of how many drafts are pending."""
-    item = get_item(item_id)
-    review[user_id] = item_id
-    last_item[user_id] = item_id
-    result = {"identification": item["identification"], "pricing": item["pricing"],
-              "listing": item["listing"], "listing_check": item.get("listing_check")}
-    # Lead with the id: during a haul several drafts sit on screen together, and
-    # a typed correction has to be aimed at one of them.
-    body = f"📄 Draft {item_id[:8]}\n" + format_draft(result)
-    sent = await _safe_reply(message, body, parse_mode=None,
-                             reply_markup=_review_markup(item_id))
-    _remember_target(sent, item_id)
-
-
-async def _publish_and_report(item_id, message) -> None:
-    """Publish an ebay_draft offer, report the live URL and what it stands to
-    make, then auto-promote at the default ad rate if one is configured. Shared
-    by /activate and advance()."""
-    if not _claim("publish", item_id):
-        await _safe_reply(message, f"⏳ {item_id[:8]} is already publishing.")
-        return
-    try:
-        await _publish_and_report_claimed(item_id, message)
-    finally:
-        _release("publish", item_id)
-
-
-async def _publish_and_report_claimed(item_id, message) -> None:
-    try:
-        ebay_data = await asyncio.to_thread(_activate_item, item_id)
-    except Exception as e:
-        traceback.print_exc()
-        await _safe_reply(message, f"⚠️ Activate failed: {type(e).__name__}: {str(e)[:300]}")
-        return
-
-    # The profit picture rides along with the "it's live" message rather than
-    # waiting for the next /report: the moment to find out an item nets $3 is
-    # while you still remember the item, not at the end of the week. Best-effort
-    # — a listing that IS live must never be reported as a failed publish because
-    # the arithmetic tripped over a half-filled item.
-    body = f"🎉 Published! {ebay_data['view_item_url']}"
-    try:
-        projection = project(get_item(item_id))
-        if projection is not None:
-            body += "\n\n" + format_projection(projection)
-    except Exception as e:
-        print("PROFIT PROJECTION FAILED:", traceback.format_exc())
-        _record_error(f"profit projection ({item_id[:8]})", e)
-    await _safe_reply(message, body)
-
-    if EBAY_DEFAULT_AD_RATE_PCT and EBAY_DEFAULT_AD_RATE_PCT > 0:
-        await _promote_item(item_id, EBAY_DEFAULT_AD_RATE_PCT, message)
-
-
-def _identify_gate_reason(ident: dict) -> str | None:
-    """Why this identification needs your eyes, or None if it can clear its gate
-    unattended. A decoded UPC lowers the bar: it's hard evidence of exactly which
-    product this is, worth more than the model's self-reported confidence."""
-    if not AUTO_CONFIRM:
-        return "auto-confirm is off"
-    if not ident.get("brand") and not ident.get("product_name"):
-        return "item is unconfirmed"
-    if ident.get("condition_flags"):
-        return f"condition flags: {', '.join(ident['condition_flags'])}"
-    try:
-        confidence = float(ident.get("confidence") or 0)
-    except (TypeError, ValueError):
-        return "confidence is unreadable"
-    # Only a DECODED barcode lowers the bar. config.py promises "decoded off the
-    # photos", but identify.py only overwrites `upc` when pyzbar actually read
-    # one — otherwise the field holds whatever digits the vision model thought it
-    # saw, which is the least reliable thing it produces. Letting that lower the
-    # bar meant the weakest evidence on the item bought the loosest gate. Items
-    # identified before upc_decoded existed have no flag, and absence correctly
-    # reads as "not decoded" and leaves them at the higher bar.
-    bar = (AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC
-           if ident.get("upc") and ident.get("upc_decoded")
-           else AUTO_CONFIRM_MIN_IDENT_CONFIDENCE)
-    if confidence < bar:
-        return f"confidence {confidence:.2f} is below {bar:.2f}"
-    return None
-
-
-def _price_gate_reason(pricing: dict) -> str | None:
-    """Why this price needs your eyes, or None if it can clear its gate
-    unattended. pipeline/price.py already decided this (needs_review); this only
-    turns it into something worth reading."""
-    if not AUTO_CONFIRM:
-        return "auto-confirm is off"
-    if pricing.get("suggested_price") is None:
-        return "no comp-backed price"
-    # Items priced before evidence tiers existed have no needs_review field, and
-    # absence must not read as "safe to skip".
-    if "needs_review" not in pricing:
-        return "priced before evidence grading"
-    if pricing.get("needs_review"):
-        flags = pricing.get("review_flags") or []
-        return ", ".join(flags) if flags else f"{pricing.get('evidence')} comp evidence"
-    return None
-
-
-async def advance(user_id, item_id, message, context) -> None:
-    """Run automatic steps for an item, pausing at the first gate that genuinely
-    needs you, then hand the gate slot to whatever else is waiting.
-
-    This is the one place that knows 'what comes next' in the pipeline, shared by
-    the capture Start button, the confirm gates, /retry and /haul.
-
-    Gates it can clear on its own — a confident identification, a solid-evidence
-    price — are cleared with a one-line note rather than a prompt, so a clean item
-    runs photos -> draft without interruption and only the genuinely ambiguous
-    ones ask. The review gate before anything reaches eBay is never skipped.
-    The compute stages report their own progress/errors via _run_stage."""
-    try:
-        await _advance_one(user_id, item_id, message, context)
-    finally:
-        # Whether this item finished, gated, or blew up, the next queued item
-        # gets its turn — a failure must not strand the rest of a haul.
-        await _activate_next_gate(user_id, message)
-
-
-async def _advance_one(user_id, item_id, message, context) -> None:
-    while True:
-        item = get_item(item_id)
-        if item is None:
-            await _safe_reply(message, "That item no longer exists.")
-            return
-        status = item["status"]
-
-        if status == "captured":
-            ident, err = await _run_stage(
-                item_id, message, _stage_identify, item.get("photos") or [])
-            if err is not None:
-                return
-            reason = _identify_gate_reason(ident)
-            if reason:
-                await _show_identify_gate(user_id, item_id, message, reason)
-                return
-            name = ident.get("product_name") or ident.get("item_type") or "item"
-            await _safe_reply(
-                message, f"✅ {ident.get('brand') or ''} {name} — identified, pricing...".strip())
-
-        elif status == "identified":
-            pricing, err = await _run_stage(item_id, message, _stage_price)
-            if err is not None:
-                return
-            reason = _price_gate_reason(pricing)
-            if reason:
-                await _show_price_gate(user_id, item_id, message, reason)
-                return
-            await _safe_reply(
-                message,
-                f"✅ ${pricing.get('suggested_price')} — {_price_evidence_line(pricing)} "
-                f"— writing the listing...")
-
-        elif status == "priced":
-            # An item can sit at 'priced' with no price: pricing found no usable
-            # comps and refused to guess. Drafting anyway writes "$None" into the
-            # listing. The gate's own confirm path guards this, but /retry comes
-            # straight here and would sail past it.
-            if (item.get("pricing") or {}).get("suggested_price") is None:
-                await _show_price_gate(user_id, item_id, message, "no comp-backed price")
-                return
-            _, err = await _run_stage(item_id, message, _stage_draft)
-            if err is None:
-                await _show_review(user_id, item_id, message)
-            return
-
-        elif status in ("drafted", "review"):
-            # Waiting on your Approve/Reject — re-show the draft to act on.
-            await _show_review(user_id, item_id, message)
-            return
-
-        elif status == "approved":
-            await _approve_item(item_id, message, context)
-            return
-
-        elif status == "ebay_draft":
-            await _publish_and_report(item_id, message)
-            return
-
-        else:  # published, rejected
-            await _safe_reply(message, f"Nothing to advance — {item_id[:8]} is '{status}'.")
-            return
-
-
-def _gate_is_busy(user_id, item_id) -> bool:
-    """Is another item already holding this user's gate slot? Re-showing the SAME
-    item (after a correction) is never 'busy' — that's the active conversation."""
-    active = gate.get(user_id)
-    return active is not None and active["item_id"] != item_id
-
-
-def _enqueue_gate(user_id, item_id, stage, reason) -> None:
-    """Park a gate behind the active one, newest last. Re-queuing an item that's
-    already waiting updates it in place rather than asking about it twice."""
-    queue = gate_queue.setdefault(user_id, [])
-    for entry in queue:
-        if entry["item_id"] == item_id:
-            entry.update(stage=stage, reason=reason)
-            return
-    queue.append({"item_id": item_id, "stage": stage, "reason": reason})
-
-
-async def _activate_next_gate(user_id, message) -> None:
-    """Show the next queued gate, if the slot is free and anything is waiting.
-    Called after every advance() so a finished item hands the floor to the next
-    one instead of leaving a haul silently stalled."""
-    if gate.get(user_id) is not None:
-        return
-    queue = gate_queue.get(user_id) or []
-    while queue:
-        entry = queue.pop(0)
-        if get_item(entry["item_id"]) is None:
-            continue  # deleted while it waited
-        # Claim the slot BEFORE the first await. Several items of a haul can
-        # finish in the same tick, and without claiming synchronously they'd each
-        # see a free slot, pop a different entry, and all but the last would be
-        # dropped on the floor.
-        gate[user_id] = {"item_id": entry["item_id"], "stage": entry["stage"]}
-        remaining = len(queue)
-        suffix = f" ({remaining} more waiting)" if remaining else ""
-        reason = (entry["reason"] or "") + suffix
-        if entry["stage"] == "identify":
-            await _show_identify_gate(user_id, entry["item_id"], message, reason)
-        else:
-            await _show_price_gate(user_id, entry["item_id"], message, reason)
-        return
-
-
-async def _show_identify_gate(user_id, item_id, message, reason=None) -> None:
-    """Pause after identification: show what was identified and wait for the user
-    to confirm or type a correction (handled in text_handler / _handle_gate).
-    `reason` says why this one couldn't clear itself — with auto-confirm on, a
-    gate that appears at all is a gate worth reading."""
-    if _gate_is_busy(user_id, item_id):
-        _enqueue_gate(user_id, item_id, "identify", reason)
-        return
-    item = get_item(item_id)
-    gate[user_id] = {"item_id": item_id, "stage": "identify"}
-    review.pop(user_id, None)
-    last_item[user_id] = item_id
-    body = f"🔎 {item_id[:8]}\n" + format_identification(item["identification"])
-    if reason:
-        body += f"\n\n🛑 Needs you: {reason}"
-    sent = await _safe_reply(
-        message,
-        body + "\n\nType 'confirm' to price it, or tell me what to fix "
-               "(e.g. 'brand is Tommy Jeans, color navy').",
-    )
-    _remember_target(sent, item_id)
-
-
-async def _show_price_gate(user_id, item_id, message, reason=None) -> None:
-    """Pause after pricing: show the suggested price and wait for confirm or a
-    manual price (a whole number is charm-priced, e.g. 35 -> $34.99). `reason`
-    says why this one couldn't clear itself."""
-    if _gate_is_busy(user_id, item_id):
-        _enqueue_gate(user_id, item_id, "price", reason)
-        return
-    item = get_item(item_id)
-    gate[user_id] = {"item_id": item_id, "stage": "price"}
-    review.pop(user_id, None)
-    last_item[user_id] = item_id
-    title = ((item.get("identification") or {}).get("product_name")
-             or (item.get("identification") or {}).get("item_type") or "")
-    body = f"💲 {item_id[:8]} {title}".rstrip() + "\n" + format_pricing(item["pricing"])
-    if reason:
-        body += f"\n\n🛑 Needs you: {reason}"
-    sent = await _safe_reply(
-        message,
-        body + "\n\nType 'confirm' to write the listing, or type a price to set it "
-               "(e.g. 35 -> $34.99).",
-    )
-    _remember_target(sent, item_id)
-
-
-async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    try:
-        _, action, item_id = query.data.split(":", 2)
-    except ValueError:
-        return
-
-    if action == "start":
-        # Identity is checked BEFORE the pop, and inside the lock. Popping first
-        # destroyed whatever was staged and only then noticed the button belonged
-        # to a different item — so tapping Start on a scrolled-back message
-        # cancelled the timer on the item currently waiting and left it stranded
-        # with no button and no countdown. Same reasoning in the "cancel" branch.
-        async with _lock_for(user_id):
-            st = staging.get(user_id)
-            if st is None or st["item_id"] != item_id:
-                await query.edit_message_text("This item is no longer waiting.")
-                return
-            staging.pop(user_id, None)
-            if st["task"] is not None:
-                st["task"].cancel()
-        paths = st["paths"]
-        await query.edit_message_text(f"Starting. {len(paths)} photo(s). Processing...")
-        # Launch as a background task so this handler returns immediately and
-        # another item can be started while this one is still processing. The item
-        # is 'captured', so advance() runs identify and pauses at its confirm gate.
-        context.application.create_task(
-            advance(user_id, item_id, query.message, context)
-        )
-
-    elif action == "wait":
-        async with _lock_for(user_id):
-            st = staging.get(user_id)
-            if st is None or st["item_id"] != item_id:
-                await query.edit_message_text("This item is no longer waiting.")
-                return
-            if st["task"] is not None:
-                st["task"].cancel()
-            st["task"] = context.application.create_task(
-                _await_more_photos(user_id, item_id, context, WAIT_EXTENSION)
-            )
-        await query.edit_message_text(f"Waiting {WAIT_EXTENSION}s for more photos. Send them now.")
-
-    elif action == "cancel":
-        # Only clear the staging slot if it's the item this button names. The
-        # unconditional pop discarded the item currently waiting while deleting a
-        # different one — losing both.
-        async with _lock_for(user_id):
-            st = staging.get(user_id)
-            if st is not None and st["item_id"] == item_id:
-                staging.pop(user_id, None)
-                if st["task"] is not None:
-                    st["task"].cancel()
-        item = get_item(item_id)
-        if item is not None:
-            photos = item.get("photos") or []
-            if photos:
-                shutil.rmtree(Path(photos[0]).parent, ignore_errors=True)
-            delete_item(item_id)
-        await query.edit_message_text("Cancelled. Photos discarded.")
-
-    elif action == "retry":
-        # The 🔁 Retry button on a failed stage (_run_stage). Claimed before the
-        # first await so a double tap doesn't run the stage twice.
-        if not _claim("retry", item_id):
-            return
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
-        async def _retry_then_release():
-            try:
-                await _retry_item(user_id, item_id, query.message, context)
-            finally:
-                _release("retry", item_id)
-        # Background, like Start: a stage takes a minute or more.
-        context.application.create_task(_retry_then_release())
-
-
-async def _approve_item(item_id: str, message, context) -> None:
-    """Mark an item approved and push it to eBay as a draft offer. Shared by the
-    typed 'approve' and the per-draft Approve button. Reports progress/errors to
-    `message`; leaves the item at 'approved' (retryable) on any eBay failure."""
-    update_status(item_id, "approved")
-    await _safe_reply(message, "✅ Approved. Creating eBay draft...")
-
-    try:
-        ebay_result = await asyncio.to_thread(create_draft_offer, item_id)
-    except MissingRequiredAspectsError as e:
-        lines = [
-            f"⚠️ Can't create the draft yet — eBay category {e.category_id} requires these "
-            "item specifics and I couldn't safely infer a value:"
-        ]
-        for m in e.missing:
-            opts = f" (allowed: {', '.join(m['allowed_values'])})" if m["allowed_values"] else ""
-            lines.append(f"  • {m['name']}{opts}")
-        lines.append("The item is saved as 'approved' — fix the listing and retry manually.")
-        await _safe_reply(message, "\n".join(lines))
-        return
-    except TitleTooLongError as e:
-        # Back to review, not left at 'approved': a title is fixed with a typed
-        # correction, and corrections only apply to a draft under review.
-        update_status(item_id, "review")
-        await _safe_reply(message, _title_too_long_text(e, item_id))
-        return
-    except Exception as e:
-        traceback.print_exc()
-        await _safe_reply(message,
-            f"⚠️ Approved, but eBay draft creation failed: {type(e).__name__}: {str(e)[:300]}\n"
-            "The item is saved as 'approved' — fix the issue and retry manually."
-        )
-        return
-
-    update_field(item_id, "ebay", ebay_result)
-    update_status(item_id, "ebay_draft")
-
-    msg = f"📝 Draft created on eBay (SKU {ebay_result['sku']}, offer {ebay_result['offer_id']})."
-    msg += "\nUse /listing to review it and /activate to publish it when ready — it may not show up in Seller Hub's Drafts UI (API-created offers often don't)."
-    if ebay_result.get("reselected_from"):
-        def _label(name, cid):
-            return f"{name} ({cid})" if name else str(cid)
-        new_label = _label(ebay_result.get("category_name"), ebay_result["category_id"])
-        old_label = _label(ebay_result.get("reselected_from_name"), ebay_result["reselected_from"])
-        msg += f"\n⚠️ Listed under category {new_label} (auto-corrected from {old_label})"
-    await _safe_reply(message, msg)
-
-
-async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the per-draft Approve/Reject buttons. The item id rides in the
-    callback data, so this works no matter how many drafts are pending."""
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    try:
-        _, action, item_id = query.data.split(":", 2)
-    except ValueError:
-        return
-    if action not in ("approve", "reject"):
-        return  # unknown button: already answered, change nothing
-
-    item = get_item(item_id)
-    if item is None:
-        await query.edit_message_text("This item no longer exists.")
-        return
-    if item["status"] not in ("review", "drafted"):
-        await query.edit_message_text(f"Item {item_id[:8]} is '{item['status']}' — nothing to review.")
-        return
-    # Claimed right after the status check, before any await, so a concurrent
-    # second tap can't also pass the check while this one is still working.
-    if not _claim("review", item_id):
-        await _safe_reply(query.message, f"⏳ Already handling {item_id[:8]}.")
-        return
-    try:
-        # Drop the buttons so the draft can't be double-actioned.
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
-        if review.get(user_id) == item_id:
-            review.pop(user_id, None)
-        last_item[user_id] = item_id
-
-        if action == "approve":
-            await _approve_item(item_id, query.message, context)
-        else:
-            update_status(item_id, "rejected")
-            await _safe_reply(query.message, f"❌ Rejected {item_id[:8]}.")
-    finally:
-        _release("review", item_id)
-
-
-# A typed correction that is really a price instruction: "159.99", "price 159.99",
-# "make it $159.99", "sell for 160". Deliberately narrow — it must not fire on
-# ordinary copy edits that happen to contain a number ("size 10 not 8", "2 front
-# pockets"), so a price word or a currency symbol is required unless the whole
-# message is just the number.
-_PRICE_CORRECTION = re.compile(
-    r"^(?:(?:the\s+)?price\s*(?:should\s*be|is|to|=)?|set\s+(?:the\s+)?price\s*(?:to)?|"
-    r"make\s+it|change\s+(?:it|the\s+price)\s*(?:to)?|sell\s+(?:it\s+)?for|list\s+(?:it\s+)?at)?"
-    r"\s*\$?\s*(\d{1,5}(?:\.\d{1,2})?)\s*(?:dollars|usd|bucks)?\s*$",
-    re.I)
-
-
-def _price_from_correction(text: str) -> float | None:
-    """The price a typed correction is asking for, or None if it isn't one.
-
-    Charm-prices a whole number the same way the price gate does (35 -> 34.99),
-    so the two entry points can't disagree."""
-    match = _PRICE_CORRECTION.match(text.strip())
-    if not match:
-        return None
-    raw = text.strip()
-    # A bare number with no price word and no "$" is ambiguous in a sentence, but
-    # unambiguous when it's the entire message.
-    if not re.search(r"price|\$|sell|list|make it|change", raw, re.I) and not re.fullmatch(
-            r"\$?\s*\d{1,5}(?:\.\d{1,2})?", raw):
-        return None
-    try:
-        return _charm_price(float(match.group(1)))
-    except (TypeError, ValueError):
-        return None
-
-
-def _apply_manual_price(pricing: dict, price: float) -> dict:
-    """Record a human price override without erasing what the machine proposed.
-
-    `machine_price` is written once by pipeline/price.py and never touched here;
-    the override goes to suggested_price (what the rest of the pipeline reads)
-    and is also kept as manual_price alongside it. Previously this assignment
-    overwrote suggested_price outright, so every correction destroyed the number
-    it was correcting — 34 of 57 items ended up with price_basis='manual' and no
-    record of how far off the suggestion had been. Keeping both makes that gap
-    measurable instead of invisible."""
-    pricing = dict(pricing)
-    pricing["manual_price"] = price
-    pricing["manual_price_at"] = datetime.now(timezone.utc).isoformat()
-    if pricing.get("machine_price") is None:
-        # Pre-existing items priced before machine_price existed: the current
-        # suggestion is the machine's, so capture it before it's replaced.
-        pricing["machine_price"] = pricing.get("suggested_price")
-    pricing["suggested_price"] = price
-    pricing["confidence"] = "manual"
-    pricing["price_basis"] = "manual"
-    return pricing
-
-
-def _charm_price(value: float) -> float:
-    """Drop a penny off a whole-dollar amount so it ends in .99 (35 -> 34.99), the
-    way the auto-pricing already rounds. Explicit cents are honored as typed."""
-    if value == int(value):
-        value -= 0.01
-    return round(max(value, 0.0), 2)
-
-
-def _parse_price_override(text: str) -> float | None:
-    """Extract a price the user typed (e.g. '35', '$35', 'make it 42.50') and
-    charm-price it. Returns None if the text doesn't name one.
-
-    Deliberately anchored. This used to `re.search` for a digit run ANYWHERE in
-    the text, which made every item id a valid price: `/setprice a1b2c3d4` (the
-    price forgotten) matched the "1", charm-priced it to $0.99, and — because
-    the id had been consumed as the price — pushed 99 cents to whatever listing
-    `last_item` happened to hold. A price is now either the whole token or
-    follows a word that means one."""
-    raw = text.replace(",", "").strip()
-    m = re.fullmatch(r"\$?\s*(\d+(?:\.\d{1,2})?)", raw)
-    if m is None:
-        # Allow a price embedded in a phrase, but only after an explicit cue —
-        # "make it 42.50", "price 35", "$35 please".
-        m = re.search(r"(?:price|sell|list|make it|change to|\$)\s*(\d+(?:\.\d{1,2})?)",
-                      raw, re.I)
-    if m is None:
-        return None
-    try:
-        value = float(m.group(1))
-    except (TypeError, ValueError):
-        return None
-    # A free item is never what someone meant to type.
-    return _charm_price(value) if value > 0 else None
-
-
-_CONFIRM_WORDS = ("confirm", "yes", "ok", "okay", "y", "✅", "👍")
-
-
-def _explicit_target(update, text: str) -> tuple[str | None, str]:
-    """Which item this message is aimed at, and the message with any id stripped.
-
-    Two ways to aim, both needed once a haul puts several items in play at once:
-      * reply to the bot's message for that item (the natural one), or
-      * lead with its id: "a1b2c3d4 color is navy".
-    Returns (None, text) when neither applies, so single-item use is unchanged."""
-    replied = _replied_item(update)
-    if replied:
-        return replied, text
-    parts = text.split(None, 1)
-    if len(parts) == 2 and re.fullmatch(r"[0-9a-f-]{4,36}", parts[0].lower()):
-        item_id, _ = _resolve_item_id(0, [parts[0].lower()])
-        if item_id:
-            return item_id, parts[1]
-    return None, text
-
-
-async def _handle_targeted(user_id, item_id, text, update, context) -> bool:
-    """Apply a message to a specific item the user aimed at, whatever else is on
-    screen. Returns True if it was handled here.
-
-    Without this, a correction typed during a haul lands on whichever draft
-    happened to be shown last, which is rarely the one being looked at."""
-    item = get_item(item_id)
-    if item is None:
-        await _safe_reply(update.message, "That item no longer exists.")
-        return True
-    status = item["status"]
-
-    if status in ("drafted", "review"):
-        review[user_id] = item_id
-        last_item[user_id] = item_id
-        return False  # fall through to the review handler, now pointed correctly
-
-    if status in ("identified", "priced"):
-        stage = "identify" if status == "identified" else "price"
-        active = gate.get(user_id)
-        if active and active["item_id"] != item_id:
-            # Put the item we're displacing back at the front of the queue rather
-            # than dropping it.
-            gate_queue.setdefault(user_id, []).insert(
-                0, {"item_id": active["item_id"], "stage": active["stage"],
-                    "reason": "returning to this one"})
-        # This item is about to be handled here and now, so it must not also
-        # remain queued — during a haul it usually IS queued, and leaving the
-        # entry meant it came back around after being dealt with and asked for a
-        # decision on a gate it had already cleared.
-        queued = gate_queue.get(user_id)
-        if queued:
-            gate_queue[user_id] = [q for q in queued if q["item_id"] != item_id]
-        gate[user_id] = {"item_id": item_id, "stage": stage}
-        await _handle_gate(user_id, text, update, context)
-        return True
-
-    await _safe_reply(
-        update.message,
-        f"{item_id[:8]} is '{status}' — nothing to change here. "
-        f"/listing {item_id[:8]} to see it, or /setprice to change the price.")
-    return True
-
-
-async def _handle_gate(user_id, text, update, context) -> None:
-    """Handle a typed message while an item is paused at the identify/price gate:
-    'confirm' advances to the next stage; anything else is applied as a change and
-    the same gate is shown again."""
-    g = gate[user_id]
-    item_id, stage = g["item_id"], g["stage"]
-    low = text.lower().strip()
-
-    if get_item(item_id) is None:
-        gate.pop(user_id, None)
-        await _safe_reply(update.message, "That item no longer exists.")
-        # Hand the slot on — otherwise a deleted item takes the rest of a haul's
-        # queued gates down with it.
-        await _activate_next_gate(user_id, update.message)
-        return
-
-    if low in _CONFIRM_WORDS:
-        if stage == "price" and (get_item(item_id)["pricing"] or {}).get("suggested_price") is None:
-            await _safe_reply(update.message, "No price set yet — type a price first (e.g. 35 -> $34.99).")
-            return
-        gate.pop(user_id, None)
-        # Confirming identify leaves the item 'identified' (advance -> price gate);
-        # confirming price leaves it 'priced' (advance -> draft + review).
-        note = "✅ Confirmed. Pricing..." if stage == "identify" else "✅ Confirmed. Writing the listing..."
-        await _safe_reply(update.message, note)
-        context.application.create_task(advance(user_id, item_id, update.message, context))
-        return
-
-    # Not a confirm → treat as a change to this stage.
-    if stage == "identify":
-        await _safe_reply(update.message, "✏️ Updating the identification...")
-        try:
-            item = get_item(item_id)
-            revised = await asyncio.to_thread(revise_identification, item["identification"], text)
-        except Exception as e:
-            await _safe_reply(update.message, f"⚠️ Could not update: {type(e).__name__}: {str(e)[:200]}")
-            return
-        update_field(item_id, "identification", revised)
-        await _show_identify_gate(user_id, item_id, update.message)
-    else:  # price
-        forced = low.endswith(" force")
-        price = _parse_price_override(text[:-6] if forced else text)
-        if price is None:
-            await _safe_reply(update.message, "Type a price to set it (e.g. 35 -> $34.99), or 'confirm'.")
-            return
-        item = get_item(item_id)
-        # Same floor the repricer and /setprice honour — the gate is a price
-        # entry point like any other, and this one leads straight to review.
-        if not forced:
-            refusal = _floor_refusal(item, price)
-            if refusal:
-                await _safe_reply(update.message,
-                                  f"⚠️ {refusal.splitlines()[0]}\nType '{price:.2f} force' to set it anyway.")
-                return
-        pricing = _apply_manual_price(item.get("pricing") or {}, price)
-        update_field(item_id, "pricing", pricing)
-        await _show_price_gate(user_id, item_id, update.message)
-
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    low = text.lower()
-
-    if user_id in inv_box:
-        from pipeline.inventory import BOX_RE
-        if BOX_RE.match(text.upper()):
-            inv_box[user_id] = text.upper()
-            await _safe_reply(update.message, f"📦 Now in {text.upper()}. Next code: "
-                              f"{db.next_piece_code(text.upper())}")
-            return
-
-    if low in ("wait", "hold", "hold on", "⏳"):
-        capture_window[user_id] = EXTENDED_CAPTURE_WINDOW
-        # If a batch is already counting down on the short window, restart its
-        # timer so the longer window takes effect right away.
-        async with _lock_for(user_id):
-            pend = pending.get(user_id)
-            if pend is not None:
-                if pend["task"] is not None:
-                    pend["task"].cancel()
-                pend["task"] = context.application.create_task(
-                    finalize_capture(user_id, update, context)
-                )
-        await _safe_reply(
-            update.message,
-            f"⏳ OK — holding for {EXTENDED_CAPTURE_WINDOW}s. Send all your photos now.",
-        )
-        return
-
-    # An explicitly aimed message wins over everything: replying to an item's
-    # message, or leading with its id, is the user saying which one they mean.
-    target, text = _explicit_target(update, text)
-    if target:
-        low = text.lower().strip()
-        if await _handle_targeted(user_id, target, text, update, context):
-            return
-        # Not handled means it's a review item and `review` now points at it.
-
-    # Confirm gates (after identify / after price) take precedence over the draft
-    # review — an item pauses here for a typed 'confirm' or a correction.
-    #
-    # Exception: 'approve'/'reject' are review words, never gate words. During a
-    # haul one item can be gated while another waits at review, and routing an
-    # "approve" into the gate fed it to revise_identification as a correction on
-    # a different item. Send those to the review handler instead.
-    if user_id in gate and not target and low not in ("approve", "reject"):
-        await _handle_gate(user_id, text, update, context)
-        return
-    if user_id in gate and user_id not in review:
-        await _safe_reply(
-            update.message,
-            "Nothing is waiting for approval. This item is at a gate — "
-            "'confirm' to accept it, or type a correction / a price.")
-        return
-
-    if user_id not in review:
-        await _safe_reply(update.message, "Send me photos of an item to start.")
-        return
-
-    # Typed approve/reject/correction target the most-recent draft (the buttons
-    # on each draft handle any-order approval unambiguously).
-    item_id = review[user_id]
-
-    if low in ("approve", "✅", "yes", "ok", "reject", "❌", "no"):
-        # Same claim as the Approve/Reject buttons: a typed approve racing a tap
-        # on the same draft must not build the eBay draft twice.
-        if not _claim("review", item_id):
-            await _safe_reply(update.message, f"⏳ Already handling {item_id[:8]}.")
-            return
-        try:
-            review.pop(user_id, None)
-            if low in ("reject", "❌", "no"):
-                update_status(item_id, "rejected")
-                await _safe_reply(update.message, "❌ Rejected.")
-            else:
-                await _approve_item(item_id, update.message, context)
-        finally:
-            _release("review", item_id)
-        return
-
-    item = get_item(item_id)
-    current = item["listing"]
-
-    # A correction that names a price is a price change, and it goes through the
-    # proper path: recorded as manual_price with machine_price preserved, exactly
-    # as typing a price at the price gate does. Without this the copywriter would
-    # be the one setting it — and the guard that stops the model drifting the
-    # price would silently revert the user's own number too.
-    wanted = _price_from_correction(text)
-    if wanted is not None:
-        pricing = _apply_manual_price(item.get("pricing") or {}, wanted)
-        update_field(item_id, "pricing", pricing)
-        listing = dict(current)
-        listing["price"] = wanted
-        update_field(item_id, "listing", listing)
-        await _safe_reply(update.message, f"💲 Price set to ${wanted} for {item_id[:8]}.")
-        await _show_review(user_id, item_id, update.message)
-        return
-
-    await _safe_reply(update.message, "✏️ Applying your correction...")
-    try:
-        revised = await asyncio.to_thread(revise_draft, current, text,
-                                            item.get("identification"))
-    except Exception as e:
-        await _safe_reply(update.message, f"⚠️ Could not revise: {e}")
-        return
-
-    update_field(item_id, "listing", revised)
-    # The correction changed the draft, so the old check no longer describes it.
-    if LISTING_CHECK_ENABLED:
-        await asyncio.to_thread(check_listing_and_store, item_id)
-    # Through _show_review, so the revised draft carries its id header and is
-    # registered as a reply target like the first one — a haul correction made
-    # by replying to it used to land on nothing.
-    await _show_review(user_id, item_id, update.message)
 
 
 # How many items /status lists by default. The full inventory is ~90 items and
@@ -2549,7 +1392,7 @@ async def listing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "listing_check": item.get("listing_check"),
     }
     # Offer Approve/Reject only while the item is still awaiting review.
-    markup = _review_markup(item_id) if item["status"] in ("review", "drafted") else None
+    markup = flow._review_markup(item_id) if item["status"] in ("review", "drafted") else None
     if markup is not None:
         review[user_id] = item_id
     await _safe_reply(update.message, format_draft(result), reply_markup=markup)
@@ -2710,7 +1553,7 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     gate_queue[user_id] = [e for e in gate_queue.get(user_id, []) if e["item_id"] != item_id]
     await _safe_reply(update.message, f"🗑️ Deleted {item_id[:8]} (offer {offer_id or 'none'} removed).")
     if released:
-        await _activate_next_gate(user_id, update.message)
+        await flow._activate_next_gate(user_id, update.message)
 
 
 def _refresh_descriptions(apply: bool, force: bool) -> dict:
@@ -2890,25 +1733,6 @@ async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🛑 Ended the live listing for {item_id[:8]} — it's back to a draft. /activate to relist.")
 
 
-def _floor_refusal(item: dict, price: float) -> str | None:
-    """Why this price shouldn't be set, or None if it's fine.
-
-    The README has always promised that price changes "respect the margin
-    floor", and pipeline/reprice honours it — but the automated path was the
-    only one that did. A price typed by hand went straight to eBay, so the one
-    route nothing reviews afterwards was also the one with no floor under it.
-
-    Returns None when the cost is unknown: breakeven_price refuses to guess from
-    an estimated cost, and a floor nobody can compute must not become a wall."""
-    floor = breakeven_price(item)
-    if floor is None or price > floor:
-        return None
-    return (f"${price:.2f} is at or below the ${floor:.2f} break-even — it would "
-            f"sell at a loss after fees, ads and postage.\n"
-            f"Add `force` to do it anyway (e.g. /setprice {item['item_id'][:8]} "
-            f"{price:.2f} force).")
-
-
 async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Set an item's price. Usage: /setprice [id] <price> [force] (a whole number
     is charm-priced, 35 -> $34.99). Updates the stored price, and if the item
@@ -2930,7 +1754,7 @@ async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _safe_reply(update.message,
             f"'{args[-1]}' names an item, not a price. Usage: /setprice {args[-1]} <price>")
         return
-    price = _parse_price_override(args[-1])
+    price = text_router._parse_price_override(args[-1])
     if price is None:
         await _safe_reply(update.message, f"'{args[-1]}' isn't a valid price.")
         return
@@ -2950,7 +1774,7 @@ async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     last_item[user_id] = item_id
 
     if not forced:
-        refusal = _floor_refusal(item, price)
+        refusal = text_router._floor_refusal(item, price)
         if refusal:
             await _safe_reply(update.message, f"⚠️ {refusal}")
             return
@@ -2960,7 +1784,7 @@ async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if listing:
         listing["price"] = price
         update_field(item_id, "listing", listing)
-    pricing = _apply_manual_price(item.get("pricing") or {}, price)
+    pricing = text_router._apply_manual_price(item.get("pricing") or {}, price)
     update_field(item_id, "pricing", pricing)
 
     offer_id = (item.get("ebay") or {}).get("offer_id")
@@ -3041,25 +1865,6 @@ async def setqty_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _safe_reply(update.message, f"📦 Quantity set to {qty} for {item_id[:8]} (updated the {where}).")
 
 
-def _activate_item(item_id: str) -> dict:
-    item = get_item(item_id)
-    offer_id = (item.get("ebay") or {}).get("offer_id")
-    if not offer_id:
-        raise ValueError("No offer_id stored for this item yet — create the eBay draft first.")
-
-    listing_id = publish_offer(offer_id)
-    ebay_data = dict(item.get("ebay") or {})
-    ebay_data["listing_id"] = listing_id
-    ebay_data["view_item_url"] = f"https://www.ebay.com/itm/{listing_id}"
-    # A relist (end -> activate again) gets a new eBay listingId and starts
-    # accumulating fresh traffic, so always stamp "now" rather than keeping an
-    # old value — pipeline/reprice.py uses this to compute weeks-live.
-    ebay_data["published_at"] = datetime.now(timezone.utc).isoformat()
-    update_field(item_id, "ebay", ebay_data)
-    update_status(item_id, "published")
-    return ebay_data
-
-
 async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     item_id, err = _resolve_item_id(user_id, context.args)
@@ -3079,24 +1884,7 @@ async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     # Publish + auto-promote, shared with advance() so both paths behave identically.
-    await _publish_and_report(item_id, update.message)
-
-
-async def _promote_item(item_id: str, pct, message) -> None:
-    """Add/adjust the Promoted Listings ad rate for an item's SKU."""
-    item = get_item(item_id)
-    sku = (item.get("ebay") or {}).get("sku") if item else None
-    if not sku:
-        await _safe_reply(message, "No eBay SKU for this item yet — create the draft first.")
-        return
-    try:
-        result = await asyncio.to_thread(promote_listing, sku, pct)
-    except Exception as e:
-        traceback.print_exc()
-        await _safe_reply(message, f"⚠️ Could not set the ad rate: {type(e).__name__}: {str(e)[:250]}")
-        return
-    verb = "Updated" if result["action"] == "updated" else "Set"
-    await _safe_reply(message, f"📣 {verb} ad rate to {result['bid_percentage']}% for {item_id[:8]} (Promoted Listings).")
+    await flow._publish_and_report(item_id, update.message)
 
 
 async def promote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3116,7 +1904,7 @@ async def promote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _safe_reply(update.message, f"⚠️ {err}")
         return
     last_item[user_id] = item_id
-    await _promote_item(item_id, pct, update.message)
+    await flow._promote_item(item_id, pct, update.message)
 
 
 def _reprice_markup(item_id: str, price: float) -> InlineKeyboardMarkup:
@@ -3722,22 +2510,7 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if err:
         await _safe_reply(update.message, f"⚠️ {err}")
         return
-    await _retry_item(user_id, item_id, update.message, context)
-
-
-async def _retry_item(user_id, item_id, message, context) -> None:
-    """/retry and the 🔁 Retry button on a failed stage."""
-    last_item[user_id] = item_id
-
-    item = get_item(item_id)
-    if item is None:
-        await _safe_reply(message, f"No item found for {item_id[:8]}.")
-        return
-
-    await _safe_reply(message, f"🔄 Retrying {item_id[:8]} (status: {item['status']})...")
-    # Route through the same dispatcher the happy path uses, so a retried item
-    # stops at the identify/price confirm gates instead of blowing past them.
-    await advance(user_id, item_id, message, context)
+    await flow._retry_item(user_id, item_id, update.message, context)
 
 
 async def photocheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
