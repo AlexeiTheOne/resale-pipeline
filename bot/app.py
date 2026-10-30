@@ -5,8 +5,11 @@ Moved out of telegram_bot.py (docs/cleanup-plan.md Phase 2, step 5).
 telegram_bot.py is the entry point (`python telegram_bot.py`) and calls main().
 """
 import asyncio
+import json
 import os
+import subprocess
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -103,9 +106,45 @@ def _start_loop(app: Application, loop_fn) -> None:
     _loop_tasks[name] = asyncio.create_task(_run_loop(app, loop_fn), name=f"bot:{name}")
 
 
+def _git_commit() -> str:
+    """The commit the repo is checked out at, or "unknown" without git."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=config.BASE_DIR,
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else "unknown"
+
+
+def write_heartbeat() -> Path:
+    """Write logs/heartbeat.json: which commit started, when, and the process id.
+    The deploy script reads it to confirm the new version came up. Written via
+    a temp file + replace so a reader never sees a half-written file."""
+    path = Path(config.LOG_DIR) / "heartbeat.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "commit": _git_commit(),
+        "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "pid": os.getpid(),
+    }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
 async def _post_init(app: Application) -> None:
     """Register the command list with Telegram so typing '/' on the phone offers
-    autocomplete. Built from HELP_SECTIONS so it stays in sync with /help."""
+    autocomplete. Built from HELP_SECTIONS so it stays in sync with /help.
+
+    Also writes the startup heartbeat. post_init runs after the bot has logged
+    in to Telegram, so the heartbeat means "started and connected"."""
+    try:
+        write_heartbeat()
+    except OSError as e:
+        print(f"WARNING: could not write heartbeat (non-fatal): {e}")
     commands = [
         BotCommand(cmd.lstrip("/").split()[0], desc[:256])
         for _, entries in ops_cmds.HELP_SECTIONS

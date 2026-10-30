@@ -152,3 +152,38 @@ def test_loop_exception_goes_to_error_handlers(monkeypatch):
     asyncio.run(go())
     assert len(seen) == 1 and seen[0][0] is None
     assert str(seen[0][1]) == "loop died"
+
+
+def test_write_heartbeat_records_commit_time_and_pid(monkeypatch, tmp_path):
+    import json
+    import os
+    monkeypatch.setattr(config, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(bot_app, "_git_commit", lambda: "abc123")
+    path = bot_app.write_heartbeat()
+    assert path == tmp_path / "logs" / "heartbeat.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["commit"] == "abc123"
+    assert data["pid"] == os.getpid()
+    assert data["started_at"].endswith("+00:00")
+    assert not path.with_suffix(".tmp").exists()
+
+
+def test_git_commit_reads_this_repo():
+    commit = bot_app._git_commit()
+    assert commit == "unknown" or len(commit) == 40
+
+
+def test_post_init_survives_heartbeat_failure(monkeypatch, capsys):
+    def boom():
+        raise OSError("disk full")
+    monkeypatch.setattr(bot_app, "write_heartbeat", boom)
+
+    async def set_my_commands(self, commands, *a, **k):
+        return True
+    monkeypatch.setattr(Bot, "set_my_commands", set_my_commands)
+    monkeypatch.setattr(util, "ALLOWED_USER_IDS", set())
+    for flag in ("SOLD_ALERTS_ENABLED", "SYNC_ENABLED", "FEEDBACK_ENABLED"):
+        monkeypatch.setattr(config, flag, False)
+    app = Application.builder().token("1:fake").build()
+    asyncio.run(bot_app._post_init(app))
+    assert "could not write heartbeat" in capsys.readouterr().out

@@ -15,4 +15,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import config  # noqa: E402
 
 config.DATA_DIR = Path(tempfile.mkdtemp(prefix="ross_test_data_"))
+# Same for logs/: startup tests write the heartbeat file there.
+config.LOG_DIR = Path(tempfile.mkdtemp(prefix="ross_test_logs_"))
 config.PRICING_V2_CACHE_DIR = str(config.DATA_DIR / "cache" / "pricing_v2")
