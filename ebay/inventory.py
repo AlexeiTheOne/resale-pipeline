@@ -1165,8 +1165,16 @@ def create_draft_offer(item_id: str) -> dict:
     stock_url = (item.get("identification") or {}).get("product_image_url")
     stock_path = _download_brand_image(stock_url, item_id)
     if stock_path:
-        image_paths.append(stock_path)
-        print("🖼️ Draft: added official brand product photo as a secondary image")
+        # A stock photo of a different product invites "not as described"
+        # returns (30 Oct 2026: wrong Polo belt), so it must match ours first.
+        from pipeline.stock_photo import stock_photo_matches
+        ok, why = stock_photo_matches(stock_path, stock_url, item.get("identification") or {},
+                                      image_paths, item_id=item_id)
+        if ok:
+            image_paths.append(stock_path)
+            print(f"🖼️ Draft: added official brand product photo as a secondary image ({why})")
+        else:
+            print(f"🖼️ Draft: skipped the brand stock photo — {why}")
 
     image_urls = upload_photos(image_paths)
     print(f"📤 Draft: {len(image_urls)} Cloudinary URL(s) returned from upload_photos")
