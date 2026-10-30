@@ -4,7 +4,9 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = "data/ross.db"
+from config import DATA_DIR, resolve_path, stored_path
+
+DB_PATH = str(DATA_DIR / "ross.db")
 
 VALID_STATUSES = [
     "captured", "identified", "priced", "drafted",
@@ -41,7 +43,7 @@ _LISTING_STATS_MIGRATIONS = {
 
 
 def _conn():
-    Path("data").mkdir(exist_ok=True)
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     # WAL lets readers and a writer coexist; busy_timeout makes a contended write
     # wait for the lock instead of raising "database is locked" immediately. Both
@@ -57,6 +59,25 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
+# Item fields holding a local file path under a key (besides "photos", which is
+# a list of them). Stored relative to BASE_DIR (data/inbox/<id>/...) and handed
+# out absolute, so a read never depends on the current working directory.
+_PATH_KEYS = {"receipt": "photo", "stock": "inventory_photo"}
+
+
+def _map_paths(field: str, value, fn):
+    if field == "photos" and isinstance(value, list):
+        return [fn(p) if isinstance(p, str) and p else p for p in value]
+    key = _PATH_KEYS.get(field)
+    if key and isinstance(value, dict) and isinstance(value.get(key), str) and value[key]:
+        return {**value, key: fn(value[key])}
+    return value
+
+
+def _resolved(p) -> str:
+    return str(resolve_path(p))
+
+
 def _row_to_dict(row, cursor):
     keys = [d[0] for d in cursor.description]
     d = dict(zip(keys, row))
@@ -64,7 +85,7 @@ def _row_to_dict(row, cursor):
                   "ebay", "price_source_url", "receipt", "photo_layout",
                   "listing_check", "stock"):
         if d.get(field) is not None:
-            d[field] = json.loads(d[field])
+            d[field] = _map_paths(field, json.loads(d[field]), _resolved)
     return d
 
 
@@ -239,7 +260,7 @@ def create_item(photos: list[str]) -> str:
     with _conn() as con:
         con.execute(
             "INSERT INTO items (item_id, status, photos, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (item_id, "captured", json.dumps(photos), now, now)
+            (item_id, "captured", json.dumps(_map_paths("photos", photos, stored_path)), now, now)
         )
     return item_id
 
@@ -269,7 +290,7 @@ def update_field(item_id: str, field: str, data: dict) -> None:
     with _conn() as con:
         con.execute(
             f"UPDATE items SET {field} = ?, updated_at = ? WHERE item_id = ?",
-            (json.dumps(data), _now(), item_id)
+            (json.dumps(_map_paths(field, data, stored_path)), _now(), item_id)
         )
 
 
@@ -427,6 +448,8 @@ PIECE_STATUSES = ("home", "sold", "lot", "donated")
 def _piece_row(row, cursor) -> dict:
     d = dict(zip([c[0] for c in cursor.description], row))
     d["info"] = json.loads(d["info"]) if d.get("info") else {}
+    if d.get("photo"):
+        d["photo"] = _resolved(d["photo"])
     return d
 
 
@@ -450,7 +473,8 @@ def add_piece(box: str, photo: str | None = None) -> str:
             with _conn() as con:
                 con.execute(
                     "INSERT INTO pieces (code, box, photo, info, created_at, updated_at) "
-                    "VALUES (?, ?, ?, '{}', ?, ?)", (code, box, photo, _now(), _now()))
+                    "VALUES (?, ?, ?, '{}', ?, ?)",
+                    (code, box, stored_path(photo) if photo else photo, _now(), _now()))
             return code
         except sqlite3.IntegrityError:
             continue
@@ -469,6 +493,8 @@ def update_piece(code: str, **fields) -> None:
         raise ValueError(f"bad piece status {fields['status']!r}")
     if "info" in fields:
         fields["info"] = json.dumps(fields["info"])
+    if fields.get("photo"):
+        fields["photo"] = stored_path(fields["photo"])
     sets = ", ".join(f"{k} = ?" for k in fields) + ", updated_at = ?"
     with _conn() as con:
         con.execute(f"UPDATE pieces SET {sets} WHERE code = ?",

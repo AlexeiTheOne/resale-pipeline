@@ -8,13 +8,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import httpx
 
-from config import EBAY_MARKETPLACE_ID
+from config import DATA_DIR, EBAY_MARKETPLACE_ID
 from ebay.auth import get_app_access_token
 from pipeline.category import path_fits, suggestion_path
 
 TAXONOMY_API_BASE = "https://api.ebay.com/commerce/taxonomy/v1"
 
-DB_PATH = "data/ross.db"
+DB_PATH = str(DATA_DIR / "ross.db")
 CACHE_TTL = 30 * 24 * 60 * 60  # 30 days
 
 
@@ -23,7 +23,7 @@ class InvalidCategoryError(Exception):
 
 
 def _conn():
-    Path("data").mkdir(exist_ok=True)
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=5000")

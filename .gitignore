@@ -16,3 +16,11 @@ env/
 .DS_Store
 .idea/
 .vscode/
+
+# Local photo dumps
+photos_*/
+
+# Bot logs
+logs/
+.env.bak
+.env.new

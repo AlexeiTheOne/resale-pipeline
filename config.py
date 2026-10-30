@@ -1,4 +1,30 @@
 import os
+from pathlib import Path
+
+# Every data path hangs off the repo folder, never the current working directory:
+# started from Task Scheduler (cwd C:\Windows\System32) a relative "data/ross.db"
+# silently becomes a new empty database with no eBay login.
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+LOG_DIR = BASE_DIR / "logs"
+
+
+def resolve_path(p) -> Path:
+    """An absolute path as-is; a relative one (a stored "data/inbox/<id>/..."
+    photo path, or a relative env value) resolved against BASE_DIR."""
+    path = Path(p)
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+def stored_path(p) -> str:
+    """The form a path is written to the DB in: relative to BASE_DIR when it lies
+    inside it (data/inbox/<id>/..., as rows have always held), so the data stays
+    portable to another folder or PC. Anything else is kept as given."""
+    try:
+        return str(Path(p).relative_to(BASE_DIR))
+    except ValueError:
+        return str(p)
+
 
 COMPS_COUNT = 10
 ACTIVE_COUNT = 5
@@ -446,7 +472,7 @@ PRICING_V2_SHIP_TO_ZIP = os.getenv("PRICING_V2_SHIP_TO_ZIP", EBAY_SHIP_FROM_ADDR
 OWN_SELLER_USERNAMES = tuple(
     s.strip().lower() for s in os.getenv("OWN_SELLER_USERNAMES", "premium_designer_outlet").split(",")
     if s.strip())
-PRICING_V2_CACHE_DIR = os.getenv("PRICING_V2_CACHE_DIR", "data/cache/pricing_v2")
+PRICING_V2_CACHE_DIR = str(resolve_path(os.getenv("PRICING_V2_CACHE_DIR") or DATA_DIR / "cache" / "pricing_v2"))
 # Apify sold actor (oTtB3VgfuE9GtxQt2) pay-per-event rates, FREE tier, read from
 # the actor's pricingInfos on 17 Oct 2026. Used only to ESTIMATE spend; Apify's
 # own usage page is the bill.

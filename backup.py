@@ -25,9 +25,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DB_PATH = Path("data/ross.db")
-INBOX = Path("data/inbox")
-BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "data/backups"))
+sys.path.insert(0, str(Path(__file__).parent))
+from config import DATA_DIR, resolve_path  # noqa: E402
+
+DB_PATH = DATA_DIR / "ross.db"
+INBOX = DATA_DIR / "inbox"
+BACKUP_DIR = resolve_path(os.getenv("BACKUP_DIR") or DATA_DIR / "backups")
 KEEP = int(os.getenv("BACKUP_KEEP", "14"))  # snapshots of each kind to retain
 
 

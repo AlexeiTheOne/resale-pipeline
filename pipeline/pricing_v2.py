@@ -351,7 +351,7 @@ def filter_candidates(cands, own_sellers, own_ids, own_titles):
 # --- our own catalogue (read-only) -------------------------------------------
 
 def _db_rows(sql: str):
-    path = ROOT / "data" / "ross.db"
+    path = config.DATA_DIR / "ross.db"
     if not path.exists():
         return []
     con = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)

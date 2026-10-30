@@ -9,6 +9,9 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config import DATA_DIR  # noqa: E402
+
 load_dotenv()
 
 CLIENT_ID = os.getenv("EBAY_CLIENT_ID")
@@ -44,11 +47,11 @@ SCOPES = [
     "https://api.ebay.com/oauth/api_scope/sell.negotiation",
 ]
 
-DB_PATH = "data/ross.db"
+DB_PATH = str(DATA_DIR / "ross.db")
 
 
 def _conn():
-    Path("data").mkdir(exist_ok=True)
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=5000")

@@ -24,7 +24,7 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import (
-    AUTO_CONFIRM, AUTO_CONFIRM_MIN_IDENT_CONFIDENCE,
+    AUTO_CONFIRM, AUTO_CONFIRM_MIN_IDENT_CONFIDENCE, DATA_DIR, LOG_DIR,
     AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC,
     GEMINI_PHOTO_LIMIT, MAX_CONCURRENT_LISTINGS, EBAY_DEFAULT_AD_RATE_PCT,
     REPRICE_WEEKDAY, REPRICE_HOUR_UTC,
@@ -82,7 +82,7 @@ from ebay.negotiation import (
 )
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-INBOX = Path("data/inbox")
+INBOX = DATA_DIR / "inbox"
 INBOX.mkdir(parents=True, exist_ok=True)
 
 
@@ -683,7 +683,7 @@ def _haul_digest(item_ids, user_id) -> str:
     return "\n".join(lines)
 
 
-_FIND_DIR = Path("data") / "cache" / "find"
+_FIND_DIR = DATA_DIR / "cache" / "find"
 
 
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -922,7 +922,7 @@ def _match_quantity_to_pieces(item_id: str) -> None:
         update_field(item_id, "ebay", {**(item.get("ebay") or {}), "quantity": n})
 
 
-_PIECES_DIR = Path("data") / "pieces"
+_PIECES_DIR = DATA_DIR / "pieces"
 _inv_sem = None
 
 
@@ -5289,6 +5289,8 @@ def _ipv4_request(connection_pool_size: int) -> HTTPXRequest:
 
 
 def main() -> None:
+    from logging_setup import setup_logging
+    setup_logging(LOG_DIR)
     app = (
         Application.builder()
         .token(TOKEN)
