@@ -349,6 +349,11 @@ PRICE_V2_MIN_SOLD_TO_AUTO = int(os.getenv("PRICE_V2_MIN_SOLD_TO_AUTO", "2"))
 REPRICE_WEEKDAY = int(os.getenv("REPRICE_WEEKDAY", "0"))  # 0 = Monday
 REPRICE_HOUR_UTC = int(os.getenv("REPRICE_HOUR_UTC", "14"))
 
+# Master switch for every background job (weekly price check, sold alerts,
+# daily sync, buyer feedback). Set JOBS_ENABLED=0 on a dev copy so a test bot
+# never acts on the live eBay account on its own.
+JOBS_ENABLED = _env_bool("JOBS_ENABLED", True)
+
 # Automatic /sync. Until this existed, /sync was manual-only and nothing else
 # wrote sold orders into the DB, so every money figure (/profit, /report, COGS)
 # silently understated whenever a sync was overdue — on 2026-09-03 the DB was

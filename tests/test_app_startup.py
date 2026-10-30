@@ -102,7 +102,7 @@ def test_post_init_starts_each_loop_once_without_ptb_warning(monkeypatch, capsys
 
     monkeypatch.setattr(Bot, "set_my_commands", set_my_commands)
     monkeypatch.setattr(util, "ALLOWED_USER_IDS", {4242})
-    for flag in ("SOLD_ALERTS_ENABLED", "SYNC_ENABLED", "FEEDBACK_ENABLED"):
+    for flag in ("JOBS_ENABLED", "SOLD_ALERTS_ENABLED", "SYNC_ENABLED", "FEEDBACK_ENABLED"):
         monkeypatch.setattr(config, flag, True)
 
     # A real (never initialized) Application: not running, exactly as in
@@ -187,3 +187,28 @@ def test_post_init_survives_heartbeat_failure(monkeypatch, capsys):
     app = Application.builder().token("1:fake").build()
     asyncio.run(bot_app._post_init(app))
     assert "could not write heartbeat" in capsys.readouterr().out
+
+
+def test_jobs_disabled_starts_no_loops(monkeypatch, capsys):
+    started = []
+    for name in LOOPS:
+        async def loop(app, name=name):
+            started.append(name)
+        loop.__name__ = name
+        monkeypatch.setattr(jobs, name, loop)
+
+    async def set_my_commands(self, commands, *a, **k):
+        return True
+    monkeypatch.setattr(Bot, "set_my_commands", set_my_commands)
+    monkeypatch.setattr(util, "ALLOWED_USER_IDS", {4242})
+    monkeypatch.setattr(config, "JOBS_ENABLED", False)
+    for flag in ("SOLD_ALERTS_ENABLED", "SYNC_ENABLED", "FEEDBACK_ENABLED"):
+        monkeypatch.setattr(config, flag, True)
+    app = Application.builder().token("1:fake").build()
+
+    async def go():
+        await bot_app._post_init(app)
+        await asyncio.sleep(0)
+    asyncio.run(go())
+    assert started == []
+    assert "Background jobs OFF" in capsys.readouterr().out

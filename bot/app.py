@@ -159,6 +159,11 @@ async def _post_init(app: Application) -> None:
     except Exception as e:
         print(f"WARNING: set_my_commands failed (non-fatal): {type(e).__name__}: {e}")
 
+    if not config.JOBS_ENABLED:
+        print("Background jobs OFF (JOBS_ENABLED=0): no price check, sold alerts, "
+              "sync or feedback. Dev mode.")
+        return
+
     if util.ALLOWED_USER_IDS:
         _start_loop(app, jobs._weekly_reprice_loop)
         print(f"Weekly price check scheduled: weekday={config.REPRICE_WEEKDAY} hour={config.REPRICE_HOUR_UTC} UTC.")
