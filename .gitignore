@@ -24,3 +24,7 @@ photos_*/
 logs/
 .env.bak
 .env.new
+
+# Any other .env copy (backups, disabled prod keys); only the example is shared
+.env.*
+!.env.example
