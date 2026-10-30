@@ -1,9 +1,9 @@
 """Photo intake: the capture debounce window, the Start/Wait/Cancel staging
 step, /addphotos appends and /haul splitting.
 
-Moved verbatim out of telegram_bot.py (docs/cleanup-plan.md Phase 2, step 3).
-photo_handler itself stays in telegram_bot.py until find / quick add / inventory
-mode move out (step 4): it dispatches to them before reaching the batching here.
+Moved verbatim out of telegram_bot.py (docs/cleanup-plan.md Phase 2, steps 3
+and 4a). photo_handler dispatches to find / Quick add / inventory mode
+(bot.inventory_cmds) before reaching the batching here.
 """
 import asyncio
 import uuid
@@ -15,7 +15,7 @@ from telegram.ext import ContextTypes
 import config
 import db
 import ross_tag
-from bot import flow, state, util
+from bot import flow, inventory_cmds, photos_cmds, state, util
 from pipeline import stages
 
 INBOX = config.DATA_DIR / "inbox"
@@ -24,6 +24,92 @@ INBOX.mkdir(parents=True, exist_ok=True)
 DEFAULT_CAPTURE_WINDOW = 5    # seconds to wait for more photos before processing
 EXTENDED_CAPTURE_WINDOW = 30  # after the user types "wait" — for forwarding big batches
 WAIT_EXTENSION = 15           # seconds the inline "Wait" button waits for more photos
+
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    # message_id increases in the order you send messages. The downloads below are
+    # awaited before we take the lock, and with concurrent update processing on,
+    # these handlers run in parallel — so lock/append order reflects which download
+    # finished first, NOT your send order. We tag each photo with its message_id
+    # and sort by it so photo position (cover / tag / receipt) is deterministic.
+    mid = update.message.message_id
+    photo = update.message.photo[-1]
+    f = await context.bot.get_file(photo.file_id)
+    data = await f.download_as_bytearray()
+
+    if user_id in state.inv_box:
+        await inventory_cmds._inv_photo(user_id, update.message, bytes(data), mid)
+        return
+    if user_id in state.quick_add:
+        await inventory_cmds._quick_add_photo(user_id, update.message, bytes(data), mid)
+        return
+    if user_id in state.find_mode:
+        await inventory_cmds._find_one(user_id, update.message, bytes(data), mid)
+        return
+
+    async with util._lock_for(user_id):
+        target = state.awaiting_photos.get(user_id)
+        if target is not None:
+            # /addphotos mode — this photo attaches to an existing item rather than
+            # starting a new one. Buffer it and (re)arm the finalize timer that
+            # writes the new photos onto the item and re-syncs the eBay offer.
+            ap = state.appending.get(user_id)
+            if ap is None or ap["item_id"] != target:
+                existing = db.get_item(target)
+                if existing is None:
+                    state.awaiting_photos.pop(user_id, None)
+                    state.appending.pop(user_id, None)
+                    await util._safe_reply(update.message, "That item no longer exists — nothing to add photos to.")
+                    return
+                photos = existing.get("photos") or []
+                folder = Path(photos[0]).parent if photos else (INBOX / target)
+                folder.mkdir(parents=True, exist_ok=True)
+                ap = state.appending[user_id] = {
+                    "item_id": target, "folder": folder, "base": list(photos),
+                    "new": [], "chat_id": update.effective_chat.id, "task": None,
+                }
+            p = ap["folder"] / f"{ap['folder'].name}_{mid}.jpg"
+            p.write_bytes(data)
+            ap["new"].append((mid, str(p)))
+            if ap["task"] is not None:
+                ap["task"].cancel()
+            ap["task"] = context.application.create_task(
+                _finalize_append(user_id, target, update, context)
+            )
+            count = len(ap["new"])
+            print(f"📷 Append: {count} new photo(s) buffered for item {target[:8]}")
+            return
+        st = state.staging.get(user_id)
+        if st is not None:
+            # Item is already awaiting confirmation — this photo belongs to it.
+            # Append it (kept sorted by message_id), then re-arm the confirmation
+            # once photos stop arriving.
+            p = st["folder"] / f"{st['folder'].name}_{mid}.jpg"
+            p.write_bytes(data)
+            st["photos"].append((mid, str(p)))
+            st["photos"].sort(key=lambda mp: mp[0])
+            st["paths"] = [path for _, path in st["photos"]]
+            db.update_field(st["item_id"], "photos", st["paths"])
+            if st["task"] is not None:
+                st["task"].cancel()
+            st["task"] = context.application.create_task(
+                _await_more_photos(user_id, st["item_id"], context, WAIT_EXTENSION)
+            )
+            count = len(st["paths"])
+        else:
+            if user_id not in state.pending:
+                state.pending[user_id] = {"files": [], "task": None}
+            state.pending[user_id]["files"].append((mid, data))
+            count = len(state.pending[user_id]["files"])
+
+            if state.pending[user_id]["task"] is not None:
+                state.pending[user_id]["task"].cancel()
+
+            state.pending[user_id]["task"] = context.application.create_task(
+                finalize_capture(user_id, update, context)
+            )
+    print(f"📷 Capture: photo appended, {count} buffered for user {user_id}")
 
 
 async def finalize_capture(user_id, update, context):
@@ -285,13 +371,10 @@ async def _await_more_photos(user_id, item_id, context, delay) -> None:
     await _send_confirmation(context, chat_id, item_id, count)
 
 
-async def _finalize_append(user_id, item_id, update, context, resync_photos) -> None:
+async def _finalize_append(user_id, item_id, update, context) -> None:
     """After photos stop arriving in /addphotos mode, commit the new photos onto
     the item (existing photos first, new ones appended in send order) and, if the
-    item already has an eBay offer, push the updated photo set to eBay.
-
-    `resync_photos` is telegram_bot._resync_photos, passed in by photo_handler
-    until the photo commands move out of telegram_bot (split step 4)."""
+    item already has an eBay offer, push the updated photo set to eBay."""
     window = state.capture_window.get(user_id, DEFAULT_CAPTURE_WINDOW)
     await asyncio.sleep(window)
     async with util._lock_for(user_id):
@@ -327,7 +410,7 @@ async def _finalize_append(user_id, item_id, update, context, resync_photos) -> 
         await flow.advance(user_id, item_id, update.message, context)
         return
     await util._safe_reply(update.message, f"➕ Added {added} photo(s) to {item_id[:8]} ({len(photos)} total).")
-    await resync_photos(item_id, update.message)
+    await photos_cmds._resync_photos(item_id, update.message)
 
 
 async def addphotos_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
