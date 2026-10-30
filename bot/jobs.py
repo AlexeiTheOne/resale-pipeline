@@ -19,20 +19,19 @@ from pipeline import reprice
 
 async def _sold_alert_loop(app: Application) -> None:
     """Every SOLD_ALERT_MINUTES: announce new orders with where to pull them."""
-    from db import mark_orders_seen, seen_order_ids
-    from ebay.orders import get_orders
-    from pipeline.inventory import order_alerts
+    from ebay import orders as ebay_orders
+    from pipeline import inventory
     first = True
     while True:
         try:
-            orders = await asyncio.to_thread(get_orders, 3 if not first else 30)
-            seen = seen_order_ids()
+            orders = await asyncio.to_thread(ebay_orders.get_orders, 3 if not first else 30)
+            seen = db.seen_order_ids()
             if first and not seen:
                 # First run ever: everything before today is history, not news.
-                mark_orders_seen([o.get("orderId") for o in orders if o.get("orderId")])
+                db.mark_orders_seen([o.get("orderId") for o in orders if o.get("orderId")])
             else:
-                lines, handled = await asyncio.to_thread(order_alerts, orders, seen)
-                mark_orders_seen(handled)
+                lines, handled = await asyncio.to_thread(inventory.order_alerts, orders, seen)
+                db.mark_orders_seen(handled)
                 for uid in util.ALLOWED_USER_IDS:
                     for line in lines:
                         try:

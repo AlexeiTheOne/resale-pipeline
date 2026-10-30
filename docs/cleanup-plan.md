@@ -6,6 +6,8 @@ here has been implemented yet.
 
 ## Phase 0: required before the move
 
+Status: done (ba5dffd).
+
 1. **One base folder for every path.** Every data path is relative to the
    current working directory (`db.py:7`, `ebay/auth.py:47`, `ebay/taxonomy.py:17`,
    `telegram_bot.py:85,686,925`, `backup.py:28-30`). Started from Task Scheduler
@@ -20,6 +22,8 @@ here has been implemented yet.
 
 ## Phase 1: safety net (before any restructure)
 
+Status: done (e0edbb9, fixes c33b357).
+
 The 391 tests cover pricing/title/category logic well but only 4 of 54 bot
 handlers; photo intake has no tests. Tests also patch names on
 `telegram_bot` (`tb.update_field = ...`) which silently stop working once code
@@ -33,6 +37,10 @@ moves. Add first:
    still reachable.
 
 ## Phase 2: structure
+
+Status: `telegram_bot.py` split into `bot/` and non-Telegram logic moved out, done
+(b5af083..the step 5 commit). The `app/` wrapper and `pyproject.toml` were
+deliberately left out.
 
 Target layout (pragmatic, one atomic commit for the move + import rewrite,
 `pyproject.toml` replaces the `sys.path.insert` hacks):

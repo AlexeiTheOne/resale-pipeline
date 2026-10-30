@@ -64,7 +64,7 @@ def _end_find(user_id: int) -> None:
 
 
 async def _find_one(user_id: int, message, data: bytes, mid: int) -> None:
-    from pipeline.stock_lookup import format_answer, lookup
+    from pipeline import stock_lookup
     _FIND_DIR.mkdir(parents=True, exist_ok=True)
     path = _FIND_DIR / f"find_{mid}.jpg"
     path.write_bytes(data)
@@ -74,12 +74,12 @@ async def _find_one(user_id: int, message, data: bytes, mid: int) -> None:
     state.last_find_photo[user_id] = str(path)
     loc = state.find_loc.get(user_id)
     try:
-        res = await asyncio.to_thread(lookup, str(path))
+        res = await asyncio.to_thread(stock_lookup.lookup, str(path))
     except Exception as e:
         traceback.print_exc()
         await util._safe_reply(message, f"⚠️ Lookup failed: {type(e).__name__}: {str(e)[:200]}")
         return
-    text = format_answer(res)
+    text = stock_lookup.format_answer(res)
     if res["item"] is not None:
         db.set_location(res["item"]["item_id"], loc)
         if loc:
@@ -157,7 +157,7 @@ def _quick_add_item(paths: list[str], loc: str | None) -> str:
     """Photos -> a 'stocked' item: identified and quick-priced, not listed.
     The Ross tag is only peeled when it's actually recognised; Quick add has
     no 'tag is the last photo' convention to fall back on."""
-    from pipeline.quick_price import quick_price
+    from pipeline import quick_price
     item_id = db.create_item([])
     folder = intake.INBOX / item_id
     folder.mkdir(parents=True, exist_ok=True)
@@ -177,7 +177,7 @@ def _quick_add_item(paths: list[str], loc: str | None) -> str:
     db.update_field(item_id, "photos", photos)
     ident = identify.identify_item(photos[:config.GEMINI_PHOTO_LIMIT], scan_paths=photos)
     db.update_field(item_id, "identification", ident)
-    priced = quick_price(ident, photos[0], receipt, item_id=item_id)
+    priced = quick_price.quick_price(ident, photos[0], receipt, item_id=item_id)
     db.update_field(item_id, "stock", {"location": loc, "quick_price": priced,
                                     "added_at": datetime.now(timezone.utc).isoformat()})
     db.update_status(item_id, "stocked")
@@ -212,9 +212,9 @@ async def stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     verdicts = {}
     norm = lambda b: b  # noqa: E731
     try:
-        from pipeline.scoreboard import load, normalize_brand
-        verdicts = {g["name"]: g["verdict"] for g in load()["brands"]}
-        norm = normalize_brand
+        from pipeline import scoreboard
+        verdicts = {g["name"]: g["verdict"] for g in scoreboard.load()["brands"]}
+        norm = scoreboard.normalize_brand
     except Exception as e:
         print(f"WARNING: scoreboard unavailable for /stock: {e}")
     rank = {"buy more": 0, "ok": 1, "pause": 2, "stop": 3}
@@ -253,10 +253,10 @@ def _inv_semaphore() -> asyncio.Semaphore:
 
 async def inv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Inventory mode: /inv G3, then one photo per item with the tag showing."""
-    from pipeline.inventory import BOX_RE
+    from pipeline import inventory
     user_id = update.effective_user.id
     box = " ".join(context.args or []).strip().upper()
-    if not box or not BOX_RE.match(box):
+    if not box or not inventory.BOX_RE.match(box):
         await util._safe_reply(update.message,
             "Usage: /inv G3 — then one photo per item, tag showing.\n"
             "Boxes: G garage, O office, S small bedroom, R full room (G1, O2, R-SHELF1).")
@@ -271,24 +271,23 @@ async def inv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def _inv_photo(user_id: int, message, data: bytes, mid: int) -> None:
-    from db import add_piece, update_piece
     box = state.inv_box[user_id]
     _PIECES_DIR.mkdir(parents=True, exist_ok=True)
-    code = add_piece(box)
+    code = db.add_piece(box)
     path = _PIECES_DIR / f"{code}.jpg"
     path.write_bytes(data)
-    update_piece(code, photo=str(path))
+    db.update_piece(code, photo=str(path))
     state.inv_session.setdefault(user_id, []).append(code)
     sent = await util._safe_reply(message, f"{code} ✓")
     asyncio.create_task(_inv_process(code, sent))
 
 
 async def _inv_process(code: str, sent) -> None:
-    from pipeline.inventory import describe, process_piece
+    from pipeline import inventory
     async with _inv_semaphore():
         try:
-            res = await asyncio.to_thread(process_piece, code)
-            text = describe(res)
+            res = await asyncio.to_thread(inventory.process_piece, code)
+            text = inventory.describe(res)
         except Exception as e:
             traceback.print_exc()
             util._record_error(f"inventory {code}", e)
@@ -302,31 +301,30 @@ async def _inv_process(code: str, sent) -> None:
 
 
 async def _inv_done(user_id: int, message) -> None:
-    from pipeline.inventory import box_summary
+    from pipeline import inventory
     codes = state.inv_session.pop(user_id, [])
     state.inv_box.pop(user_id, None)
     # Give pieces still being read a moment to finish.
-    from db import get_piece
     for _ in range(30):
-        if all((get_piece(c) or {}).get("item_id") for c in codes):
+        if all((db.get_piece(c) or {}).get("item_id") for c in codes):
             break
         await asyncio.sleep(2)
-    await util._send_chunked(message, box_summary(codes) + ["", "/stock for what to list · /ghosts after the whole house"])
+    await util._send_chunked(message, inventory.box_summary(codes) + ["", "/stock for what to list · /ghosts after the whole house"])
 
 
 async def where_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/where G3-07 · /where G3 · /where oakley · /where 198190095323"""
-    from pipeline.inventory import piece_line, search
+    from pipeline import inventory
     q = " ".join(context.args or []).strip()
     if not q:
         await util._safe_reply(update.message, "Usage: /where G3-07 · /where G3 · /where oakley · /where <UPC>")
         return
-    found = await asyncio.to_thread(search, q)
+    found = await asyncio.to_thread(inventory.search, q)
     if not found:
         await util._safe_reply(update.message, f"Nothing found for '{q}'.")
         return
     items = {i["item_id"]: i for i in db.list_items()}
-    lines = [f"🔎 {len(found)} piece(s) for '{q}':"] + [piece_line(p, items) for p in found[:40]]
+    lines = [f"🔎 {len(found)} piece(s) for '{q}':"] + [inventory.piece_line(p, items) for p in found[:40]]
     if len(found) > 40:
         lines.append(f"... and {len(found) - 40} more")
     await util._send_chunked(update.message, lines)
@@ -334,40 +332,38 @@ async def where_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def move_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/move G3-07 R2 — the code stays, the location changes."""
-    from db import get_piece, update_piece
-    from pipeline.inventory import BOX_RE
+    from pipeline import inventory
     args = [a.upper() for a in (context.args or [])]
-    if len(args) != 2 or not BOX_RE.match(args[1]):
+    if len(args) != 2 or not inventory.BOX_RE.match(args[1]):
         await util._safe_reply(update.message, "Usage: /move G3-07 R2")
         return
-    p = get_piece(args[0])
+    p = db.get_piece(args[0])
     if not p:
         await util._safe_reply(update.message, f"No piece {args[0]}.")
         return
-    update_piece(p["code"], box=args[1])
+    db.update_piece(p["code"], box=args[1])
     await util._safe_reply(update.message, f"👍 {p['code']} is now in {args[1]} (its code stays {p['code']}).")
 
 
 async def mark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/mark G3-07 lot|donated|home|sold"""
-    from db import PIECE_STATUSES, get_piece, update_piece
     args = context.args or []
-    if len(args) != 2 or args[1].lower() not in PIECE_STATUSES:
+    if len(args) != 2 or args[1].lower() not in db.PIECE_STATUSES:
         await util._safe_reply(update.message, "Usage: /mark G3-07 lot  (lot, donated, home, sold)")
         return
-    p = get_piece(args[0])
+    p = db.get_piece(args[0])
     if not p:
         await util._safe_reply(update.message, f"No piece {args[0].upper()}.")
         return
-    update_piece(p["code"], status=args[1].lower())
+    db.update_piece(p["code"], status=args[1].lower())
     await util._safe_reply(update.message, f"👍 {p['code']} marked {args[1].lower()}.")
 
 
 async def ghosts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Live listings vs pieces found at home. Meaningful after the whole house."""
-    from pipeline.inventory import ghost_report
+    from pipeline import inventory
     await util._safe_reply(update.message, "🔎 Checking every live listing against what's at home...")
-    lines = await asyncio.to_thread(ghost_report)
+    lines = await asyncio.to_thread(inventory.ghost_report)
     await util._send_chunked(update.message, lines)
 
 

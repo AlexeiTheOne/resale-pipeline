@@ -25,14 +25,12 @@ async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     replies with the consent URL to open; /auth <pasted redirect URL or code>
     completes the exchange. Handy when the token loses a scope (e.g. sell.marketing
     was added) and needs re-granting without a laptop."""
-    from ebay.auth import exchange_code, get_consent_url
-
     args = context.args
     if not args:
         await util._safe_reply(update.message,
             "🔑 eBay re-consent:\n"
             "1) Open this URL and approve (sign in as the seller):\n\n"
-            f"{get_consent_url()}\n\n"
+            f"{auth.get_consent_url()}\n\n"
             "2) On the 'Authorization successfully completed' page, copy the WHOLE "
             "address-bar URL (it contains code=) and send it back as:\n"
             "/auth <paste the URL>")
@@ -40,7 +38,7 @@ async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await util._safe_reply(update.message, "🔑 Exchanging with eBay...")
     try:
-        token = await asyncio.to_thread(exchange_code, " ".join(args))
+        token = await asyncio.to_thread(auth.exchange_code, " ".join(args))
     except Exception as e:
         traceback.print_exc()
         util._record_error("auth exchange", e)

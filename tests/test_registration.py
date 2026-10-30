@@ -5,7 +5,7 @@ Part A: every command / callback / message handler main() registers, and the
 Part B: every telegram_bot attribute the tests patch must still exist AND still
         be read by code living in telegram_bot, otherwise the patch is a no-op.
 
-No network, bot never started: main() runs against a fake Application.
+No network, bot never started: main() (bot.app) runs against a fake Application.
 """
 import ast
 import asyncio
@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 import telegram_bot as tb
+from bot import app as bot_app
 
 TESTS_DIR = Path(__file__).parent
 
@@ -83,8 +84,10 @@ def registered():
     app = _FakeApp()
     mp = pytest.MonkeyPatch()
     try:
-        mp.setattr(tb, "Application", types.SimpleNamespace(builder=lambda: _FakeBuilder(app)))
-        mp.setattr(tb, "_ipv4_request", lambda *a, **k: None)
+        mp.setattr(bot_app, "Application", types.SimpleNamespace(builder=lambda: _FakeBuilder(app)))
+        mp.setattr(bot_app, "_ipv4_request", lambda *a, **k: None)
+        mp.setattr(bot_app, "load_dotenv", lambda *a, **k: None)
+        mp.setattr(bot_app.util, "ALLOWED_USER_IDS", set())  # main() rebinds it
         import logging_setup
         mp.setattr(logging_setup, "setup_logging", lambda *a, **k: None)
         tb.main()
@@ -163,13 +166,11 @@ def test_menu_lists_only_registered_commands(registered):
     class _App:
         bot = _Bot()
 
-        def create_task(self, coro):
-            coro.close()
-
     mp = pytest.MonkeyPatch()
     try:
         from bot import util
-        mp.setattr(util, "ALLOWED_USER_IDS", [])  # skip background loops
+        mp.setattr(util, "ALLOWED_USER_IDS", [])
+        mp.setattr(bot_app, "_start_loop", lambda app, fn: None)  # no background loops
         asyncio.run(tb._post_init(_App()))
     finally:
         mp.undo()

@@ -236,8 +236,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     low = text.lower()
 
     if user_id in state.inv_box:
-        from pipeline.inventory import BOX_RE
-        if BOX_RE.match(text.upper()):
+        from pipeline import inventory
+        if inventory.BOX_RE.match(text.upper()):
             state.inv_box[user_id] = text.upper()
             await util._safe_reply(update.message, f"📦 Now in {text.upper()}. Next code: "
                               f"{db.next_piece_code(text.upper())}")
