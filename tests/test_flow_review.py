@@ -311,18 +311,20 @@ def test_button_on_missing_item_and_malformed_data(bot):
     assert sent_texts(ctx) == []
 
 
-def test_unknown_action_strips_buttons_but_changes_nothing(bot):
-    # NOTE: looks like a bug (minor): any unrecognised review:<action> still
-    # removes the buttons, pops review and sets last_item, then silently does
-    # nothing, so the draft is left with no buttons. Only approve/reject exist
-    # today, so this is unreachable from the real keyboard.
+def test_unknown_action_is_answered_and_changes_nothing(bot):
+    # The action is validated before the buttons are stripped or review /
+    # last_item touched, so an unrecognised review:<action> leaves the draft
+    # exactly as it was, buttons included.
     item_id = seed()
     tb.review[UID] = item_id
+    tb.last_item.pop(UID, None)
     tap, ctx = make_callback_update(f"review:edit:{item_id}")
     run(tb.review_callback, tap, ctx)
     assert tb.get_item(item_id)["status"] == "drafted"
-    assert UID not in tb.review
-    assert len(ctx.transcript.of("edit_message_reply_markup")) == 1
+    assert tb.review[UID] == item_id
+    assert UID not in tb.last_item
+    assert ctx.transcript.of("edit_message_reply_markup") == []
+    assert len(ctx.transcript.of("answer")) == 1
     assert sent_texts(ctx) == []
 
 

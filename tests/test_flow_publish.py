@@ -478,10 +478,11 @@ def _slow_markup_edit(update):
     q.edit_message_reply_markup = slow
 
 
-def test_concurrent_double_tap_on_approve_creates_the_draft_twice(bot, http):
+def test_concurrent_double_tap_on_approve_creates_the_draft_once(bot, http):
     """The app runs with concurrent_updates(True), so two taps on Approve are
     handled at once. review_callback checks the status, then awaits the
-    button-removal edit, and only then (_approve_item) sets 'approved'."""
+    button-removal edit; the item is claimed between the two, so the second tap
+    is turned away instead of building the draft again."""
     item_id = seed_review_item()
     ctx = FakeContext()
     t1, _ = make_callback_update(f"review:approve:{item_id}", context=ctx)
@@ -493,18 +494,16 @@ def test_concurrent_double_tap_on_approve_creates_the_draft_twice(bot, http):
         await asyncio.gather(tb.review_callback(t1, ctx), tb.review_callback(t2, ctx))
     asyncio.run(both())
 
-    # NOTE: looks like a bug: both taps pass the status check (the check and
-    # update_status('approved') are separated by an await), so the draft is
-    # built twice: 6 Cloudinary uploads, 2 inventory_item PUTs, 2 createOffer
-    # POSTs. eBay's "offer already exists" answer turns the 2nd into a PUT on
-    # the same offer, so there is still only one offer and nothing goes live.
-    assert len(http.of("create_offer")) == 2
-    assert len(http.of("update_offer")) == 1
-    assert len(http.of("cloudinary")) == 6
+    assert len(http.of("create_offer")) == 1
+    assert http.of("update_offer") == []
+    assert len(http.of("cloudinary")) == 3
     assert http.of("publish") == []
-    assert sent_texts(ctx).count("✅ Approved. Creating eBay draft...") == 2
+    texts = sent_texts(ctx)
+    assert texts.count("✅ Approved. Creating eBay draft...") == 1
+    assert f"⏳ Already handling {item_id[:8]}." in texts
     item = get_item(item_id)
     assert item["status"] == "ebay_draft" and item["ebay"]["offer_id"] == "OFFER-1"
+    assert tb._in_flight == set()
 
 
 def test_second_activate_after_first_finished_does_not_republish(bot, http):
@@ -517,7 +516,10 @@ def test_second_activate_after_first_finished_does_not_republish(bot, http):
                                    "not 'ebay_draft'. Nothing to activate.")
 
 
-def test_concurrent_double_activate_publishes_twice(bot, http, monkeypatch):
+def test_concurrent_double_activate_publishes_and_promotes_once(bot, http, monkeypatch):
+    """Two overlapping /activate (concurrent_updates=True) for one item: the
+    first claims it before the worker-thread publish, the second is told it's
+    already publishing."""
     monkeypatch.setattr(tb, "EBAY_DEFAULT_AD_RATE_PCT", 5)
     item_id = seed_review_item()
     ctx = approve(item_id)
@@ -529,16 +531,13 @@ def test_concurrent_double_activate_publishes_twice(bot, http, monkeypatch):
         await asyncio.gather(tb.activate_command(u1, ctx), tb.activate_command(u2, ctx))
     asyncio.run(both())
 
-    # NOTE: looks like a bug: activate_command checks status == 'ebay_draft'
-    # and nothing claims the item before the publish runs in a worker thread,
-    # so two overlapping /activate (concurrent_updates=True) both POST
-    # .../publish and both promote. Same offer id, so eBay sees a publish of an
-    # already-live offer rather than a second listing, but the user gets two
-    # "Published!" messages and the ad is created twice.
-    assert len(http.of("publish")) == 2
-    assert len(http.of("create_ad")) == 2
-    assert sum(t.startswith("🎉 Published!") for t in sent_texts(ctx)) == 2
+    assert len(http.of("publish")) == 1
+    assert len(http.of("create_ad")) == 1
+    texts = sent_texts(ctx)
+    assert sum(t.startswith("🎉 Published!") for t in texts) == 1
+    assert f"⏳ {item_id[:8]} is already publishing." in texts
     assert get_item(item_id)["status"] == "published"
+    assert tb._in_flight == set()
 
 
 # --------------------------------------------------------------------------- #
@@ -607,19 +606,34 @@ def test_retry_publish_script_recreates_the_draft_and_keeps_other_ebay_keys(bot,
     assert http.of("publish") == []
 
 
-def test_retry_publish_script_on_a_live_item_sets_it_back_to_ebay_draft(bot, http):
+def test_retry_publish_script_refuses_a_live_item(bot, http, capsys):
     item_id = seed_review_item()
     ctx = approve(item_id)
     activate(item_id, ctx)
     assert get_item(item_id)["status"] == "published"
+    before = len(http.calls)
 
     retry_publish.retry_publish(item_id)
     item = get_item(item_id)
-    # NOTE: looks like a bug: retry_publish.py sets 'ebay_draft' unconditionally,
-    # so running it on a listing that is live demotes it in the DB (the listing
-    # stays live on eBay; listing_id is kept). /activate would then re-publish.
-    assert item["status"] == "ebay_draft"
+    assert item["status"] == "published"
     assert item["ebay"]["listing_id"] == "LIST-OFFER-1"
+    assert len(http.calls) == before  # nothing sent to eBay or Cloudinary
+    out = capsys.readouterr().out
+    assert f"Refusing: {item_id} is already published (listing LIST-OFFER-1)" in out
+
+
+def test_retry_publish_script_refuses_an_item_with_a_listing_id(bot, http, capsys):
+    """A listing_id means it was live at some point, whatever the status says."""
+    item_id = seed_review_item()
+    http.fail["create_offer"] = FakeResp(500, {"errors": []})
+    approve(item_id)
+    update_field(item_id, "ebay", {"listing_id": "LIST-OLD"})
+    before = len(http.calls)
+
+    retry_publish.retry_publish(item_id)
+    assert get_item(item_id)["status"] == "approved"
+    assert len(http.calls) == before
+    assert "Refusing:" in capsys.readouterr().out
 
 
 def test_cloudinary_failure_sends_nothing_to_ebay(bot, http):

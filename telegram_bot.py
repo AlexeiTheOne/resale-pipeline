@@ -1552,8 +1552,17 @@ async def _run_stage(item_id, message, stage_fn, *args):
     except Exception as e:
         print("PIPELINE ERROR:", traceback.format_exc())
         _record_error(f"{stage_fn.__name__} ({item_id[:8]})", e)
-        await _safe_reply(message, f"⚠️ {stage_fn.__name__} failed: {type(e).__name__}: {str(e)[:200]}")
+        # The item stays at the status it failed from, so the Retry button just
+        # re-runs advance() for it (same path as /retry).
+        await _safe_reply(message, f"⚠️ {stage_fn.__name__} failed: {type(e).__name__}: {str(e)[:200]}",
+                          reply_markup=_retry_markup(item_id))
         return None, e
+
+
+def _retry_markup(item_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔁 Retry", callback_data=f"confirm:retry:{item_id}"),
+    ]])
 
 
 async def _show_review(user_id, item_id, message) -> None:
@@ -1574,10 +1583,40 @@ async def _show_review(user_id, item_id, message) -> None:
     _remember_target(sent, item_id)
 
 
+# (kind, item_id) pairs with work in flight. The app runs with
+# concurrent_updates(True), so two taps / two commands for the same item are
+# handled at once; a status check followed by an await lets both through.
+# _claim must be called with no await between the status check and it.
+_in_flight: set[tuple[str, str]] = set()
+
+
+def _claim(kind: str, item_id: str) -> bool:
+    """Claim (kind, item_id) synchronously. False if someone else holds it."""
+    key = (kind, item_id)
+    if key in _in_flight:
+        return False
+    _in_flight.add(key)
+    return True
+
+
+def _release(kind: str, item_id: str) -> None:
+    _in_flight.discard((kind, item_id))
+
+
 async def _publish_and_report(item_id, message) -> None:
     """Publish an ebay_draft offer, report the live URL and what it stands to
     make, then auto-promote at the default ad rate if one is configured. Shared
     by /activate and advance()."""
+    if not _claim("publish", item_id):
+        await _safe_reply(message, f"⏳ {item_id[:8]} is already publishing.")
+        return
+    try:
+        await _publish_and_report_claimed(item_id, message)
+    finally:
+        _release("publish", item_id)
+
+
+async def _publish_and_report_claimed(item_id, message) -> None:
     try:
         ebay_data = await asyncio.to_thread(_activate_item, item_id)
     except Exception as e:
@@ -1890,6 +1929,24 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             delete_item(item_id)
         await query.edit_message_text("Cancelled. Photos discarded.")
 
+    elif action == "retry":
+        # The 🔁 Retry button on a failed stage (_run_stage). Claimed before the
+        # first await so a double tap doesn't run the stage twice.
+        if not _claim("retry", item_id):
+            return
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        async def _retry_then_release():
+            try:
+                await _retry_item(user_id, item_id, query.message, context)
+            finally:
+                _release("retry", item_id)
+        # Background, like Start: a stage takes a minute or more.
+        context.application.create_task(_retry_then_release())
+
 
 async def _approve_item(item_id: str, message, context) -> None:
     """Mark an item approved and push it to eBay as a draft offer. Shared by the
@@ -1949,6 +2006,8 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         _, action, item_id = query.data.split(":", 2)
     except ValueError:
         return
+    if action not in ("approve", "reject"):
+        return  # unknown button: already answered, change nothing
 
     item = get_item(item_id)
     if item is None:
@@ -1957,22 +2016,29 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if item["status"] not in ("review", "drafted"):
         await query.edit_message_text(f"Item {item_id[:8]} is '{item['status']}' — nothing to review.")
         return
-
-    # Drop the buttons so the draft can't be double-actioned.
+    # Claimed right after the status check, before any await, so a concurrent
+    # second tap can't also pass the check while this one is still working.
+    if not _claim("review", item_id):
+        await _safe_reply(query.message, f"⏳ Already handling {item_id[:8]}.")
+        return
     try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+        # Drop the buttons so the draft can't be double-actioned.
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
-    if review.get(user_id) == item_id:
-        review.pop(user_id, None)
-    last_item[user_id] = item_id
+        if review.get(user_id) == item_id:
+            review.pop(user_id, None)
+        last_item[user_id] = item_id
 
-    if action == "approve":
-        await _approve_item(item_id, query.message, context)
-    elif action == "reject":
-        update_status(item_id, "rejected")
-        await _safe_reply(query.message, f"❌ Rejected {item_id[:8]}.")
+        if action == "approve":
+            await _approve_item(item_id, query.message, context)
+        else:
+            update_status(item_id, "rejected")
+            await _safe_reply(query.message, f"❌ Rejected {item_id[:8]}.")
+    finally:
+        _release("review", item_id)
 
 
 def _find_tag_photo(paths: list[str]) -> tuple[int, str] | None:
@@ -2663,15 +2729,21 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # on each draft handle any-order approval unambiguously).
     item_id = review[user_id]
 
-    if low in ("approve", "✅", "yes", "ok"):
-        review.pop(user_id, None)
-        await _approve_item(item_id, update.message, context)
-        return
-
-    if low in ("reject", "❌", "no"):
-        update_status(item_id, "rejected")
-        review.pop(user_id, None)
-        await _safe_reply(update.message, "❌ Rejected.")
+    if low in ("approve", "✅", "yes", "ok", "reject", "❌", "no"):
+        # Same claim as the Approve/Reject buttons: a typed approve racing a tap
+        # on the same draft must not build the eBay draft twice.
+        if not _claim("review", item_id):
+            await _safe_reply(update.message, f"⏳ Already handling {item_id[:8]}.")
+            return
+        try:
+            review.pop(user_id, None)
+            if low in ("reject", "❌", "no"):
+                update_status(item_id, "rejected")
+                await _safe_reply(update.message, "❌ Rejected.")
+            else:
+                await _approve_item(item_id, update.message, context)
+        finally:
+            _release("review", item_id)
         return
 
     item = get_item(item_id)
@@ -4931,17 +5003,22 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if err:
         await _safe_reply(update.message, f"⚠️ {err}")
         return
+    await _retry_item(user_id, item_id, update.message, context)
+
+
+async def _retry_item(user_id, item_id, message, context) -> None:
+    """/retry and the 🔁 Retry button on a failed stage."""
     last_item[user_id] = item_id
 
     item = get_item(item_id)
     if item is None:
-        await _safe_reply(update.message, f"No item found for {item_id[:8]}.")
+        await _safe_reply(message, f"No item found for {item_id[:8]}.")
         return
 
-    await _safe_reply(update.message, f"🔄 Retrying {item_id[:8]} (status: {item['status']})...")
+    await _safe_reply(message, f"🔄 Retrying {item_id[:8]} (status: {item['status']})...")
     # Route through the same dispatcher the happy path uses, so a retried item
     # stops at the identify/price confirm gates instead of blowing past them.
-    await advance(user_id, item_id, update.message, context)
+    await advance(user_id, item_id, message, context)
 
 
 async def photocheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

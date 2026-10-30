@@ -456,7 +456,7 @@ def _piece_row(row, cursor) -> dict:
 def next_piece_code(box: str) -> str:
     """G3 -> G3-01, G3-02, ... Numbering follows the code prefix, so a piece
     that moved out of G3 still holds its number."""
-    prefix = f"{box}-"
+    prefix = f"{box.upper()}-"
     with _conn() as con:
         codes = [r[0] for r in con.execute(
             "SELECT code FROM pieces WHERE code LIKE ?", (prefix + "%",))]
@@ -467,6 +467,7 @@ def next_piece_code(box: str) -> str:
 def add_piece(box: str, photo: str | None = None) -> str:
     """Reserve the next code in `box` and store the piece. Retries if two
     photos race for the same number."""
+    box = box.upper()
     for _ in range(5):
         code = next_piece_code(box)
         try:
@@ -486,11 +487,16 @@ _PIECE_COLUMNS = {"box", "item_id", "status", "photo", "info", "value", "cost",
 
 
 def update_piece(code: str, **fields) -> None:
+    code = code.upper()
     bad = set(fields) - _PIECE_COLUMNS
     if bad:
         raise ValueError(f"unknown piece field(s): {bad}")
     if "status" in fields and fields["status"] not in PIECE_STATUSES:
         raise ValueError(f"bad piece status {fields['status']!r}")
+    if not fields:
+        return
+    if isinstance(fields.get("box"), str):
+        fields["box"] = fields["box"].upper()
     if "info" in fields:
         fields["info"] = json.dumps(fields["info"])
     if fields.get("photo"):
@@ -514,10 +520,13 @@ def list_pieces(*, box: str | None = None, item_id: str | None = None,
     for col, val in (("box", box), ("item_id", item_id), ("status", status)):
         if val is not None:
             where.append(f"{col} = ?")
-            args.append(val)
+            args.append(val.upper() if col == "box" else val)
     sql = "SELECT * FROM pieces" + (" WHERE " + " AND ".join(where) if where else "")
     with _conn() as con:
-        cur = con.execute(sql + " ORDER BY code", args)
+        # Numeric part of "G3-100" so it sorts after "G3-11"; code breaks ties.
+        cur = con.execute(
+            sql + " ORDER BY box, CAST(substr(code, instr(code, '-') + 1) AS INTEGER), code",
+            args)
         return [_piece_row(r, cur) for r in cur.fetchall()]
 
 

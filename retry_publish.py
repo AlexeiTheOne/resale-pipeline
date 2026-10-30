@@ -23,6 +23,17 @@ def retry_publish(arg: str) -> None:
     if item_id is None:
         return
 
+    # This script only rebuilds a draft offer that never got made. On an item
+    # that is (or was) live it would set the DB back to 'ebay_draft' while the
+    # listing stays up on eBay, and /activate would then publish it again.
+    item = get_item(item_id)
+    listing_id = (item.get("ebay") or {}).get("listing_id")
+    if item["status"] in ("published", "sold") or listing_id:
+        print(f"Refusing: {item_id} is already {item['status']}"
+              + (f" (listing {listing_id})" if listing_id else "")
+              + ". Nothing to retry.")
+        return
+
     print("Retrying", item_id)
     try:
         result = create_draft_offer(item_id)

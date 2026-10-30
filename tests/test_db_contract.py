@@ -505,13 +505,12 @@ def test_piece_code_widens_past_99(conn_db):
     assert db.next_piece_code("G3") == "G3-100"
 
 
-def test_list_pieces_sorts_codes_as_strings(conn_db):
-    # NOTE: looks like a bug: ORDER BY code is textual, so once a box passes 99
-    # pieces "G3-100" sorts before "G3-11" and "G3-99".
+def test_list_pieces_sorts_codes_numerically(conn_db):
+    # Once a box passes 99 pieces, "G3-100" must still sort after "G3-99".
     for code in ("G3-99", "G3-100", "G3-11"):
         raw_exec("INSERT INTO pieces (code, box, status, info, created_at, updated_at) "
                  "VALUES (?, 'G3', 'home', '{}', 't', 't')", (code,))
-    assert [p["code"] for p in db.list_pieces()] == ["G3-100", "G3-11", "G3-99"]
+    assert [p["code"] for p in db.list_pieces()] == ["G3-11", "G3-99", "G3-100"]
 
 
 def test_get_piece_missing_and_case_insensitive(conn_db):
@@ -520,13 +519,12 @@ def test_get_piece_missing_and_case_insensitive(conn_db):
     assert db.get_piece("g3-01")["code"] == "G3-01"
 
 
-def test_lowercase_box_codes_cannot_be_fetched(conn_db):
-    # NOTE: looks like a bug: add_piece keeps the box's case but get_piece
-    # upper-cases the lookup, so a piece added to box "g3" is unreachable by code.
+def test_lowercase_box_is_normalised_to_upper(conn_db):
     code = db.add_piece("g3")
-    assert code == "g3-01"
-    assert db.get_piece(code) is None
-    assert [p["code"] for p in db.list_pieces()] == ["g3-01"]
+    assert code == "G3-01"
+    assert db.get_piece(code)["box"] == "G3"
+    assert db.next_piece_code("g3") == "G3-02"
+    assert [p["code"] for p in db.list_pieces(box="g3")] == ["G3-01"]
 
 
 def test_update_piece_fields(conn_db):
@@ -589,19 +587,17 @@ def test_update_piece_missing_code_is_silent_noop(conn_db):
     assert db.get_piece("G3-99") is None
 
 
-def test_update_piece_code_lookup_is_case_sensitive(conn_db):
-    # NOTE: looks like a bug (minor): get_piece upper-cases the code but
-    # update_piece doesn't, so a lower-case code silently updates nothing.
+def test_update_piece_code_lookup_is_case_insensitive(conn_db):
     code = db.add_piece("G3")
     db.update_piece(code.lower(), value=5)
-    assert db.get_piece(code)["value"] is None
+    assert db.get_piece(code)["value"] == 5
 
 
-def test_update_piece_with_no_fields_raises_operational_error(conn_db):
-    # NOTE: looks like a bug (minor): builds "SET  , updated_at = ?" -> SQL error.
+def test_update_piece_with_no_fields_is_noop(conn_db):
     code = db.add_piece("G3")
-    with pytest.raises(sqlite3.OperationalError):
-        db.update_piece(code)
+    before = db.get_piece(code)
+    db.update_piece(code)
+    assert db.get_piece(code) == before
 
 
 def test_update_piece_none_photo_clears_it(conn_db):

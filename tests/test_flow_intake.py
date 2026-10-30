@@ -432,17 +432,65 @@ def test_identify_failure_reports_error_and_leaves_item_captured(bot, monkeypatc
 
     texts = sent_texts(ctx)
     assert texts[-1] == "⚠️ _stage_identify failed: RuntimeError: vision model down"
+    # The staging slot was consumed by Start, so the failure message carries
+    # its own way forward.
+    assert buttons_of(ctx.transcript[-1]) == [("🔁 Retry", f"confirm:retry:{item_id}")]
     item = tb.get_item(item_id)
     assert item["status"] == "captured"
     assert item["identification"] is None
     assert pipe.seen == [("identify", "captured")]
     assert UID not in tb.gate and UID not in tb.review
-    # NOTE: the staging slot was consumed by Start, so the item now sits at
-    # 'captured' with no Start button; the user's way back is /retry.
     assert UID not in tb.staging
     assert any("_stage_identify" in where for _, where, _ in tb._recent_errors)
     assert all(t.done() and not t.cancelled() and t.exception() is None
                for t in ctx.application.tasks)
+
+
+def test_retry_button_after_identify_failure_reruns_the_pipeline(bot, monkeypatch):
+    pipe = Pipeline(monkeypatch, identify_error=RuntimeError("vision model down"))
+    ctx, item_id, _ = send_batch(1)
+    pipe.current_item = item_id
+    tap(ctx, f"confirm:start:{item_id}")
+    assert last_markup_buttons(ctx) == [("🔁 Retry", f"confirm:retry:{item_id}")]
+
+    pipe.identify_error = None               # the model is back
+    n_before = len(ctx.transcript)
+    tap(ctx, f"confirm:retry:{item_id}")
+
+    # The Retry button is taken off the failure message, then the same path as
+    # /retry runs: identify -> price -> draft -> review.
+    new = ctx.transcript[n_before:]
+    assert [c.kind for c in new if c.kind == "edit_message_reply_markup"] == [
+        "edit_message_reply_markup"]
+    texts = [c.text for c in new if c.text]
+    assert "🔄 Retrying " + item_id[:8] + " (status: captured)..." in texts
+    assert pipe.seen == [("identify", "captured"), ("identify", "captured"),
+                         ("price", "identified"), ("draft", "priced"),
+                         ("check", "drafted")]
+    assert tb.get_item(item_id)["status"] == "review"
+    assert buttons_of(ctx.transcript[-1]) == [("✅ Approve", f"review:approve:{item_id}"),
+                                             ("❌ Reject", f"review:reject:{item_id}")]
+    assert tb.review[UID] == item_id
+    assert tb._in_flight == set()
+    assert all(t.done() and t.exception() is None for t in ctx.application.tasks)
+
+
+def test_retry_button_double_tap_runs_the_stage_once(bot, monkeypatch):
+    pipe = Pipeline(monkeypatch, identify_error=RuntimeError("vision model down"))
+    ctx, item_id, _ = send_batch(1)
+    pipe.current_item = item_id
+    tap(ctx, f"confirm:start:{item_id}")
+    pipe.identify_error = None
+
+    t1, _ = make_callback_update(f"confirm:retry:{item_id}", context=ctx)
+    t2, _ = make_callback_update(f"confirm:retry:{item_id}", context=ctx)
+    ctx.application.tasks.clear()
+    run_steps((tb.confirm_callback, t1), (tb.confirm_callback, t2), ctx=ctx)
+
+    assert [s for s in pipe.seen if s[0] == "identify"] == [("identify", "captured")] * 2
+    assert sent_texts(ctx).count(f"🔄 Retrying {item_id[:8]} (status: captured)...") == 1
+    assert tb.get_item(item_id)["status"] == "review"
+    assert tb._in_flight == set()
 
 
 # --------------------------------------------------------------------------- #
