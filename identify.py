@@ -13,14 +13,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 from google.genai import errors, types
 
-from llm import error_code, generate_with_retry, make_client, response_text
+from llm import LazyClient, error_code, generate_with_retry, response_text
 from config import GEMINI_MODEL, GEMINI_FAST_MODEL, GEMINI_RESEARCH_THINKING_LEVEL
 from pipeline.gtin import product_gtin
 from ross_tag import read_product_upcs, ocr_text
 
 load_dotenv()
 
-client = make_client()
+client = LazyClient()
 
 # Resolve the configured research thinking level to the SDK enum once. Unknown
 # values fall back to LOW rather than erroring — a typo in .env shouldn't crash

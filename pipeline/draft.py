@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from google.genai import types
 
 from ebay.taxonomy import category_aspects, category_suggestions
-from llm import generate_with_retry, make_client, response_text
+from llm import LazyClient, generate_with_retry, response_text
 from pipeline.category import choose_category, department_of
 from pipeline.description_guard import sanitize_description
 from pipeline.gtin import product_gtin
@@ -17,7 +17,7 @@ from pipeline.title import (TITLE_MAX_LEN, TITLE_RULES, enforce_band_for_device,
                             ensure_title_fits, fit_title)
 
 load_dotenv()
-client = make_client(api_key=os.getenv("GEMINI_API_KEY"))
+client = LazyClient(api_key=os.getenv("GEMINI_API_KEY"))
 
 from config import GEMINI_FAST_MODEL
 

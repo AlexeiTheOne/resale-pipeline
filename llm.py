@@ -48,6 +48,20 @@ def make_client(api_key: str | None = None) -> "genai.Client":
     )
 
 
+class LazyClient:
+    """A Gemini client built on first use, not at import. Modules can keep a
+    module-level `client`, and importing them (tests, scripts) needs no API key."""
+
+    def __init__(self, **kwargs):
+        self._kwargs = kwargs
+        self._client = None
+
+    def __getattr__(self, name):
+        if self._client is None:
+            self._client = make_client(**self._kwargs)
+        return getattr(self._client, name)
+
+
 def _code_of(exc: "errors.APIError"):
     return getattr(exc, "code", None) or getattr(exc, "status_code", None)
 
