@@ -16,7 +16,7 @@ from google.genai import errors, types
 from llm import error_code, generate_with_retry, make_client, response_text
 from config import GEMINI_MODEL, GEMINI_FAST_MODEL, GEMINI_RESEARCH_THINKING_LEVEL
 from pipeline.gtin import product_gtin
-from receipt import read_product_upcs, ocr_text
+from ross_tag import read_product_upcs, ocr_text
 
 load_dotenv()
 

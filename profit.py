@@ -264,3 +264,56 @@ def format_projection(p: dict, *, header: str | None = None) -> str:
     if not p["actual"]:
         lines.append("  Fees/shipping are measured averages, not this item's actual bill.")
     return "\n".join(lines)
+
+
+# --- sale economics (moved from telegram_bot.py, cleanup-plan Phase 2) ---
+
+def sale_profit(item: dict):
+    """(paid, sale, profit) for an item, or Nones where unknown. Cost is what you
+    paid Ross (the receipt); sale is the recorded sale price, falling back to the
+    listed price. Profit is gross — before eBay fees, shipping, and ad rate. Kept
+    for /sold's immediate reply (fees usually aren't known yet at sale time);
+    /profit uses the richer sale_economics below once /sync has pulled fees."""
+    paid = (item.get("receipt") or {}).get("reduced_price")
+    ebay = item.get("ebay") or {}
+    sale = ebay.get("sale_price")
+    if sale is None:
+        sale = (item.get("listing") or {}).get("price")
+    profit = round(sale - paid, 2) if (paid is not None and sale is not None) else None
+    return paid, sale, profit
+
+
+def sale_economics(item: dict) -> dict:
+    """Full profit picture for a sold item. When /sync has pulled the real eBay
+    order (net_proceeds set), profit is exact — net of actual fees; otherwise it
+    falls back to a gross estimate (recorded/listed sale price, fees unknown).
+
+    Returns paid, sale, fees, net (proceeds after fees), profit (net − paid),
+    margin (profit / sale), and fees_known.
+
+    `paid` is charged per unit SOLD: sale_price is the realized total across the
+    order(s), so a two-unit sale has to carry two units of Ross cost."""
+    ebay = item.get("ebay") or {}
+    paid = (item.get("receipt") or {}).get("reduced_price")
+    try:
+        units = max(int(ebay.get("units_sold") or 1), 1)
+    except (TypeError, ValueError):
+        units = 1
+    if paid is not None:
+        paid = round(float(paid) * units, 2)
+    sale = ebay.get("sale_price")
+    if sale is None:
+        sale = (item.get("listing") or {}).get("price")
+
+    net = ebay.get("net_proceeds")
+    fees_known = net is not None and ebay.get("fees_known", True)
+    # Real net when we have it; otherwise the gross sale stands in (fees unknown).
+    proceeds = net if fees_known else sale
+
+    profit = round(proceeds - paid, 2) if (paid is not None and proceeds is not None) else None
+    margin = round(profit / sale, 4) if (profit is not None and sale) else None
+    return {
+        "paid": paid, "sale": sale, "fees": ebay.get("ebay_fees"),
+        "net": net, "proceeds": proceeds, "profit": profit,
+        "margin": margin, "fees_known": fees_known,
+    }

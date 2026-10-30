@@ -3,13 +3,15 @@
 Characterisation tests of TODAY's behaviour, written as a safety net for the
 telegram_bot.py -> bot/ split. They drive the real handlers with the fakes in
 tests/tg_fakes.py and stub only the leaf calls that would reach a model or the
-network, so the stage code (_stage_identify / _stage_price / _stage_draft,
-_split_receipt, the gates, _show_review) really runs:
+network, so the stage code (pipeline/stages.py: stage_identify / stage_price /
+stage_draft, split_receipt; plus the gates and _show_review) really runs:
 
-    identify_item, decode_barcode, detect_ross_tags, extract_receipt,
-    generate_draft                       -> patched on telegram_bot
+    identify.identify_item               -> patched on its module
+    ross_tag.decode_barcode, detect_ross_tags, extract_receipt
+                                         -> patched on its module
+    pipeline.draft.generate_draft        -> patched on its module
     pipeline.pricing_v2.get_pricing_v2   -> patched on its module (imported
-                                            inside _stage_price at call time)
+                                            inside stage_price at call time)
     pipeline.listing_check.check_listing -> patched on its module
     pipeline.stock_lookup.lookup         -> patched on its module (find mode)
 
@@ -28,7 +30,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import config  # noqa: E402
 import db  # noqa: E402
+import identify  # noqa: E402
+import ross_tag  # noqa: E402
 import telegram_bot as tb  # noqa: E402
+import pipeline.draft as draft  # noqa: E402
 import pipeline.listing_check as listing_check  # noqa: E402
 import pipeline.pricing_v2 as pricing_v2  # noqa: E402
 import pipeline.stock_lookup as stock_lookup  # noqa: E402
@@ -99,15 +104,16 @@ class Pipeline:
         monkeypatch.setattr(tb, "AUTO_CONFIRM", True)
         monkeypatch.setattr(tb, "AUTO_CONFIRM_MIN_IDENT_CONFIDENCE", 0.8)
         monkeypatch.setattr(tb, "AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC", 0.6)
-        monkeypatch.setattr(tb, "PRICING_ENGINE", "v2")
-        monkeypatch.setattr(tb, "LISTING_CHECK_ENABLED", True)
+        # Read by pipeline/stages.py through `config.`, so patched there.
+        monkeypatch.setattr(config, "PRICING_ENGINE", "v2")
+        monkeypatch.setattr(config, "LISTING_CHECK_ENABLED", True)
         monkeypatch.setattr(tb, "EBAY_DEFAULT_AD_RATE_PCT", 0)
-        monkeypatch.setattr(tb, "decode_barcode", lambda path: None)
-        monkeypatch.setattr(tb, "detect_ross_tags", lambda paths: set())
-        monkeypatch.setattr(tb, "extract_receipt", self._extract_receipt)
-        monkeypatch.setattr(tb, "identify_item", self._identify)
+        monkeypatch.setattr(ross_tag, "decode_barcode", lambda path: None)
+        monkeypatch.setattr(ross_tag, "detect_ross_tags", lambda paths: set())
+        monkeypatch.setattr(ross_tag, "extract_receipt", self._extract_receipt)
+        monkeypatch.setattr(identify, "identify_item", self._identify)
         monkeypatch.setattr(pricing_v2, "get_pricing_v2", self._price)
-        monkeypatch.setattr(tb, "generate_draft", self._draft)
+        monkeypatch.setattr(draft, "generate_draft", self._draft)
         monkeypatch.setattr(listing_check, "check_listing", self._check)
 
     def _status(self):
@@ -431,7 +437,7 @@ def test_identify_failure_reports_error_and_leaves_item_captured(bot, monkeypatc
     tap(ctx, f"confirm:start:{item_id}")     # drain() would re-raise a task error
 
     texts = sent_texts(ctx)
-    assert texts[-1] == "⚠️ _stage_identify failed: RuntimeError: vision model down"
+    assert texts[-1] == "⚠️ stage_identify failed: RuntimeError: vision model down"
     # The staging slot was consumed by Start, so the failure message carries
     # its own way forward.
     assert buttons_of(ctx.transcript[-1]) == [("🔁 Retry", f"confirm:retry:{item_id}")]
@@ -441,7 +447,7 @@ def test_identify_failure_reports_error_and_leaves_item_captured(bot, monkeypatc
     assert pipe.seen == [("identify", "captured")]
     assert UID not in tb.gate and UID not in tb.review
     assert UID not in tb.staging
-    assert any("_stage_identify" in where for _, where, _ in tb._recent_errors)
+    assert any("stage_identify" in where for _, where, _ in tb._recent_errors)
     assert all(t.done() and not t.cancelled() and t.exception() is None
                for t in ctx.application.tasks)
 

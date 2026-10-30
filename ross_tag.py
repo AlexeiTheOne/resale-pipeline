@@ -348,7 +348,7 @@ def vision_read_tag(image_path: str) -> dict:
     JPEG-compressed by Telegram. That is ordinary reading for a vision model.
 
     Returns {} on any failure — this is a best-effort improvement on "ask the user
-    to type it", and must never break the pipeline. Imports are local so receipt.py
+    to type it", and must never break the pipeline. Imports are local so ross_tag.py
     still runs standalone without the Gemini SDK installed."""
     try:
         import json as _json
@@ -543,7 +543,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python receipt.py <tag_image.jpg>")
+        print("Usage: python ross_tag.py <tag_image.jpg>")
         sys.exit(1)
     path = sys.argv[1]
     if not Path(path).exists():

@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import uuid
 import json
@@ -611,3 +612,45 @@ def llm_usage_breakdown(since_iso: str) -> list[dict]:
         return [dict(zip(keys, row)) for row in cur.fetchall()]
 
 create_tables()
+
+
+# --- small item queries (moved from telegram_bot.py, cleanup-plan Phase 2) ---
+
+def set_location(item_id: str, loc: str | None) -> None:
+    if not loc:
+        return
+    item = get_item(item_id) or {}
+    stock = dict(item.get("stock") or {})
+    stock["location"] = loc
+    update_field(item_id, "stock", stock)
+
+
+# Real Ross tag codes are full 12-digit numbers (≥ 1e11). Generated placeholder
+# codes count up from 0 and stay far below that ceiling, so a generated code can
+# never collide with a real barcode no matter how many we mint.
+REAL_CODE_FLOOR = 100_000_000_000  # smallest true 12-digit code (1e11)
+
+
+def next_receipt_code() -> str:
+    """Next synthetic 12-digit Ross code, for an item you paid for but have no tag
+    code on hand. Continues the PLACEHOLDER sequence from the highest placeholder
+    on file (+1) — deliberately ignoring real barcodes, so it counts up 0, 1, 2…
+    in its own low range and can't ever match a real code. Zero-padded to 12
+    digits; starts at 0 when no placeholder has been recorded yet."""
+    highest = -1
+    for it in list_items():
+        c = (it.get("receipt") or {}).get("code")
+        digits = re.sub(r"\D", "", str(c)) if c else ""
+        if digits:
+            value = int(digits)
+            if value < REAL_CODE_FLOOR:
+                highest = max(highest, value)
+    return str(highest + 1).zfill(12)
+
+
+def match_quantity_to_pieces(item_id: str) -> None:
+    """Before a stocked item is drafted, list as many as were found at home."""
+    n = len(list_pieces(item_id=item_id, status="home"))
+    if n > 1:
+        item = get_item(item_id) or {}
+        update_field(item_id, "ebay", {**(item.get("ebay") or {}), "quantity": n})

@@ -21,6 +21,7 @@ db.create_tables()
 
 import profit  # noqa: E402
 import telegram_bot as tb  # noqa: E402
+from ebay import inventory  # noqa: E402
 from ebay import orders  # noqa: E402
 
 CENT = 0.005
@@ -126,15 +127,16 @@ def test_each_order_keeps_its_own_date_and_money():
 
 
 def _sync_with(item, offer, sold_map):
+    # pipeline/sync.py calls these through their modules, so patch them there.
     writes = []
-    saved = (tb.get_offer, tb.update_field, tb.update_status)
-    tb.get_offer = lambda _id: offer
-    tb.update_field = lambda *a: writes.append(("field",) + a)
-    tb.update_status = lambda *a: writes.append(("status",) + a)
+    saved = (inventory.get_offer, db.update_field, db.update_status)
+    inventory.get_offer = lambda _id: offer
+    db.update_field = lambda *a: writes.append(("field",) + a)
+    db.update_status = lambda *a: writes.append(("status",) + a)
     try:
         return tb._sync_one(item, sold_map), writes
     finally:
-        tb.get_offer, tb.update_field, tb.update_status = saved
+        inventory.get_offer, db.update_field, db.update_status = saved
 
 
 _OFFER_ENDED = {"pricingSummary": {"price": {"value": "89.99"}}, "availableQuantity": 0,

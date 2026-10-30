@@ -50,7 +50,7 @@ def read_tag(photo: str) -> dict:
     from config import GEMINI_FAST_MODEL
     from identify import client
     from llm import generate_with_retry, response_text
-    from receipt import decode_barcode, read_product_upcs
+    from ross_tag import decode_barcode, read_product_upcs
 
     info: dict = {}
     try:

@@ -90,7 +90,7 @@ def test_revision_keeps_a_valid_upc_and_drops_a_store_code():
 
 
 def test_barcode_reader_drops_the_ross_tag_symbol(monkeypatch):
-    import receipt
+    import ross_tag
 
     class _Sym:
         def __init__(self, kind, data):
@@ -102,13 +102,13 @@ def test_barcode_reader_drops_the_ross_tag_symbol(monkeypatch):
         def resize(self, size):
             return self
 
-    monkeypatch.setattr(receipt, "Image", type("I", (), {"open": staticmethod(lambda p: _Img())}))
-    monkeypatch.setattr(receipt, "ImageOps", type("O", (), {
+    monkeypatch.setattr(ross_tag, "Image", type("I", (), {"open": staticmethod(lambda p: _Img())}))
+    monkeypatch.setattr(ross_tag, "ImageOps", type("O", (), {
         "exif_transpose": staticmethod(lambda im: im),
         "grayscale": staticmethod(lambda im: im)}))
-    monkeypatch.setattr(receipt, "_zbar_decode", lambda im, symbols=None: [
+    monkeypatch.setattr(ross_tag, "_zbar_decode", lambda im, symbols=None: [
         _Sym("UPCA", "400299113298"), _Sym("UPCA", "196163464596")])
-    assert receipt.read_product_upcs("tag.jpg") == ["196163464596"]
+    assert ross_tag.read_product_upcs("tag.jpg") == ["196163464596"]
 
 
 if __name__ == "__main__":

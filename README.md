@@ -272,7 +272,7 @@ Un-aimed messages behave exactly as they do for a single item.
 | `identify.py` | Step 2: two-stage Gemini product identification |
 | `pipeline/price.py` | Step 3: eBay comps (Apify) and pricing logic |
 | `pipeline/draft.py` | Step 4: listing copy generation |
-| `receipt.py` | Decode the Ross tag (last photo): barcode → paid price + 12-digit code, OCR → original price |
+| `ross_tag.py` | Decode the Ross tag (last photo): barcode → paid price + 12-digit code, OCR → original price |
 | `ebay/auth.py` | eBay OAuth: user token (seller) and app token (catalog) |
 | `ebay/inventory.py` | Step 6/7: build, create, and publish eBay offers |
 | `ebay/listings.py` | Enumerate every live listing on the account (Trading API), including ones the bot didn't create |

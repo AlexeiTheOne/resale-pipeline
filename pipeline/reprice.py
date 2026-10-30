@@ -211,7 +211,7 @@ class PricingBudget:
 
 def _reprice_via_engine(item: dict) -> dict:
     """Fresh comps for `item` through config.PRICING_ENGINE, called the way
-    telegram_bot._stage_price calls it. Nothing is stored."""
+    pipeline.stages.stage_price calls it. Nothing is stored."""
     ident = item.get("identification") or {}
     if config.PRICING_ENGINE == "v2":
         from pipeline.pricing_v2 import get_pricing_v2
