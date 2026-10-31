@@ -35,6 +35,21 @@ def _conn():
     return con
 
 
+def connect() -> sqlite3.Connection:
+    """A read-write connection to the bot's DB (WAL, busy timeout). The one
+    way in for code outside db.py; close it when done."""
+    return _conn()
+
+
+def connect_readonly(path=None) -> sqlite3.Connection:
+    """A read-only connection: to the bot's DB, or to `path` (a backup copy).
+    Writes through it fail, so reports can't change data by mistake."""
+    p = Path(path or DB_PATH)
+    con = sqlite3.connect(f"file:{p.as_posix()}?mode=ro", uri=True)
+    con.execute("PRAGMA busy_timeout=5000")
+    return con
+
+
 def _now():
     return datetime.now(timezone.utc).isoformat()
 

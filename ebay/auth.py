@@ -1,6 +1,5 @@
 import base64
 import os
-import sqlite3
 import sys
 import time
 import urllib.parse
@@ -10,7 +9,7 @@ import httpx
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import DATA_DIR  # noqa: E402
+import db  # noqa: E402
 
 load_dotenv()
 
@@ -47,30 +46,7 @@ SCOPES = [
     "https://api.ebay.com/oauth/api_scope/sell.negotiation",
 ]
 
-DB_PATH = str(DATA_DIR / "ross.db")
-
-
-def _conn():
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=5000")
-    return con
-
-
-def _create_table() -> None:
-    with _conn() as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS ebay_tokens (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                access_token TEXT,
-                refresh_token TEXT,
-                expires_at REAL
-            )
-        """)
-
-
-_create_table()
+# Tokens live in the ebay_tokens table (created by migrations.py).
 
 
 def _basic_auth_header() -> str:
@@ -111,7 +87,7 @@ def _save_token(token: dict) -> None:
     expires_at = now + token.get("expires_in", 0)
     refresh_token = token.get("refresh_token")
 
-    with _conn() as con:
+    with db.connect() as con:
         if refresh_token:
             con.execute(
                 "INSERT INTO ebay_tokens (id, access_token, refresh_token, expires_at) "
@@ -134,7 +110,7 @@ def _save_token(token: dict) -> None:
 
 
 def _load_token() -> dict | None:
-    with _conn() as con:
+    with db.connect() as con:
         cur = con.execute(
             "SELECT access_token, refresh_token, expires_at FROM ebay_tokens WHERE id = 1"
         )

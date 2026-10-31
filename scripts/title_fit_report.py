@@ -9,13 +9,13 @@ The output is for the owner to approve before any title is pushed live.
     python scripts/title_fit_report.py --db C:/Ebay-list/data/ross.db ...
 """
 import json
-import sqlite3
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import db  # noqa: E402
 from pipeline.title import TITLE_MAX_LEN, fit_title  # noqa: E402
 
 # The live listings whose titles the old _truncate_title cut (verified 2026).
@@ -24,12 +24,12 @@ TRUNCATED = ["bff24df0", "a129b1b5", "2f57c0f4", "ed54b249",
 
 
 def main(argv: list[str]) -> None:
-    db = ROOT / "data" / "ross.db"
+    db_path = Path(db.DB_PATH)
     if argv[:1] == ["--db"]:
-        db, argv = Path(argv[1]), argv[2:]
-    if not db.exists():
-        raise SystemExit(f"{db} not found")
-    con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+        db_path, argv = Path(argv[1]), argv[2:]
+    if not db_path.exists():
+        raise SystemExit(f"{db_path} not found")
+    con = db.connect_readonly(db_path)
     if argv == ["--all"]:
         rows = con.execute("SELECT item_id, identification, listing FROM items "
                            "WHERE listing IS NOT NULL").fetchall()

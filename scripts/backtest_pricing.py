@@ -35,7 +35,6 @@ import csv
 import json
 import math
 import os
-import sqlite3
 import statistics
 import sys
 import time
@@ -44,15 +43,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-os.chdir(ROOT)  # db.DB_PATH is relative: llm_usage rows must land in data/ross.db
+os.chdir(ROOT)
 
 from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
+import db  # noqa: E402
 from pipeline import pricing_v2 as v2  # noqa: E402
 
-DB = ROOT / "data" / "ross.db"
 FAST_DAYS, STALE_DAYS = 7, 60
 SOLD_TOL, FAST_UP, STALE_TOL = 0.20, 0.40, 0.05
 
@@ -86,7 +85,7 @@ CLAUDE_ITEM_WORST = 0.10
 
 
 def load_items(prefixes, limit):
-    con = sqlite3.connect(f"file:{DB.as_posix()}?mode=ro", uri=True)
+    con = db.connect_readonly()
     rows = con.execute("SELECT item_id, status, identification, listing, pricing, ebay, receipt, "
                        "photos, created_at FROM items WHERE status IN ('published','sold') "
                        "ORDER BY item_id").fetchall()
@@ -126,7 +125,7 @@ def load_items(prefixes, limit):
 
 
 def claude_spend(since_iso, item_id=None):
-    con = sqlite3.connect(f"file:{DB.as_posix()}?mode=ro", uri=True)
+    con = db.connect_readonly()
     sql = "SELECT COALESCE(SUM(cost_usd),0), COUNT(*) FROM llm_usage WHERE ts >= ? AND stage = ?"
     args = [since_iso, v2.JUDGE_STAGE]
     if item_id:

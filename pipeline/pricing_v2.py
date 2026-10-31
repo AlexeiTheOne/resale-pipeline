@@ -58,12 +58,12 @@ import io
 import json
 import math
 import re
-import sqlite3
 import threading
 import time
 from pathlib import Path
 
 import config
+import db
 from pipeline import price as v1
 
 JUDGE_STAGE = "price_judge"
@@ -354,7 +354,7 @@ def _db_rows(sql: str):
     path = config.DATA_DIR / "ross.db"
     if not path.exists():
         return []
-    con = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    con = db.connect_readonly(path)
     try:
         return con.execute(sql).fetchall()
     finally:

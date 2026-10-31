@@ -33,13 +33,14 @@ from xml.sax.saxutils import escape
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-DB = ROOT / "data" / "ross.db"
+import db  # noqa: E402
+
 BACKUPS = ROOT / "data" / "backups"
 DAYS = 700   # every order this account has (first sale May 2026); eBay caps at 2 years
 
 
 def _connect() -> sqlite3.Connection:
-    con = sqlite3.connect(str(DB), timeout=30)
+    con = db.connect()
     con.execute("PRAGMA busy_timeout=30000")
     return con
 
@@ -157,6 +158,7 @@ def backup() -> Path:
     bot keeps writing (a plain file copy can miss the -wal contents)."""
     BACKUPS.mkdir(parents=True, exist_ok=True)
     dest = BACKUPS / f"ross-{datetime.now().strftime('%Y%m%d-%H%M%S')}-pre-backfill-sales.db"
+    # The backup target is a new file, not the bot's DB, so raw sqlite3.
     src, dst = _connect(), sqlite3.connect(str(dest))
     try:
         src.backup(dst)

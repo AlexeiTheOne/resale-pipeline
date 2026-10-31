@@ -58,6 +58,8 @@ def backup_db(dest: Path) -> Path:
         raise FileNotFoundError(f"{DB_PATH} not found — nothing to back up.")
     out = dest / f"ross-{_stamp()}.db"
     tmp = dest / f"{PARTIAL}{out.name}"
+    # Deliberately raw sqlite3, not db.connect(): importing db runs the
+    # migrations, and a backup must still work when the app code is broken.
     src = sqlite3.connect(str(DB_PATH))
     try:
         dst = sqlite3.connect(str(tmp))

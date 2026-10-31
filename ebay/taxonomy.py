@@ -1,5 +1,4 @@
 import json
-import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -8,13 +7,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import httpx
 
-from config import DATA_DIR, EBAY_MARKETPLACE_ID
+import db
+from config import EBAY_MARKETPLACE_ID
 from ebay.auth import get_app_access_token
 from pipeline.category import path_fits, suggestion_path
 
 TAXONOMY_API_BASE = "https://api.ebay.com/commerce/taxonomy/v1"
 
-DB_PATH = str(DATA_DIR / "ross.db")
 CACHE_TTL = 30 * 24 * 60 * 60  # 30 days
 
 
@@ -22,30 +21,11 @@ class InvalidCategoryError(Exception):
     """Raised when the Taxonomy API rejects a category id as invalid (error 62005)."""
 
 
-def _conn():
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=5000")
-    return con
-
-
-def _create_cache_table() -> None:
-    with _conn() as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS taxonomy_cache (
-                cache_key TEXT PRIMARY KEY,
-                payload TEXT NOT NULL,
-                fetched_at REAL NOT NULL
-            )
-        """)
-
-
-_create_cache_table()
+# The cache lives in the taxonomy_cache table (created by migrations.py).
 
 
 def _cache_get(key: str):
-    with _conn() as con:
+    with db.connect() as con:
         cur = con.execute(
             "SELECT payload, fetched_at FROM taxonomy_cache WHERE cache_key = ?", (key,)
         )
@@ -59,7 +39,7 @@ def _cache_get(key: str):
 
 
 def _cache_set(key: str, value) -> None:
-    with _conn() as con:
+    with db.connect() as con:
         con.execute(
             "INSERT INTO taxonomy_cache (cache_key, payload, fetched_at) VALUES (?, ?, ?) "
             "ON CONFLICT(cache_key) DO UPDATE SET "
