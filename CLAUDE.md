@@ -87,6 +87,7 @@ change eBay. Use `.env.example` as the template.
 - `ebay/`: eBay API clients (inventory, listings, orders, browse, marketing,
   negotiation, auth).
 - `db.py`: SQLite (`data/ross.db`).
+- `migrations.py`: every schema change, as numbered steps.
 - `config.py`: every setting, read from env. `BASE_DIR`, `DATA_DIR` and
   `LOG_DIR` live here.
 - `identify.py`, `ross_tag.py`: product identification and Ross tag reading
@@ -109,6 +110,10 @@ These are enforced by `tests/test_bot_conventions.py`:
 - `bot/` never imports `telegram_bot`.
 
 Other conventions:
+
+- **Schema changes go in `migrations.py` only.** Append a new numbered
+  step. Never edit a step that has shipped, and never `ALTER TABLE` anywhere
+  else. Deploys back up the DB first.
 
 - Paths come from `config` (`BASE_DIR`/`DATA_DIR`), never from the working
   directory.
