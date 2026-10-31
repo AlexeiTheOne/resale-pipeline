@@ -58,6 +58,9 @@ python -m pytest -q          # needs no API keys and never touches data/
 python telegram_bot.py       # the TEST bot, with the laptop .env
 ```
 
+`.claude/settings.json` runs the tests before every `git commit` Claude makes
+and blocks the commit if they fail (`scripts/precommit_tests.py`).
+
 The laptop `.env` uses a separate test bot token and `JOBS_ENABLED=0` (no
 background jobs). The laptop DB has no eBay user token, so the test bot cannot
 change eBay. Use `.env.example` as the template.

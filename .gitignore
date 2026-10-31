@@ -28,3 +28,7 @@ logs/
 # Any other .env copy (backups, disabled prod keys); only the example is shared
 .env.*
 !.env.example
+
+# Claude Code: worktrees and personal settings stay local
+.claude/worktrees/
+.claude/settings.local.json
