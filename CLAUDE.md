@@ -30,6 +30,10 @@ The live bot runs on Person B's PC, not on a laptop. Task `EbayBotDeploy` runs
 
 Its log is `logs/deploy.log`.
 
+Project skills: `deploy-status` (what's live, did the deploy work, rollback)
+and `prod-logs` (read live logs and DB, read-only). Both use
+`scripts/prod_status.ps1`.
+
 So:
 - Push only code that passed the tests locally. A push restarts the live bot.
 - Never commit on the production PC. A dirty or diverged live copy blocks

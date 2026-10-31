@@ -384,7 +384,11 @@ function Invoke-Deploy {
         $more = ''
         if ($count -gt 10) { $more = "`n(+$($count - 10) more)" }
         $subject = Git-Must @('log', '-1', '--format=%s', $new)
-        Send-Notify "$IconOk Deployed ${short}: $subject`n`n$subjects$more"
+        # List the commits only when there is more than one; a single commit
+        # would just repeat the title line.
+        $msg = "$IconOk Deployed ${short}: $subject"
+        if ($count -gt 1) { $msg += "`n`n$count commits:`n$subjects$more" }
+        Send-Notify $msg
         $state.alert = ''; $state.failed = ''; Save-State $state
         return 0
     }
