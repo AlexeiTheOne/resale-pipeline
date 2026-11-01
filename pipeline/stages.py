@@ -223,6 +223,14 @@ def stage_price(item_id, notify=lambda _t: None) -> dict:
     ident = db.get_item(item_id)["identification"]
     notify("💰 Pricing...")
     t = time.perf_counter()
+    # Price notes run alongside pricing (both mostly wait on the network).
+    notes_job = None
+    if config.VALUE_NOTES_ENABLED:
+        from concurrent.futures import ThreadPoolExecutor
+        from pipeline import value_notes
+        pool = ThreadPoolExecutor(1)
+        notes_job = pool.submit(value_notes.find_notes, ident, item_id)
+        pool.shutdown(wait=False)
     if config.PRICING_ENGINE == "v2":
         # The default since 17 Oct 2026 (config.PRICING_ENGINE); same return
         # shape as v1, which stays selectable with config.PRICING_ENGINE=v1.
@@ -234,6 +242,11 @@ def stage_price(item_id, notify=lambda _t: None) -> dict:
         pricing = price.get_pricing(ident["search_query"], research=ident)
     print(f"✓ Priced in {time.perf_counter() - t:.0f}s:", pricing.get("suggested_price"),
           f"({pricing.get('confidence')})")
+    if notes_job is not None:
+        try:
+            pricing["value_notes"] = notes_job.result(timeout=config.CLAUDE_TIMEOUT_S * 2)
+        except Exception as e:   # advisory: never hold up pricing
+            print(f"WARNING: price notes skipped: {type(e).__name__}: {e}")
     db.update_field(item_id, "pricing", pricing)
     if pricing.get("price_source_url"):
         db.update_field(item_id, "price_source_url", pricing["price_source_url"])

@@ -396,6 +396,11 @@ CLAUDE_CHEAP_MODEL = os.getenv("CLAUDE_CHEAP_MODEL", "claude-haiku-5-5")
 FIND_MODEL = os.getenv("FIND_MODEL", CLAUDE_MODEL)
 # Quick add: a fast price from MSRP habits + up to 2 web searches.
 QUICK_PRICE_MODEL = os.getenv("QUICK_PRICE_MODEL", CLAUDE_MODEL)
+# Price notes (pipeline/value_notes.py): short facts with links shown at the
+# price gate, from Claude + a few web searches while pricing runs.
+VALUE_NOTES_ENABLED = _env_bool("VALUE_NOTES_ENABLED", True)
+VALUE_NOTES_MODEL = os.getenv("VALUE_NOTES_MODEL", CLAUDE_MODEL)
+VALUE_NOTES_SEARCHES = int(os.getenv("VALUE_NOTES_SEARCHES", "5"))
 # Per-attempt HTTP timeout and SDK retries (connection errors, 408/409/429/5xx).
 # Worst-case wall clock is timeout x (retries + 1), so keep both modest.
 CLAUDE_TIMEOUT_S = float(os.getenv("CLAUDE_TIMEOUT_S", "120"))

@@ -99,23 +99,24 @@ def _format_pricing_v2(pricing: dict) -> str:
     return "\n".join(lines)
 
 
-def format_value_notes(ident: dict | None) -> str:
-    """What could make a buyer pay more or less (identify.py's value_notes):
+def format_value_notes(pricing: dict | None) -> str:
+    """What could make a buyer pay more or less (pipeline/value_notes.py):
     short facts with links, to back up the owner's own call on price."""
-    notes = (ident or {}).get("value_notes") or []
+    notes = (pricing or {}).get("value_notes") or []
     if not notes:
         return ""
     lines = ["📝 Price notes:"]
     for n in notes:
-        lines.append(f"  • {n.get('text')}")
+        mark = {"up": "⬆️", "down": "⬇️"}.get(n.get("effect"), "•")
+        lines.append(f"  {mark} {n.get('text')}")
         if n.get("url"):
             lines.append(f"    {n['url']}")
     return "\n".join(lines)
 
 
-def format_pricing(pricing: dict, ident: dict | None = None) -> str:
+def format_pricing(pricing: dict) -> str:
     text = _format_pricing_body(pricing)
-    notes = format_value_notes(ident)
+    notes = format_value_notes(pricing)
     return f"{text}\n\n{notes}" if notes else text
 
 
@@ -197,7 +198,7 @@ def format_draft(result) -> str:
     if pricing.get("price_source_url"):
         lines.append(f"  price source: {pricing['price_source_url']}")
 
-    notes = format_value_notes(ident)
+    notes = format_value_notes(pricing)
     if notes:
         lines += ["", notes]
 

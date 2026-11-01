@@ -152,11 +152,6 @@ RESEARCH_PROMPT = (
     "website or a major retailer (Macy's, Nordstrom, etc.), matching this exact "
     "color/variant. Give the direct image-file URL (ending in .jpg/.png/.webp) if "
     "you can. Do NOT use another eBay/Poshmark/Mercari seller's photo.\n"
-    "7. Find what would make a buyer pay MORE or LESS for THIS specific item, "
-    "beyond the comps: buzz or hype (Reddit, forums, TikTok, collector talk, "
-    "'grail' posts), a sought-after design or collab, standout build or material, "
-    "useful features buyers praise, or known complaints. Only facts you found, "
-    "each with the page URL. Say 'none found' if there is nothing.\n"
     "\n"
     "Then write a findings report with these labelled lines:\n"
     "- Brand / Item type / SKU-Style number / UPC / Color code / Product line name / "
@@ -171,8 +166,7 @@ RESEARCH_PROMPT = (
     "- eBay resale prices found (list each: price + sold or active)\n"
     "- Best estimate of what it sells for on eBay in this condition\n"
     "- Official product image URL (brand/retailer only, direct image link) or none\n"
-    "- A short eBay search string a buyer would use to find this exact item\n"
-    "- Value notes (step 7): up to 4, each one line + its URL, or 'none found'"
+    "- A short eBay search string a buyer would use to find this exact item"
 )
 
 FORMAT_SYSTEM = (
@@ -204,7 +198,6 @@ FORMAT_INSTRUCTIONS = (
     '  "price_evidence": [{"source": "ebay sold|ebay active|tag|msrp", "price": number, "note": "short note"}],\n'
     '  "specifications": {"<item-specific name>": "<value>", "...": "... every spec from the matched product + photo-verified visual details, e.g. Hardware Color, Lining Color, Strap Color, Exterior Color, Pattern, Finish, Closure, Features, Country of Origin, Bag Height, Bag Width, Bag Depth ..."},\n'
     '  "product_image_url": "direct URL to an OFFICIAL brand/retailer product photo (https, ideally ending .jpg/.png/.webp), or null. Never an eBay/Poshmark/Mercari seller photo",\n'
-    '  "value_notes": [{"text": "one short line", "url": "source page URL or null"}],\n'
     '  "confidence": 0.0\n'
     "}\n"
     "\n"
@@ -221,12 +214,6 @@ FORMAT_INSTRUCTIONS = (
     "Height, etc.). Empty object if the report has none.\n"
     "- product_image_url: only an official brand/retailer image URL from the report; "
     "null if the report has none or only cites marketplace-seller photos.\n"
-    "- value_notes: the report's Value notes, at most 4, most important first. "
-    "Each text is short and plain (under 90 characters). Any brand, material or "
-    "slang term a non-expert might not know gets a few words of explanation in "
-    "parentheses, e.g. 'Bridle leather (thick leather made for horse gear, very "
-    "tough), lasts decades'. Only notes the report states; url from the report or "
-    "null. Empty array if the report found none.\n"
     "- confidence 0.0-1.0; lower it if the report could not pin the product or price.\n"
     "- If the report says the item is UNCONFIRMED / could not be verified, do NOT "
     "invent a specific brand or product_name: set product_name (and brand, if the "
@@ -321,29 +308,6 @@ def _tag_data_block(upcs: list[str], style_codes: list[str]) -> str:
         "as a 12-digit UPC-A) to pull up the exact product. Only conclude the item "
         "is unconfirmed if these searches genuinely fail.\n\n"
     )
-
-
-MAX_VALUE_NOTES = 4
-
-
-def _clean_value_notes(notes) -> list[dict]:
-    """Keep the value notes short and safe to show: at most 4, text required,
-    url kept only if it is a plain http(s) link."""
-    out = []
-    for n in notes if isinstance(notes, list) else []:
-        if isinstance(n, str):
-            n = {"text": n}
-        if not isinstance(n, dict):
-            continue
-        text = " ".join(str(n.get("text") or "").split())
-        if not text or text.lower().rstrip(".") in ("none", "none found"):
-            continue
-        url = str(n.get("url") or "").strip()
-        out.append({"text": text[:160],
-                    "url": url if url.startswith(("http://", "https://")) else None})
-        if len(out) == MAX_VALUE_NOTES:
-            break
-    return out
 
 
 def identify_item(image_paths: list[str], scan_paths: list[str] | None = None) -> dict:
@@ -473,7 +437,6 @@ def identify_item(image_paths: list[str], scan_paths: list[str] | None = None) -
     # _tag_signals). telegram_bot.py lowers the auto-confirm bar when a UPC is
     # present, so it has to be able to tell which kind it's holding.
     result["upc_decoded"] = bool(upcs)
-    result["value_notes"] = _clean_value_notes(result.get("value_notes"))
 
     # Safety net: downstream pricing requires a search_query.
     if not result.get("search_query"):

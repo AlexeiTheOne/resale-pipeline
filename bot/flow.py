@@ -347,8 +347,7 @@ async def _show_price_gate(user_id, item_id, message, reason=None) -> None:
     state.last_item[user_id] = item_id
     title = ((item.get("identification") or {}).get("product_name")
              or (item.get("identification") or {}).get("item_type") or "")
-    body = f"💲 {item_id[:8]} {title}".rstrip() + "\n" + formatting.format_pricing(
-        item["pricing"], item.get("identification"))
+    body = f"💲 {item_id[:8]} {title}".rstrip() + "\n" + formatting.format_pricing(item["pricing"])
     if reason:
         body += f"\n\n🛑 Needs you: {reason}"
     sent = await util._safe_reply(
