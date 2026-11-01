@@ -13,6 +13,10 @@ def _setup(monkeypatch, tmp_path):
     out = tmp_path / "backups"
     monkeypatch.setattr(backup, "DB_PATH", db)
     monkeypatch.setattr(backup, "INBOX", tmp_path / "inbox")
+    pieces = tmp_path / "pieces"
+    pieces.mkdir()
+    (pieces / "O1-01.jpg").write_bytes(b"jpg")
+    monkeypatch.setattr(backup, "PIECES", pieces)
     monkeypatch.setattr(backup, "BACKUP_DIR", out)
     return out
 
@@ -31,3 +35,12 @@ def test_default_backs_up_both(monkeypatch, tmp_path):
     names = [p.name for p in out.iterdir()]
     assert any(n.startswith("ross-") for n in names)
     assert any(n.startswith("inbox-") for n in names)
+
+
+def test_photo_zip_holds_inbox_and_inventory_pieces(monkeypatch, tmp_path):
+    import zipfile
+    out = _setup(monkeypatch, tmp_path)
+    backup.main([])
+    zip_path = next(out.glob("inbox-*.zip"))
+    names = set(zipfile.ZipFile(zip_path).namelist())
+    assert {"inbox/item1/a.jpg", "pieces/O1-01.jpg"} <= names

@@ -34,6 +34,7 @@ EXPECTED_CALLBACKS = {
     r"^review:": "review_callback",
     r"^reprice:": "reprice_callback",
     r"^qa:": "quick_add_callback",
+    r"^invpost:": "inv_post_callback",
 }
 # callback name -> substrings that must appear in the lowercased filters repr
 EXPECTED_MESSAGE_HANDLERS = {

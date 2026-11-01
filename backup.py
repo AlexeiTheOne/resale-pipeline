@@ -4,6 +4,7 @@ Two things hold the whole business and neither is in git (data/ is gitignored):
   • data/ross.db — items, receipt/cost history, the eBay OAuth tokens, and the
     taxonomy cache.
   • data/inbox/  — the only copy of each item's photos until they reach Cloudinary.
+  • data/pieces/ — the /inv inventory photos (the tag readings are in the DB).
 
 Run this on a schedule (Windows Task Scheduler / cron). Point BACKUP_DIR at a
 synced folder (OneDrive / Dropbox / Google Drive) to get the data off the machine:
@@ -26,6 +27,7 @@ from config import DATA_DIR, resolve_path  # noqa: E402
 
 DB_PATH = DATA_DIR / "ross.db"
 INBOX = DATA_DIR / "inbox"
+PIECES = DATA_DIR / "pieces"
 BACKUP_DIR = resolve_path(os.getenv("BACKUP_DIR") or DATA_DIR / "backups")
 KEEP = int(os.getenv("BACKUP_KEEP", "14"))  # snapshots of each kind to retain
 
@@ -70,14 +72,16 @@ def backup_db(dest: Path) -> Path:
 
 
 def backup_inbox(dest: Path) -> Path | None:
-    if not INBOX.exists() or not any(p.is_file() for p in INBOX.rglob("*")):
+    """Zip the photo folders (inbox/ and pieces/) into one inbox-<stamp>.zip."""
+    files = [(p, p.relative_to(d.parent)) for d in (INBOX, PIECES) if d.exists()
+             for p in d.rglob("*") if p.is_file()]
+    if not files:
         return None
     out = dest / f"inbox-{_stamp()}.zip"
     tmp = dest / f"{PARTIAL}{out.name}"
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in INBOX.rglob("*"):
-            if p.is_file():
-                z.write(p, p.relative_to(INBOX.parent))
+        for p, name in files:
+            z.write(p, name)
     tmp.replace(out)
     return out
 

@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import db
+import ross_tag
 from pipeline.gtin import product_gtin
 
 # A box: room letter(s) + number (G3), optionally with a label stuck on or after
@@ -28,8 +29,9 @@ BOX_RE = re.compile(rf"^{_BOX}$")
 CODE_RE = re.compile(rf"^{_BOX}-\d{{2,4}}$")
 LINKABLE = ("published", "stocked", "ebay_draft")
 
-_TAG_PROMPT = """This is a quick inventory photo of one retail item, usually with its tags.
-Read what you can see. Return JSON with these keys (null when not visible):
+_TAG_PROMPT = """These are quick inventory photos (one or more) of ONE retail item, usually
+with its tags; several photos are different views of the same item, so combine
+what they show. Read what you can see. Return JSON with these keys (null when not visible):
 brand, item_type (e.g. "crossbody bag", "sunglasses", "duvet cover set"),
 product_name (model/collection name if printed), color, style_code (style/model
 number on the hang tag), upc (12-13 digit product barcode number if printed),
@@ -38,7 +40,8 @@ the Ross tag, the reduced one if marked down, a number), ross_original_price
 (Ross's crossed-out/original price, a number), notes (anything odd: damage,
 missing tag, a set of several pieces), brand_visible (true only if the brand
 name or logo is actually readable in the photo; false if you are guessing from
-the style or print)."""
+the style or print), ross_tag_visible (true if a Ross store price tag or sticker
+is in ANY photo, even partly; false only if you are sure there is none)."""
 
 
 def _num(v):
@@ -48,20 +51,44 @@ def _num(v):
         return None
 
 
-def read_tag(photo: str) -> dict:
-    """One Gemini call + barcodes. Never raises on a bad read: returns what it got."""
+def extra_photo_path(main: str | Path, n: int) -> Path:
+    """Where photo n (2, 3, ...) of a piece sent as an album is kept: next to the
+    main photo, O1-03.jpg -> O1-03_2.jpg. The pieces table holds one photo, so
+    the extras live beside it rather than in the database."""
+    main = Path(main)
+    return main.with_name(f"{main.stem}_{n}{main.suffix}")
+
+
+def piece_photos(piece: dict) -> list[str]:
+    """The piece's main photo, then any album extras (O1-03_2.jpg, ...) in order."""
+    main = piece.get("photo")
+    if not main:
+        return []
+    main = Path(main)
+    extras = []
+    for f in main.parent.glob(f"{main.stem}_*{main.suffix}"):
+        n = f.stem[len(main.stem) + 1:]
+        if n.isdigit():
+            extras.append((int(n), str(f)))
+    return [str(main)] + [f for _, f in sorted(extras)]
+
+
+def read_tag(photo: str | list[str]) -> dict:
+    """One Gemini call over every photo of the piece, + barcodes from each.
+    Never raises on a bad read: returns what it got."""
     from google.genai import types
     from config import GEMINI_FAST_MODEL
     from identify import client
     from llm import generate_with_retry, response_text
     from ross_tag import decode_barcode, read_product_upcs
 
+    photos = [photo] if isinstance(photo, (str, Path)) else list(photo)
     info: dict = {}
     try:
         resp = generate_with_retry(
             client, stage="inventory_tag", model=GEMINI_FAST_MODEL,
-            contents=[types.Part.from_bytes(data=Path(photo).read_bytes(), mime_type="image/jpeg"),
-                      _TAG_PROMPT],
+            contents=[types.Part.from_bytes(data=Path(p).read_bytes(), mime_type="image/jpeg")
+                      for p in photos] + [_TAG_PROMPT],
             config=types.GenerateContentConfig(
                 temperature=0, max_output_tokens=2000,
                 response_mime_type="application/json",
@@ -76,12 +103,15 @@ def read_tag(photo: str) -> dict:
         # Spade from its polka dots). Unknown is better than wrong.
         info["brand_guess"] = info.pop("brand")
     # Free barcode reads beat OCR'd digits.
-    upcs = read_product_upcs(photo)
-    if upcs:
-        info["upc"] = upcs[0]
+    for p in photos:
+        upcs = read_product_upcs(p)
+        if upcs:
+            info["upc"] = upcs[0]
+            break
     info["upc"] = product_gtin(info.get("upc"))
-    ross = decode_barcode(photo)
-    if ross and len(ross) >= 18:
+    ross = next((r for r in map(decode_barcode, photos) if r and len(r) >= 18), None)
+    if ross:
+        info["ross_barcode"] = ross   # the whole barcode, kept for the record
         info["ross_code"] = ross[:12]
         price = int(ross[-6:]) / 100
         if price > 0:
@@ -167,16 +197,35 @@ def _as_identification(info: dict) -> dict:
             "source": "inventory"}
 
 
+def post_check(info: dict, photos: list[str]) -> str | None:
+    """None when a piece can be posted straight from its /inv photos, else why
+    not. Never with a Ross tag in shot (it shows buyers what we paid): the read
+    must say outright there is none, and a dedicated tag check must agree."""
+    if (info.get("ross_tag_visible") is not False or info.get("ross_price") is not None
+            or info.get("ross_code") or info.get("ross_original_price") is not None):
+        return "Ross tag in the photo"
+    if not info.get("brand"):
+        return "brand not readable"
+    if not info.get("item_type"):
+        return "not sure what the item is"
+    if not (info.get("upc") or info.get("style_code")):
+        return "no UPC or style number"
+    if ross_tag.detect_ross_tags(photos):
+        return "Ross tag in the photo"
+    return None
+
+
 def process_piece(code: str, ask=None) -> dict:
     """Fill in a freshly captured piece. Returns a summary for the reply."""
     piece = db.get_piece(code)
     photo = piece.get("photo")
-    info = read_tag(photo) if photo else {}
+    photos = piece_photos(piece)
+    info = read_tag(photos if len(photos) > 1 else photo) if photo else {}
     items = db.list_items()
     item, how = find_match(info, photo, items, ask=ask)
     created = False
     if item is None:
-        item_id = db.create_item([photo] if photo else [])
+        item_id = db.create_item(photos)
         db.update_field(item_id, "identification", _as_identification(info))
         if info.get("ross_price") is not None or info.get("ross_code"):
             # peeled=False: the inventory photo shows the tag, so /list asks for
@@ -186,9 +235,11 @@ def process_piece(code: str, ask=None) -> dict:
                 "original_price": info.get("ross_original_price"), "source": "inventory",
                 "peeled": False})
         value, basis = rough_value(info, None, items)
+        not_postable = post_check(info, photos)
         db.update_field(item_id, "stock", {
             "location": piece["box"], "source": "inventory",
             "quick_price": {"price": value, "basis": basis, "rough": True},
+            "post_ready": not_postable is None, "post_blocker": not_postable,
             "added_at": datetime.now(timezone.utc).isoformat()})
         db.update_status(item_id, "stocked")
         item = db.get_item(item_id)
@@ -198,7 +249,8 @@ def process_piece(code: str, ask=None) -> dict:
     db.update_piece(code, item_id=item["item_id"], info=info, value=value,
                     cost=info.get("ross_price"))
     return {"code": code, "item": item, "how": how, "created": created,
-            "value": value, "basis": basis, "info": info}
+            "value": value, "basis": basis, "info": info,
+            "post_ready": bool(created and (item.get("stock") or {}).get("post_ready"))}
 
 
 def describe(res: dict) -> str:

@@ -457,7 +457,7 @@ def run_steps(*steps, ctx: FakeContext, drain_each: bool = False):
 BOT_STATE_NAMES = (
     "pending", "review", "locks", "last_item", "capture_window", "staging",
     "awaiting_photos", "appending", "gate", "gate_queue", "find_mode", "find_loc",
-    "last_find_photo", "quick_add", "inv_box", "inv_session", "list_after_photos",
+    "last_find_photo", "quick_add", "inv_box", "inv_session", "inv_album", "list_after_photos",
     "haul_mode", "msg_target", "_in_flight",
 )
 

@@ -251,6 +251,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(flow.review_callback, pattern=r"^review:"))
     app.add_handler(CallbackQueryHandler(listing_cmds.reprice_callback, pattern=r"^reprice:"))
     app.add_handler(CallbackQueryHandler(inventory_cmds.quick_add_callback, pattern=r"^qa:"))
+    app.add_handler(CallbackQueryHandler(inventory_cmds.inv_post_callback, pattern=r"^invpost:"))
     app.add_handler(CommandHandler("haul", intake.haul_command))
     app.add_handler(CommandHandler("find", inventory_cmds.find_command))
     app.add_handler(CommandHandler("done", inventory_cmds.done_command))

@@ -63,7 +63,7 @@ from bot.inventory_cmds import (  # noqa: E402,F401  (re-export)
     _FIND_DIR, find_command, done_command, _end_find, _find_one, _QUICK_ADD_WAIT_FIRST,
     _QUICK_ADD_WAIT_NEXT, quick_add_callback, _quick_add_photo, _quick_add_timer,
     _quick_add_item, _stock_line, stock_command, _PIECES_DIR, _inv_semaphore,
-    inv_command, _inv_photo, _inv_process, _inv_done, where_command, move_command,
+    inv_command, _inv_photo, _inv_process, inv_post_callback, _inv_done, where_command, move_command,
     mark_command, ghosts_command, list_command,
 )
 from bot.photos_cmds import (  # noqa: E402,F401  (re-export)

@@ -258,7 +258,8 @@ async def inv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     box = " ".join(context.args or []).strip().upper()
     if not box or not inventory.BOX_RE.match(box):
         await util._safe_reply(update.message,
-            "Usage: /inv G3 — then one photo per item, tag showing.\n"
+            "Usage: /inv G3 — then one photo per item, tag showing "
+            "(an album of 2-3 photos = one item).\n"
             "Boxes: G garage, O office, S small bedroom, R full room (G1, O2, R-SHELF1).\n"
             "Add a label if you like: O1-WATCHES or O1W. No spaces.")
         return
@@ -266,21 +267,58 @@ async def inv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     state.inv_box[user_id] = box
     state.inv_session.setdefault(user_id, [])
     await util._safe_reply(update.message,
-        f"📦 Inventory mode: {box}. Send one photo per item with the tag showing; "
+        f"📦 Inventory mode: {box}. Send one photo per item with the tag showing "
+        "(or several as one album for the same item); "
         f"each gets the next code ({db.next_piece_code(box)} first). Type another box "
         "code (e.g. G4) to switch. /done for the summary.")
 
 
+INV_ALBUM_WAIT = 3.0  # seconds after an album's last photo before it's read
+
+
 async def _inv_photo(user_id: int, message, data: bytes, mid: int) -> None:
+    """One photo = one piece. Photos sent together as an album = ONE piece: the
+    first becomes its photo, the rest are kept beside it (O1-03_2.jpg) and all
+    are read together once the album stops arriving."""
+    from pipeline import inventory
     box = state.inv_box[user_id]
     _PIECES_DIR.mkdir(parents=True, exist_ok=True)
+    group = getattr(message, "media_group_id", None)
+    # No await between this lookup and registering a new album below, so two
+    # album photos handled at once can't both start a piece.
+    album = state.inv_album.get((user_id, group)) if group else None
+    if album is not None:
+        album["n"] += 1
+        inventory.extra_photo_path(_PIECES_DIR / f"{album['code']}.jpg", album["n"]).write_bytes(data)
+        _schedule_inv_album(user_id, group)
+        return
     code = db.add_piece(box)
     path = _PIECES_DIR / f"{code}.jpg"
     path.write_bytes(data)
     db.update_piece(code, photo=str(path))
     state.inv_session.setdefault(user_id, []).append(code)
+    if group:
+        album = state.inv_album[(user_id, group)] = {"code": code, "n": 1, "sent": None, "task": None}
+        _schedule_inv_album(user_id, group)
+        album["sent"] = await util._safe_reply(message, f"{code} ✓ (album: reading all photos)")
+        return
     sent = await util._safe_reply(message, f"{code} ✓")
     asyncio.create_task(_inv_process(code, sent))
+
+
+def _schedule_inv_album(user_id: int, group: str) -> None:
+    """(Re)start the album's countdown: each new photo pushes the read back."""
+    album = state.inv_album[(user_id, group)]
+    if album["task"] is not None:
+        album["task"].cancel()
+    album["task"] = asyncio.create_task(_inv_album_ready(user_id, group))
+
+
+async def _inv_album_ready(user_id: int, group: str) -> None:
+    await asyncio.sleep(INV_ALBUM_WAIT)
+    album = state.inv_album.pop((user_id, group), None)
+    if album is not None:
+        await _inv_process(album["code"], album["sent"])
 
 
 async def _inv_process(code: str, sent) -> None:
@@ -293,12 +331,49 @@ async def _inv_process(code: str, sent) -> None:
             traceback.print_exc()
             util._record_error(f"inventory {code}", e)
             text = f"{code} ✓ saved, but reading it failed ({type(e).__name__}). /where {code}"
+            res = {}
+    markup = None
+    if res.get("post_ready"):
+        # Everything a listing needs is readable and no Ross tag is in shot.
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "📤 Post it", callback_data=f"invpost:{code}")]])
     if sent is not None:
         try:
-            await sent.edit_text(util._scrub(text))
+            await sent.edit_text(util._scrub(text), reply_markup=markup)
             return
         except Exception as e:
             print(f"WARNING: couldn't edit {code} reply: {e}")
+
+
+async def inv_post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """📤 Post it on an /inv piece: list it from its own photos. Offered only
+    when they show no Ross tag and everything a listing needs. Pricing, draft
+    and the review before eBay run as for any item."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    code = query.data.split(":", 1)[1]
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    piece = db.get_piece(code)
+    item = db.get_item(piece["item_id"]) if piece and piece.get("item_id") else None
+    # No await between this check and the status change: a second tap sees
+    # the item already moved on.
+    if (not item or item["status"] != "stocked"
+            or not (item.get("stock") or {}).get("post_ready")):
+        await util._safe_reply(query.message,
+            f"{code} can't be posted from here (already posted, or its photos show "
+            "the Ross tag). /where " + code)
+        return
+    item_id = item["item_id"]
+    db.update_status(item_id, "identified")
+    db.match_quantity_to_pieces(item_id)
+    await util._safe_reply(query.message,
+        f"🚀 Posting {code} ({item_id[:8]}). Full pricing next, then the draft for review.\n"
+        f"More photos on the listing? /addphotos {item_id[:8]} any time before you approve.")
+    await flow.advance(user_id, item_id, query.message, context)
 
 
 async def _inv_done(user_id: int, message) -> None:

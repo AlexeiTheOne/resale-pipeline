@@ -130,9 +130,9 @@ def test_box_names_can_carry_a_label():
 
 
 def test_labelled_box_numbers_and_searches():
-    code = db.add_piece("o1-watches")
-    assert code == "O1-WATCHES-01"
-    assert db.add_piece("O1-WATCHES") == "O1-WATCHES-02"
-    assert db.add_piece("O1") == "O1-01"          # the plain box counts on its own
-    assert [p["code"] for p in inv.search("o1-watches-01")] == [code]
-    assert {p["code"] for p in inv.search("O1-WATCHES")} == {"O1-WATCHES-01", "O1-WATCHES-02"}
+    code = db.add_piece("q9-labeltest")
+    assert code == "Q9-LABELTEST-01"
+    assert db.add_piece("Q9-LABELTEST") == "Q9-LABELTEST-02"
+    assert db.add_piece("Q9") == "Q9-01"          # the plain box counts on its own
+    assert [p["code"] for p in inv.search("q9-labeltest-01")] == [code]
+    assert {p["code"] for p in inv.search("Q9-LABELTEST")} == {"Q9-LABELTEST-01", "Q9-LABELTEST-02"}

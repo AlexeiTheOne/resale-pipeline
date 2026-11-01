@@ -376,7 +376,7 @@ HELP_SECTIONS = [
         ("/delete [id]", "Delete the item, its photos, and its eBay offer"),
         ("/find [box]", "Photo an item: posted or not? Quick add what isn't. /done to stop"),
         ("/stock", "Items quick-added but not posted, best to list first"),
-        ("/inv <box>", "Inventory mode: one photo per item, each gets a code (G3-07)"),
+        ("/inv <box>", "Inventory mode: one photo (or one album) per item, each gets a code (G3-07)"),
         ("/where <q>", "Find pieces by code, box, brand, text or UPC"),
         ("/move <code> <box>", "Piece moved to another box (code stays)"),
         ("/mark <code> <status>", "Mark a piece lot, donated, home or sold"),
