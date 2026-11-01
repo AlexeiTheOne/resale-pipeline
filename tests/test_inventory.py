@@ -118,3 +118,21 @@ def test_ghost_report_compares_ebay_with_home():
     text = "\n".join(lines)
     assert a[:8] in text and "never found" in text
     assert f"/setqty {b[:8]} 1" in text
+
+
+def test_box_names_can_carry_a_label():
+    """/inv O1-watches and /inv O1w were refused (1 Nov 2026)."""
+    for box in ("G3", "O2", "R-SHELF1", "O1-WATCHES", "O1W", "S2-BAGS2"):
+        assert inv.BOX_RE.match(box), box
+        assert inv.CODE_RE.match(f"{box}-01"), box
+    for not_box in ("O1-01", "O1-WATCHES-01", "WATCHES", "O1 WATCHES", "1O", ""):
+        assert not inv.BOX_RE.match(not_box), not_box
+
+
+def test_labelled_box_numbers_and_searches():
+    code = db.add_piece("o1-watches")
+    assert code == "O1-WATCHES-01"
+    assert db.add_piece("O1-WATCHES") == "O1-WATCHES-02"
+    assert db.add_piece("O1") == "O1-01"          # the plain box counts on its own
+    assert [p["code"] for p in inv.search("o1-watches-01")] == [code]
+    assert {p["code"] for p in inv.search("O1-WATCHES")} == {"O1-WATCHES-01", "O1-WATCHES-02"}

@@ -259,7 +259,8 @@ async def inv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not box or not inventory.BOX_RE.match(box):
         await util._safe_reply(update.message,
             "Usage: /inv G3 — then one photo per item, tag showing.\n"
-            "Boxes: G garage, O office, S small bedroom, R full room (G1, O2, R-SHELF1).")
+            "Boxes: G garage, O office, S small bedroom, R full room (G1, O2, R-SHELF1).\n"
+            "Add a label if you like: O1-WATCHES or O1W. No spaces.")
         return
     _end_find(user_id)
     state.inv_box[user_id] = box

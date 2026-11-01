@@ -20,8 +20,12 @@ from pathlib import Path
 import db
 from pipeline.gtin import product_gtin
 
-BOX_RE = re.compile(r"^(?:[A-Z]{1,3}\d{1,3}|[A-Z]{1,3}-[A-Z]+\d{0,3})$")
-CODE_RE = re.compile(r"^(?:[A-Z]{1,3}\d{1,3}|[A-Z]{1,3}-[A-Z]+\d{0,3})-\d{2,4}$")
+# A box: room letter(s) + number (G3), optionally with a label stuck on or after
+# a dash (O1W, O1-WATCHES), or a named spot (R-SHELF1). A label always starts
+# with a letter, so a box never looks like a piece code (O1-01 is a code).
+_BOX = r"(?:[A-Z]{1,3}\d{1,3}(?:-?[A-Z][A-Z0-9]{0,14})?|[A-Z]{1,3}-[A-Z]+\d{0,3})"
+BOX_RE = re.compile(rf"^{_BOX}$")
+CODE_RE = re.compile(rf"^{_BOX}-\d{{2,4}}$")
 LINKABLE = ("published", "stocked", "ebay_draft")
 
 _TAG_PROMPT = """This is a quick inventory photo of one retail item, usually with its tags.
