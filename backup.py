@@ -21,10 +21,6 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 sys.path.insert(0, str(Path(__file__).parent))
 from config import DATA_DIR, resolve_path  # noqa: E402
 

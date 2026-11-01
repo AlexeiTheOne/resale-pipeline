@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
-from dotenv import load_dotenv
 from telegram import BotCommand, Update
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (
@@ -36,15 +35,11 @@ from bot import (
     sales_cmds, text_router, util,
 )
 
-_REPO_ENV = Path(__file__).resolve().parent.parent / ".env"
-
-
 def configure() -> None:
     """Startup configuration, run by main() before the Application is built.
 
-    Loads the repo's .env (a no-op for variables already set, and telegram_bot
-    has normally loaded it already) and then parses the allowlist, so the
-    allowlist can never be read before .env is.
+    Parses the allowlist. .env is already loaded: config (imported above) does
+    that once for the whole process.
 
     Whitelist of Telegram user IDs allowed to drive the bot. This gates a LIVE
     eBay seller account (publish / delete / ad-rate), so an open bot means anyone
@@ -53,7 +48,6 @@ def configure() -> None:
     warning; use /whoami to get your id, then set TELEGRAM_ALLOWED_USER_IDS in
     .env. Lives on bot.util (read as util.ALLOWED_USER_IDS) because bot/jobs.py
     and /whoami read it too."""
-    load_dotenv(_REPO_ENV)
     util.ALLOWED_USER_IDS = util._parse_allowed_ids(os.getenv("TELEGRAM_ALLOWED_USER_IDS"))
     if not util.ALLOWED_USER_IDS:
         print("⚠️ SECURITY: TELEGRAM_ALLOWED_USER_IDS is unset — the bot accepts "

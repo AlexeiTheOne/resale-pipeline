@@ -1,4 +1,4 @@
-"""Keep the test run off the real data/ folder.
+"""Keep the test run off the real data/ folder and the real .env.
 
 db.py, ebay/auth.py and ebay/taxonomy.py create their tables at import, and
 telegram_bot.py makes data/inbox at import. Every data path is built from
@@ -6,11 +6,15 @@ config.DATA_DIR, so pointing it at a temp dir here — before any test module
 imports those — means nothing under C:/Ebay-list/data is opened or created.
 Test modules that also point db.DB_PATH at their own file still do so.
 """
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Before config is imported: never load the real .env (keys, JOBS_ENABLED...).
+os.environ["ROSS_SKIP_DOTENV"] = "1"
 
 import config  # noqa: E402
 

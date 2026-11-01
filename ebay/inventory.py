@@ -13,7 +13,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import httpx
-from dotenv import load_dotenv
 
 from config import (
     BEST_OFFER_ENABLED,
@@ -33,8 +32,6 @@ from pipeline.description_guard import sanitize_description
 from pipeline.gtin import product_gtin
 from pipeline.title import TITLE_MAX_LEN, fit_title
 from profit import breakeven_price
-
-load_dotenv()
 
 EBAY_API_BASE = "https://api.ebay.com"
 

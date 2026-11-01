@@ -67,7 +67,7 @@ _SECRET_ENV_NAMES = (
 
 def _secrets() -> list[str]:
     """Read at call time, not import time: an import that runs before
-    load_dotenv() must not leave the scrub list empty."""
+    .env is loaded must not leave the scrub list empty."""
     return sorted(
         (v for v in (os.getenv(k) for k in _SECRET_ENV_NAMES) if v and len(v) >= 8),
         key=len, reverse=True)

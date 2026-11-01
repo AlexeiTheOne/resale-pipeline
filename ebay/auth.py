@@ -6,12 +6,10 @@ import urllib.parse
 from pathlib import Path
 
 import httpx
-from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+import config  # noqa: E402,F401  (loads .env)
 import db  # noqa: E402
-
-load_dotenv()
 
 CLIENT_ID = os.getenv("EBAY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("EBAY_CLIENT_SECRET")

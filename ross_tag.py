@@ -20,8 +20,7 @@ import os
 import re
 from pathlib import Path
 
-from dotenv import load_dotenv
-
+import config  # noqa: F401  (loads .env: TESSERACT_CMD)
 from pipeline.gtin import product_gtin
 
 try:
@@ -50,8 +49,6 @@ _PRODUCT_ZBAR_SYMBOLS = (
     if _ZBarSymbol else None
 )
 _TAG_ZBAR_SYMBOLS = [_ZBarSymbol.CODE128] if _ZBarSymbol else None
-
-load_dotenv()
 
 # On Windows the tesseract binary usually isn't on PATH; let .env point at it.
 _TESSERACT_CMD = os.getenv("TESSERACT_CMD")

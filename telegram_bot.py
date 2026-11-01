@@ -1,15 +1,12 @@
 """Entry point: `python telegram_bot.py` starts the bot (bot.app.main).
 
 Everything lives in the bot/ package (docs/cleanup-plan.md Phase 2). This file
-loads .env, re-exports the names the tests reach as telegram_bot.<name>, and
+re-exports the names the tests reach as telegram_bot.<name>, and
 runs main(). No bot/ module imports it.
 """
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent))
 
 from telegram.ext import (  # noqa: E402,F401  (re-export for tests)

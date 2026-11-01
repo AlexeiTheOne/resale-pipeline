@@ -9,7 +9,6 @@ import time
 import httpx
 import json
 import os
-from dotenv import load_dotenv
 from config import (
     ACTIVE_COUNT, ACTIVE_FETCH_COUNT, ACTIVE_FLOOR_MIN_RATIO, COMPS_COUNT,
     COMPS_FETCH_COUNT, DEBUG_MODE, PRICE_SOLID_MAX_DISPERSION,
@@ -17,7 +16,6 @@ from config import (
     RESEARCH_SANITY_RATIO, UNDERCUT_PCT,
 )
 
-load_dotenv()
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 # Second key (a second free-tier account), used when APIFY_TOKEN is rejected
 # (401/403), out of credit (402), or about to run out (see _sync_token_choice).

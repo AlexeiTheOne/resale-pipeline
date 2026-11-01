@@ -1,12 +1,23 @@
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 # Every data path hangs off the repo folder, never the current working directory:
 # started from Task Scheduler (cwd C:\Windows\System32) a relative "data/ross.db"
 # silently becomes a new empty database with no eBay login.
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 LOG_DIR = BASE_DIR / "logs"
+
+# The only load_dotenv in the codebase. Every module imports config (directly or
+# through db), so .env is loaded before any os.getenv runs, whatever the import
+# order. Values already in the environment win. The tests set ROSS_SKIP_DOTENV
+# (tests/conftest.py) so a run never depends on, or reads keys from, a real .env.
+# scripts/notify.py is the one exception: it stays standalone for deploy.ps1.
+ENV_FILE = BASE_DIR / ".env"
+if not os.getenv("ROSS_SKIP_DOTENV"):
+    load_dotenv(ENV_FILE)
 
 
 def resolve_path(p) -> Path:

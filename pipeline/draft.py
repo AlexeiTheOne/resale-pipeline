@@ -4,7 +4,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import json
 import os
-from dotenv import load_dotenv
 from google.genai import types
 
 from ebay.taxonomy import category_aspects, category_suggestions
@@ -16,10 +15,9 @@ from pipeline.specifics import clean_specifics
 from pipeline.title import (TITLE_MAX_LEN, TITLE_RULES, enforce_band_for_device,
                             ensure_title_fits, fit_title)
 
-load_dotenv()
-client = LazyClient(api_key=os.getenv("GEMINI_API_KEY"))
-
 from config import GEMINI_FAST_MODEL
+
+client = LazyClient(api_key=os.getenv("GEMINI_API_KEY"))
 
 MODEL = GEMINI_FAST_MODEL
 ASPECT_HINT_VALUE_CAP = 20

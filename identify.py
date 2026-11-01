@@ -10,15 +10,12 @@ import sys
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
 from google.genai import errors, types
 
 from llm import LazyClient, error_code, generate_with_retry, response_text
 from config import GEMINI_MODEL, GEMINI_FAST_MODEL, GEMINI_RESEARCH_THINKING_LEVEL
 from pipeline.gtin import product_gtin
 from ross_tag import read_product_upcs, ocr_text
-
-load_dotenv()
 
 client = LazyClient()
 

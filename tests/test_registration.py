@@ -86,7 +86,6 @@ def registered():
     try:
         mp.setattr(bot_app, "Application", types.SimpleNamespace(builder=lambda: _FakeBuilder(app)))
         mp.setattr(bot_app, "_ipv4_request", lambda *a, **k: None)
-        mp.setattr(bot_app, "load_dotenv", lambda *a, **k: None)
         mp.setattr(bot_app.util, "ALLOWED_USER_IDS", set())  # main() rebinds it
         import logging_setup
         mp.setattr(logging_setup, "setup_logging", lambda *a, **k: None)

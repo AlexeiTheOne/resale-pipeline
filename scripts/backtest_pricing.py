@@ -45,10 +45,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
-from dotenv import load_dotenv  # noqa: E402
-
-load_dotenv(ROOT / ".env")
-
 import db  # noqa: E402
 from pipeline import pricing_v2 as v2  # noqa: E402
 

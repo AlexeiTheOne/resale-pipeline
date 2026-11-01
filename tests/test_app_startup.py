@@ -29,8 +29,7 @@ LOOPS = ("_weekly_reprice_loop", "_sold_alert_loop", "_daily_sync_loop",
 
 @pytest.fixture
 def startup_env(monkeypatch):
-    """configure() reads only the test's environment, not the real .env."""
-    monkeypatch.setattr(bot_app, "load_dotenv", lambda *a, **k: None)
+    """configure() reads only the test's environment (conftest skips .env)."""
     monkeypatch.setattr(util, "ALLOWED_USER_IDS", set())  # restored afterwards
     return monkeypatch
 
