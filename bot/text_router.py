@@ -51,7 +51,7 @@ def _price_from_correction(text: str) -> float | None:
 def _apply_manual_price(pricing: dict, price: float) -> dict:
     """Record a human price override without erasing what the machine proposed.
 
-    `machine_price` is written once by pipeline/price.py and never touched here;
+    `machine_price` is written once by pipeline/pricing_v2.py and never touched here;
     the override goes to suggested_price (what the rest of the pipeline reads)
     and is also kept as manual_price alongside it. Previously this assignment
     overwrote suggested_price outright, so every correction destroyed the number

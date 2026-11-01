@@ -77,8 +77,8 @@ def _scrub(text: str) -> str:
     """Replace any credential that made it into an outbound string.
 
     Belt and braces, not the primary defence — the real fix is not putting
-    secrets somewhere they can be formatted into a message (see pipeline/price.py's
-    _call). But error text reaches Telegram through several paths, str(e) on a
+    secrets somewhere they can be formatted into a message (see pipeline/comps.py's
+    call). But error text reaches Telegram through several paths, str(e) on a
     third-party exception can embed anything, and a chat log is forever. Cheap
     insurance against the next library that decides to be helpful."""
     if not text:

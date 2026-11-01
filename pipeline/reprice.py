@@ -32,8 +32,8 @@ Impressions are eBay's TOTAL_IMPRESSION_TOTAL (promoted placements included),
 not the organic-only LISTING_IMPRESSION_TOTAL this used to judge on — organic is
 ~7-9% of the total on this all-promoted account. See ebay/analytics.py.
 
-A suggested cut (OVERPRICED / STALE) re-prices through config.PRICING_ENGINE
-(v2 by default), never lands under the sold-comp median or the cost floor, and
+A suggested cut (OVERPRICED / STALE) re-prices through
+pricing_v2.price_item, never lands under the sold-comp median or the cost floor, and
 never cuts more than REPRICE_MAX_CUT_PCT at once. Listings with watchers get a
 private offer instead (plan_watcher_offers), sent only when the owner taps the
 digest's one button (send_planned_offers).
@@ -70,7 +70,7 @@ from db import (
 from ebay.analytics import get_traffic_report, get_watch_count
 from ebay.inventory import auto_decline_price
 from ebay.negotiation import MIN_DISCOUNT_PCT, eligible_listing_ids, send_offer
-from pipeline.price import get_pricing
+from pipeline import pricing_v2
 from profit import breakeven_price
 
 
@@ -209,17 +209,6 @@ class PricingBudget:
         return True
 
 
-def _reprice_via_engine(item: dict) -> dict:
-    """Fresh comps for `item` through config.PRICING_ENGINE, called the way
-    pipeline.stages.stage_price calls it. Nothing is stored."""
-    ident = item.get("identification") or {}
-    if config.PRICING_ENGINE == "v2":
-        from pipeline.pricing_v2 import get_pricing_v2
-        return get_pricing_v2(ident, photo_paths=item.get("photos") or [],
-                              receipt=item.get("receipt"), item_id=item.get("item_id"))
-    return get_pricing(ident.get("search_query"), research=ident)
-
-
 def _sold_evidence_floor(pricing: dict) -> float | None:
     """The sold-comp median as an ITEM price: the lowest a cut may go ("no
     undercut"). The 29 Oct review found listings priced under 0.9x their comp
@@ -281,14 +270,12 @@ def _suggest_price(item: dict, verdict: str, current_price: float | None,
         target = current_price * (1 - cut_pct)
         if max(target, floor) >= current_price:
             return None, f"a {int(cut_pct * 100)}% cut would land under the floor — held"
-    elif config.PRICING_ENGINE != "v2" and not (item.get("identification") or {}).get("search_query"):
-        return None, "no search query to re-pull comps with"
 
     if budget is not None and not budget.take():
         return None, (f"this run's re-pricing budget ({budget.used} call(s)) is used up — "
                       f"re-checked next week")
     try:
-        pricing = _reprice_via_engine(item) or {}
+        pricing = pricing_v2.price_item(item) or {}
     except Exception as e:
         return None, f"re-pricing failed ({type(e).__name__}) — no cut suggested"
 

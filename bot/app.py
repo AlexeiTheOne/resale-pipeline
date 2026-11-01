@@ -53,6 +53,12 @@ def configure() -> None:
         print("⚠️ SECURITY: TELEGRAM_ALLOWED_USER_IDS is unset — the bot accepts "
               "commands from ANY Telegram user, on a live eBay account. Send /whoami "
               "to get your id, then set TELEGRAM_ALLOWED_USER_IDS=<id> in .env and restart.")
+    # v1 pricing was removed on 1 Nov 2026. A leftover PRICING_ENGINE=v1 would
+    # otherwise switch v2 on silently.
+    engine = (os.getenv("PRICING_ENGINE") or "v2").strip().lower()
+    if engine != "v2":
+        print(f"⚠️ PRICING_ENGINE={engine} in .env is ignored: v1 pricing was removed, "
+              "everything prices with v2. Delete the line from .env.")
 
 
 async def _auth_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

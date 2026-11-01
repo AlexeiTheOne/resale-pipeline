@@ -99,9 +99,8 @@ def test_price_stage_saves_notes(monkeypatch):
     from pipeline import stages
     item_id = db.create_item(["p.jpg"])
     db.update_field(item_id, "identification", {"brand": "Polo", "search_query": "polo belt"})
-    monkeypatch.setattr(config, "PRICING_ENGINE", "v1")
     monkeypatch.setattr(config, "VALUE_NOTES_ENABLED", True)
-    monkeypatch.setattr(stages.price, "get_pricing", lambda q, research=None: {"suggested_price": 1})
+    monkeypatch.setattr(stages.pricing_v2, "price_item", lambda item: {"suggested_price": 1})
     monkeypatch.setattr(value_notes, "find_notes",
                         lambda ident, item_id=None: [{"text": "t", "effect": "up", "url": None}])
     stages.stage_price(item_id)

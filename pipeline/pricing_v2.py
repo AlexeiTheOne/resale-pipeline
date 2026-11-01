@@ -1,13 +1,14 @@
 """Pricing v2: pooled comps, one Claude judgement, price computed in code.
 
 docs/pricing-design.md is the agreed design; this is stages 2-3 of it. The
-caller hands over the identification (stage 1, Gemini) and gets back the same
-dict shape pipeline/price.py's get_pricing returns, plus the judge's working.
-It is switched on with config.PRICING_ENGINE = "v2"; v1 stays the default.
+caller hands over the identification (stage 1, Gemini) and gets back the
+pricing dict (the shape the old v1 engine returned, plus the judge's working).
+The only pricing engine since 1 Nov 2026: the v1 comps ladder and the
+PRICING_ENGINE switch are gone. Callers use price_item(item).
 
 Flow
   1. Candidates, pooled and de-duplicated by eBay item id:
-       sold    Apify sold actor (the v1 helper), up to three queries: the style
+       sold    Apify sold actor (pipeline/comps.py), up to three queries: the style
                code, the identification's search_query, brand + product name.
                All are pooled; v1 stopped at the first query that returned.
        active  Browse search_active on brand + product name (and on the UPC as
@@ -64,7 +65,7 @@ from pathlib import Path
 
 import config
 import db
-from pipeline import price as v1
+from pipeline import comps
 
 JUDGE_STAGE = "price_judge"
 ROOT = Path(__file__).resolve().parent.parent
@@ -148,7 +149,7 @@ def fetch_sold(query: str, count: int | None = None) -> list[dict]:
                     f"${worst:.3f} would pass the ${apify_cap_usd:.2f} cap")
             apify_spend["usd"] += worst
         try:
-            rows = v1._call(v1.SOLD_URL, payload)
+            rows = comps.call(comps.SOLD_URL, payload)
         except Exception:
             with _lock:
                 apify_spend["usd"] -= worst
@@ -268,12 +269,12 @@ def to_total(item_price, shipping, our_shipping: float) -> tuple[float, float, b
 
 
 def sold_candidate(row: dict, our_shipping: float) -> dict | None:
-    item = v1._to_float(row.get("soldPrice"))
-    ship = v1._to_float(row.get("shippingPrice"))
+    item = comps.to_float(row.get("soldPrice"))
+    ship = comps.to_float(row.get("shippingPrice"))
     if (row.get("shippingType") or "").lower() == "free":
         ship = 0.0
     if item is None:
-        total = v1._to_float(row.get("totalPrice"))
+        total = comps.to_float(row.get("totalPrice"))
         if total is None:
             return None
         item = total - (ship or 0.0)
@@ -339,7 +340,7 @@ def filter_candidates(cands, own_sellers, own_ids, own_titles):
             continue
         if is_own(c, own_sellers, own_ids, own_titles):
             dropped["own"] += 1
-        elif v1._is_used(c.get("condition")):
+        elif comps.is_used(c.get("condition")):
             dropped["used"] += 1
         elif not (MIN_PRICE <= c["item_price"] <= MAX_PRICE):
             dropped["price"] += 1
@@ -533,7 +534,7 @@ def judge(identity, cands, photo, calibration, *, item_id=None, ask=None) -> dic
         escalated = True
         model = config.PRICING_ESCALATE_MODEL
         out = call(model, thumbnails)
-    if not (v1._to_float(out.get("claude_price")) or 0) > 0:
+    if not (comps.to_float(out.get("claude_price")) or 0) > 0:
         # Seen twice in 40 backtest items: a sensible price in the reasoning
         # and 0 in claude_price. Asked once more, saying so; still 0 -> no price.
         judge_stats["zero_price_retries"] += 1
@@ -564,14 +565,14 @@ def price_from_judged(cands: list[dict], verdicts: dict, *, undercut: float | No
     res = {"evidence": grade, "same_item_sold": n,
            "same_item_active": sum(1 for c in same if c["source"] != "sold"),
            "sold_median": None, "sold_p10": None, "sold_p90": None,
-           "dispersion": v1._dispersion(sold), "active_floor": None,
+           "dispersion": comps.dispersion(sold), "active_floor": None,
            "raw_active_floor": active[0] if active else None,
            "price": None, "target_total": None, "warnings": []}
     if grade == "none":
         return res
-    median = v1._median(sold)
-    res.update(sold_median=round(median, 2), sold_p10=v1._quantile(sold, 0.10),
-               sold_p90=v1._quantile(sold, 0.90))
+    median = comps.median(sold)
+    res.update(sold_median=round(median, 2), sold_p10=comps.quantile(sold, 0.10),
+               sold_p90=comps.quantile(sold, 0.90))
     target = median * (1 - undercut)
     cap = active[0] if active else None
     if cap is not None and cap < median * config.ACTIVE_FLOOR_MIN_RATIO:
@@ -673,6 +674,15 @@ def _pct_apart(a: float, b: float) -> float:
     return abs(a - b) / min(a, b) if a > 0 and b > 0 else float("inf")
 
 
+def price_item(item: dict) -> dict:
+    """Price a stored item: the one entry point for the intake price stage
+    (pipeline/stages.py) and the weekly repricer (pipeline/reprice.py).
+    Nothing is stored here."""
+    return get_pricing_v2(item.get("identification") or {},
+                          photo_paths=item.get("photos") or [],
+                          receipt=item.get("receipt"), item_id=item.get("item_id"))
+
+
 def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
                    item_id: str | None = None, ask=None) -> dict:
     """Claude's price is the suggested price. The formula over same_item sold
@@ -715,7 +725,7 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
     for c in cands:
         c["verdict"] = verdict_map.get(c["id"])
 
-    claude_raw = v1._to_float(j.get("claude_price")) if j else None
+    claude_raw = comps.to_float(j.get("claude_price")) if j else None
     claude_conf = j.get("confidence") if j else None
     p = charm(claude_raw) if claude_raw and claude_raw > 0 else None
     formula = priced["price"]
@@ -746,7 +756,7 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
                         f"({store['n']} {store['level']} sales)")
     if j and not p:
         flags.append("no_claude_price")
-    retail = v1._to_float(ident.get("retail_price"))
+    retail = comps.to_float(ident.get("retail_price"))
     if p and retail and p > retail:
         flags.append("above_retail")
         warnings.append(f"price ${p} is above the researched retail ${retail}")
@@ -774,10 +784,10 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
         reference = {"title": top["title"], "price": top["total"], "condition": top["condition"],
                      "source": "sold" if top["source"] == "sold" else "active",
                      "url": top["url"] or None}
-        stock_image_url = v1._upgrade_image(top["image"])
+        stock_image_url = comps.upgrade_image(top["image"])
         price_source_url = top["url"] or None
 
-    research_resale = v1._research_resale(ident)
+    research_resale = comps.research_resale(ident)
     return {
         # --- v1 shape ---
         "suggested_price": p, "machine_price": p,

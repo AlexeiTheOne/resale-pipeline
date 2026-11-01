@@ -166,7 +166,7 @@ def _identify_gate_reason(ident: dict) -> str | None:
 
 def _price_gate_reason(pricing: dict) -> str | None:
     """Why this price needs your eyes, or None if it can clear its gate
-    unattended. pipeline/price.py already decided this (needs_review); this only
+    unattended. pipeline/pricing_v2.py already decided this (needs_review); this only
     turns it into something worth reading."""
     if not config.AUTO_CONFIRM:
         return "auto-confirm is off"

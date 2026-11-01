@@ -17,7 +17,7 @@ import json
 import re
 import statistics
 
-from pipeline import price as v1
+from pipeline import comps
 
 MIN_N = 3
 # Sold/MSRP ratios outside this band are data errors (a wrong MSRP, a lot
@@ -62,7 +62,7 @@ def type_bucket(item_type) -> str:
 
 
 def msrp_of(ident: dict) -> float | None:
-    m = v1._to_float((ident or {}).get("retail_price"))
+    m = comps.to_float((ident or {}).get("retail_price"))
     return m if m and m > 0 else None
 
 
@@ -73,8 +73,8 @@ def msrp_flags(ident: dict, receipt: dict | None = None) -> list[str]:
         return ["missing"]
     flags = []
     receipt = receipt or {}
-    orig = v1._to_float(receipt.get("original_price"))
-    cost = v1._to_float(receipt.get("reduced_price"))
+    orig = comps.to_float(receipt.get("original_price"))
+    cost = comps.to_float(receipt.get("reduced_price"))
     if orig and abs(m - orig) <= 0.02 * orig:
         flags.append("equals_ross_tag_price")
     if cost and m < 1.2 * cost:
@@ -113,8 +113,8 @@ def load_history() -> list[dict]:
 def _stats(ratios: list[float]) -> dict:
     s = sorted(ratios)
     return {"n": len(s), "ratio": round(statistics.median(s), 3) if s else None,
-            "q1": round(v1._quantile(s, 0.25), 3) if s else None,
-            "q3": round(v1._quantile(s, 0.75), 3) if s else None}
+            "q1": round(comps.quantile(s, 0.25), 3) if s else None,
+            "q3": round(comps.quantile(s, 0.75), 3) if s else None}
 
 
 def ratio_for(brand, item_type, history, exclude_item_id=None) -> dict:

@@ -37,35 +37,18 @@ def stored_path(p) -> str:
         return str(p)
 
 
-COMPS_COUNT = 10
-ACTIVE_COUNT = 5
-UNDERCUT_PCT = 0.15
-
-# --- Comp evidence quality (pipeline/price.py) ---
-# How many raw sold rows to pull per search before filtering and outlier-trimming.
-# Deliberately larger than COMPS_COUNT (which caps what's KEPT): the trim throws
-# away a chunk of every fetch, and a wide fetch that survives trimming beats a
-# narrow one that leaves nothing to reason about.
-COMPS_FETCH_COUNT = int(os.getenv("COMPS_FETCH_COUNT", "25"))
-ACTIVE_FETCH_COUNT = int(os.getenv("ACTIVE_FETCH_COUNT", "15"))
-# An item's comps are "solid" evidence at or above this many trimmed comps AND at
-# or below this price dispersion (p90/p10). Dispersion is the check that matters:
-# a median over comps spanning 9x isn't a price, it's a coin flip — those comps
-# are different products that happen to share search words.
+# --- Comp evidence quality (pipeline/pricing_v2.py's comp-formula cross-check) ---
+# The same-item sold comps are "solid" evidence at or above this many, "thin"
+# (usable, but shown for a human OK) at or above the thin count.
 PRICE_SOLID_MIN_COMPS = int(os.getenv("PRICE_SOLID_MIN_COMPS", "5"))
-PRICE_SOLID_MAX_DISPERSION = float(os.getenv("PRICE_SOLID_MAX_DISPERSION", "2.5"))
-# "Thin" evidence: usable, but shown for a human OK rather than trusted silently.
 PRICE_THIN_MIN_COMPS = int(os.getenv("PRICE_THIN_MIN_COMPS", "3"))
+# Past this price dispersion (p90/p10) the comps disagree too much for the
+# formula price to count: a median over comps spanning 9x isn't a price.
 PRICE_THIN_MAX_DISPERSION = float(os.getenv("PRICE_THIN_MAX_DISPERSION", "4.0"))
 # Below this fraction of the sold median, the cheapest active listing is treated
 # as a different product rather than a competitor, and does NOT cap our price.
 # Without this an unrelated cheap listing drags a good comp-backed price down.
 ACTIVE_FLOOR_MIN_RATIO = float(os.getenv("ACTIVE_FLOOR_MIN_RATIO", "0.5"))
-# If the comp price and the research estimate disagree by more than this ratio,
-# the item is flagged for a human look. The comps still set the price — research
-# is a sanity check here, never a price source (an LLM resale guess priced 60% of
-# past inventory and was overridden most of the time).
-RESEARCH_SANITY_RATIO = float(os.getenv("RESEARCH_SANITY_RATIO", "2.0"))
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -74,14 +57,6 @@ def _env_bool(name: str, default: bool) -> bool:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
-
-# When true, pricing pulls only 3 sold + 3 active comps to save time/cost — fine
-# for local testing, WRONG for production: it can't clear the >=3 sold-comp bar
-# that pricing needs to trust comps, so items silently fall back to the research
-# estimate. Defaults to False (full comps); set DEBUG_MODE=true in .env to speed
-# up local runs. This was hardcoded True and is the reason real pricing has been
-# running on debug-sized samples.
-DEBUG_MODE = _env_bool("DEBUG_MODE", False)
 
 # --- Auto-confirm (telegram_bot.py's advance()) ---
 # When on, the pipeline clears its own identify/price gates for items where the
@@ -457,14 +432,12 @@ GEMINI_PRICES = [
 ]
 
 # --- Pricing engine v2 (pipeline/pricing_v2.py, docs/pricing-design.md) ---------
-# "v2" (the default since 17 Oct 2026) pools sold + active comps, has Claude
-# judge which are the same item and set the price, with the comp formula and the
-# store's MSRP range as cross-checks computed after Claude answers. Confirmed
-# from cache on 33 items: 18/32 outcome hits and a median 1.00x the sold price,
-# against v1's 11/32 and 0.74x. "v1" is the old comps ladder in
-# pipeline/price.py; PRICING_ENGINE=v1 in .env goes back. The weekly repricer
-# follows this setting too (since 29 Oct 2026; it used to always use v1).
-PRICING_ENGINE = os.getenv("PRICING_ENGINE", "v2").strip().lower()
+# The only engine: pools sold + active comps, has Claude judge which are the
+# same item and set the price, with the comp formula and the store's MSRP range
+# as cross-checks computed after Claude answers. Confirmed from cache on 33
+# items: 18/32 outcome hits and a median 1.00x the sold price, against the old
+# v1 ladder's 11/32 and 0.74x. v1 and its PRICING_ENGINE switch were removed on
+# 1 Nov 2026; bot/app.py warns at startup if .env still sets PRICING_ENGINE.
 PRICING_JUDGE_MODEL = os.getenv("PRICING_JUDGE_MODEL", "claude-sonnet-5-5")
 # Low, not medium: the judge's job is sorting 30-60 titles+thumbnails into four
 # buckets and naming a price, which is perception more than reasoning; low keeps

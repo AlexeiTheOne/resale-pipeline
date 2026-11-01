@@ -1,15 +1,14 @@
-"""APIFY_TOKEN_BACKUP failover in pipeline/price.py's _call.
+"""APIFY_TOKEN_BACKUP failover in pipeline/comps.py's call.
 
 The primary Apify token started returning 403 in production. The fix: on a
 401/403, retry with APIFY_TOKEN_BACKUP, stick to it for the rest of the
-process once it's proven necessary (the query ladder can make a dozen calls
-in one pricing run), and if the backup is rejected too, fail with one clear
+process once it's proven necessary (a pricing run makes several calls), and if the backup is rejected too, fail with one clear
 message instead of the raw httpx error. The one constraint that matters more
 than the feature working at all: neither token value may ever show up in a
 print, a log line, or anything that reaches a raised exception's text — three
 separate paths format str(e) straight into a Telegram message.
 
-No real Apify calls are made. pipeline.price._post — the seam between _call's
+No real Apify calls are made. pipeline.comps._post — the seam between _call's
 retry/failover logic and the actual network request — is monkeypatched, the
 same way tests/test_images.py stubs ebay.inventory._request. Fake responses
 are built with real httpx.Response/httpx.Request objects (constructing those
@@ -26,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import httpx
 
-import pipeline.price as price
+import pipeline.comps as comps
 
 PRIMARY = "primary-tok-AAAAAAAAAAAAAAAAAAAAAAAA"
 BACKUP = "backup-tok-BBBBBBBBBBBBBBBBBBBBBBBBBB"
@@ -37,20 +36,20 @@ def _reset(primary=PRIMARY, backup=None):
     """Every test starts from a clean slate: _use_backup_token is a sticky
     module global by design (that's the point of it), so left alone it would
     leak state between tests and make results depend on execution order."""
-    price.APIFY_TOKEN = primary
-    price.APIFY_TOKEN_BACKUP = backup
-    price._use_backup_token = False
-    price.time.sleep = lambda _seconds: None  # keep retry backoff out of test time
-    price._credit_checked_at = 0.0
-    price._fetch_remaining = lambda _tok: None  # no balance lookups: stays offline
+    comps.APIFY_TOKEN = primary
+    comps.APIFY_TOKEN_BACKUP = backup
+    comps._use_backup_token = False
+    comps.time.sleep = lambda _seconds: None  # keep retry backoff out of test time
+    comps._credit_checked_at = 0.0
+    comps._fetch_remaining = lambda _tok: None  # no balance lookups: stays offline
 
 
 def _fake_post(status_by_token, ok_payload=None):
-    """Stub for price._post(url, payload, token). Returns a REAL httpx.Response
+    """Stub for comps._post(url, payload, token). Returns a REAL httpx.Response
     built from the token's scripted status, and records every token used.
 
     The fake httpx.Request carries the real Authorization header production
-    would send (see price._post), not a bare URL — so the leak-text assertions
+    would send (see comps._post), not a bare URL — so the leak-text assertions
     prove httpx's own exception formatting omits headers, rather than merely
     proving the stub never had the token to begin with."""
     calls = []
@@ -71,22 +70,22 @@ def test_primary_403_falls_back_to_backup_and_succeeds():
     fake, calls = _fake_post(
         lambda tok: 200 if tok == BACKUP else 403,
         ok_payload=[{"price": "19.99"}])
-    price._post = fake
+    comps._post = fake
 
-    result = price._call(URL, {"keyword": "x", "count": 3})
+    result = comps.call(URL, {"keyword": "x", "count": 3})
 
     assert result == [{"price": "19.99"}]
     assert calls == [PRIMARY, BACKUP], "should try primary once, then fall back"
-    assert price._use_backup_token is True, "the switch must stick for later calls"
+    assert comps._use_backup_token is True, "the switch must stick for later calls"
 
 
 def test_backup_also_rejected_raises_one_clear_combined_error():
     _reset(backup=BACKUP)
     fake, calls = _fake_post(lambda tok: 403)
-    price._post = fake
+    comps._post = fake
 
     try:
-        price._call(URL, {"keyword": "x", "count": 3})
+        comps.call(URL, {"keyword": "x", "count": 3})
         raise AssertionError("expected a RuntimeError")
     except RuntimeError as e:
         msg = str(e)
@@ -101,14 +100,14 @@ def test_sticky_flag_skips_the_dead_primary_on_the_next_call():
     should never spend a round trip on it again — it should go straight to
     the backup."""
     _reset(backup=BACKUP)
-    price._use_backup_token = True  # simulate an earlier call having switched
+    comps._use_backup_token = True  # simulate an earlier call having switched
 
     fake, calls = _fake_post(
         lambda tok: 200 if tok == BACKUP else 403,
         ok_payload=[{"price": "5.00"}])
-    price._post = fake
+    comps._post = fake
 
-    result = price._call(URL, {"keyword": "x", "count": 3})
+    result = comps.call(URL, {"keyword": "x", "count": 3})
 
     assert result == [{"price": "5.00"}]
     assert calls == [BACKUP], "must not touch the primary once already switched"
@@ -120,10 +119,10 @@ def test_no_backup_configured_behaves_exactly_as_before():
     from before this feature existed."""
     _reset(backup=None)
     fake, calls = _fake_post(lambda tok: 403)
-    price._post = fake
+    comps._post = fake
 
     try:
-        price._call(URL, {"keyword": "x", "count": 3}, attempts=3)
+        comps.call(URL, {"keyword": "x", "count": 3}, attempts=3)
         raise AssertionError("expected an httpx.HTTPStatusError")
     except RuntimeError:
         raise AssertionError("must not take the failover path with no backup configured")
@@ -138,9 +137,9 @@ def test_no_token_ever_appears_in_the_raised_error_text():
     that matters more than the feature working."""
     _reset(backup=BACKUP)
     fake, _ = _fake_post(lambda tok: 403)
-    price._post = fake
+    comps._post = fake
     try:
-        price._call(URL, {"keyword": "x", "count": 3})
+        comps.call(URL, {"keyword": "x", "count": 3})
     except Exception as e:
         assert PRIMARY not in str(e), "primary token leaked into an exception"
         assert BACKUP not in str(e), "backup token leaked into an exception"
@@ -149,9 +148,9 @@ def test_no_token_ever_appears_in_the_raised_error_text():
 
     _reset(backup=None)
     fake, _ = _fake_post(lambda tok: 403)
-    price._post = fake
+    comps._post = fake
     try:
-        price._call(URL, {"keyword": "x", "count": 3}, attempts=1)
+        comps.call(URL, {"keyword": "x", "count": 3}, attempts=1)
     except Exception as e:
         assert PRIMARY not in str(e), "primary token leaked into an exception"
     else:
@@ -168,11 +167,11 @@ def test_failover_notice_is_printed_without_the_token():
     fake, _ = _fake_post(
         lambda tok: 200 if tok == BACKUP else 403,
         ok_payload=[{"price": "1.00"}])
-    price._post = fake
+    comps._post = fake
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        price._call(URL, {"keyword": "x", "count": 3})
+        comps.call(URL, {"keyword": "x", "count": 3})
     printed = buf.getvalue()
 
     assert printed.strip(), "failover should print something visible"
@@ -186,44 +185,44 @@ def test_primary_402_out_of_credit_falls_back_to_backup():
     fake, calls = _fake_post(
         lambda tok: 200 if tok == BACKUP else 402,
         ok_payload=[{"price": "9.99"}])
-    price._post = fake
+    comps._post = fake
 
-    assert price._call(URL, {"keyword": "x", "count": 3}) == [{"price": "9.99"}]
+    assert comps.call(URL, {"keyword": "x", "count": 3}) == [{"price": "9.99"}]
     assert calls == [PRIMARY, BACKUP]
-    assert price._use_backup_token is True
+    assert comps._use_backup_token is True
 
 
 def test_low_primary_balance_switches_before_the_402():
     _reset(backup=BACKUP)
-    price._fetch_remaining = lambda tok: 0.10 if tok == PRIMARY else 4.90
+    comps._fetch_remaining = lambda tok: 0.10 if tok == PRIMARY else 4.90
     fake, calls = _fake_post(lambda tok: 200, ok_payload=[])
-    price._post = fake
+    comps._post = fake
 
-    price._call(URL, {"keyword": "x", "count": 3})
+    comps.call(URL, {"keyword": "x", "count": 3})
 
     assert calls == [BACKUP], "primary under the floor: go straight to the backup"
 
 
 def test_switches_back_to_primary_after_monthly_reset():
     _reset(backup=BACKUP)
-    price._use_backup_token = True
-    price._fetch_remaining = lambda tok: 5.00
+    comps._use_backup_token = True
+    comps._fetch_remaining = lambda tok: 5.00
     fake, calls = _fake_post(lambda tok: 200, ok_payload=[])
-    price._post = fake
+    comps._post = fake
 
-    price._call(URL, {"keyword": "x", "count": 3})
+    comps.call(URL, {"keyword": "x", "count": 3})
 
     assert calls == [PRIMARY]
-    assert price._use_backup_token is False
+    assert comps._use_backup_token is False
 
 
 def test_unreadable_balance_keeps_current_choice():
     _reset(backup=BACKUP)
-    price._use_backup_token = True
+    comps._use_backup_token = True
     fake, calls = _fake_post(lambda tok: 200, ok_payload=[])
-    price._post = fake
+    comps._post = fake
 
-    price._call(URL, {"keyword": "x", "count": 3})
+    comps.call(URL, {"keyword": "x", "count": 3})
 
     assert calls == [BACKUP]
 
@@ -231,12 +230,12 @@ def test_unreadable_balance_keeps_current_choice():
 def test_balance_checked_at_most_once_per_window():
     _reset(backup=BACKUP)
     looked_up = []
-    price._fetch_remaining = lambda tok: looked_up.append(tok) or 5.00
+    comps._fetch_remaining = lambda tok: looked_up.append(tok) or 5.00
     fake, _ = _fake_post(lambda tok: 200, ok_payload=[])
-    price._post = fake
+    comps._post = fake
 
-    price._call(URL, {"keyword": "x", "count": 3})
-    price._call(URL, {"keyword": "y", "count": 3})
+    comps.call(URL, {"keyword": "x", "count": 3})
+    comps.call(URL, {"keyword": "y", "count": 3})
 
     assert looked_up == [PRIMARY], "second call inside the window must not re-check"
 

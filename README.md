@@ -83,31 +83,14 @@ photos -> identify -> [confirm?] -> price -> [confirm?] -> draft -> [approve] ->
    and waits: reply `confirm` to price it, or type a correction (e.g. "brand is
    Tommy Jeans, color navy") that the model applies before re-showing it.
 
-3. **Price** (`pipeline/price.py`). Two eBay scrapers run in parallel via Apify:
-   sold listings and active listings. **A price is only ever derived from real
-   comps** — when the comps aren't good enough, the bot returns *no price* and
-   asks you for one, rather than emitting a number it can't stand behind.
-
-   - **Query ladder.** The identify step's `search_query` is tried first. If it
-     doesn't yield usable comps, the search broadens — `brand + product_name`,
-     then `brand + item_type` — stopping at the first rung that works. Rungs only
-     run on a miss, so a well-identified item still costs a single pass.
-   - **Trim, then judge.** Comps are filtered to ones that actually name the
-     brand, used items are dropped, and the rest are outlier-trimmed to the
-     interquartile range. The surviving set is graded on **count and
-     dispersion** (p90/p10): 10 comps spanning 9× are worse evidence than 4 that
-     agree, so both bars must clear.
-     - `solid` — 5+ comps, ≤2.5× spread
-     - `thin` — 3+ comps, ≤4× spread (shown for a human look)
-     - `none` — no price is derived; you're asked for one
-   - **Price floors.** The median is undercut and capped by the cheapest active
-     competitor, but never below `sold_p10` — the 10th percentile of *proven*
-     sales. Undercutting past what people demonstrably paid isn't competing,
-     it's donating margin. An active listing far below the sold median is
-     treated as a different product and ignored entirely.
-   - **Research is a sanity check, not a price.** The resale estimate from
-     identification is *never* used as the price. If it disagrees with the comps
-     by more than ~2×, that's flagged for you to look at.
+3. **Price** (`pipeline/pricing_v2.py`, design in `docs/pricing-design.md`).
+   Sold comps (Apify, `pipeline/comps.py`) and active listings (eBay Browse,
+   including a search by the item's photo) are pooled. Claude sorts them into
+   same item / variant / wrong / bundle and sets the price. Two cross-checks run
+   after Claude answers: a formula over the same-item sold comps, and the
+   store's MSRP range (`pipeline/msrp.py`). A big gap is flagged for you.
+   Comps are graded `solid` / `thin` / `none` on how many same-item sales there
+   are and how much they disagree (p90/p10).
 
    The eBay URL of the best-match comp is saved on the item
    (`price_source_url`), and the machine's own suggestion is recorded
@@ -270,7 +253,8 @@ Un-aimed messages behave exactly as they do for a single item.
 | ---- | -------------- |
 | `telegram_bot.py` | Bot entry point, commands, and the pipeline orchestration |
 | `identify.py` | Step 2: two-stage Gemini product identification |
-| `pipeline/price.py` | Step 3: eBay comps (Apify) and pricing logic |
+| `pipeline/pricing_v2.py` | Step 3: pricing (pooled comps, Claude judge, cross-checks) |
+| `pipeline/comps.py` | Apify sold-comps client and the stats helpers pricing shares |
 | `pipeline/draft.py` | Step 4: listing copy generation |
 | `ross_tag.py` | Decode the Ross tag (last photo): barcode → paid price + 12-digit code, OCR → original price |
 | `ebay/auth.py` | eBay OAuth: user token (seller) and app token (catalog) |
@@ -407,16 +391,10 @@ Defaults are in `config.py`; the marked ones can be overridden in `.env`:
 - `GEMINI_MODEL` / `GEMINI_FAST_MODEL` — research vs. format/draft models
 - `GEMINI_PHOTO_LIMIT` — how many photos are sent to the paid API per item
 - `MAX_CONCURRENT_LISTINGS` — how many items may run the pipeline at once
-- `COMPS_COUNT` / `ACTIVE_COUNT` — how many comps to *keep* after trimming
-- `COMPS_FETCH_COUNT` / `ACTIVE_FETCH_COUNT` — how many raw rows to *pull* per
-  search (wider than the keep count, because outlier-trimming discards some)
-- `UNDERCUT_PCT` — how far below the comp median to price
-- `PRICE_SOLID_MIN_COMPS` / `PRICE_SOLID_MAX_DISPERSION` and
-  `PRICE_THIN_MIN_COMPS` / `PRICE_THIN_MAX_DISPERSION` — the bars a comp set must
-  clear to count as solid or thin evidence (see step 3)
+- `PRICE_SOLID_MIN_COMPS`, `PRICE_THIN_MIN_COMPS` and `PRICE_THIN_MAX_DISPERSION`
+  — the bars the same-item comps must clear to count as solid or thin evidence
 - `ACTIVE_FLOOR_MIN_RATIO` — how far below the sold median an active listing may
   be before it's treated as a different product and ignored
-- `RESEARCH_SANITY_RATIO` — comp-vs-research disagreement that triggers a flag
 - `AUTO_CONFIRM` — let strong-evidence items clear their own identify/price gates
   (default on; the eBay review gate is never skipped), plus
   `AUTO_CONFIRM_MIN_IDENT_CONFIDENCE` and
@@ -442,10 +420,6 @@ Defaults are in `config.py`; the marked ones can be overridden in `.env`:
   when no receipt was captured, as a share of the list price. Costing those at
   zero reported their whole sale price as profit; a share of list scales with
   the item, unlike a flat guess. Always shown as an estimate.
-- `DEBUG_MODE` — pulls only 3 sold / 3 active comps to save time and cost when
-  set. **Defaults to `false`.** Leave it off in production: 3 comps can't clear
-  the `solid` bar, so every item lands on `thin` at best and stops to ask you.
-  Set `DEBUG_MODE=true` only for local testing.
 - `TELEGRAM_ALLOWED_USER_IDS` — comma-separated Telegram user ids allowed to use
   the bot. **Unset means the bot is open to anyone** (a loud warning prints on
   startup). Send `/whoami` to the bot to get your id, then set this and restart.
@@ -523,13 +497,12 @@ without syncing anything. Use `job_runs`, or the newest `sold_at` across `items`
   none have a parseable price (a sign the third-party actor changed its output
   schema), the suggested price shows a ⚠️ warning. It also explains itself when a
   price was held up off the active floor, or when comps and research disagree.
-- Neither scraper is sent a condition filter. eBay's maps to "New" (condition
+- The sold scraper is sent no condition filter. eBay's maps to "New" (condition
   1000) only, which throws away new-without-tags and open-box comps — most of the
   pool for apparel. Used rows are dropped locally instead, on the row's own
   condition text, which keeps the pool wide and the filtering visible.
-- `_call` retries transient Apify failures (connection resets, 5xx, 429). The
-  query ladder makes up to one scrape per rung, so an un-retried blip would cost
-  an item its comps.
+- `comps.call` retries transient Apify failures (connection resets, 5xx, 429),
+  so an un-retried blip doesn't cost an item its comps.
 
 ## Listings the bot didn't create
 

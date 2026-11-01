@@ -51,6 +51,17 @@ def test_configure_parses_allowlist_and_guard_uses_it(startup_env):
         assert sent_texts(ctx) == []
 
 
+def test_configure_warns_about_leftover_pricing_engine(startup_env, capsys):
+    """v1 pricing is gone; a leftover PRICING_ENGINE=v1 must not pass silently."""
+    startup_env.setenv("TELEGRAM_ALLOWED_USER_IDS", "111")
+    startup_env.setenv("PRICING_ENGINE", "v1")
+    bot_app.configure()
+    assert "PRICING_ENGINE=v1 in .env is ignored" in capsys.readouterr().out
+    startup_env.setenv("PRICING_ENGINE", "v2")
+    bot_app.configure()
+    assert "PRICING_ENGINE" not in capsys.readouterr().out
+
+
 def test_configure_unset_leaves_bot_open_with_warning(startup_env, capsys):
     startup_env.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
     bot_app.configure()

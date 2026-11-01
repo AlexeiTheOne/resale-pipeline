@@ -10,8 +10,8 @@ stage_draft, split_receipt; plus the gates and _show_review) really runs:
     ross_tag.decode_barcode, detect_ross_tags, extract_receipt
                                          -> patched on its module
     pipeline.draft.generate_draft        -> patched on its module
-    pipeline.pricing_v2.get_pricing_v2   -> patched on its module (imported
-                                            inside stage_price at call time)
+    pipeline.pricing_v2.get_pricing_v2   -> patched on its module (price_item
+                                            calls it through the module)
     pipeline.listing_check.check_listing -> patched on its module
     pipeline.stock_lookup.lookup         -> patched on its module (find mode)
 
@@ -105,8 +105,6 @@ class Pipeline:
         monkeypatch.setattr(config, "AUTO_CONFIRM", True)
         monkeypatch.setattr(config, "AUTO_CONFIRM_MIN_IDENT_CONFIDENCE", 0.8)
         monkeypatch.setattr(config, "AUTO_CONFIRM_MIN_IDENT_CONFIDENCE_WITH_UPC", 0.6)
-        # Read by pipeline/stages.py through `config.`, so patched there.
-        monkeypatch.setattr(config, "PRICING_ENGINE", "v2")
         monkeypatch.setattr(config, "LISTING_CHECK_ENABLED", True)
         monkeypatch.setattr(config, "EBAY_DEFAULT_AD_RATE_PCT", 0)
         monkeypatch.setattr(ross_tag, "decode_barcode", lambda path: None)

@@ -316,8 +316,8 @@ def test_zero_claude_price_is_asked_once_more():
 
 def test_apify_cap_reserves_worst_case_across_parallel_queries():
     import threading
-    from pipeline import price as v1
-    saved = (config.PRICING_V2_CACHE_DIR, v2.apify_cap_usd, dict(v2.apify_spend), v1._call)
+    from pipeline import comps
+    saved = (config.PRICING_V2_CACHE_DIR, v2.apify_cap_usd, dict(v2.apify_spend), comps.call)
     gate = threading.Barrier(3, timeout=5)
     try:
         config.PRICING_V2_CACHE_DIR = tempfile.mkdtemp()
@@ -329,7 +329,7 @@ def test_apify_cap_reserves_worst_case_across_parallel_queries():
             started.append(payload["keyword"])
             return [{}] * 15
 
-        v1._call = fake_call
+        comps.call = fake_call
         results = []
 
         def run(q):
@@ -348,7 +348,7 @@ def test_apify_cap_reserves_worst_case_across_parallel_queries():
         assert sorted(results) == ["capped", "ok", "ok"] and len(started) == 2
         assert v2.apify_spend["usd"] <= 0.13
     finally:
-        (config.PRICING_V2_CACHE_DIR, v2.apify_cap_usd, spend, v1._call) = saved
+        (config.PRICING_V2_CACHE_DIR, v2.apify_cap_usd, spend, comps.call) = saved
         v2.apify_spend.clear()
         v2.apify_spend.update(spend)
 

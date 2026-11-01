@@ -15,7 +15,7 @@ import ross_tag
 from config import GEMINI_PHOTO_LIMIT
 # `as draft_mod`: stage_draft has a local named `draft`.
 from pipeline import draft as draft_mod
-from pipeline import listing_check, price
+from pipeline import listing_check, pricing_v2
 from pipeline.gtin import product_gtin
 
 
@@ -220,7 +220,8 @@ def duplicate_warnings(item_id: str) -> list[str]:
 
 
 def stage_price(item_id, notify=lambda _t: None) -> dict:
-    ident = db.get_item(item_id)["identification"]
+    item = db.get_item(item_id)
+    ident = item["identification"]
     notify("💰 Pricing...")
     t = time.perf_counter()
     # Price notes run alongside pricing (both mostly wait on the network).
@@ -231,15 +232,7 @@ def stage_price(item_id, notify=lambda _t: None) -> dict:
         pool = ThreadPoolExecutor(1)
         notes_job = pool.submit(value_notes.find_notes, ident, item_id)
         pool.shutdown(wait=False)
-    if config.PRICING_ENGINE == "v2":
-        # The default since 17 Oct 2026 (config.PRICING_ENGINE); same return
-        # shape as v1, which stays selectable with config.PRICING_ENGINE=v1.
-        from pipeline.pricing_v2 import get_pricing_v2
-        item = db.get_item(item_id)
-        pricing = get_pricing_v2(ident, photo_paths=item.get("photos") or [],
-                                 receipt=item.get("receipt"), item_id=item_id)
-    else:
-        pricing = price.get_pricing(ident["search_query"], research=ident)
+    pricing = pricing_v2.price_item(item)
     print(f"✓ Priced in {time.perf_counter() - t:.0f}s:", pricing.get("suggested_price"),
           f"({pricing.get('confidence')})")
     if notes_job is not None:

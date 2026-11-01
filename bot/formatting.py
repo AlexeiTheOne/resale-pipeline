@@ -44,7 +44,7 @@ def format_identification(ident: dict) -> str:
     return "\n".join(lines)
 
 
-# How much the comps behind a price can be trusted (pipeline/price.py's tiers).
+# How much the comps behind a price can be trusted (pipeline/pricing_v2.py's tiers).
 _EVIDENCE_LABEL = {
     "solid": "✅ solid comps",
     "thin": "🟡 thin comps — worth a look",

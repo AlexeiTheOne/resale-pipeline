@@ -3,7 +3,7 @@
 1. Impressions are eBay's TOTAL_IMPRESSION_TOTAL (promoted included), not the
    organic-only LISTING_IMPRESSION_TOTAL that made 53 of 115 listings look
    INVISIBLE while each was shown ~500 times a week.
-2. A suggested cut re-prices through config.PRICING_ENGINE (v2), never lands
+2. A suggested cut re-prices through pricing_v2.price_item, never lands
    under the sold-comp median or the cost floor, never cuts more than 12%, and
    the expensive call only happens for a listing that would actually get a cut.
 3. Watched listings get a private offer plan, sent on ONE digest tap.
@@ -177,58 +177,56 @@ def _v2(price, sold_median_total, flags=()):
 
 
 class _Engine:
-    """Stands in for get_pricing_v2 / get_pricing and counts the calls."""
+    """Stands in for get_pricing_v2 and counts the calls."""
     def __init__(self, answer):
-        self.answer, self.calls = answer, 0
+        self.answer, self.calls, self.kwargs = answer, 0, None
 
     def __call__(self, *a, **k):
         self.calls += 1
+        self.kwargs = k
         return self.answer
 
 
-def _suggest(item, verdict, answer, engine="v2", watchers=0, budget=None, weeks=OLD):
+def _suggest(item, verdict, answer, watchers=0, budget=None, weeks=OLD):
     import pipeline.pricing_v2 as v2
-    fake_v2, fake_v1 = _Engine(answer), _Engine(answer)
-    with _Patch(config, PRICING_ENGINE=engine), _Patch(v2, get_pricing_v2=fake_v2), \
-            _Patch(rp, get_pricing=fake_v1):
+    fake = _Engine(answer)
+    with _Patch(v2, get_pricing_v2=fake):
         out = rp._suggest_price(item, verdict, item["listing"]["price"], weeks,
                                 watchers=watchers, budget=budget)
-    return out, fake_v2.calls, fake_v1.calls
+    return out, fake.calls
 
 
-def test_overpriced_uses_v2_not_v1():
-    (price, note), v2_calls, v1_calls = _suggest(_priced_item(), "OVERPRICED",
-                                                 _v2(54.99, 50.0 + config.EBAY_SHIP_CHARGED))
-    assert (v2_calls, v1_calls) == (1, 0)
-    assert price == 54.99 and note is None
-
-
-def test_engine_setting_v1_still_honoured():
-    v1_answer = {"suggested_price": 54.99, "sold_median": 50.0, "review_flags": []}
-    (price, _), v2_calls, v1_calls = _suggest(_priced_item(), "OVERPRICED", v1_answer,
-                                              engine="v1")
-    assert (v2_calls, v1_calls) == (0, 1) and price == 54.99
+def test_overpriced_reprices_through_price_item():
+    import pipeline.pricing_v2 as v2
+    item = _priced_item()
+    fake = _Engine(_v2(54.99, 50.0 + config.EBAY_SHIP_CHARGED))
+    with _Patch(v2, get_pricing_v2=fake):
+        price, note = rp._suggest_price(item, "OVERPRICED", item["listing"]["price"], OLD)
+    assert fake.calls == 1 and price == 54.99 and note is None
+    # Called the way the intake price stage calls it.
+    assert fake.kwargs["receipt"] == item.get("receipt")
+    assert fake.kwargs["item_id"] == item.get("item_id")
 
 
 def test_never_below_the_sold_median():
     """v2 wants $39.99 but same-item sales median $55 (item basis): hold at $55."""
-    (price, _), _, _ = _suggest(_priced_item(), "OVERPRICED",
+    (price, _), _ = _suggest(_priced_item(), "OVERPRICED",
                                 _v2(39.99, 55.0 + config.EBAY_SHIP_CHARGED))
     assert price == 55.0
 
 
 def test_no_cut_when_comps_sit_above_the_price():
-    (price, note), _, _ = _suggest(_priced_item(), "OVERPRICED",
+    (price, note), _ = _suggest(_priced_item(), "OVERPRICED",
                                    _v2(39.99, 70.0 + config.EBAY_SHIP_CHARGED))
     assert price is None and "sold comps" in note
 
 
 def test_one_cut_is_capped_at_12_percent():
-    (price, _), _, _ = _suggest(_priced_item(price=100.0), "OVERPRICED",
+    (price, _), _ = _suggest(_priced_item(price=100.0), "OVERPRICED",
                                 _v2(49.99, 20.0 + config.EBAY_SHIP_CHARGED))
     assert price is not None and price >= 88.0 and price < 100.0
     # STALE's old 15% step is capped too.
-    (stale, _), _, _ = _suggest(_priced_item(price=100.0), "STALE",
+    (stale, _), _ = _suggest(_priced_item(price=100.0), "STALE",
                                 _v2(99.99, 20.0 + config.EBAY_SHIP_CHARGED),
                                 weeks=config.REPRICE_STALE_WEEKS * 3)
     assert stale is not None and stale >= 88.0
@@ -237,13 +235,13 @@ def test_one_cut_is_capped_at_12_percent():
 def test_cost_floor_still_holds():
     # Cost $40 -> floor (with the $5 margin) ~ $63.7; sold median is lower.
     item = _priced_item(cost=40.0, price=69.99)
-    (price, _), _, _ = _suggest(item, "OVERPRICED", _v2(49.99, 40.0 + config.EBAY_SHIP_CHARGED))
+    (price, _), _ = _suggest(item, "OVERPRICED", _v2(49.99, 40.0 + config.EBAY_SHIP_CHARGED))
     assert price is not None and price >= rp._cost_floor(item)
 
 
 def test_review_flags_mean_no_suggestion():
     for flags in (["few_sales"], ["priced_from_asks"], ["judge_low_confidence"]):
-        (price, note), _, _ = _suggest(_priced_item(), "OVERPRICED",
+        (price, note), _ = _suggest(_priced_item(), "OVERPRICED",
                                        _v2(49.99, 60.0 + config.EBAY_SHIP_CHARGED, flags))
         assert price is None and flags[0] in note
 
@@ -251,16 +249,16 @@ def test_review_flags_mean_no_suggestion():
 def test_no_engine_call_for_visibility_verdicts_or_watched_listings():
     answer = _v2(49.99, 60.0)
     for verdict in ("INVISIBLE", "LOW_CTR", "STALE_UNSEEN", "SEND_OFFERS", "HEALTHY"):
-        (price, _), v2_calls, _ = _suggest(_priced_item(), verdict, answer)
+        (price, _), v2_calls = _suggest(_priced_item(), verdict, answer)
         assert price is None and v2_calls == 0
-    (price, note), v2_calls, _ = _suggest(_priced_item(), "STALE", answer, watchers=2)
+    (price, note), v2_calls = _suggest(_priced_item(), "STALE", answer, watchers=2)
     assert price is None and v2_calls == 0 and "offer" in note
 
 
 def test_no_engine_call_without_a_cost_floor():
     item = _priced_item()
     item["receipt"] = None
-    (price, note), v2_calls, _ = _suggest(item, "OVERPRICED", _v2(49.99, 60.0))
+    (price, note), v2_calls = _suggest(item, "OVERPRICED", _v2(49.99, 60.0))
     assert price is None and v2_calls == 0 and "Ross cost" in note
 
 
@@ -268,7 +266,7 @@ def test_pricing_calls_are_capped_per_run():
     budget = rp.PricingBudget(2)
     calls = 0
     for _ in range(4):
-        (_, note), v2_calls, _ = _suggest(_priced_item(), "OVERPRICED",
+        (_, note), v2_calls = _suggest(_priced_item(), "OVERPRICED",
                                           _v2(54.99, 50.0 + config.EBAY_SHIP_CHARGED),
                                           budget=budget)
         calls += v2_calls
@@ -280,7 +278,7 @@ def test_engine_failure_is_a_note_not_a_crash():
 
     def boom(*a, **k):
         raise TimeoutError("apify")
-    with _Patch(config, PRICING_ENGINE="v2"), _Patch(v2, get_pricing_v2=boom):
+    with _Patch(v2, get_pricing_v2=boom):
         price, note = rp._suggest_price(_priced_item(), "OVERPRICED", 59.99, OLD, watchers=0)
     assert price is None and "failed" in note
 

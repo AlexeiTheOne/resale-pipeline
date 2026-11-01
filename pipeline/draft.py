@@ -462,7 +462,7 @@ def generate_draft(identification: dict, pricing: dict, examples: list | None = 
                             + store_boilerplate(draft.get("condition_id")))
     draft["stock_image_url"] = stock_url
 
-    # The price is decided by pipeline/price.py (or by you at the gate), never by
+    # The price is decided by pipeline/pricing_v2.py (or by you at the gate), never by
     # the copywriter. The prompt asks it to echo suggested_price exactly and it
     # mostly does — but on 6 of 64 real listings it wrote its own number instead,
     # from -22% to +71% off, and that number is what went live. An LLM's aside is
