@@ -997,13 +997,13 @@ answers were relayed by Person B; **Person A to confirm** (marked ⧗).
 | Q5 | Decimal-loss fixes | Auto-fix only when the raw text or the subtotal agrees; the rest by hand | Person B |
 | Q6 | Unique ReceiptNumber | Yes; the receipt bot catches the duplicate error and replies "already saved" | Person B |
 | Q7 | Read-only access | Mixed-mode auth plus a read-only SQL login (`resale_reader`) | Person B |
-| Q8 | Deleting a sold item | Blocked | Person A ⧗ |
-| Q9 | Case-insensitive collation | OK | Person A ⧗ |
-| Q10 | `condition` spelling | Normalise | Person A ⧗ |
-| Q11 | Pricing history | Keep every run (change 6) | Person A ⧗ |
-| Q12 | Tests on Person A's machine | Person A installs SQL Server Express | Person A ⧗ |
-| Q13 | SQL outside `db.py` | Move it into `db.py` in this branch | Person A ⧗ |
-| Q14 | Targeted writers (phase 2) | After cutover | Person A ⧗ |
+| Q8 | Deleting a sold item | Blocked | Person A ✓ (2026-11-02) |
+| Q9 | Case-insensitive collation | OK | Person A ✓ (2026-11-02) |
+| Q10 | `condition` spelling | Normalise | Person A ✓ (2026-11-02) |
+| Q11 | Pricing history | Keep every run (change 6) | Person A ✓ (2026-11-02) |
+| Q12 | Tests on Person A's machine | Person A installs SQL Server Express | Person A ✓ (2026-11-02) |
+| Q13 | SQL outside `db.py` | Move it into `db.py` in this branch | Person A ✓ (2026-11-02) |
+| Q14 | Targeted writers (phase 2) | After cutover | Person A ✓ (2026-11-02) |
 | Q15 | Backups | Agreed, with change 4 | Both |
 | Q16 | Location code format | `^[A-Z0-9]+(-[A-Z0-9]+)*$` for now (`LOCATION_CODE_PATTERN`) | Person B |
 

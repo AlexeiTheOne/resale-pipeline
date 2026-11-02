@@ -194,8 +194,8 @@ Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) 
     them).
   - Delete `resale-dev\data\rehearsal\*`.
   - Done for rehearsals 1 and 2 on 2026-11-02; repeat after any new one.
-- 💤 **Person A:** install SQL Server Express on their machine (Q12) and
-  confirm the Person A answers (Q8–Q14) that Person B relayed.
+- ✅ **Person A:** SQL Server is on their laptop (Q12; the suite ran on it 2026-11-02) and
+  Q8–Q14 are confirmed as proposed.
 
 ---
 
