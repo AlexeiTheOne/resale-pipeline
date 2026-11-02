@@ -38,7 +38,7 @@ re-counts everything on the day it runs (section 7).
 - **Receipts are optional enrichment.** Many items will never have a receipt
   match, and nothing requires one. Cost uses a confirmed receipt price, else
   the tag price, else none. Tax is added on top with a configurable rate.
-- Every timestamp is **UTC `DATETIME2(3)`**. Money is `DECIMAL(10,2)`.
+- Every timestamp is **UTC `DATETIME2(6)`**. Money is `DECIMAL(10,2)`.
 - `db.py` keeps every public name and signature. Callers don't change in
   phase 1.
 
@@ -48,8 +48,8 @@ re-counts everything on the day it runs (section 7).
 |---|---|
 | Names | New tables are `snake_case` in `dbo`. `Receipts`/`ReceiptItems` keep their PascalCase names for compatibility. |
 | Keys | `items.item_id` stays the existing lowercase UUID string as `VARCHAR(36)`, not `UNIQUEIDENTIFIER`. pyodbc returns that type upper-cased, which would break id comparisons and Telegram callback data. |
-| Time | `DATETIME2(3)`, UTC always, column names end in `_at`, default `SYSUTCDATETIME()`. `db.py` hands out aware ISO strings (`...+00:00`), as it does today. |
-| Money | `DECIMAL(10,2)`. LLM cost is `DECIMAL(12,6)`. |
+| Time | `DATETIME2(6)`, UTC always, column names end in `_at`, default `SYSUTCDATETIME()`. `db.py` hands out aware ISO strings (`...+00:00`), as it does today. |
+| Money | `DECIMAL(10,2)`. LLM cost is `DECIMAL(18,10)`. |
 | Flags | `BIT`. |
 | Text | `NVARCHAR` for anything a human or an AI wrote. `VARCHAR` for codes and ids. |
 | JSON | `NVARCHAR(MAX)` with `CHECK (ISJSON(col) = 1)`, named `*_raw`. See the JSON rule below. |
@@ -91,8 +91,9 @@ stay JSON. Their **result** is stored in columns (`listing_specifics`,
 | photos_as_sent | BIT | NO, default 0 | `photo_layout.as_sent` |
 | price_source_url | NVARCHAR(1000) | yes | the old top-level `price_source_url` column |
 | extra_raw | NVARCHAR(MAX) JSON | yes | keys no mapping knows, as `{group: {key: value}}`. Should stay empty; a test reports it if not. |
-| created_at / updated_at | DATETIME2(3) | NO | UTC |
+| created_at / updated_at | DATETIME2(6) | NO | UTC |
 | row_ver | ROWVERSION | NO | |
+| seq | BIGINT IDENTITY | NO | insertion order, like SQLite's rowid; `list_items()` returns items in this order |
 
 Indexes: `(status)`, `(updated_at)`.
 
@@ -120,7 +121,7 @@ Indexes: `(status)`, `(updated_at)`.
 | confidence | DECIMAL(4,3) | 0–1 float today |
 | product_image_url | NVARCHAR(1000) | |
 | identification_raw | NVARCHAR(MAX) JSON | full Gemini output (specifications, price_evidence, …) |
-| identified_at | DATETIME2(3) | |
+| identified_at | DATETIME2(6) | |
 
 Indexes: `(brand)`, `(upc)`, `(item_type)`.
 
@@ -133,7 +134,7 @@ Indexes: `(brand)`, `(upc)`, `(item_type)`.
 | suggested_price | DECIMAL(10,2) | |
 | machine_price | DECIMAL(10,2) | |
 | manual_price | DECIMAL(10,2) | |
-| manual_price_at | DATETIME2(3) | |
+| manual_price_at | DATETIME2(6) | |
 | claude_price | DECIMAL(10,2) | |
 | formula_price | DECIMAL(10,2) | |
 | price_basis | VARCHAR(20) | comps / research / manual … |
@@ -153,7 +154,7 @@ Indexes: `(brand)`, `(upc)`, `(item_type)`.
 | stock_image_url | NVARCHAR(1000) | |
 | value_notes | NVARCHAR(2000) | Claude price notes (display) |
 | pricing_raw | NVARCHAR(MAX) JSON | store_estimate, claude_reasoning/evidence, disagreements, dropped, raw_counts, price_evidence, … |
-| priced_at | DATETIME2(3) | |
+| priced_at | DATETIME2(6) | |
 
 The comp lists (`sold_comps`, `active_listings`, `judged_comps`, `reference`)
 go to `pricing_comps` under the run that produced them. `review_flags` goes to
@@ -166,7 +167,7 @@ backtests.
 |---|---|---|
 | run_id | INT IDENTITY PK | |
 | item_id | VARCHAR(36) FK → items CASCADE | |
-| priced_at | DATETIME2(3) NOT NULL | UTC |
+| priced_at | DATETIME2(6) NOT NULL | UTC |
 | engine | VARCHAR(10) | e.g. `v2` |
 | query_used | NVARCHAR(300) | search query the comps came from |
 
@@ -188,7 +189,7 @@ Each re-price **inserts a new run** with its comps and moves
 | category_id | VARCHAR(10) | draft category |
 | condition_id | VARCHAR(10) | |
 | stock_image_url | NVARCHAR(1000) | |
-| drafted_at | DATETIME2(3) | |
+| drafted_at | DATETIME2(6) | |
 
 Index: `(list_price)`. `item_specifics` goes to `listing_specifics`.
 
@@ -205,7 +206,7 @@ Index: `(list_price)`. `item_specifics` goes to `listing_specifics`.
 | category_id | VARCHAR(10) | category actually published |
 | category_name | NVARCHAR(200) | |
 | reselected_from / reselected_from_name | VARCHAR(10) / NVARCHAR(200) | |
-| published_at | DATETIME2(3) | mixed `Z` / `+00:00` today, all UTC |
+| published_at | DATETIME2(6) | mixed `Z` / `+00:00` today, all UTC |
 | stock_note | NVARCHAR(300) | |
 | ebay_raw | NVARCHAR(MAX) JSON | anything else eBay returned that we keep |
 
@@ -231,7 +232,7 @@ named "tags" so it isn't confused with purchase receipts.
 | tag_error | NVARCHAR(200) | |
 | tag_photo_path | NVARCHAR(400) | relative to BASE_DIR, as today |
 | tag_raw | NVARCHAR(MAX) | OCR `raw_text` (plain text) |
-| read_at | DATETIME2(3) | |
+| read_at | DATETIME2(6) | |
 
 Index: `(ross_code)`. The effective cost comes from `v_item_cost` (section 1D).
 
@@ -241,11 +242,11 @@ Index: `(ross_code)`. The effective cost comes from `v_item_cost` (section 1D).
 |---|---|---|---|
 | **item_photos** | item_id VARCHAR(36) FK CASCADE, position TINYINT, path NVARCHAR(400) | PK (item_id, position) | `photos[]` |
 | **listing_images** | item_id FK CASCADE, position TINYINT, url NVARCHAR(1000) | PK (item_id, position) | `ebay.image_urls[]` |
-| **listing_specifics** | item_id FK CASCADE, name NVARCHAR(65), position TINYINT, value NVARCHAR(400) | PK (item_id, name, position); index (name, value) | `listing.item_specifics{}`. One row per value, so multi-value aspects work. |
-| **item_flags** | item_id FK CASCADE, kind VARCHAR(20) (`condition` / `review`), flag NVARCHAR(100) | PK (item_id, kind, flag); index (kind, flag) | `identification.condition_flags[]`, `pricing.review_flags[]` |
-| **pricing_comps** | comp_id INT IDENTITY PK, run_id INT FK → pricing_runs CASCADE, kind VARCHAR(10) (`sold`/`active`/`judged`/`reference`), position SMALLINT, price, item_price, shipping DECIMAL(10,2), shipping_imputed BIT, title NVARCHAR(300), condition NVARCHAR(60), url NVARCHAR(1000), image_url NVARCHAR(1000), verdict VARCHAR(20), seller NVARCHAR(100), source VARCHAR(30), ext_id VARCHAR(40) | index (run_id, kind) | `pricing.sold_comps[]`, `active_listings[]`, `judged_comps[]`, `reference{}`. Belongs to one run; every run is kept. Used by `/comps` (latest run), listing_check and backtests. |
-| **sales** | sale_id INT IDENTITY PK, item_id FK (**NO ACTION**), order_id VARCHAR(30) NOT NULL, listing_id VARCHAR(20), sold_at DATETIME2(3), units INT, sale, shipping, fees, label, ad_fee, refund, net DECIMAL(10,2), fees_known BIT | **UNIQUE (order_id, item_id)**; index (item_id), (sold_at) | `ebay.sales[]` (81 records in dev) |
-| **listing_checks** | check_id INT IDENTITY PK, item_id FK CASCADE, checked_at, model VARCHAR(60), cost_usd DECIMAL(12,6), input_tokens INT, output_tokens INT, unchecked BIT | index (item_id, checked_at) | `listing_check{}`. `get_item` returns the newest. |
+| **listing_specifics** | item_id FK CASCADE, name NVARCHAR(65), position TINYINT (0 = single value, 1..n = list), value NVARCHAR(400) null | PK (item_id, name, position); index (name, value) | `listing.item_specifics{}`. One row per value, so multi-value aspects work. |
+| **item_flags** | item_id FK CASCADE, kind VARCHAR(20) (`condition` / `review`), flag NVARCHAR(100), position SMALLINT (list order) | PK (item_id, kind, flag); index (kind, flag) | `identification.condition_flags[]`, `pricing.review_flags[]` |
+| **pricing_comps** | comp_id INT IDENTITY PK, run_id INT FK → pricing_runs CASCADE, kind VARCHAR(10) (`sold`/`active`/`judged`/`reference`), position SMALLINT, price, item_price, shipping DECIMAL(10,2), shipping_imputed BIT, title NVARCHAR(300), condition NVARCHAR(60), url NVARCHAR(1000), image_url NVARCHAR(1000), verdict VARCHAR(20), seller NVARCHAR(100), source VARCHAR(30), ext_id VARCHAR(40), comp_raw NVARCHAR(MAX) JSON (keys with no column: judged `total`) | index (run_id, kind) | `pricing.sold_comps[]`, `active_listings[]`, `judged_comps[]`, `reference{}`. Belongs to one run; every run is kept. Used by `/comps` (latest run), listing_check and backtests. |
+| **sales** | sale_id INT IDENTITY PK, item_id FK (**NO ACTION**), order_id VARCHAR(30) NOT NULL, listing_id VARCHAR(20), sold_at DATETIME2(6), units INT, sale, shipping, fees, label, ad_fee, refund, net DECIMAL(10,2), fees_known BIT | **UNIQUE (order_id, item_id)**; index (item_id), (sold_at) | `ebay.sales[]` (81 records in dev) |
+| **listing_checks** | check_id INT IDENTITY PK, item_id FK CASCADE, checked_at, model VARCHAR(60), cost_usd DECIMAL(18,10), input_tokens INT, output_tokens INT, unchecked BIT | index (item_id, checked_at) | `listing_check{}`. `get_item` returns the newest. |
 | **listing_check_issues** | check_id FK CASCADE, position TINYINT, severity VARCHAR(10), field VARCHAR(40), message NVARCHAR(500) | PK (check_id, position) | `listing_check.issues[]` |
 
 **Views** (read-only, used by `db.py` and reports):
@@ -286,7 +287,7 @@ only stores the code and does not judge it.
 | kind | VARCHAR(20) | box / shelf / bin / room / other |
 | parent_code | VARCHAR(40) FK → locations, null | optional nesting (box on a shelf) |
 | active | BIT default 1 | retired boxes stay for history |
-| created_at | DATETIME2(3) | |
+| created_at | DATETIME2(6) | |
 
 The allowed format lives in config as `LOCATION_CODE_PATTERN` (a regex) and
 is checked in `db.py`/`bot/`. Changing the format is a config change, not a
@@ -312,7 +313,7 @@ migration. A location row is created on first use, as `/inv G3` does today.
 | notes | NVARCHAR(500) | |
 | info_raw | NVARCHAR(MAX) JSON | rest of the tag read (brand_guess, brand_visible, ross_tag_visible, inventory_tag) |
 | order_id | VARCHAR(30) | set when sold |
-| sold_at, created_at, updated_at | DATETIME2(3) | |
+| sold_at, created_at, updated_at | DATETIME2(6) | |
 
 Indexes: `(location_code)`, `(item_id, status)`, `(ross_code)`, `(status)`.
 
@@ -343,7 +344,7 @@ unchanged. The only changes are ones its INSERTs can't see:
 | Change | Why it is safe for the receipt bot |
 |---|---|
 | `ReceiptID` / `ItemID` values copied with `IDENTITY_INSERT`, then reseeded | its code reads ids back by ReceiptNumber |
-| `CreatedAt` becomes `DATETIME2(3)` with default `SYSUTCDATETIME()`; old values converted from Eastern time to UTC | the bot never writes CreatedAt |
+| `CreatedAt` becomes `DATETIME2(6)` with default `SYSUTCDATETIME()`; old values converted from Eastern time to UTC | the bot never writes CreatedAt |
 | new computed column `StoreNumber AS LEFT(ReceiptNumber, 4) PERSISTED` | computed columns are ignored by INSERTs that list their columns |
 | new nullable `ReviewStatus VARCHAR(20)` on `Receipts`, nullable `PriceOriginal DECIMAL(10,2)` on `ReceiptItems` | nullable, not in its column lists |
 | `UNIQUE (ReceiptNumber) WHERE ReceiptNumber IS NOT NULL` | only after the duplicate is cleaned up. The bot already checks first; the index only catches its double-submit race. **Decided (Q6):** the receipt bot catches the duplicate-key error (2601/2627) and replies "already saved". That is a small change in `receipt_pipeline/bot.py` (Person B's code), made before the index is added. |
@@ -383,7 +384,7 @@ tag price, then to none (`v_item_cost`).
 | confidence | DECIMAL(3,2) | 0–1 |
 | status | VARCHAR(10) | `proposed` / `confirmed` / `rejected` |
 | matched_by | VARCHAR(30) | `auto` / Telegram user id |
-| created_at / decided_at | DATETIME2(3) | |
+| created_at / decided_at | DATETIME2(6) | |
 
 Constraints:
 - `CHECK (piece_code IS NOT NULL OR item_id IS NOT NULL)`.
@@ -427,7 +428,7 @@ person decides.
 | old_value / new_value | NVARCHAR(200) |
 | reason | VARCHAR(40), e.g. `decimal_loss`, `duplicate_receipt`, `duplicate_line` |
 | fixed_by | VARCHAR(30) |
-| fixed_at | DATETIME2(3) |
+| fixed_at | DATETIME2(6) |
 
 **`v_receipt_checks`** (view, computed live, never stored): one row per receipt with:
 
@@ -453,8 +454,8 @@ Because it's a view, a flag clears by itself once the data is fixed.
 | feedback_failures | order_line VARCHAR(40) PK, first_failed_at, last_error NVARCHAR(1000) | | |
 | not_duplicates | a, b VARCHAR(36) | PK (a, b), CHECK (a < b) | |
 | seen_orders | order_id VARCHAR(30) PK, seen_at | | |
-| llm_usage | id BIGINT IDENTITY PK, ts, provider VARCHAR(20), model VARCHAR(60), stage VARCHAR(40), item_id VARCHAR(36) (no FK: 1 orphan in dev), input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, web_searches INT NOT NULL default 0, cost_usd DECIMAL(12,6) | index (ts) | |
-| ebay_tokens | id TINYINT PK CHECK (id = 1), access_token, refresh_token NVARCHAR(MAX) (today's access token is ~2,400 characters; eBay sets no maximum), expires_at DATETIME2(3) | | epoch REAL becomes UTC datetime; `db.py` converts back to epoch for `ebay/auth.py` |
+| llm_usage | id BIGINT IDENTITY PK, ts, provider VARCHAR(20), model VARCHAR(60), stage VARCHAR(40), item_id VARCHAR(36) (no FK: 1 orphan in dev), input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, web_searches INT NOT NULL default 0, cost_usd DECIMAL(18,10) | index (ts) | |
+| ebay_tokens | id TINYINT PK CHECK (id = 1), access_token, refresh_token NVARCHAR(MAX) (today's access token is ~2,400 characters; eBay sets no maximum), expires_at DATETIME2(6) | | epoch REAL becomes UTC datetime; `db.py` converts back to epoch for `ebay/auth.py` |
 | taxonomy_cache | cache_key VARCHAR(200) PK, payload_raw NVARCHAR(MAX) JSON, fetched_at | | external API cache; JSON is fine |
 | schema_version | version INT PK, name VARCHAR(100), applied_at | | restarts at 1 for SQL Server |
 | app_settings | name VARCHAR(40) PK, value NVARCHAR(200), updated_at | | new. `db.py` writes `SALES_TAX_RATE` (config, default `0.07`) here at startup so views can use it. config.py stays the source of truth. |

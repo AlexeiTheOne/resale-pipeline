@@ -289,7 +289,7 @@ def migrate(con: sqlite3.Connection, migrations=None) -> list[int]:
 # Same rules: append only, never edit a step that has shipped.
 #
 # Constraint and index names are explicit (PK_, FK_, UX_, IX_, CK_, DF_) so
-# later steps can alter them by name. Every timestamp is UTC DATETIME2(3).
+# later steps can alter them by name. Every timestamp is UTC DATETIME2(6).
 # =============================================================================
 
 def _json_check(table: str, col: str) -> str:
@@ -326,10 +326,13 @@ _MSSQL_BASELINE = [
         photos_as_sent     BIT           NOT NULL CONSTRAINT DF_items_photos_as_sent DEFAULT 0,
         price_source_url   NVARCHAR(1000) NULL,
         extra_raw          NVARCHAR(MAX) NULL {_json_check('items', 'extra_raw')},
-        created_at         DATETIME2(3)  NOT NULL CONSTRAINT DF_items_created_at DEFAULT SYSUTCDATETIME(),
-        updated_at         DATETIME2(3)  NOT NULL CONSTRAINT DF_items_updated_at DEFAULT SYSUTCDATETIME(),
-        row_ver            ROWVERSION    NOT NULL
+        created_at         DATETIME2(6)  NOT NULL CONSTRAINT DF_items_created_at DEFAULT SYSUTCDATETIME(),
+        updated_at         DATETIME2(6)  NOT NULL CONSTRAINT DF_items_updated_at DEFAULT SYSUTCDATETIME(),
+        row_ver            ROWVERSION    NOT NULL,
+        -- Insertion order, like SQLite's rowid: list_items() returns items in it.
+        seq                BIGINT IDENTITY(1,1) NOT NULL
     )""",
+    "CREATE UNIQUE INDEX UX_items_seq ON dbo.items (seq)",
     "CREATE INDEX IX_items_status ON dbo.items (status)",
     "CREATE INDEX IX_items_updated_at ON dbo.items (updated_at)",
 
@@ -356,7 +359,7 @@ _MSSQL_BASELINE = [
         confidence         DECIMAL(4,3)  NULL,
         product_image_url  NVARCHAR(1000) NULL,
         identification_raw NVARCHAR(MAX) NULL {_json_check('item_identification', 'identification_raw')},
-        identified_at      DATETIME2(3)  NULL
+        identified_at      DATETIME2(6)  NULL
     )""",
     "CREATE INDEX IX_item_identification_brand ON dbo.item_identification (brand)",
     "CREATE INDEX IX_item_identification_upc ON dbo.item_identification (upc)",
@@ -367,7 +370,7 @@ _MSSQL_BASELINE = [
         run_id      INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_pricing_runs PRIMARY KEY,
         item_id     VARCHAR(36)   NOT NULL
                     CONSTRAINT FK_pricing_runs_items REFERENCES dbo.items (item_id) ON DELETE CASCADE,
-        priced_at   DATETIME2(3)  NOT NULL CONSTRAINT DF_pricing_runs_priced_at DEFAULT SYSUTCDATETIME(),
+        priced_at   DATETIME2(6)  NOT NULL CONSTRAINT DF_pricing_runs_priced_at DEFAULT SYSUTCDATETIME(),
         engine      VARCHAR(10)   NULL,
         query_used  NVARCHAR(300) NULL
     )""",
@@ -384,7 +387,7 @@ _MSSQL_BASELINE = [
         suggested_price   DECIMAL(10,2) NULL,
         machine_price     DECIMAL(10,2) NULL,
         manual_price      DECIMAL(10,2) NULL,
-        manual_price_at   DATETIME2(3)  NULL,
+        manual_price_at   DATETIME2(6)  NULL,
         claude_price      DECIMAL(10,2) NULL,
         formula_price     DECIMAL(10,2) NULL,
         price_basis       VARCHAR(20)   NULL,
@@ -409,7 +412,7 @@ _MSSQL_BASELINE = [
         stock_image_url   NVARCHAR(1000) NULL,
         value_notes       NVARCHAR(2000) NULL,
         pricing_raw       NVARCHAR(MAX) NULL {_json_check('item_pricing', 'pricing_raw')},
-        priced_at         DATETIME2(3)  NULL
+        priced_at         DATETIME2(6)  NULL
     )""",
     "CREATE INDEX IX_item_pricing_latest_run ON dbo.item_pricing (latest_run_id)",
 
@@ -423,7 +426,7 @@ _MSSQL_BASELINE = [
         category_id     VARCHAR(10)   NULL,
         condition_id    VARCHAR(10)   NULL,
         stock_image_url NVARCHAR(1000) NULL,
-        drafted_at      DATETIME2(3)  NULL
+        drafted_at      DATETIME2(6)  NULL
     )""",
     "CREATE INDEX IX_item_listing_list_price ON dbo.item_listing (list_price)",
 
@@ -441,7 +444,7 @@ _MSSQL_BASELINE = [
         category_name        NVARCHAR(200) NULL,
         reselected_from      VARCHAR(10)   NULL,
         reselected_from_name NVARCHAR(200) NULL,
-        published_at         DATETIME2(3)  NULL,
+        published_at         DATETIME2(6)  NULL,
         stock_note           NVARCHAR(300) NULL,
         ebay_raw             NVARCHAR(MAX) NULL {_json_check('ebay_listings', 'ebay_raw')}
     )""",
@@ -464,7 +467,7 @@ _MSSQL_BASELINE = [
         tag_error           NVARCHAR(200) NULL,
         tag_photo_path      NVARCHAR(400) NULL,
         tag_raw             NVARCHAR(MAX) NULL,
-        read_at             DATETIME2(3)  NULL
+        read_at             DATETIME2(6)  NULL
     )""",
     "CREATE INDEX IX_item_tags_ross_code ON dbo.item_tags (ross_code)",
 
@@ -491,7 +494,7 @@ _MSSQL_BASELINE = [
                  CONSTRAINT FK_listing_specifics_items REFERENCES dbo.items (item_id) ON DELETE CASCADE,
         name     NVARCHAR(65)  NOT NULL,
         position TINYINT       NOT NULL,
-        value    NVARCHAR(400) NOT NULL,
+        value    NVARCHAR(400) NULL,
         CONSTRAINT PK_listing_specifics PRIMARY KEY (item_id, name, position)
     )""",
     "CREATE INDEX IX_listing_specifics_name_value ON dbo.listing_specifics (name, value)",
@@ -501,6 +504,7 @@ _MSSQL_BASELINE = [
                 CONSTRAINT FK_item_flags_items REFERENCES dbo.items (item_id) ON DELETE CASCADE,
         kind    VARCHAR(20)   NOT NULL CONSTRAINT CK_item_flags_kind CHECK (kind IN ('condition', 'review')),
         flag    NVARCHAR(100) NOT NULL,
+        position SMALLINT     NOT NULL,
         CONSTRAINT PK_item_flags PRIMARY KEY (item_id, kind, flag)
     )""",
     "CREATE INDEX IX_item_flags_kind_flag ON dbo.item_flags (kind, flag)",
@@ -523,7 +527,8 @@ _MSSQL_BASELINE = [
         verdict          VARCHAR(20)    NULL,
         seller           NVARCHAR(100)  NULL,
         source           VARCHAR(30)    NULL,
-        ext_id           VARCHAR(40)    NULL
+        ext_id           VARCHAR(40)    NULL,
+        comp_raw         NVARCHAR(MAX)  NULL CONSTRAINT CK_pricing_comps_comp_raw_json CHECK (ISJSON(comp_raw) = 1)
     )""",
     "CREATE INDEX IX_pricing_comps_run_kind ON dbo.pricing_comps (run_id, kind)",
     # Money columns NOT NULL DEFAULT 0: ebay/orders.py totals_from_sales treats a
@@ -536,7 +541,7 @@ _MSSQL_BASELINE = [
         item_id    VARCHAR(36)   NOT NULL CONSTRAINT FK_sales_items REFERENCES dbo.items (item_id),
         order_id   VARCHAR(30)   NOT NULL,
         listing_id VARCHAR(20)   NULL,
-        sold_at    DATETIME2(3)  NULL,
+        sold_at    DATETIME2(6)  NULL,
         units      INT           NOT NULL CONSTRAINT DF_sales_units DEFAULT 1,
         sale       DECIMAL(10,2) NOT NULL CONSTRAINT DF_sales_sale DEFAULT 0,
         shipping   DECIMAL(10,2) NOT NULL CONSTRAINT DF_sales_shipping DEFAULT 0,
@@ -555,9 +560,9 @@ _MSSQL_BASELINE = [
         check_id      INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_listing_checks PRIMARY KEY,
         item_id       VARCHAR(36)   NOT NULL
                       CONSTRAINT FK_listing_checks_items REFERENCES dbo.items (item_id) ON DELETE CASCADE,
-        checked_at    DATETIME2(3)  NOT NULL CONSTRAINT DF_listing_checks_checked_at DEFAULT SYSUTCDATETIME(),
+        checked_at    DATETIME2(6)  NOT NULL CONSTRAINT DF_listing_checks_checked_at DEFAULT SYSUTCDATETIME(),
         model         VARCHAR(60)   NULL,
-        cost_usd      DECIMAL(12,6) NULL,
+        cost_usd      DECIMAL(18,10) NULL,
         input_tokens  INT           NULL,
         output_tokens INT           NULL,
         unchecked     BIT           NOT NULL CONSTRAINT DF_listing_checks_unchecked DEFAULT 0
@@ -587,7 +592,7 @@ _MSSQL_BASELINE = [
         parent_code   VARCHAR(40)   NULL
                       CONSTRAINT FK_locations_parent REFERENCES dbo.locations (location_code),
         active        BIT           NOT NULL CONSTRAINT DF_locations_active DEFAULT 1,
-        created_at    DATETIME2(3)  NOT NULL CONSTRAINT DF_locations_created_at DEFAULT SYSUTCDATETIME()
+        created_at    DATETIME2(6)  NOT NULL CONSTRAINT DF_locations_created_at DEFAULT SYSUTCDATETIME()
     )""",
     f"""
     CREATE TABLE dbo.pieces (
@@ -617,9 +622,9 @@ _MSSQL_BASELINE = [
         notes               NVARCHAR(500) NULL,
         info_raw            NVARCHAR(MAX) NULL {_json_check('pieces', 'info_raw')},
         order_id            VARCHAR(30)   NULL,
-        sold_at             DATETIME2(3)  NULL,
-        created_at          DATETIME2(3)  NOT NULL CONSTRAINT DF_pieces_created_at DEFAULT SYSUTCDATETIME(),
-        updated_at          DATETIME2(3)  NOT NULL CONSTRAINT DF_pieces_updated_at DEFAULT SYSUTCDATETIME()
+        sold_at             DATETIME2(6)  NULL,
+        created_at          DATETIME2(6)  NOT NULL CONSTRAINT DF_pieces_created_at DEFAULT SYSUTCDATETIME(),
+        updated_at          DATETIME2(6)  NOT NULL CONSTRAINT DF_pieces_updated_at DEFAULT SYSUTCDATETIME()
     )""",
     "CREATE INDEX IX_pieces_location ON dbo.pieces (location_code)",
     "CREATE INDEX IX_pieces_item_status ON dbo.pieces (item_id, status)",
@@ -648,7 +653,7 @@ _MSSQL_BASELINE = [
         Confidence      DECIMAL(4,2)  NULL,
         Flags           VARCHAR(200)  NULL,
         RawFileID       VARCHAR(50)   NULL,
-        CreatedAt       DATETIME2(3)  NULL CONSTRAINT DF_Receipts_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CreatedAt       DATETIME2(6)  NULL CONSTRAINT DF_Receipts_CreatedAt DEFAULT SYSUTCDATETIME(),
         ItemsCount      INT           NULL,
         SourceFile      NVARCHAR(255) NULL,
         Status          NVARCHAR(100) NULL,
@@ -701,8 +706,8 @@ _MSSQL_BASELINE = [
         status          VARCHAR(10)   NOT NULL CONSTRAINT DF_receipt_matches_status DEFAULT 'proposed'
                         CONSTRAINT CK_receipt_matches_status CHECK (status IN ('proposed', 'confirmed', 'rejected')),
         matched_by      VARCHAR(30)   NULL,
-        created_at      DATETIME2(3)  NOT NULL CONSTRAINT DF_receipt_matches_created_at DEFAULT SYSUTCDATETIME(),
-        decided_at      DATETIME2(3)  NULL,
+        created_at      DATETIME2(6)  NOT NULL CONSTRAINT DF_receipt_matches_created_at DEFAULT SYSUTCDATETIME(),
+        decided_at      DATETIME2(6)  NULL,
         CONSTRAINT CK_receipt_matches_target CHECK (piece_code IS NOT NULL OR item_id IS NOT NULL)
     )""",
     # A receipt line, and a piece, can each be confirmed once.
@@ -723,7 +728,7 @@ _MSSQL_BASELINE = [
         new_value   NVARCHAR(200) NULL,
         reason      VARCHAR(40)   NOT NULL,
         fixed_by    VARCHAR(30)   NULL,
-        fixed_at    DATETIME2(3)  NOT NULL CONSTRAINT DF_receipt_fixes_fixed_at DEFAULT SYSUTCDATETIME()
+        fixed_at    DATETIME2(6)  NOT NULL CONSTRAINT DF_receipt_fixes_fixed_at DEFAULT SYSUTCDATETIME()
     )""",
 
     # --- 1E. operations -------------------------------------------------------
@@ -740,7 +745,7 @@ _MSSQL_BASELINE = [
         price             DECIMAL(10,2) NULL,
         suggested_price   DECIMAL(10,2) NULL,
         verdict           VARCHAR(30)   NULL,
-        created_at        DATETIME2(3)  NOT NULL CONSTRAINT DF_listing_stats_created_at DEFAULT SYSUTCDATETIME(),
+        created_at        DATETIME2(6)  NOT NULL CONSTRAINT DF_listing_stats_created_at DEFAULT SYSUTCDATETIME(),
         CONSTRAINT PK_listing_stats PRIMARY KEY (item_id, week)
     )""",
     """
@@ -751,15 +756,15 @@ _MSSQL_BASELINE = [
         list_price  DECIMAL(10,2) NULL,
         offer_price DECIMAL(10,2) NOT NULL,
         source      VARCHAR(20)   NULL,
-        sent_at     DATETIME2(3)  NOT NULL CONSTRAINT DF_offer_sends_sent_at DEFAULT SYSUTCDATETIME()
+        sent_at     DATETIME2(6)  NOT NULL CONSTRAINT DF_offer_sends_sent_at DEFAULT SYSUTCDATETIME()
     )""",
     "CREATE INDEX IX_offer_sends_listing_sent ON dbo.offer_sends (listing_id, sent_at)",
     "CREATE INDEX IX_offer_sends_sent_at ON dbo.offer_sends (sent_at)",
     """
     CREATE TABLE dbo.offer_plans (
         plan_id    VARCHAR(36)  NOT NULL CONSTRAINT PK_offer_plans PRIMARY KEY,
-        created_at DATETIME2(3) NOT NULL CONSTRAINT DF_offer_plans_created_at DEFAULT SYSUTCDATETIME(),
-        used_at    DATETIME2(3) NULL
+        created_at DATETIME2(6) NOT NULL CONSTRAINT DF_offer_plans_created_at DEFAULT SYSUTCDATETIME(),
+        used_at    DATETIME2(6) NULL
     )""",
     """
     CREATE TABLE dbo.offer_plan_rows (
@@ -778,14 +783,14 @@ _MSSQL_BASELINE = [
     """
     CREATE TABLE dbo.job_runs (
         job         VARCHAR(40)    NOT NULL CONSTRAINT PK_job_runs PRIMARY KEY,
-        last_run_at DATETIME2(3)   NOT NULL,
+        last_run_at DATETIME2(6)   NOT NULL,
         status      VARCHAR(20)    NULL,
         detail      NVARCHAR(1000) NULL
     )""",
     """
     CREATE TABLE dbo.feedback_failures (
         order_line      VARCHAR(40)    NOT NULL CONSTRAINT PK_feedback_failures PRIMARY KEY,
-        first_failed_at DATETIME2(3)   NOT NULL CONSTRAINT DF_feedback_failures_first DEFAULT SYSUTCDATETIME(),
+        first_failed_at DATETIME2(6)   NOT NULL CONSTRAINT DF_feedback_failures_first DEFAULT SYSUTCDATETIME(),
         last_error      NVARCHAR(1000) NULL
     )""",
     """
@@ -798,12 +803,12 @@ _MSSQL_BASELINE = [
     """
     CREATE TABLE dbo.seen_orders (
         order_id VARCHAR(30)  NOT NULL CONSTRAINT PK_seen_orders PRIMARY KEY,
-        seen_at  DATETIME2(3) NOT NULL CONSTRAINT DF_seen_orders_seen_at DEFAULT SYSUTCDATETIME()
+        seen_at  DATETIME2(6) NOT NULL CONSTRAINT DF_seen_orders_seen_at DEFAULT SYSUTCDATETIME()
     )""",
     """
     CREATE TABLE dbo.llm_usage (
         id                 BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_llm_usage PRIMARY KEY,
-        ts                 DATETIME2(3)  NOT NULL CONSTRAINT DF_llm_usage_ts DEFAULT SYSUTCDATETIME(),
+        ts                 DATETIME2(6)  NOT NULL CONSTRAINT DF_llm_usage_ts DEFAULT SYSUTCDATETIME(),
         provider           VARCHAR(20)   NOT NULL,
         model              VARCHAR(60)   NOT NULL,
         stage              VARCHAR(40)   NULL,
@@ -813,7 +818,7 @@ _MSSQL_BASELINE = [
         cache_read_tokens  INT           NOT NULL CONSTRAINT DF_llm_usage_cache_read DEFAULT 0,
         cache_write_tokens INT           NOT NULL CONSTRAINT DF_llm_usage_cache_write DEFAULT 0,
         web_searches       INT           NOT NULL CONSTRAINT DF_llm_usage_web DEFAULT 0,
-        cost_usd           DECIMAL(12,6) NULL
+        cost_usd           DECIMAL(18,10) NULL
     )""",
     "CREATE INDEX IX_llm_usage_ts ON dbo.llm_usage (ts)",
     # NVARCHAR(MAX): today's access token is ~2,400 characters and eBay
@@ -824,19 +829,19 @@ _MSSQL_BASELINE = [
                       CONSTRAINT CK_ebay_tokens_single CHECK (id = 1),
         access_token  NVARCHAR(MAX) NULL,
         refresh_token NVARCHAR(MAX) NULL,
-        expires_at    DATETIME2(3)  NULL
+        expires_at    DATETIME2(6)  NULL
     )""",
     f"""
     CREATE TABLE dbo.taxonomy_cache (
         cache_key   VARCHAR(200)  NOT NULL CONSTRAINT PK_taxonomy_cache PRIMARY KEY,
         payload_raw NVARCHAR(MAX) NOT NULL {_json_check('taxonomy_cache', 'payload_raw')},
-        fetched_at  DATETIME2(3)  NOT NULL
+        fetched_at  DATETIME2(6)  NOT NULL
     )""",
     """
     CREATE TABLE dbo.app_settings (
         name       VARCHAR(40)   NOT NULL CONSTRAINT PK_app_settings PRIMARY KEY,
         value      NVARCHAR(200) NOT NULL,
-        updated_at DATETIME2(3)  NOT NULL CONSTRAINT DF_app_settings_updated_at DEFAULT SYSUTCDATETIME()
+        updated_at DATETIME2(6)  NOT NULL CONSTRAINT DF_app_settings_updated_at DEFAULT SYSUTCDATETIME()
     )""",
     # The default the view uses until db.py syncs config.SALES_TAX_RATE at
     # startup (Q17: 7%, measured on receipts).
@@ -967,7 +972,7 @@ def mssql_current_version(cur) -> int:
         CREATE TABLE dbo.schema_version (
             version    INT          NOT NULL CONSTRAINT PK_schema_version PRIMARY KEY,
             name       VARCHAR(100) NOT NULL,
-            applied_at DATETIME2(3) NOT NULL CONSTRAINT DF_schema_version_applied_at DEFAULT SYSUTCDATETIME()
+            applied_at DATETIME2(6) NOT NULL CONSTRAINT DF_schema_version_applied_at DEFAULT SYSUTCDATETIME()
         )""")
     cur.execute("SELECT MAX(version) FROM dbo.schema_version")
     return cur.fetchone()[0] or 0
