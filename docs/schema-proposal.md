@@ -3,8 +3,7 @@
 Status: **approved with changes, nothing built yet.** Branch `sqlserver-migration`.
 Draft 2026-11-02; revised 2026-11-02 after review.
 Readers: Person A (bot, pricing, listings) and Person B (databases, receipts, buying).
-Sign-off: Person B approved the design and answered their questions. Person A's
-answers were relayed by Person B and still need Person A's own confirmation.
+Sign-off: both people approved the design (Person A confirmed 2026-11-02).
 Section 8 lists every decision.
 
 Numbers below come from the **dev copy** of `ross.db` (162 items) and from
@@ -268,8 +267,8 @@ Index: `(ross_code)`. The effective cost comes from `v_item_cost` (section 1D).
   | `unit_cost_with_tax` | `ROUND(unit_cost * (1 + tax_rate), 2)`, NULL when unit_cost is NULL |
 
   NULL means "no cost known". profit.py's list-price estimate stays in Python,
-  flagged as an estimate, as today. Which cost profit reports use (with or
-  without tax) is Person A's call once Q17 is answered. Line prices on Ross
+  flagged as an estimate, as today. Profit reports use the cost with tax
+  (Q17, profit.paid_with_tax). Line prices on Ross
   receipts are before tax, so both sources compare like for like.
 - `v_items`: a flat row per item (identification + pricing + listing + eBay +
   sales totals + cost + piece counts) for reports, the `prod-logs` skill and the
@@ -968,7 +967,7 @@ from a fresh backup made with `python backup.py --db-only`.
 ## 8. Decisions and open questions
 
 Review: 2026-11-02. Person B answered their questions directly. Person A's
-answers were relayed by Person B; **Person A to confirm** (marked ⧗).
+answers were relayed by Person B and confirmed by Person A on 2026-11-02 (✓).
 
 ### Changes made after review
 
