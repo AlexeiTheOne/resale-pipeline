@@ -320,6 +320,27 @@ ASSUMED_COST_RATIO = float(os.getenv("ASSUMED_COST_RATIO", "0.29"))
 # blended), likely tax-exempt items, so 7% slightly overstates a few costs.
 # Used by the SQL Server view v_item_cost (docs/schema-proposal.md).
 SALES_TAX_RATE = float(os.getenv("SALES_TAX_RATE", "0.07"))
+
+# --- /check: the pre-buy check (docs/check-command-design.md) ---------------
+# Verdict thresholds (design §5; Person B, 2026-11-02). Backtest them with
+# scripts/backtest_check.py before trusting them.
+CHECK_BUY_MIN_PROFIT = float(os.getenv("CHECK_BUY_MIN_PROFIT", "15"))
+CHECK_BUY_MIN_ROI = float(os.getenv("CHECK_BUY_MIN_ROI", "0.75"))
+CHECK_MIN_SALES = int(os.getenv("CHECK_MIN_SALES", "3"))
+CHECK_MIN_PROFIT = float(os.getenv("CHECK_MIN_PROFIT", "5"))
+CHECK_MIN_PROFIT_AT_CHEAPEST = float(os.getenv("CHECK_MIN_PROFIT_AT_CHEAPEST", "5"))
+# Checks per day (US Eastern), and when to warn.
+CHECK_DAILY_MAX = int(os.getenv("CHECK_DAILY_MAX", "50"))
+CHECK_DAILY_WARN = int(os.getenv("CHECK_DAILY_WARN", "40"))
+# Cached sold rows older than this are not used by /check (pricing for stored
+# items keeps any age until Person A agrees otherwise).
+CHECK_SOLD_CACHE_DAYS = float(os.getenv("CHECK_SOLD_CACHE_DAYS", "7"))
+# Shipping label we pay, by item type: "type=dollars,..." Starting estimates;
+# correct them from real label costs. "other" is EBAY_SHIP_COST, the measured
+# average.
+CHECK_LABEL_COSTS = os.getenv(
+    "CHECK_LABEL_COSTS", f"bags=11.00,jewelry=4.50,shoes=12.00,clothing=7.20,other={EBAY_SHIP_COST:.2f}")
+
 # Smallest NET margin (after eBay fees, ad rate, and shipping) a repricing
 # suggestion may land on — never suggest a cut that sells at a loss.
 REPRICE_MIN_MARGIN_DOLLARS = float(os.getenv("REPRICE_MIN_MARGIN_DOLLARS", "5"))
