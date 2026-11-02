@@ -41,12 +41,22 @@ _KEEP_TABLES = {"schema_version", "app_settings"}
 def pytest_configure(config):  # pytest's config object; the name is required
     config.addinivalue_line(
         "markers", "sqlserver: needs the local SQL Server (a ResaleDB_Test_* database)")
+    config.addinivalue_line(
+        "markers", "sqlite_only(reason): skipped when the run uses DB_BACKEND=sqlserver")
+    config.addinivalue_line(
+        "markers", "allow_inconsistent: the test corrupts a column on purpose (no consistency check after it)")
 
 
 def pytest_collection_modifyitems(items):
     for item in items:
         if _MSSQL_FIXTURES & set(getattr(item, "fixturenames", ())):
             item.add_marker(pytest.mark.sqlserver)
+        # sqlite_only("why"): tests of SQLite's own storage (its file, its JSON
+        # text, PRAGMAs) or of a behaviour SQL Server changes on purpose.
+        mark = item.get_closest_marker("sqlite_only")
+        if mark and config.DB_BACKEND == "sqlserver":
+            reason = mark.args[0] if mark.args else "tests SQLite's own storage"
+            item.add_marker(pytest.mark.skip(reason=f"SQLite only: {reason}"))
 
 
 def _unavailable(reason: str):
@@ -108,12 +118,10 @@ def _delete_order(cur) -> list[str]:
     return order
 
 
-@pytest.fixture
-def mssql(mssql_db):
-    """An open connection to this run's test database, emptied first."""
+def _empty(con) -> None:
+    """Delete every row (keeping the schema record and settings)."""
     import sqlserver
 
-    con = sqlserver.connect(mssql_db)
     cur = con.cursor()
     # Second lock: the connection itself must be on a test database.
     cur.execute("SELECT DB_NAME()")
@@ -124,6 +132,40 @@ def mssql(mssql_db):
     cur.execute("UPDATE dbo.app_settings SET value = '0.07' WHERE name = 'SALES_TAX_RATE'")
     con.commit()
     cur.close()
+
+
+@pytest.fixture(autouse=True)
+def _sqlserver_backend(request):
+    """With DB_BACKEND=sqlserver the whole suite runs on SQL Server: every test
+    gets this run's test database, emptied first (as every test gets a fresh
+    SQLite file today)."""
+    if config.DB_BACKEND != "sqlserver":
+        yield
+        return
+    name = request.getfixturevalue("mssql_db")
+    import sqlserver
+
+    con = sqlserver.connect(name)
+    try:
+        _empty(con)
+    finally:
+        con.close()
+    yield
+    # Whatever the test wrote, every column must still match its JSON copy.
+    if config.DB_BACKEND == "sqlserver" and not request.node.get_closest_marker("allow_inconsistent"):
+        import db_mssql
+        mismatches = db_mssql.consistency_report()
+        if mismatches:
+            pytest.fail("column/JSON copy mismatch after the test:\n" + "\n".join(mismatches[:10]))
+
+
+@pytest.fixture
+def mssql(mssql_db):
+    """An open connection to this run's test database, emptied first."""
+    import sqlserver
+
+    con = sqlserver.connect(mssql_db)
+    _empty(con)
     try:
         yield con
     finally:

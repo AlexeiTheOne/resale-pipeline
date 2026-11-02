@@ -62,11 +62,13 @@ def cols(table):
     return [r[1] for r in raw(f"PRAGMA table_info({table})")]
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_create_tables_makes_all_tables(conn_db):
     names = {r[0] for r in raw("SELECT name FROM sqlite_master WHERE type='table'")}
     assert EXPECTED_TABLES <= names
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_create_tables_idempotent_and_keeps_data(conn_db):
     iid = db.create_item(["a.jpg"])
     before = cols("items")
@@ -76,16 +78,19 @@ def test_create_tables_idempotent_and_keeps_data(conn_db):
     assert db.get_item(iid) is not None
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_items_has_all_expected_columns(conn_db):
     c = set(cols("items"))
     assert set(db.VALID_FIELDS) <= c
     assert {"item_id", "status", "created_at", "updated_at"} <= c
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_listing_stats_has_migrated_columns(conn_db):
     assert {"total_impressions", "search_views"} <= set(cols("listing_stats"))
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_bootstrap_adds_missing_columns_to_old_schema(tmp_path):
     """A DB created before the ALTER TABLE migrations gains the new columns and
     keeps its rows."""
@@ -117,6 +122,7 @@ def test_bootstrap_adds_missing_columns_to_old_schema(tmp_path):
         db.DB_PATH = old
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_conn_creates_missing_parent_dir_and_uses_wal(tmp_path):
     old = db.DB_PATH
     db.DB_PATH = str(tmp_path / "nested" / "dir" / "x.db")
@@ -162,11 +168,13 @@ def test_get_item_missing_returns_none(conn_db):
     assert db.get_item("nope") is None
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_get_item_has_exactly_the_table_columns(conn_db):
     item = db.get_item(db.create_item([]))
     assert list(item) == cols("items")
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 @pytest.mark.parametrize("field", [
     "identification", "pricing", "listing", "ebay", "processed", "price_source_url",
     "receipt", "photo_layout", "listing_check", "stock"])
@@ -194,6 +202,7 @@ def test_update_field_accepts_non_dict_json(conn_db):
     assert db.get_item(iid)["price_source_url"] == "https://x.example/1"
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_update_field_none_reads_back_none(conn_db):
     iid = db.create_item([])
     db.update_field(iid, "pricing", {"a": 1})
@@ -218,6 +227,7 @@ def test_update_field_invalid_field_raises(conn_db):
     assert db.get_item(iid) is not None
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_update_field_touches_updated_at_only(conn_db):
     iid = db.create_item([])
     raw_exec("UPDATE items SET updated_at='2000-01-01T00:00:00+00:00' WHERE item_id=?", (iid,))
@@ -229,12 +239,14 @@ def test_update_field_touches_updated_at_only(conn_db):
     assert item["status"] == "captured"
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_update_field_missing_item_is_silent_noop(conn_db):
     db.update_field("nope", "pricing", {"a": 1})
     assert db.get_item("nope") is None
     assert raw("SELECT COUNT(*) FROM items")[0][0] == 0
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 @pytest.mark.parametrize("status", db.VALID_STATUSES)
 def test_update_status_valid(conn_db, status):
     iid = db.create_item([])
@@ -296,6 +308,7 @@ def test_delete_item(conn_db):
     db.delete_item("nope")
 
 
+@pytest.mark.sqlite_only("SQL Server unlinks a deleted item's pieces (FK SET NULL) instead of keeping a dangling item_id")
 def test_delete_item_does_not_cascade(conn_db):
     iid = db.create_item([])
     db.record_listing_stats(iid, "2026-10-26", views=1)
@@ -308,6 +321,7 @@ def test_delete_item_does_not_cascade(conn_db):
 
 # --- photo path handling --------------------------------------------------------
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_photos_inside_base_dir_stored_relative_returned_absolute(conn_db):
     p = inside("data", "inbox", "abc", "1.jpg")
     iid = db.create_item([p])
@@ -316,6 +330,7 @@ def test_photos_inside_base_dir_stored_relative_returned_absolute(conn_db):
     assert db.get_item(iid)["photos"] == [p]
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_photos_outside_base_dir_stored_unchanged(conn_db, tmp_path):
     p = str(tmp_path / "elsewhere.jpg")
     iid = db.create_item([p])
@@ -324,6 +339,7 @@ def test_photos_outside_base_dir_stored_unchanged(conn_db, tmp_path):
     assert db.get_item(iid)["photos"] == [p]
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_photos_mixed_and_update_field(conn_db, tmp_path):
     inner, outer = inside("data", "x.jpg"), str(tmp_path / "y.jpg")
     iid = db.create_item([])
@@ -340,6 +356,7 @@ def test_photos_empty_and_non_string_entries_untouched(conn_db):
     assert db.get_item(iid)["photos"] == ["", None, 5]
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_existing_absolute_rows_read_back_correctly(conn_db, tmp_path):
     inner, outer = inside("data", "inbox", "z", "1.jpg"), str(tmp_path / "o.jpg")
     raw_exec("INSERT INTO items (item_id, photos, receipt, stock, created_at, updated_at) "
@@ -353,12 +370,14 @@ def test_existing_absolute_rows_read_back_correctly(conn_db, tmp_path):
     assert item["stock"] == {"inventory_photo": outer, "location": "G3"}
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_existing_relative_rows_read_back_absolute(conn_db):
     raw_exec("INSERT INTO items (item_id, photos, created_at, updated_at) "
              "VALUES ('rel', ?, 't', 't')", (json.dumps(["data/inbox/r/1.jpg"]),))
     assert db.get_item("rel")["photos"] == [inside("data", "inbox", "r", "1.jpg")]
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_receipt_photo_path_mapping(conn_db):
     p = inside("data", "inbox", "i", "receipt.jpg")
     iid = db.create_item([])
@@ -368,6 +387,7 @@ def test_receipt_photo_path_mapping(conn_db):
     assert db.get_item(iid)["receipt"] == {"photo": p, "cost": 4.5, "code": "123"}
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_receipt_photo_outside_base_dir_unchanged(conn_db, tmp_path):
     p = str(tmp_path / "r.jpg")
     iid = db.create_item([])
@@ -376,6 +396,7 @@ def test_receipt_photo_outside_base_dir_unchanged(conn_db, tmp_path):
     assert db.get_item(iid)["receipt"] == {"photo": p}
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_stock_inventory_photo_path_mapping(conn_db):
     p = inside("data", "inbox", "i", "inv.jpg")
     iid = db.create_item([])
@@ -385,6 +406,7 @@ def test_stock_inventory_photo_path_mapping(conn_db):
     assert db.get_item(iid)["stock"] == {"location": "G3", "inventory_photo": p}
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_path_mapping_leaves_missing_empty_or_other_keys(conn_db):
     iid = db.create_item([])
     db.update_field(iid, "receipt", {"cost": 1})
@@ -410,6 +432,7 @@ def test_path_mapping_does_not_mutate_callers_data(conn_db):
     assert photos == [p] and rec == {"photo": p}
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_piece_photo_path_mapping(conn_db, tmp_path):
     p = inside("data", "inbox", "pieces", "1.jpg")
     code = db.add_piece("G3", photo=p)
@@ -424,6 +447,7 @@ def test_piece_photo_path_mapping(conn_db, tmp_path):
     assert db.list_pieces()[0]["photo"] == p
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_piece_photo_absolute_legacy_row_and_none(conn_db):
     p = inside("data", "inbox", "legacy.jpg")
     raw_exec("INSERT INTO pieces (code, box, status, photo, info, created_at, updated_at) "
@@ -463,6 +487,7 @@ def test_piece_numbering_follows_code_prefix_not_current_box(conn_db):
     assert db.get_piece("G3-01")["box"] == "B1"
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_piece_numbering_after_gap_uses_max(conn_db):
     for _ in range(3):
         db.add_piece("G3")
@@ -472,12 +497,14 @@ def test_piece_numbering_after_gap_uses_max(conn_db):
     assert db.next_piece_code("G3") == "G3-02"
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_piece_numbering_ignores_non_numeric_suffix(conn_db):
     raw_exec("INSERT INTO pieces (code, box, status, info, created_at, updated_at) "
              "VALUES ('G3-X', 'G3', 'home', '{}', 't', 't')")
     assert db.next_piece_code("G3") == "G3-01"
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_piece_codes_unique_primary_key(conn_db):
     code = db.add_piece("G3")
     with pytest.raises(sqlite3.IntegrityError):
@@ -485,6 +512,7 @@ def test_piece_codes_unique_primary_key(conn_db):
                  "VALUES (?, 'G3', 'home', '{}', 't', 't')", (code,))
 
 
+@pytest.mark.sqlite_only('SQL Server picks the code under a lock on the box, so it never retries next_piece_code')
 def test_add_piece_retries_on_code_collision(conn_db, monkeypatch):
     db.add_piece("G3")
     seq = iter(["G3-01", "G3-01", "G3-05"])
@@ -492,6 +520,7 @@ def test_add_piece_retries_on_code_collision(conn_db, monkeypatch):
     assert db.add_piece("G3") == "G3-05"
 
 
+@pytest.mark.sqlite_only('SQL Server picks the code under a lock on the box, so it never retries next_piece_code')
 def test_add_piece_gives_up_after_five_collisions(conn_db, monkeypatch):
     db.add_piece("G3")
     monkeypatch.setattr(db, "next_piece_code", lambda box: "G3-01")
@@ -499,12 +528,14 @@ def test_add_piece_gives_up_after_five_collisions(conn_db, monkeypatch):
         db.add_piece("G3")
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_piece_code_widens_past_99(conn_db):
     raw_exec("INSERT INTO pieces (code, box, status, info, created_at, updated_at) "
              "VALUES ('G3-99', 'G3', 'home', '{}', 't', 't')")
     assert db.next_piece_code("G3") == "G3-100"
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_list_pieces_sorts_codes_numerically(conn_db):
     # Once a box passes 99 pieces, "G3-100" must still sort after "G3-99".
     for code in ("G3-99", "G3-100", "G3-11"):
@@ -527,6 +558,7 @@ def test_lowercase_box_is_normalised_to_upper(conn_db):
     assert [p["code"] for p in db.list_pieces(box="g3")] == ["G3-01"]
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_update_piece_fields(conn_db):
     code = db.add_piece("G3")
     raw_exec("UPDATE pieces SET updated_at='2000-01-01T00:00:00+00:00'")
@@ -544,6 +576,7 @@ def test_update_piece_fields(conn_db):
     assert raw("SELECT info FROM pieces")[0][0] == json.dumps(p["info"])
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_update_piece_empty_info_reads_as_dict(conn_db):
     code = db.add_piece("G3")
     db.update_piece(code, info={})
@@ -634,6 +667,7 @@ def test_list_pieces_empty(conn_db):
 
 # --- listing_stats ---------------------------------------------------------------
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_record_listing_stats_and_history(conn_db):
     db.record_listing_stats("i1", "2026-10-12", impressions=10, views=2, watchers=1,
                             price=20.0, verdict="hold", suggested_price=18.0,
@@ -693,6 +727,7 @@ def test_stats_missing_item(conn_db):
 
 # --- offers ----------------------------------------------------------------------
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_record_offer_sent_and_offers_sent_since(conn_db):
     db.record_offer_sent(12345, 9.5, item_id="i1", list_price=12.0, source="digest")
     db.record_offer_sent("999", 5)
@@ -703,6 +738,7 @@ def test_record_offer_sent_and_offers_sent_since(conn_db):
     assert db.offers_sent_since("9999-01-01") == set()
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_offers_sent_since_boundary_is_inclusive_and_distinct(conn_db):
     db.record_offer_sent("L1", 1)
     db.record_offer_sent("L1", 2)
@@ -753,6 +789,7 @@ def test_job_run_never_run(conn_db):
     assert db.job_run_status("weekly") is None
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_record_job_run_ok(conn_db):
     before = datetime.now(timezone.utc)
     db.record_job_run("weekly")
@@ -763,6 +800,7 @@ def test_record_job_run_ok(conn_db):
     assert raw("SELECT detail FROM job_runs")[0][0] is None
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_record_job_run_non_ok_does_not_count_as_completed(conn_db):
     db.record_job_run("weekly", "partial", "2 batches failed")
     assert db.last_job_run("weekly") is None
@@ -770,6 +808,7 @@ def test_record_job_run_non_ok_does_not_count_as_completed(conn_db):
     assert raw("SELECT detail FROM job_runs")[0][0] == "2 batches failed"
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_record_job_run_upserts_one_row_per_job(conn_db):
     db.record_job_run("a", "partial")
     db.record_job_run("a", "ok")
@@ -779,6 +818,7 @@ def test_record_job_run_upserts_one_row_per_job(conn_db):
     assert db.last_job_run("a") is not None
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_last_job_run_legacy_null_status_counts_as_ok(conn_db):
     raw_exec("INSERT INTO job_runs (job, last_run_at, status) VALUES "
              "('legacy', '2026-10-01T10:00:00+00:00', NULL)")
@@ -786,12 +826,14 @@ def test_last_job_run_legacy_null_status_counts_as_ok(conn_db):
     assert db.job_run_status("legacy") is None
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_last_job_run_naive_timestamp_assumed_utc(conn_db):
     raw_exec("INSERT INTO job_runs (job, last_run_at, status) VALUES "
              "('n', '2026-10-01T10:00:00', 'ok')")
     assert db.last_job_run("n") == datetime(2026, 10, 1, 10, tzinfo=timezone.utc)
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_last_job_run_garbage_timestamp_is_none(conn_db):
     raw_exec("INSERT INTO job_runs (job, last_run_at, status) VALUES "
              "('bad', 'not a date', 'ok')")
@@ -801,6 +843,7 @@ def test_last_job_run_garbage_timestamp_is_none(conn_db):
 
 # --- feedback failures / not-duplicates / seen orders ----------------------------
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_feedback_failures(conn_db):
     assert db.known_feedback_failures() == set()
     db.record_feedback_failure("L1", "err1")
@@ -832,6 +875,7 @@ def test_not_duplicate_with_self_is_allowed(conn_db):
     assert db.not_duplicate_pairs() == {("a", "a")}
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_seen_orders(conn_db):
     assert db.seen_order_ids() == set()
     db.mark_orders_seen(["o1", "o2"])
@@ -847,6 +891,7 @@ def test_seen_orders(conn_db):
 
 # --- llm usage -------------------------------------------------------------------
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_record_llm_usage_defaults(conn_db):
     db.record_llm_usage(provider="anthropic", model="sonnet")
     row = raw("SELECT provider, model, stage, item_id, input_tokens, output_tokens, "
@@ -856,6 +901,7 @@ def test_record_llm_usage_defaults(conn_db):
     assert datetime.fromisoformat(raw("SELECT ts FROM llm_usage")[0][0]).tzinfo is not None
 
 
+@pytest.mark.sqlite_only("reads SQLite's file directly (its tables, JSON text or PRAGMAs)")
 def test_record_llm_usage_explicit_ts_and_fields(conn_db):
     db.record_llm_usage(provider="gemini", model="flash", stage="identify", item_id="i1",
                         input_tokens=10, output_tokens=5, cache_read_tokens=2,

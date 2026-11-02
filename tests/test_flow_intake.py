@@ -29,6 +29,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import config  # noqa: E402
+import backend_sql  # noqa: E402
 import db  # noqa: E402
 import identify  # noqa: E402
 import ross_tag  # noqa: E402
@@ -181,8 +182,11 @@ def tap(ctx, data, handler=None):
 
 
 def raw_photos(item_id):
-    """The photos column as stored, bypassing db's absolute-path mapping."""
+    """The photos as stored, bypassing db's absolute-path mapping."""
     import json
+    if backend_sql.on_sqlserver():
+        return [r["path"] for r in backend_sql.rows(
+            "", "SELECT path FROM dbo.item_photos WHERE item_id = ? ORDER BY position", (item_id,))]
     with sqlite3.connect(db.DB_PATH) as con:
         row = con.execute("SELECT photos FROM items WHERE item_id = ?", (item_id,)).fetchone()
     return json.loads(row[0])

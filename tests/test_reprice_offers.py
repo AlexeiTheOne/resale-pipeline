@@ -18,6 +18,8 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import db  # noqa: E402
@@ -142,6 +144,7 @@ def test_listing_stats_keeps_organic_and_stores_total():
     assert result["impressions"] == 566 and result["organic_impressions"] == 56
 
 
+@pytest.mark.sqlite_only("an old SQLite schema migrated by SQLite's migrations")
 def test_migration_adds_columns_to_an_old_listing_stats_table():
     import sqlite3
     path = str(Path(tempfile.mkdtemp(prefix="mig_")) / "old.db")
