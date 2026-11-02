@@ -16,6 +16,11 @@ person's area, say so in the commit message and tell them. Never silently
 undo the other person's decision. If you disagree, write up both sides and
 give a recommendation.
 
+Only ask the other person (or the user) a question when the answer is
+undecided. If the answer is obvious, decide it, write the decision and why
+into the commit or doc, and move on. No sign-off lists. Example of what not to
+ask: "Should profit include the sales tax we pay?" Yes, obviously.
+
 ## Production: pushing to `main` goes live
 
 The live bot runs on Person B's PC, not on a laptop. Task `EbayBotDeploy` runs

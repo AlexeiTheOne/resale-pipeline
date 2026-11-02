@@ -1024,4 +1024,4 @@ answers were relayed by Person B; **Person A to confirm** (marked ⧗).
     6.3%.
   - 7% = Florida 6% + Miami-Dade 1% surtax. **`SALES_TAX_RATE = 0.07`** (in
     config.py); it slightly overstates cost for exempt items.
-  - Person A decides which cost (with or without tax) profit reports use.
+  - Profit reports use the cost WITH tax (decided by Person A, 2026-11-02: it is paid).
