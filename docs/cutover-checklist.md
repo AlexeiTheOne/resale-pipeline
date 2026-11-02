@@ -137,8 +137,16 @@ included.
    Confirm nothing is left:
    `Get-CimInstance Win32_Process -Filter "CommandLine like '%telegram_bot.py%'"`.
    Never kill `python.exe` broadly.
-3. ⬜ **Stop the receipt bot by hand** (Person B; started with
-   `run_bot.bat`). Never touch its processes from a script.
+3. ⬜ **Stop the receipt bot** (Person B). It runs as the `ReceiptBot`
+   scheduled task (`C:\Users\boris\Projects\run_receipt_bot.cmd`, log
+   `receipt_pipeline\service.out.log`):
+   `Disable-ScheduledTask ReceiptBot; Stop-ScheduledTask ReceiptBot`.
+   Then check that no `bot.py` is left (from an admin PowerShell, or the
+   command line stays hidden):
+   `Get-CimInstance Win32_Process -Filter "CommandLine like '%receipt_pipeline%' or CommandLine like '%bot.py%'"`.
+   If one is left, Person B ends that one PID by hand. Never kill `python.exe`
+   broadly, and don't start it with `run_bot.bat` while the task exists (two
+   copies on one token fight).
 4. ⬜ **Final backups:**
    - `python backup.py --db-only` in `ebay-list` (SQLite);
    - a copy-only backup of ReceiptsDB:
@@ -174,8 +182,9 @@ included.
     and a read command (`/report`) in Telegram.
 13. ⬜ **Receipt bot:** set `SQL_CONN_STR` in `receipt_pipeline\.env` to
     `Driver={ODBC Driver 18 for SQL Server};Server=localhost\SQLEXPRESS;Database=ResaleDB;Trusted_Connection=yes;Encrypt=no;`
-    and start it with `run_bot.bat`. Paste one test receipt and check it
-    lands in `ResaleDB.dbo.Receipts`.
+    and start it: `Enable-ScheduledTask ReceiptBot; Start-ScheduledTask ReceiptBot`
+    (not `run_bot.bat`). Paste one test receipt and check it lands in
+    `ResaleDB.dbo.Receipts`.
 14. ⬜ **ReceiptsDB read-only:** `ALTER DATABASE ReceiptsDB SET READ_ONLY`.
     Keep it for **30 days** (Q2), then take a final backup and drop it.
 15. ⬜ **Re-enable deploys:** `Enable-ScheduledTask EbayBotDeploy`.
@@ -272,6 +281,12 @@ applies.
 - 💤 Fill `stores` for the 18 store numbers (clean names, city, zip).
 - 💤 Receipt matching (`receipt_matches`): the matcher and its Telegram review.
 - 💤 Drop ReceiptsDB after 30 days (final backup first).
+- 💤 **When receipts merge into the main bot:** disable and delete the
+  `ReceiptBot` task, so the old receipt bot can't come back at the next boot.
+  From an admin PowerShell:
+  `Disable-ScheduledTask ReceiptBot; Stop-ScheduledTask ReceiptBot; Unregister-ScheduledTask ReceiptBot -Confirm:$false`.
+  Check that no receipt `bot.py` is left (section 2, step 3), then delete
+  `C:\Users\boris\Projects\run_receipt_bot.cmd`.
 - 💤 After the first day, the SQLite fallback is retired (section 3). Then,
   when convenient: remove the frozen SQLite migration steps from
   `migrations.py`, the SQLite branch of db.py and backup.py, and the
@@ -282,6 +297,13 @@ applies.
 ---
 
 ## Log
+- 2026-11-02: the receipt bot gets its own scheduled task, `ReceiptBot`
+  (Person B). It is a copy of EbayBot's settings: boot trigger, runs whether
+  logged on or not, no time limit, restart on failure. It runs
+  `C:\Users\boris\Projects\run_receipt_bot.cmd`, which restarts `bot.py` 15 s
+  after it exits and appends to `receipt_pipeline\service.out.log`.
+  receipt_pipeline's code is unchanged. Steps 3 and 13 now use the task, and
+  section 4 says to delete it when receipts merge into the main bot.
 - 2026-11-02: rollback decided (Person B): fix forward + SQL Server
   restores, no SQLite export. Back to SQLite only within the first day,
   losing the writes since the switch (eBay sync re-pulls orders). Section 3
