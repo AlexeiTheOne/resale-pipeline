@@ -7,6 +7,93 @@ pricing and reviews the PR. Builds on proposal (b) in
 `legacy/comps_app.py` (both on branch `post-cutover-ideas`). Every fact about
 today's code is from `main` at `9428e3a`.
 
+## 00. v1 change: shopping mode, photos only (Person B, 2026-11-02). This overrides everything below where they differ.
+
+**No typing in the aisle.**
+- **`/shop`** turns shopping mode on; `/shop off` ends it. It also ends by
+  itself **3 hours** after it was turned on: the bot posts "🛒 Shopping mode
+  ended", and a later photo is normal intake again.
+- While it's on, every photo or album is a check. Normal intake, `/find`,
+  `/inv` and `/haul` are untouched, and resume when it's off.
+- **It's clearly visible:** turning it on replies "🛒 Shopping mode ON until
+  HH:MM: every photo or album is a check, not a new item". Every check reply
+  starts with "🛒".
+- Typed `/check …` still works as a fallback, and is saved the same way.
+
+**One album = one check** (1–3 photos, any order).
+- **Batching:** photos that arrive within 3 s of each other (an album, or
+  quick separate shots) form one check. Beyond 3 photos, the first 3 are used
+  and the reply says so.
+- **The tag photo** is found by its **Ross barcode**
+  (`ross_tag.decode_barcode` → `parse_barcode`: 12-digit Ross SKU + price in
+  cents). It's local, with **no AI**. The other photos go to identification
+  (`identify.identify_item`, with all photos as scan paths, so UPC and style
+  codes on the maker's tag are read too). If the tag is the only photo, it is
+  also the identification photo.
+- **No tag barcode found:** the bot asks "No Ross tag found: what did it
+  cost?".
+  - Quick buttons: $4.99, $7.99, $9.99, $12.99, $14.99, $19.99, $24.99,
+    $29.99.
+  - Or the user sends **one number**, as the next message.
+  - The check waits for 10 minutes. Identification already runs meanwhile,
+    so the answer comes faster.
+
+**Then pricing and the verdict, as now:** quick by default, and ❓ NO DATA
+goes on to the full check automatically. The buttons on the reply:
+
+| Button | Does |
+|---|---|
+| 🔬 Full check | Rerun in full (if the result was quick) |
+| Any matches / Exact only | Widen or narrow the matching |
+| 🛍 Bought | Status → `bought` (stock creation is v2) |
+
+**Every check is saved** (no longer "store nothing"). It's a new table
+`checks` (schema-proposal 1E; SQL Server migration step 3, plus the same
+table on SQLite). It is **not an item**: nothing appears in `/status`,
+listings or reports.
+
+| Column | Notes |
+|---|---|
+| check_id | INT IDENTITY PK |
+| user_id | Telegram user |
+| created_at / updated_at | UTC |
+| ross_sku / ross_price | from the tag barcode, or the price typed/tapped (SKU then NULL) |
+| photos | JSON list of paths under `data/checks/<check_id>/` (kept; `data/` is not in git) |
+| identification | JSON, as used for pricing |
+| mode / exact | `quick` / `full`, and the match mode of the latest run |
+| verdict | BUY / MAYBE / BORDERLINE / SKIP / NO_DATA, latest run |
+| suggested_price / profit / roi / break_even / cheapest_identical / sold_count | the latest run's numbers |
+| comps_summary | JSON: price basis, sales count, sold median, up to 5 comps (title, total, url, verdict), warnings |
+| status | `checked` (default) / `bought` / `skipped` |
+| status_at | when the status last changed |
+| receipt_item_id | the receipt line it matched (NULL until receipt matching; see below) |
+| item_id | the item made from it (NULL until v2's "add to stock") |
+
+A rerun (Full check, Any/Exact) **updates the same row**: one row per thing
+looked at.
+
+**Receipt link (design only; built with receipt matching).** When a receipt
+arrives (the receipt bot inserts `ReceiptItems`), each line's `SKU` is looked
+up in `checks.ross_sku`:
+
+- The candidates are checks by either allowed user in the **3 days before**
+  the receipt date (a check after the receipt is impossible).
+- **One match:** status → `bought`, and `receipt_item_id` = the line. The
+  line's price wins over the tag price for cost.
+- **Several:** the newest unlinked one, or a person picks one in Telegram, as
+  `receipt_matches` does.
+- **No match:** nothing happens.
+- Checks still `checked` 3 days after a receipt from the same store and day →
+  `skipped`. That's the only automatic route to `skipped`. There's no Skip
+  button in v1.
+
+**Still to do (noted, not in v1):**
+- Add `data/checks` to the nightly photo backup. That means one robocopy line
+  in `scripts/backup_task.ps1`, then copying it over the production
+  `backup_ebay_bot.ps1`.
+- Receipt matching, as above.
+- Stock creation from a bought check (v2).
+
 ## 0. Decisions (Person B's review, 2026-11-02). These override the sections below.
 
 | Topic | Decision |

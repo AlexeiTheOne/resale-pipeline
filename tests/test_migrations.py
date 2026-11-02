@@ -45,7 +45,7 @@ def test_existing_db_without_versions_keeps_its_data(tmp_path):
     cols = {r[1] for r in con.execute("PRAGMA table_info(items)")}
     assert {"receipt", "stock", "listing_check"} <= cols
     assert con.execute("SELECT item_id FROM items").fetchall() == [("a",)]
-    assert migrations.current_version(con) == 1
+    assert migrations.current_version(con) == migrations.MIGRATIONS[-1][0]
 
 
 def test_failed_step_changes_nothing_and_is_not_recorded(tmp_path):
@@ -67,18 +67,20 @@ def test_new_step_runs_once_in_order(tmp_path):
     con = _con(tmp_path)
     migrations.migrate(con)
     calls = []
+    last = migrations.MIGRATIONS[-1][0]
     steps = migrations.MIGRATIONS + [
-        (2, "two", lambda c: calls.append(2)),
-        (3, "three", lambda c: calls.append(3)),
+        (last + 1, "next", lambda c: calls.append(last + 1)),
+        (last + 2, "after", lambda c: calls.append(last + 2)),
     ]
-    assert migrations.migrate(con, steps) == [2, 3]
+    assert migrations.migrate(con, steps) == [last + 1, last + 2]
     assert migrations.migrate(con, steps) == []
-    assert calls == [2, 3]
+    assert calls == [last + 1, last + 2]
 
 
 def test_db_newer_than_code_warns_but_works(tmp_path, capsys):
     con = _con(tmp_path)
-    migrations.migrate(con, migrations.MIGRATIONS + [(2, "future", lambda c: None)])
+    future = migrations.MIGRATIONS[-1][0] + 1
+    migrations.migrate(con, migrations.MIGRATIONS + [(future, "future", lambda c: None)])
     assert migrations.migrate(con) == []
     assert "Was a deploy rolled back?" in capsys.readouterr().out
 
