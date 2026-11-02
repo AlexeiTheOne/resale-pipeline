@@ -235,6 +235,28 @@ def choose_price(pricing: dict, exact: bool) -> dict:
             "disagrees": "formula_disagrees" in flags}
 
 
+def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
+             text: str = "") -> dict:
+    """Price choice, money and verdict from a pricing result. Shared by
+    run_check and the backtest (scripts/backtest_check.py), so the backtest
+    scores exactly what /check would say."""
+    pick = choose_price(pricing, exact)
+    kind, label = label_for(ident, text)
+    money = economics(pick["price"], ross_price, label) if pick["price"] and ross_price else None
+    cheapest = pricing.get("raw_active_floor")
+    at_cheapest = at_total(cheapest, ross_price, label) if cheapest and ross_price else None
+    if ross_price is None:
+        v, why = "SKIP", ["no Ross price given"]
+    else:
+        v, why = verdict(profit=money["profit"] if money else None, roi=money["roi"] if money else None,
+                         sales=pick["sales"],
+                         profit_at_cheapest=at_cheapest["profit"] if at_cheapest else None,
+                         low_confidence=pricing.get("claude_confidence") == "low",
+                         from_asks=pick["from_asks"], disagrees=pick["disagrees"])
+    return {"item_type": kind, "label": label, "verdict": v, "reasons": why, "pick": pick,
+            "money": money, "cheapest_total": cheapest, "at_cheapest": at_cheapest}
+
+
 def already_have(ident: dict) -> list[str]:
     """Our items with the same UPC or brand + model (read only)."""
     from pipeline import stages
@@ -279,29 +301,14 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
     for k, v in (pricing.get("timings") or {}).items():
         if k != "total_s":
             timings[k] = v
-    pick = choose_price(pricing, bool(req.get("exact", True)))
-    kind, label = label_for(ident, text)
-    ross = req.get("ross_price")
-    money = economics(pick["price"], ross, label) if pick["price"] and ross else None
-    cheapest = pricing.get("raw_active_floor")
-    at_cheapest = at_total(cheapest, ross, label) if cheapest and ross else None
-    if ross is None:
-        v, why = "SKIP", ["no Ross price given"]
-    else:
-        v, why = verdict(profit=money["profit"] if money else None, roi=money["roi"] if money else None,
-                         sales=pick["sales"],
-                         profit_at_cheapest=at_cheapest["profit"] if at_cheapest else None,
-                         low_confidence=pricing.get("claude_confidence") == "low",
-                         from_asks=pick["from_asks"], disagrees=pick["disagrees"])
+    ev = evaluate(pricing, ident, req.get("ross_price"), bool(req.get("exact", True)), text)
     try:
         have = have_fn(ident)
     except Exception:            # advisory only
         have = []
     timings["total_s"] = round(time.perf_counter() - t0, 2)
     return {"request": dict(req), "photo": bool(photo_path), "identification": ident,
-            "item_type": kind, "label": label, "verdict": v, "reasons": why, "pick": pick,
-            "money": money, "cheapest_total": cheapest, "at_cheapest": at_cheapest,
-            "already_have": have, "timings": timings,
+            **ev, "already_have": have, "timings": timings,
             "sold_cache_misses": pricing.get("sold_cache_misses") or [],
             "same_item_active": pricing.get("same_item_active_count"),
             "reference": pricing.get("reference"), "warnings": pricing.get("comp_warning"),
