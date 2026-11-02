@@ -733,9 +733,10 @@ _MSSQL_BASELINE = [
 
     # --- 1E. operations -------------------------------------------------------
     """
+    -- History: no foreign key, so a week's stats outlive a deleted item (as on
+    -- SQLite, and like llm_usage).
     CREATE TABLE dbo.listing_stats (
-        item_id           VARCHAR(36)   NOT NULL
-                          CONSTRAINT FK_listing_stats_items REFERENCES dbo.items (item_id) ON DELETE CASCADE,
+        item_id           VARCHAR(36)   NOT NULL,
         week              DATE          NOT NULL,
         impressions       INT           NULL,
         views             INT           NULL,
@@ -778,6 +779,7 @@ _MSSQL_BASELINE = [
         pct         DECIMAL(5,2)  NULL,
         watchers    INT           NULL,
         title       NVARCHAR(80)  NULL,
+        row_raw     NVARCHAR(MAX) NULL CONSTRAINT CK_offer_plan_rows_row_raw_json CHECK (ISJSON(row_raw) = 1),
         CONSTRAINT PK_offer_plan_rows PRIMARY KEY (plan_id, position)
     )""",
     """
@@ -798,7 +800,9 @@ _MSSQL_BASELINE = [
         a VARCHAR(36) NOT NULL,
         b VARCHAR(36) NOT NULL,
         CONSTRAINT PK_not_duplicates PRIMARY KEY (a, b),
-        CONSTRAINT CK_not_duplicates_order CHECK (a < b)
+        -- Binary order, like Python's sorted() in db.mark_not_duplicate (the
+        -- database collation is case-insensitive).
+        CONSTRAINT CK_not_duplicates_order CHECK (a <= b COLLATE Latin1_General_BIN2)
     )""",
     """
     CREATE TABLE dbo.seen_orders (

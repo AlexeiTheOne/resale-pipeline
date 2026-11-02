@@ -446,13 +446,13 @@ Because it's a view, a flag clears by itself once the data is fixed.
 
 | Table | Columns | Keys / indexes | Change from SQLite |
 |---|---|---|---|
-| listing_stats | item_id VARCHAR(36) FK CASCADE, week DATE, impressions, views, watchers, total_impressions, search_views INT, price, suggested_price DECIMAL(10,2), verdict VARCHAR(30), created_at | PK (item_id, week) | week becomes DATE; FK added (0 orphans in dev) |
+| listing_stats | item_id VARCHAR(36) (no FK: history outlives a deleted item like llm_usage), week DATE, impressions, views, watchers, total_impressions, search_views INT, price, suggested_price DECIMAL(10,2), verdict VARCHAR(30), created_at | PK (item_id, week) | week becomes DATE |
 | offer_sends | id INT IDENTITY PK, item_id VARCHAR(36) null (no FK), listing_id VARCHAR(20) NOT NULL, list_price, offer_price DECIMAL(10,2), source VARCHAR(20), sent_at | index (listing_id, sent_at), (sent_at) | |
 | offer_plans | plan_id VARCHAR(36) PK, created_at, used_at | | `rows` JSON goes to offer_plan_rows |
-| offer_plan_rows | plan_id FK CASCADE, position SMALLINT, item_id, listing_id, price, offer_price DECIMAL(10,2), pct DECIMAL(5,2), watchers INT, title NVARCHAR(80) | PK (plan_id, position) | new |
+| offer_plan_rows | plan_id FK CASCADE, position SMALLINT, item_id, listing_id, price, offer_price DECIMAL(10,2), pct DECIMAL(5,2), watchers INT, title NVARCHAR(80), row_raw NVARCHAR(MAX) JSON (keys with no column) | PK (plan_id, position) | new |
 | job_runs | job VARCHAR(40) PK, last_run_at, status VARCHAR(20), detail NVARCHAR(1000) | | |
 | feedback_failures | order_line VARCHAR(40) PK, first_failed_at, last_error NVARCHAR(1000) | | |
-| not_duplicates | a, b VARCHAR(36) | PK (a, b), CHECK (a < b) | |
+| not_duplicates | a, b VARCHAR(36) | PK (a, b), CHECK (a <= b, binary order like Python's `sorted`) | |
 | seen_orders | order_id VARCHAR(30) PK, seen_at | | |
 | llm_usage | id BIGINT IDENTITY PK, ts, provider VARCHAR(20), model VARCHAR(60), stage VARCHAR(40), item_id VARCHAR(36) (no FK: 1 orphan in dev), input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, web_searches INT NOT NULL default 0, cost_usd DECIMAL(18,10) | index (ts) | |
 | ebay_tokens | id TINYINT PK CHECK (id = 1), access_token, refresh_token NVARCHAR(MAX) (today's access token is ~2,400 characters; eBay sets no maximum), expires_at DATETIME2(6) | | epoch REAL becomes UTC datetime; `db.py` converts back to epoch for `ebay/auth.py` |
@@ -750,9 +750,9 @@ names directly.
 |---|---|
 | `get_item(id)` → dict with 11 nested groups | Joins the 1:1 tables and loads the child tables, then **builds the same nested dict** (`dbmap.join_item`). Columns go back to their old keys, child rows become lists, the sale totals inside `ebay` are rebuilt from the `sales` rows with ebay/orders.py's own maths, and the leftover is applied last. Paths are resolved as today. Built in step 2a: identical to SQLite on all 162 dev items. |
 | `list_items(status)` | Same output. Uses a few set-based queries (one per table for all ids) rather than one per item. |
-| `update_field(id, field, data)` | Maps `data` to that group's table. **Writes only the columns whose value differs from the current row**, in one transaction with `UPDLOCK`. Child lists are replaced only if they changed. Unknown keys go to `extra_raw`. This shrinks the last-writer-wins window from "the whole blob" to "the same key". |
+| `update_field(id, field, data)` | **Merges, then writes only what changed**, in one transaction that first takes `UPDLOCK` on the item row. Merge: `data` is compared with the version this caller read (db.py remembers the recent versions it handed out per item and group, and takes the one closest to `data`); only the keys the caller changed are applied onto the current row. Comparing with the current row alone would not be enough: a second writer's dict still holds the first writer's old value and would write it back. Then the item is split again (`dbmap.split_item`) and only changed columns and changed child lists are written, each column together with its JSON copy. Two writers changing different keys of one group both survive; on the same key, the last writer wins. Built in step 2b. |
 | `update_field(id, "pricing", data)` | Writes `item_pricing` as above. When `data` carries comps (a real pricing run), it **inserts a new `pricing_runs` row** with those comps and moves `latest_run_id`. When it doesn't (a manual price, a flag change), it touches `item_pricing` only. `get_item` builds `sold_comps` etc. from the latest run, so `/comps` shows the latest run. |
-| `update_status`, `create_item`, `delete_item` | Same. `delete_item` cascades to child tables. **It is blocked for sold items (decided, Q8):** it raises a clear `ValueError` before the delete, and the `sales` FK backs that up. |
+| `update_status`, `create_item`, `delete_item` | Same. `delete_item` cascades to child tables; a deleted item's pieces are unlinked (FK SET NULL); its `listing_stats` stay (history, no FK). **It is blocked for sold items (decided, Q8):** it raises a clear `ValueError` before the delete, and the `sales` FK backs that up. |
 | `record_listing_stats`, `record_job_run`, `record_feedback_failure`, taxonomy and token upserts (`ON CONFLICT … DO UPDATE`) | `UPDATE …; IF @@ROWCOUNT = 0 INSERT …` inside `SERIALIZABLE`/`UPDLOCK`. Not `MERGE`, which has known concurrency bugs. |
 | `mark_not_duplicate`, `mark_orders_seen` (`INSERT OR IGNORE`) | `INSERT … WHERE NOT EXISTS`, plus catching the duplicate-key error (2627/2601) for the race. |
 | `claim_offer_plan` (rowcount) | Same SQL; pyodbc `rowcount` works. |
@@ -761,7 +761,7 @@ names directly.
 | `next_piece_code` (`LIKE 'BOX-%'`) | Same, with `_ % [` escaped (a label with `_` would otherwise be a wildcard). |
 | `next_receipt_code` (scans every item) | `SELECT MAX(ross_code) FROM item_tags WHERE ross_code < '100000000000'` |
 | `set_location`, `match_quantity_to_pieces` | Same names; they work on `pieces`. |
-| `add_piece` retry on `sqlite3.IntegrityError` | Retry on `pyodbc.IntegrityError`. |
+| `add_piece` retry on `sqlite3.IntegrityError` | Takes `UPDLOCK` + `HOLDLOCK` on the box's `locations` row first, then picks the next code in the same transaction, so pieces added to one box at once queue up instead of colliding (a retry on a duplicate key stays as a safety net). |
 | `llm_usage_breakdown` (`SUM(cost_usd IS NULL)`) | `SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)` |
 | ISO string comparisons (`sent_at >= ?`) | `db.py` parses the ISO argument into a UTC `datetime` and passes that. |
 | `VALID_STATUSES`, `VALID_FIELDS`, `PIECE_STATUSES`, `REAL_CODE_FLOOR` | unchanged |
@@ -772,9 +772,17 @@ names directly.
 
 Plumbing:
 - Connections come from pyodbc's ODBC pooling, one per call as today, and
-  always close.
+  always close (tested).
 - One retry on deadlock (error 1205).
 - `READ_COMMITTED_SNAPSHOT` replaces WAL.
+- **Consistency check** (`db_mssql.consistency_report()`, in the loader's
+  report): wherever a column and its JSON copy both hold a value, the column
+  must be exactly what the copy converts to. With `DB_BACKEND=sqlserver` the
+  test suite runs it after every test.
+- Timestamps without an offset count as UTC (as `last_job_run` and SQLite's
+  text comparisons treat them), except legacy `items.updated_at`, which
+  `backfill_sales.py` wrote in Eastern local time. Partial dates in "since"
+  filters (`"2026"`, `"2026-10"`) mean the start of that year or month.
 
 **SQL outside `db.py` moves into it, in this branch (decided, Q13).** This is
 the only caller-visible change, and it touches Person A's files:
