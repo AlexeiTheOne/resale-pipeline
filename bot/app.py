@@ -31,7 +31,7 @@ import config
 import db
 import logging_setup
 from bot import (
-    flow, intake, inventory_cmds, jobs, listing_cmds, ops_cmds, photos_cmds,
+    check_cmds, flow, intake, inventory_cmds, jobs, listing_cmds, ops_cmds, photos_cmds,
     sales_cmds, text_router, util,
 )
 
@@ -246,7 +246,12 @@ def register_handlers(app: Application) -> None:
     app.add_error_handler(error_handler)
     # Auth gate first (group -1): blocks unauthorized users before any handler below.
     app.add_handler(TypeHandler(Update, _auth_guard), group=-1)
+    # A photo captioned /check is a pre-buy check, never a new item: before intake.
+    app.add_handler(MessageHandler(filters.PHOTO & filters.CaptionRegex(r"^/check(@\w+)?(\s|$)"),
+                                   check_cmds.photo_check))
     app.add_handler(MessageHandler(filters.PHOTO, intake.photo_handler))
+    app.add_handler(CallbackQueryHandler(check_cmds.check_callback, pattern=r"^chk:"))
+    app.add_handler(CommandHandler("check", check_cmds.check_command))
     app.add_handler(CallbackQueryHandler(flow.confirm_callback, pattern=r"^confirm:"))
     app.add_handler(CallbackQueryHandler(flow.review_callback, pattern=r"^review:"))
     app.add_handler(CallbackQueryHandler(listing_cmds.reprice_callback, pattern=r"^reprice:"))
