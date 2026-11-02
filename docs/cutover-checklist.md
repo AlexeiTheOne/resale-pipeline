@@ -236,6 +236,10 @@ included.
    scheduled task (`C:\Users\boris\Projects\run_receipt_bot.cmd`, log
    `receipt_pipeline\service.out.log`):
    `Disable-ScheduledTask ReceiptBot; Stop-ScheduledTask ReceiptBot`.
+   **`Stop-ScheduledTask` ends only the `run_receipt_bot.cmd` loop: the
+   `bot.py` it started keeps running** (this happened twice on 2026-11-02).
+   So always end the leftover pair by PID, as admin, after checking their
+   command lines: `Stop-Process -Id <launcher>, <python>`.
    Then check that no `bot.py` is left (from an admin PowerShell, or the
    command line stays hidden):
    `Get-CimInstance Win32_Process -Filter "CommandLine like '%receipt_pipeline%' or CommandLine like '%bot.py%'"`.
@@ -294,11 +298,24 @@ included.
 13. ⬜ **Receipt bot:** set `SQL_CONN_STR` in `receipt_pipeline\.env` to
     `Driver={ODBC Driver 18 for SQL Server};Server=localhost\SQLEXPRESS;Database=ResaleDB;Trusted_Connection=yes;Encrypt=no;`
     and start it: `Enable-ScheduledTask ReceiptBot; Start-ScheduledTask ReceiptBot`
-    (not `run_bot.bat`). The restart also loads the "already saved" change.
-    Paste one test receipt and check it lands in `ResaleDB.dbo.Receipts`.
-    Then paste it again: the reply must be "already saved", and no second
-    row may appear.
-14. ⬜ **ReceiptsDB read-only:** `ALTER DATABASE ReceiptsDB SET READ_ONLY`.
+    (not `run_bot.bat`). The restart also loads the "already saved" changes.
+    **Test** (corrected 2026-11-02; the first version expected "already
+    saved" from a code path that only handled two pastes at the same
+    instant):
+    1. Paste a receipt that is **already saved**. The reply must be
+       "✅ Receipt <number> already saved", and the counts in
+       `ResaleDB.dbo.Receipts` / `ReceiptItems` must not change.
+    2. Paste a **new** receipt: "Receipt saved successfully". Exactly one new
+       `Receipts` row appears in ResaleDB, with `CreatedAt` in UTC, plus its
+       lines.
+    3. Paste that new receipt again: "already saved", and no new rows.
+
+    `receipt_pipeline` commits: `8f16893` (duplicate-key race) and `9372f1c`
+    (a receipt pasted again; before it, the bot wrote nothing but replied
+    "saved successfully").
+14. ✅ **ReceiptsDB read-only:** `ALTER DATABASE ReceiptsDB SET READ_ONLY`.
+    Done 2026-11-02 at about 16:10, before step 13's test: anything still
+    pointed at ReceiptsDB now fails loudly instead of saving there.
     Keep it for **30 days** (Q2), then take a final backup and drop it.
 15. ⬜ **Re-enable deploys:** `Enable-ScheduledTask EbayBotDeploy`.
 16. ⬜ **Keep the old SQLite file** read-only as the fallback:
@@ -399,6 +416,13 @@ applies.
 - 💤 **`SALES_TAX_RATE` sync:** db.py writes `config.SALES_TAX_RATE` into
   `app_settings` at startup. The baseline seeds 0.07, which matches the
   config default, so this only matters if the rate changes.
+- 💤 **`deploy.ps1` from a normal window:** a manual `deploy.ps1 -Force`
+  fails at `git clean` in `ebay-list-staging`. The deploy task's S4U logon
+  gets the full admin token, so the `.pytest_cache` it creates can't be
+  removed by a non-elevated session. Fix: run the staging tests with the
+  cache outside the staging folder (`-p no:cacheprovider`, or
+  `-o cache_dir=<logs>\pytest-cache`), so manual deploys work again. Until
+  then, retry through the task (section 1).
 - 💤 **`prod-logs` skill and `README.md` on SQL Server:** both query
   `data/ross.db` with raw `sqlite3`, which is frozen after cutover. Switch
   them to read-only SQL Server queries (`db.connect_readonly()`, `sqlcmd -K
@@ -430,6 +454,24 @@ applies.
 ---
 
 ## Log
+- 2026-11-02 cutover, steps done:
+  - 1–3: tasks disabled. The receipt bot's leftover `bot.py` (from its
+    15:18 restart) was ended by PID.
+  - 4: SQLite backup `ross-20261102-205010.db`; ReceiptsDB
+    `ReceiptsDB-20261102-205011-pre-cutover.bak`, verified.
+  - 7: migration, all checks passed, 7.9 s.
+  - 8: cleanup applied, 19 fixes; unique indexes built (schema v2).
+  - 9: `.env` switched.
+  - 10: 163 items and the token read.
+  - 11: new nightly script swapped in; it ran: `ResaleDB-20261102-205410.bak`
+    is 28.1 MB, with the same hash as the OneDrive copy.
+  - 12: **bot started on ResaleDB at 2026-11-02 15:55:11 -05:00 (20:55:11
+    UTC) = the switch time.** The one-day SQLite rollback window ends
+    2026-11-03 15:55. `/health` all green, `/report` OK.
+  - 13: the first test showed "saved successfully" for a receipt pasted
+    again. Nothing was written: the bot found it and skipped. Fixed in
+    `9372f1c`, and the test is corrected.
+  - 14: done before step 13's retest.
 - 2026-11-02 cutover day:
   - Rehearsal (Phase A) passed: migration about 12 s, cleanup 19 changes,
     unique indexes built, every check after them passed.
