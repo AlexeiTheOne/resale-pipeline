@@ -55,15 +55,23 @@ def _conn():
     return con
 
 
-def connect() -> sqlite3.Connection:
+def connect():
     """A read-write connection to the bot's DB (WAL, busy timeout). The one
-    way in for code outside db.py; close it when done."""
+    way in for code outside db.py; close it when done. On SQL Server, a
+    pyodbc connection to config.SQL_DATABASE (T-SQL, autocommit off)."""
+    if _on_sqlserver():
+        import sqlserver
+        return sqlserver.connect()
     return _conn()
 
 
-def connect_readonly(path=None) -> sqlite3.Connection:
+def connect_readonly(path=None):
     """A read-only connection: to the bot's DB, or to `path` (a backup copy).
-    Writes through it fail, so reports can't change data by mistake."""
+    Writes through it fail, so reports can't change data by mistake. On SQL
+    Server `path` may name another database; only SELECT/WITH statements run,
+    and the connection never commits."""
+    if _on_sqlserver():
+        return _sqlserver().connect_readonly(path)
     p = Path(path or DB_PATH)
     con = sqlite3.connect(f"file:{p.as_posix()}?mode=ro", uri=True)
     con.execute("PRAGMA busy_timeout=5000")
@@ -104,7 +112,17 @@ def _row_to_dict(row, cursor):
     return d
 
 def create_tables() -> None:
-    """Bring the DB schema up to date (see migrations.py)."""
+    """Bring the DB schema up to date (see migrations.py). On SQL Server the
+    SQL Server steps, when a database is configured; no SQLite file is opened."""
+    if _on_sqlserver():
+        if config.SQL_DATABASE:
+            import sqlserver
+            con = sqlserver.connect()
+            try:
+                migrations.migrate_mssql(con)
+            finally:
+                con.close()
+        return
     con = _conn()
     try:
         migrations.migrate(con)
@@ -573,3 +591,138 @@ def match_quantity_to_pieces(item_id: str) -> None:
     if n > 1:
         item = get_item(item_id) or {}
         update_field(item_id, "ebay", {**(item.get("ebay") or {}), "quantity": n})
+
+
+# --- moved here from ebay/, pipeline/ and scripts/ (Q13) --------------------
+# The SQL those modules ran themselves. Same results as before on SQLite; on
+# SQL Server the same functions run on ResaleDB, so no caller opens a SQLite
+# file.
+
+def save_ebay_token(access_token: str, refresh_token: str | None, expires_at: float) -> None:
+    """Store the eBay user token (ebay/auth.py). Without a new refresh token
+    the stored one is kept. expires_at is epoch seconds."""
+    if _on_sqlserver():
+        return _sqlserver().save_ebay_token(access_token, refresh_token, expires_at)
+    with _conn() as con:
+        if refresh_token:
+            con.execute(
+                "INSERT INTO ebay_tokens (id, access_token, refresh_token, expires_at) "
+                "VALUES (1, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "access_token = excluded.access_token, "
+                "refresh_token = excluded.refresh_token, "
+                "expires_at = excluded.expires_at",
+                (access_token, refresh_token, expires_at),
+            )
+        else:
+            con.execute(
+                "INSERT INTO ebay_tokens (id, access_token, refresh_token, expires_at) "
+                "VALUES (1, ?, NULL, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "access_token = excluded.access_token, "
+                "expires_at = excluded.expires_at",
+                (access_token, expires_at),
+            )
+
+
+def load_ebay_token() -> dict | None:
+    """{access_token, refresh_token, expires_at (epoch seconds)} or None."""
+    if _on_sqlserver():
+        return _sqlserver().load_ebay_token()
+    with _conn() as con:
+        row = con.execute(
+            "SELECT access_token, refresh_token, expires_at FROM ebay_tokens WHERE id = 1"
+        ).fetchone()
+    if row is None:
+        return None
+    return {"access_token": row[0], "refresh_token": row[1], "expires_at": row[2]}
+
+
+def taxonomy_cache_get(key: str):
+    """(cached value, fetched_at epoch seconds) or None (ebay/taxonomy.py
+    applies its own TTL)."""
+    if _on_sqlserver():
+        return _sqlserver().taxonomy_cache_get(key)
+    with _conn() as con:
+        row = con.execute(
+            "SELECT payload, fetched_at FROM taxonomy_cache WHERE cache_key = ?", (key,)
+        ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row[0]), row[1]
+
+
+def taxonomy_cache_set(key: str, value, fetched_at: float) -> None:
+    if _on_sqlserver():
+        return _sqlserver().taxonomy_cache_set(key, value, fetched_at)
+    with _conn() as con:
+        con.execute(
+            "INSERT INTO taxonomy_cache (cache_key, payload, fetched_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET "
+            "payload = excluded.payload, fetched_at = excluded.fetched_at",
+            (key, json.dumps(value), fetched_at),
+        )
+
+
+def own_listings() -> list[tuple]:
+    """(eBay listing id, listing title) for every item, either may be None
+    (pipeline/pricing_v2.own_listings builds its sets from these)."""
+    return [((it.get("ebay") or {}).get("listing_id"), (it.get("listing") or {}).get("title"))
+            for it in list_items()]
+
+
+def sold_items_for_calibration() -> list[dict]:
+    """Sold items as {item_id, identification, ebay, receipt}, by item_id
+    (pricing_v2's calibration examples, msrp's sold history)."""
+    return [{"item_id": it["item_id"], "identification": it.get("identification"),
+             "ebay": it.get("ebay"), "receipt": it.get("receipt")}
+            for it in sorted(list_items("sold"), key=lambda it: it["item_id"])]
+
+
+def llm_stage_spend(since_iso: str, stage: str, item_id: str | None = None) -> tuple[float, int]:
+    """(cost USD, calls) for one stage since since_iso, optionally one item."""
+    if _on_sqlserver():
+        return _sqlserver().llm_stage_spend(since_iso, stage, item_id)
+    sql = "SELECT COALESCE(SUM(cost_usd),0), COUNT(*) FROM llm_usage WHERE ts >= ? AND stage = ?"
+    args = [since_iso, stage]
+    if item_id:
+        sql += " AND item_id = ?"
+        args.append(item_id)
+    with _conn() as con:
+        cost, calls = con.execute(sql, args).fetchone()
+    return float(cost), int(calls)
+
+
+def modify_field(item_id: str, field: str, change) -> bool:
+    """Atomic read-modify-write of one item field: change(value) gets the
+    current value (as get_item returns it) and returns the new one, or None to
+    leave the item alone. True if written. Nothing else can write the item in
+    between (SQLite: BEGIN IMMEDIATE; SQL Server: the item row's UPDLOCK)."""
+    if field not in VALID_FIELDS:
+        raise ValueError(f"Invalid field '{field}'. Must be one of: {VALID_FIELDS}")
+    if _on_sqlserver():
+        return _sqlserver().modify_field(item_id, field, change)
+    con = _conn()
+    con.execute("PRAGMA busy_timeout=30000")
+    con.isolation_level = None
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(f"SELECT {field} FROM items WHERE item_id = ?", (item_id,)).fetchone()
+        if row is None:
+            con.execute("ROLLBACK")
+            return False
+        current = _map_paths(field, json.loads(row[0]), _resolved) if row[0] is not None else None
+        new = change(current)
+        if new is None:
+            con.execute("ROLLBACK")
+            return False
+        con.execute(f"UPDATE items SET {field} = ?, updated_at = ? WHERE item_id = ?",
+                    (json.dumps(_map_paths(field, new, stored_path)), _now(), item_id))
+        con.execute("COMMIT")
+        return True
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()

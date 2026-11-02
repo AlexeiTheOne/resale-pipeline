@@ -85,37 +85,12 @@ def _save_token(token: dict) -> None:
     expires_at = now + token.get("expires_in", 0)
     refresh_token = token.get("refresh_token")
 
-    with db.connect() as con:
-        if refresh_token:
-            con.execute(
-                "INSERT INTO ebay_tokens (id, access_token, refresh_token, expires_at) "
-                "VALUES (1, ?, ?, ?) "
-                "ON CONFLICT(id) DO UPDATE SET "
-                "access_token = excluded.access_token, "
-                "refresh_token = excluded.refresh_token, "
-                "expires_at = excluded.expires_at",
-                (access_token, refresh_token, expires_at),
-            )
-        else:
-            con.execute(
-                "INSERT INTO ebay_tokens (id, access_token, refresh_token, expires_at) "
-                "VALUES (1, ?, NULL, ?) "
-                "ON CONFLICT(id) DO UPDATE SET "
-                "access_token = excluded.access_token, "
-                "expires_at = excluded.expires_at",
-                (access_token, expires_at),
-            )
+    # A refresh without a new refresh token keeps the stored one.
+    db.save_ebay_token(access_token, refresh_token, expires_at)
 
 
 def _load_token() -> dict | None:
-    with db.connect() as con:
-        cur = con.execute(
-            "SELECT access_token, refresh_token, expires_at FROM ebay_tokens WHERE id = 1"
-        )
-        row = cur.fetchone()
-        if row is None:
-            return None
-        return {"access_token": row[0], "refresh_token": row[1], "expires_at": row[2]}
+    return db.load_ebay_token()
 
 
 def _extract_code(code_or_url: str) -> str:

@@ -735,6 +735,141 @@ def llm_usage_breakdown(since_iso: str) -> list[dict]:
     return rows
 
 
+# --- moved from ebay/, pipeline/ and scripts/ (Q13) --------------------------------------
+
+def _epoch_to_dt(epoch: float):
+    return datetime.fromtimestamp(float(epoch), timezone.utc).replace(tzinfo=None)
+
+
+def _dt_to_epoch(dt) -> float | None:
+    return dt.replace(tzinfo=timezone.utc).timestamp() if dt is not None else None
+
+
+def save_ebay_token(access_token, refresh_token, expires_at) -> None:
+    values = {"access_token": access_token, "expires_at": _epoch_to_dt(expires_at)}
+    if refresh_token:
+        values["refresh_token"] = refresh_token
+    _write(_upsert, "ebay_tokens", {"id": 1}, values)
+
+
+def load_ebay_token() -> dict | None:
+    rows = _query("SELECT access_token, refresh_token, expires_at FROM dbo.ebay_tokens WHERE id = 1")
+    if not rows:
+        return None
+    r = rows[0]
+    return {"access_token": r["access_token"], "refresh_token": r["refresh_token"],
+            "expires_at": _dt_to_epoch(r["expires_at"])}
+
+
+def taxonomy_cache_get(key: str):
+    rows = _query("SELECT payload_raw, fetched_at FROM dbo.taxonomy_cache WHERE cache_key = ?", key)
+    if not rows:
+        return None
+    return json.loads(rows[0]["payload_raw"]), _dt_to_epoch(rows[0]["fetched_at"])
+
+
+def taxonomy_cache_set(key: str, value, fetched_at: float) -> None:
+    _write(_upsert, "taxonomy_cache", {"cache_key": key},
+           {"payload_raw": json.dumps(value), "fetched_at": _epoch_to_dt(fetched_at)})
+
+
+def llm_stage_spend(since_iso: str, stage: str, item_id: str | None = None) -> tuple[float, int]:
+    sql = ("SELECT COALESCE(SUM(cost_usd), 0) AS cost, COUNT(*) AS calls FROM dbo.llm_usage "
+           "WHERE ts >= ? AND stage = ?")
+    args = [_since(since_iso), stage]
+    if item_id:
+        sql += " AND item_id = ?"
+        args.append(item_id)
+    r = _query(sql, *args)[0]
+    return float(r["cost"]), int(r["calls"])
+
+
+def modify_field(item_id: str, field: str, change) -> bool:
+    done = {}
+
+    def edit(raw):
+        current = raw.get(field)
+        shown = copy.deepcopy(db._map_paths(field, current, db._resolved)) if current is not None else None
+        new = change(shown)
+        if new is None:
+            return
+        raw[field] = json.loads(json.dumps(db._map_paths(field, new, db.stored_path)))
+        raw["updated_at"] = _now()
+        done["raw"] = raw
+    _write(_rewrite, item_id, edit)
+    if done:
+        _remember(done["raw"])
+    return bool(done)
+
+
+_READ_ONLY_FIRST_WORDS = ("SELECT", "WITH")
+
+
+class ReadOnlyError(RuntimeError):
+    """A statement other than SELECT/WITH on a read-only connection."""
+
+
+def _check_read_only(sql: str) -> None:
+    body = "\n".join(line for line in sql.splitlines() if not line.strip().startswith("--")).strip()
+    if body.endswith(";"):
+        body = body[:-1]
+    first = body.split(None, 1)[0].upper() if body else ""
+    if first not in _READ_ONLY_FIRST_WORDS or ";" in body:
+        raise ReadOnlyError(f"read-only connection: only one SELECT/WITH statement, not {sql[:60]!r}")
+
+
+class _ReadOnlyCursor:
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql, *params):
+        _check_read_only(sql)
+        self._cur.execute(sql, *params)
+        return self
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+class ReadOnlyConnection:
+    """db.connect_readonly() on SQL Server. Only SELECT/WITH runs, and the
+    transaction is always rolled back, so nothing can be changed through it.
+    (Q7's read-only SQL login needs mixed-mode auth, a server setting.)"""
+
+    def __init__(self, con):
+        self._con = con
+
+    def cursor(self):
+        return _ReadOnlyCursor(self._con.cursor())
+
+    def execute(self, sql, *params):
+        return self.cursor().execute(sql, *params)
+
+    def commit(self):
+        raise ReadOnlyError("read-only connection: commit refused")
+
+    def close(self):
+        try:
+            self._con.rollback()
+        finally:
+            self._con.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def connect_readonly(path=None) -> ReadOnlyConnection:
+    if path is not None:
+        name = str(path)
+        if any(ch in name for ch in "/\\.:"):
+            raise ValueError(f"{name!r} looks like a file; on SQL Server pass a database name")
+        return ReadOnlyConnection(sqlserver.connect(name))
+    return ReadOnlyConnection(sqlserver.connect())
+
+
 # --- consistency ------------------------------------------------------------------------
 
 def consistency_report() -> list[str]:
