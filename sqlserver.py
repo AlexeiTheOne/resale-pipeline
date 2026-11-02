@@ -118,6 +118,30 @@ def drop_test_database(name: str) -> None:
         con.close()
 
 
+DEV_DATABASE = "ResaleDB_Dev"
+
+
+def assert_resettable(name: str) -> None:
+    """Only the dev database and test databases may be wiped and rebuilt."""
+    _check_name(name)
+    if name != DEV_DATABASE:
+        assert_test_database(name)
+
+
+def reset_database(name: str) -> None:
+    """Drop and recreate ResaleDB_Dev or a ResaleDB_Test_* database (empty,
+    no schema). Anything else is refused before connecting."""
+    assert_resettable(name)
+    con = connect("master", autocommit=True)
+    try:
+        if con.execute("SELECT DB_ID(?)", name).fetchone()[0] is not None:
+            con.execute(f"ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE")
+            con.execute(f"DROP DATABASE [{name}]")
+    finally:
+        con.close()
+    create_database(name)
+
+
 def stale_test_databases(names, now: datetime | None = None,
                          older_than: timedelta = timedelta(hours=24)) -> list[str]:
     """Which of `names` are ResaleDB_Test_* databases older than `older_than`,

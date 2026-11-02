@@ -39,6 +39,17 @@ def test_drop_refuses_real_databases_without_connecting(monkeypatch):
             sqlserver.drop_test_database(name)
 
 
+def test_only_dev_and_test_databases_can_be_reset(monkeypatch):
+    def no_connect(*a, **k):
+        raise AssertionError("must refuse before connecting")
+    monkeypatch.setattr(sqlserver, "connect", no_connect)
+    for name in ("ResaleDB", "ReceiptsDB", "resaledb_dev", "master"):
+        with pytest.raises(RuntimeError):
+            sqlserver.reset_database(name)
+    sqlserver.assert_resettable("ResaleDB_Dev")
+    sqlserver.assert_resettable("ResaleDB_Test_1_20261102010203")
+
+
 def test_new_names_are_unique_per_process_and_time():
     t = datetime(2026, 11, 2, 1, 2, 3, tzinfo=timezone.utc)
     name = sqlserver.new_test_database_name(t)
