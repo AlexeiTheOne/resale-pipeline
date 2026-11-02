@@ -288,15 +288,17 @@ def test_calibration_is_sold_items_at_sold_price_only():
              '{"sale_price": 159.98, "units_sold": 2}'),
             ("bbb2", '{"brand": "DKNY"}', '{}'),                # sold row with no sale data
             ("ccc3", '{"brand": "Coach"}', '{"sale_price": 99.99}')]
-    saved = v2._db_rows
+    saved = v2.db.sold_items_for_calibration
     try:
-        v2._db_rows = lambda sql: (rows if "status = 'sold'" in sql else [])
+        v2.db.sold_items_for_calibration = lambda: [
+            {"item_id": i, "identification": json.loads(ident), "ebay": json.loads(eb), "receipt": None}
+            for i, ident, eb in sorted(rows)]
         ex = v2.calibration_examples(None, n=5)
         assert [(e["brand"], e["sold_price"]) for e in ex] == [("Oakley", 79.99), ("Coach", 99.99)]
         assert [e["brand"] for e in v2.calibration_examples("ccc3", n=5)] == ["Oakley"]
         assert "$79.99" in v2._calibration_text(ex)
     finally:
-        v2._db_rows = saved
+        v2.db.sold_items_for_calibration = saved
 
 
 def test_zero_claude_price_is_asked_once_more():

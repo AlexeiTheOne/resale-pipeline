@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # DB_PATH at call time, so telegram_bot's by-name imports of record_job_run /
 # last_job_run follow this too.
 _TMPDIR = tempfile.mkdtemp(prefix="jobsched_")
+import backend_sql  # noqa: E402
 import db  # noqa: E402
 
 db.DB_PATH = str(Path(_TMPDIR) / "test.db")
@@ -44,12 +45,19 @@ def utc(y, m, d, h=0, mi=0):
 
 def _stamp(job, when):
     """Force a job's last-completed time, bypassing record_job_run's own clock."""
-    with db._conn() as con:
-        con.execute(
-            "INSERT INTO job_runs (job, last_run_at) VALUES (?, ?) "
-            "ON CONFLICT(job) DO UPDATE SET last_run_at=excluded.last_run_at",
-            (job, when if isinstance(when, str) else when.isoformat()),
-        )
+    value = when if isinstance(when, str) else when.isoformat()
+    backend_sql.execute(
+        "INSERT INTO job_runs (job, last_run_at) VALUES (?, ?) "
+        "ON CONFLICT(job) DO UPDATE SET last_run_at=excluded.last_run_at",
+        "UPDATE dbo.job_runs SET last_run_at = ? WHERE job = ?; IF @@ROWCOUNT = 0 "
+        "INSERT INTO dbo.job_runs (last_run_at, job) VALUES (?, ?)",
+        (job, value) if not backend_sql.on_sqlserver() else (_db_time(value), job, _db_time(value), job))
+
+
+def _db_time(value):
+    """What SQL Server stores for an ISO string (naive = UTC, as last_job_run reads it)."""
+    import dbmap
+    return dbmap.to_db(value, dbmap.TS)[0]
 
 
 # --- slot arithmetic -------------------------------------------------------
@@ -142,10 +150,8 @@ def test_record_job_run_is_an_upsert():
     first = db.last_job_run("upsert")
     db.record_job_run("upsert")
     assert db.last_job_run("upsert") >= first
-    with db._conn() as con:
-        rows = con.execute(
-            "SELECT COUNT(*) FROM job_runs WHERE job = 'upsert'").fetchone()[0]
-    assert rows == 1
+    rows = backend_sql.rows("SELECT COUNT(*) AS n FROM job_runs WHERE job = 'upsert'")
+    assert rows[0]["n"] == 1
 
 
 # --- a partial run is not a completed run ----------------------------------

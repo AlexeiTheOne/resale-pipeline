@@ -25,27 +25,17 @@ class InvalidCategoryError(Exception):
 
 
 def _cache_get(key: str):
-    with db.connect() as con:
-        cur = con.execute(
-            "SELECT payload, fetched_at FROM taxonomy_cache WHERE cache_key = ?", (key,)
-        )
-        row = cur.fetchone()
+    row = db.taxonomy_cache_get(key)
     if row is None:
         return None
-    payload, fetched_at = row
+    value, fetched_at = row
     if time.time() - fetched_at > CACHE_TTL:
         return None
-    return json.loads(payload)
+    return value
 
 
 def _cache_set(key: str, value) -> None:
-    with db.connect() as con:
-        con.execute(
-            "INSERT INTO taxonomy_cache (cache_key, payload, fetched_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(cache_key) DO UPDATE SET "
-            "payload = excluded.payload, fetched_at = excluded.fetched_at",
-            (key, json.dumps(value), time.time()),
-        )
+    db.taxonomy_cache_set(key, value, time.time())
 
 
 def _headers() -> dict:

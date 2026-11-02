@@ -26,6 +26,7 @@ from config import (
     WYSIWYG_NOTE,
 )
 from db import get_item, update_field
+from ebay import guard
 from ebay.auth import get_access_token
 from ebay.taxonomy import InvalidCategoryError, category_aspects, category_name, resolve_valid_category
 from pipeline.description_guard import sanitize_description
@@ -250,6 +251,7 @@ def _headers() -> dict:
 
 
 def _request(method: str, path: str, **kwargs):
+    guard.require_rest_write(method, path)
     r = httpx.request(method, f"{EBAY_API_BASE}{path}", headers=_headers(), timeout=30, **kwargs)
     if r.status_code >= 400:
         raise RuntimeError(f"eBay API {method} {path} failed [{r.status_code}]: {r.text}")
@@ -269,6 +271,7 @@ def _ensure_location() -> None:
         "locationTypes": ["WAREHOUSE"],
         "name": "Resale warehouse",
     }
+    guard.require_writes("create inventory location")
     create = httpx.post(url, headers=_headers(), json=body, timeout=30)
     if create.status_code >= 400:
         raise RuntimeError(f"eBay API create location failed [{create.status_code}]: {create.text}")
@@ -289,6 +292,7 @@ def _existing_offer_id(body_text: str) -> str | None:
 
 
 def _create_offer(offer: dict) -> str:
+    guard.require_writes("create offer")
     r = httpx.post(f"{EBAY_API_BASE}/sell/inventory/v1/offer", headers=_headers(), json=offer, timeout=30)
     if r.status_code >= 400:
         existing_id = _existing_offer_id(r.text)
@@ -316,6 +320,7 @@ def _create_offer(offer: dict) -> str:
 def delete_offer(offer_id: str) -> None:
     """Remove an offer from eBay's side. Treats 'already gone' (404) as success
     so cleanup is safe to retry."""
+    guard.require_writes(f"delete offer {offer_id}")
     r = httpx.delete(f"{EBAY_API_BASE}/sell/inventory/v1/offer/{offer_id}", headers=_headers(), timeout=30)
     if r.status_code in (204, 404):
         return
@@ -335,6 +340,7 @@ def withdraw_offer(offer_id: str) -> None:
     as a draft, so it can be re-published later with publish_offer. A 404 (already
     gone) or an 'offer not published' error is treated as success so /end is safe
     to retry."""
+    guard.require_writes(f"withdraw offer {offer_id}")
     r = httpx.post(
         f"{EBAY_API_BASE}/sell/inventory/v1/offer/{offer_id}/withdraw",
         headers=_headers(), timeout=30,
@@ -1118,6 +1124,8 @@ def _build_product(listing: dict, image_urls: list[str], aspects: dict, descript
 def create_draft_offer(item_id: str) -> dict:
     """Push the listing to eBay as an unpublished offer (a Draft in Seller Hub).
     Does not call publishOffer — nothing goes live until that's done separately."""
+    # Up front, so no photos are uploaded for a draft that can't be created.
+    guard.require_writes(f"create eBay draft for item {item_id}")
     item = get_item(item_id)
     if item is None:
         raise ValueError(f"No item found for id {item_id}")

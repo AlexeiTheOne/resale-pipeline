@@ -1,14 +1,13 @@
 """Show what fit_title would do to over-long titles — read-only, for approval.
 
-Nothing here writes: the DB is opened with mode=ro and no eBay call is made.
+Nothing here writes: the DB is only read (through db.py) and no eBay call is made.
 The output is for the owner to approve before any title is pushed live.
 
     python scripts/title_fit_report.py              # the 7 titles eBay truncated
     python scripts/title_fit_report.py bff24df0 ... # specific item id prefixes
     python scripts/title_fit_report.py --all        # every stored title over 80
-    python scripts/title_fit_report.py --db C:/Ebay-list/data/ross.db ...
+    python scripts/title_fit_report.py --db C:/Ebay-list/data/ross.db ...   # SQLite only
 """
-import json
 import sys
 from pathlib import Path
 
@@ -24,30 +23,32 @@ TRUNCATED = ["bff24df0", "a129b1b5", "2f57c0f4", "ed54b249",
 
 
 def main(argv: list[str]) -> None:
-    db_path = Path(db.DB_PATH)
     if argv[:1] == ["--db"]:
+        if db._on_sqlserver():
+            raise SystemExit("--db is a SQLite file; with DB_BACKEND=sqlserver use SQL_DATABASE")
         db_path, argv = Path(argv[1]), argv[2:]
-    if not db_path.exists():
-        raise SystemExit(f"{db_path} not found")
-    con = db.connect_readonly(db_path)
+        if not db_path.exists():
+            raise SystemExit(f"{db_path} not found")
+        db.DB_PATH = str(db_path)
+    elif not db._on_sqlserver() and not Path(db.DB_PATH).exists():
+        raise SystemExit(f"{db.DB_PATH} not found")
+    items = db.list_items()
     if argv == ["--all"]:
-        rows = con.execute("SELECT item_id, identification, listing FROM items "
-                           "WHERE listing IS NOT NULL").fetchall()
-        rows = [r for r in rows
-                if len((json.loads(r[2]) or {}).get("title") or "") > TITLE_MAX_LEN]
+        rows = [it for it in items if it.get("listing") is not None
+                and len((it["listing"] or {}).get("title") or "") > TITLE_MAX_LEN]
     else:
         rows = []
         for prefix in argv or TRUNCATED:
-            r = con.execute("SELECT item_id, identification, listing FROM items "
-                            "WHERE item_id LIKE ?", (prefix + "%",)).fetchone()
-            if r is None:
+            found = next((it for it in items if it["item_id"].startswith(prefix)), None)
+            if found is None:
                 print(f"{prefix}: not found")
             else:
-                rows.append(r)
+                rows.append(found)
 
-    for item_id, ident_raw, listing_raw in rows:
-        ident = json.loads(ident_raw or "{}") or {}
-        listing = json.loads(listing_raw or "{}") or {}
+    for it in rows:
+        item_id = it["item_id"]
+        ident = it.get("identification") or {}
+        listing = it.get("listing") or {}
         title = listing.get("title") or ""
         fitted, dropped = fit_title(title, ident, listing.get("item_specifics"))
         print(f"{item_id[:8]}  {len(title)} -> {len(fitted)}")

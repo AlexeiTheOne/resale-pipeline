@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import httpx
 
 from config import EBAY_MARKETPLACE_ID, EBAY_PROMOTED_CAMPAIGN_NAME
+from ebay import guard
 from ebay.auth import get_access_token
 
 EBAY_API_BASE = "https://api.ebay.com"
@@ -45,6 +46,7 @@ def _headers() -> dict:
 
 
 def _request(method: str, path: str, **kwargs) -> httpx.Response:
+    guard.require_rest_write(method, path)
     r = httpx.request(method, f"{EBAY_API_BASE}{path}", headers=_headers(), timeout=30, **kwargs)
     if r.status_code >= 400:
         raise RuntimeError(f"eBay Marketing API {method} {path} failed [{r.status_code}]: {r.text}")
@@ -125,6 +127,7 @@ def promote_listing(sku: str, bid_percentage) -> dict:
     "change the ad rate". Returns {'campaign_id', 'bid_percentage', 'action'}.
     """
     bid = normalize_bid(bid_percentage)
+    guard.require_writes(f"promote SKU {sku}")
     campaign_id = ensure_campaign()
 
     body = {

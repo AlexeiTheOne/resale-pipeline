@@ -11,11 +11,13 @@ The MSRP is the brand's retail price as found by research. It is NOT the Ross
 tag's original_price: that is Ross's own pre-markdown price, not retail, so an
 MSRP equal to it is flagged as suspicious (research may have read the tag).
 
-Read-only on data/ross.db.
+Read-only, through db.py (either backend).
 """
 import json
 import re
 import statistics
+
+import db
 
 from pipeline import comps
 
@@ -82,13 +84,20 @@ def msrp_flags(ident: dict, receipt: dict | None = None) -> list[str]:
     return flags
 
 
+def _obj(value, empty):
+    """A stored group as a dict: JSON text (old callers, tests) or already decoded."""
+    if isinstance(value, str):
+        value = json.loads(value)
+    return value if value is not None else empty
+
+
 def sold_history(rows) -> list[dict]:
-    """rows: (item_id, identification json, ebay json, receipt json) of SOLD items.
-    Returns the usable sales with their sold/MSRP ratio."""
+    """rows: (item_id, identification, ebay, receipt) of SOLD items, each group
+    a dict or its JSON text. Returns the usable sales with their sold/MSRP ratio."""
     out = []
     for item_id, ident_json, ebay_json, receipt_json in rows:
-        ident = json.loads(ident_json or "{}")
-        e = json.loads(ebay_json or "{}")
+        ident = _obj(ident_json, {})
+        e = _obj(ebay_json, {})
         if not e.get("sale_price"):
             continue
         unit = e["sale_price"] / max(1, e.get("units_sold") or 1)
@@ -96,7 +105,7 @@ def sold_history(rows) -> list[dict]:
         rec = {"item_id": item_id, "brand": brand_key(ident.get("brand")),
                "bucket": type_bucket(ident.get("item_type")), "msrp": m,
                "sold": round(unit, 2), "ratio": None}
-        if m and not msrp_flags(ident, json.loads(receipt_json or "null")):
+        if m and not msrp_flags(ident, _obj(receipt_json, None)):
             r = unit / m
             if RATIO_BOUNDS[0] <= r <= RATIO_BOUNDS[1]:
                 rec["ratio"] = r
@@ -105,9 +114,8 @@ def sold_history(rows) -> list[dict]:
 
 
 def load_history() -> list[dict]:
-    from pipeline.pricing_v2 import _db_rows
-    return sold_history(_db_rows(
-        "SELECT item_id, identification, ebay, receipt FROM items WHERE status = 'sold'"))
+    return sold_history([(s["item_id"], s["identification"], s["ebay"], s["receipt"])
+                         for s in db.sold_items_for_calibration()])
 
 
 def _stats(ratios: list[float]) -> dict:

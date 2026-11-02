@@ -45,6 +45,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
+import config  # noqa: E402
 import db  # noqa: E402
 from pipeline import pricing_v2 as v2  # noqa: E402
 
@@ -80,21 +81,27 @@ OUT_DIR = ROOT / "data" / "cache" / "backtest"
 CLAUDE_ITEM_WORST = 0.10
 
 
+def _stored(path):
+    """A photo path as the DB stores it (relative to the repo when inside it)."""
+    return config.stored_path(path) if path else path
+
+
 def load_items(prefixes, limit):
-    con = db.connect_readonly()
-    rows = con.execute("SELECT item_id, status, identification, listing, pricing, ebay, receipt, "
-                       "photos, created_at FROM items WHERE status IN ('published','sold') "
-                       "ORDER BY item_id").fetchall()
-    con.close()
+    rows = sorted((it for it in db.list_items() if it["status"] in ("published", "sold")),
+                  key=lambda it: it["item_id"])
     now = datetime.now(timezone.utc)
     items = []
-    for item_id, status, ident, listing, pricing, ebay, receipt, photos, created in rows:
+    for it in rows:
+        item_id, status, created = it["item_id"], it["status"], it["created_at"]
         if prefixes and not any(item_id.startswith(p) for p in prefixes):
             continue
-        ident, listing = json.loads(ident or "{}"), json.loads(listing or "{}")
+        ident, listing = it.get("identification") or {}, it.get("listing") or {}
         if not ident or not listing.get("price"):
             continue
-        e = json.loads(ebay or "{}")
+        e = it.get("ebay") or {}
+        receipt = it.get("receipt")
+        if isinstance(receipt, dict) and receipt.get("photo"):
+            receipt = {**receipt, "photo": _stored(receipt["photo"])}
         sold = None
         if status == "sold" and e.get("sale_price"):
             sold = round(e["sale_price"] / max(1, e.get("units_sold") or 1), 2)
@@ -103,16 +110,16 @@ def load_items(prefixes, limit):
         listed = _ts(e.get("published_at")) or _ts(created)
         end = _ts(e.get("sold_at")) if status == "sold" else now
         days = round((end - listed).total_seconds() / 86400, 1) if listed and end else None
-        photo_list = json.loads(photos or "[]")
+        photo_list = [_stored(p) for p in it.get("photos") or []]
         inbox = ROOT / "data" / "inbox" / item_id
         if inbox.is_dir():
             photo_list = sorted(str(p) for p in inbox.glob("*.jpg")) + photo_list
         items.append({
             "item_id": item_id, "status": status, "ident": ident,
-            "receipt": json.loads(receipt or "null"), "photos": photo_list,
+            "receipt": receipt, "photos": photo_list,
             "owner_price": listing["price"], "sold_price": sold,
             "category_id": listing.get("category_id"),
-            "v1_price": json.loads(pricing or "{}").get("machine_price"),
+            "v1_price": (it.get("pricing") or {}).get("machine_price"),
             "days": days,
         })
     if prefixes:  # keep the order given on the command line
@@ -121,15 +128,7 @@ def load_items(prefixes, limit):
 
 
 def claude_spend(since_iso, item_id=None):
-    con = db.connect_readonly()
-    sql = "SELECT COALESCE(SUM(cost_usd),0), COUNT(*) FROM llm_usage WHERE ts >= ? AND stage = ?"
-    args = [since_iso, v2.JUDGE_STAGE]
-    if item_id:
-        sql += " AND item_id = ?"
-        args.append(item_id)
-    cost, calls = con.execute(sql, args).fetchone()
-    con.close()
-    return float(cost), int(calls)
+    return db.llm_stage_spend(since_iso, v2.JUDGE_STAGE, item_id)
 
 
 def ratio(a, b):

@@ -23,7 +23,14 @@ Files it keeps (all under <repo>\logs, which git ignores):
   deploy-state.json  last alert sent (so a blocked state alerts once) and the
                      last failed sha (skipped until a newer commit, or -Force)
 
-Never touches data\ross.db (backup.py only reads it), .env, other projects,
+The bot runs on SQL Server (ResaleDB). Staging tests run on SQL Server too
+(DB_BACKEND=sqlserver, ROSS_REQUIRE_SQLSERVER=1: a missing server fails the
+deploy instead of skipping the SQL Server tests), in per-run ResaleDB_Test_*
+databases. The backup before a deploy is a SQL Server BACKUP DATABASE into
+SQL_BACKUP_DIR (backup.py --expect-backend sqlserver refuses if the live .env
+isn't on SQL Server). A rollback restores code only, never the database.
+
+Never touches the database except through backup.py, .env, other projects,
 or any python process except the bot via restart_ebay_bot.ps1.
 #>
 [CmdletBinding()]
@@ -197,11 +204,14 @@ function Test-InStaging([string]$Sha) {
     # No API keys in the test process, so a test can never call a real API.
     # Tests need none (clients are created on first use). Restored afterwards.
     $keys = 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'ANTHROPIC_API_KEY'
+    # The tests run on SQL Server, like production; skipping them is a failure.
+    $testEnv = @{ DB_BACKEND = 'sqlserver'; ROSS_REQUIRE_SQLSERVER = '1' }
     $saved = @{}
-    foreach ($k in $keys) {
+    foreach ($k in ($keys + @($testEnv.Keys))) {
         $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
-        [Environment]::SetEnvironmentVariable($k, $null, 'Process')
     }
+    foreach ($k in $keys) { [Environment]::SetEnvironmentVariable($k, $null, 'Process') }
+    foreach ($k in $testEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $testEnv[$k], 'Process') }
     $outFile = Join-Path $LogDir 'deploy-pytest.out'
     $errFile = Join-Path $LogDir 'deploy-pytest.err'
     try {
@@ -219,13 +229,16 @@ function Test-InStaging([string]$Sha) {
                (Get-Content $errFile -Raw -ErrorAction SilentlyContinue)
         return @{ Ok = ($p.ExitCode -eq 0); Out = $out.Trim() }
     } finally {
-        foreach ($k in $keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') }
+        foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') }
     }
 }
 
+# SQL Server BACKUP DATABASE (verified) into SQL_BACKUP_DIR, then a copy to
+# BACKUP_DIR (warn-only: the local .bak is enough to roll back). Fails, and so
+# stops the deploy, if the live .env is not on SQL Server.
 function Invoke-Backup {
     Push-Location $RepoPath
-    try { $r = Invoke-Native $Python @('backup.py', '--db-only') } finally { Pop-Location }
+    try { $r = Invoke-Native $Python @('backup.py', '--db-only', '--expect-backend', 'sqlserver') } finally { Pop-Location }
     return $r
 }
 

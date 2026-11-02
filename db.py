@@ -5,10 +5,30 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import config
 import migrations
 from config import DATA_DIR, resolve_path, stored_path
 
 DB_PATH = str(DATA_DIR / "ross.db")
+
+
+# --- backend switch (SQL Server migration, docs/schema-proposal.md) ----------
+# config.DB_BACKEND picks the database. "sqlite" (default) is this file as it
+# always was. "sqlserver" sends every public function below to db_mssql.py,
+# which reads and writes ResaleDB and returns the same shapes.
+
+def _on_sqlserver() -> bool:
+    backend = config.DB_BACKEND
+    if backend not in ("sqlite", "sqlserver"):
+        raise ValueError(f"DB_BACKEND must be 'sqlite' or 'sqlserver', not {backend!r}")
+    return backend == "sqlserver"
+
+
+def _sqlserver():
+    import db_mssql  # only needs pyodbc when the backend is actually used
+    return db_mssql
+
+
 
 VALID_STATUSES = [
     "captured", "identified", "priced", "drafted",
@@ -35,15 +55,23 @@ def _conn():
     return con
 
 
-def connect() -> sqlite3.Connection:
+def connect():
     """A read-write connection to the bot's DB (WAL, busy timeout). The one
-    way in for code outside db.py; close it when done."""
+    way in for code outside db.py; close it when done. On SQL Server, a
+    pyodbc connection to config.SQL_DATABASE (T-SQL, autocommit off)."""
+    if _on_sqlserver():
+        import sqlserver
+        return sqlserver.connect()
     return _conn()
 
 
-def connect_readonly(path=None) -> sqlite3.Connection:
+def connect_readonly(path=None):
     """A read-only connection: to the bot's DB, or to `path` (a backup copy).
-    Writes through it fail, so reports can't change data by mistake."""
+    Writes through it fail, so reports can't change data by mistake. On SQL
+    Server `path` may name another database; only SELECT/WITH statements run,
+    and the connection never commits."""
+    if _on_sqlserver():
+        return _sqlserver().connect_readonly(path)
     p = Path(path or DB_PATH)
     con = sqlite3.connect(f"file:{p.as_posix()}?mode=ro", uri=True)
     con.execute("PRAGMA busy_timeout=5000")
@@ -84,7 +112,17 @@ def _row_to_dict(row, cursor):
     return d
 
 def create_tables() -> None:
-    """Bring the DB schema up to date (see migrations.py)."""
+    """Bring the DB schema up to date (see migrations.py). On SQL Server the
+    SQL Server steps, when a database is configured; no SQLite file is opened."""
+    if _on_sqlserver():
+        if config.SQL_DATABASE:
+            import sqlserver
+            con = sqlserver.connect()
+            try:
+                migrations.migrate_mssql(con)
+            finally:
+                con.close()
+        return
     con = _conn()
     try:
         migrations.migrate(con)
@@ -93,6 +131,8 @@ def create_tables() -> None:
 
 
 def create_item(photos: list[str]) -> str:
+    if _on_sqlserver():
+        return _sqlserver().create_item(photos)
     item_id = str(uuid.uuid4())
     now = _now()
     with _conn() as con:
@@ -104,6 +144,8 @@ def create_item(photos: list[str]) -> str:
 
 
 def get_item(item_id: str) -> dict | None:
+    if _on_sqlserver():
+        return _sqlserver().get_item(item_id)
     with _conn() as con:
         cur = con.execute("SELECT * FROM items WHERE item_id = ?", (item_id,))
         row = cur.fetchone()
@@ -113,6 +155,8 @@ def get_item(item_id: str) -> dict | None:
 
 
 def update_status(item_id: str, status: str) -> None:
+    if _on_sqlserver():
+        return _sqlserver().update_status(item_id, status)
     if status not in VALID_STATUSES:
         raise ValueError(f"Invalid status '{status}'. Must be one of: {VALID_STATUSES}")
     with _conn() as con:
@@ -123,6 +167,8 @@ def update_status(item_id: str, status: str) -> None:
 
 
 def update_field(item_id: str, field: str, data: dict) -> None:
+    if _on_sqlserver():
+        return _sqlserver().update_field(item_id, field, data)
     if field not in VALID_FIELDS:
         raise ValueError(f"Invalid field '{field}'. Must be one of: {VALID_FIELDS}")
     with _conn() as con:
@@ -133,6 +179,8 @@ def update_field(item_id: str, field: str, data: dict) -> None:
 
 
 def list_items(status: str | None = None) -> list[dict]:
+    if _on_sqlserver():
+        return _sqlserver().list_items(status)
     with _conn() as con:
         if status is not None:
             cur = con.execute("SELECT * FROM items WHERE status = ?", (status,))
@@ -143,6 +191,8 @@ def list_items(status: str | None = None) -> list[dict]:
 
 
 def delete_item(item_id: str) -> None:
+    if _on_sqlserver():
+        return _sqlserver().delete_item(item_id)
     with _conn() as con:
         con.execute("DELETE FROM items WHERE item_id = ?", (item_id,))
 
@@ -156,6 +206,8 @@ def record_listing_stats(item_id: str, week: str, *, impressions=None, views=Non
 
     `impressions` is ORGANIC (search + store), its historical meaning;
     `total_impressions` includes promoted placements."""
+    if _on_sqlserver():
+        return _sqlserver().record_listing_stats(item_id, week, impressions=impressions, views=views, watchers=watchers, price=price, verdict=verdict, suggested_price=suggested_price, total_impressions=total_impressions, search_views=search_views)
     with _conn() as con:
         con.execute(
             "INSERT INTO listing_stats (item_id, week, impressions, views, watchers, "
@@ -174,6 +226,8 @@ def record_listing_stats(item_id: str, week: str, *, impressions=None, views=Non
 def record_offer_sent(listing_id: str, offer_price: float, *, item_id: str | None = None,
                       list_price: float | None = None, source: str | None = None) -> None:
     """Note that an offer to watchers went out (see offer_sends)."""
+    if _on_sqlserver():
+        return _sqlserver().record_offer_sent(listing_id, offer_price, item_id=item_id, list_price=list_price, source=source)
     with _conn() as con:
         con.execute(
             "INSERT INTO offer_sends (item_id, listing_id, list_price, offer_price, source, "
@@ -183,12 +237,16 @@ def record_offer_sent(listing_id: str, offer_price: float, *, item_id: str | Non
 
 def offers_sent_since(since_iso: str) -> set[str]:
     """Listing ids that had an offer to watchers sent at or after `since_iso`."""
+    if _on_sqlserver():
+        return _sqlserver().offers_sent_since(since_iso)
     with _conn() as con:
         return {row[0] for row in con.execute(
             "SELECT DISTINCT listing_id FROM offer_sends WHERE sent_at >= ?", (since_iso,))}
 
 
 def save_offer_plan(rows: list[dict]) -> str:
+    if _on_sqlserver():
+        return _sqlserver().save_offer_plan(rows)
     plan_id = str(uuid.uuid4())
     with _conn() as con:
         con.execute("INSERT INTO offer_plans (plan_id, rows, created_at) VALUES (?, ?, ?)",
@@ -197,6 +255,8 @@ def save_offer_plan(rows: list[dict]) -> str:
 
 
 def get_offer_plan(plan_id: str) -> dict | None:
+    if _on_sqlserver():
+        return _sqlserver().get_offer_plan(plan_id)
     with _conn() as con:
         row = con.execute("SELECT rows, created_at, used_at FROM offer_plans WHERE plan_id = ?",
                           (plan_id,)).fetchone()
@@ -208,6 +268,8 @@ def get_offer_plan(plan_id: str) -> dict | None:
 
 def claim_offer_plan(plan_id: str) -> bool:
     """Mark a plan used. True only for the one caller that got there first."""
+    if _on_sqlserver():
+        return _sqlserver().claim_offer_plan(plan_id)
     with _conn() as con:
         cur = con.execute("UPDATE offer_plans SET used_at = ? WHERE plan_id = ? "
                           "AND used_at IS NULL", (_now(), plan_id))
@@ -216,6 +278,8 @@ def claim_offer_plan(plan_id: str) -> bool:
 
 def stats_history(item_id: str, limit: int = 8) -> list[dict]:
     """Most recent weekly snapshots for an item, newest week first."""
+    if _on_sqlserver():
+        return _sqlserver().stats_history(item_id, limit)
     with _conn() as con:
         cur = con.execute(
             "SELECT * FROM listing_stats WHERE item_id = ? ORDER BY week DESC LIMIT ?",
@@ -239,6 +303,8 @@ def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> N
     A status other than "ok" (e.g. "partial": the weekly price check ran but
     some traffic batches failed) records the attempt without counting it as
     completed — last_job_run ignores it, so the slot is still caught up."""
+    if _on_sqlserver():
+        return _sqlserver().record_job_run(job, status, detail)
     with _conn() as con:
         con.execute(
             "INSERT INTO job_runs (job, last_run_at, status, detail) VALUES (?, ?, ?, ?) "
@@ -250,11 +316,15 @@ def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> N
 
 def known_feedback_failures() -> set[str]:
     """Order lines whose feedback failure has already been reported."""
+    if _on_sqlserver():
+        return _sqlserver().known_feedback_failures()
     with _conn() as con:
         return {r[0] for r in con.execute("SELECT order_line FROM feedback_failures")}
 
 
 def record_feedback_failure(order_line: str, error: str) -> None:
+    if _on_sqlserver():
+        return _sqlserver().record_feedback_failure(order_line, error)
     with _conn() as con:
         con.execute(
             "INSERT INTO feedback_failures (order_line, first_failed, last_error) "
@@ -263,17 +333,23 @@ def record_feedback_failure(order_line: str, error: str) -> None:
 
 
 def clear_feedback_failure(order_line: str) -> None:
+    if _on_sqlserver():
+        return _sqlserver().clear_feedback_failure(order_line)
     with _conn() as con:
         con.execute("DELETE FROM feedback_failures WHERE order_line = ?", (order_line,))
 
 
 def mark_not_duplicate(item_a: str, item_b: str) -> None:
+    if _on_sqlserver():
+        return _sqlserver().mark_not_duplicate(item_a, item_b)
     a, b = sorted((item_a, item_b))
     with _conn() as con:
         con.execute("INSERT OR IGNORE INTO not_duplicates (a, b) VALUES (?, ?)", (a, b))
 
 
 def not_duplicate_pairs() -> set[tuple[str, str]]:
+    if _on_sqlserver():
+        return _sqlserver().not_duplicate_pairs()
     with _conn() as con:
         return {(a, b) for a, b in con.execute("SELECT a, b FROM not_duplicates")}
 
@@ -294,6 +370,8 @@ def _piece_row(row, cursor) -> dict:
 def next_piece_code(box: str) -> str:
     """G3 -> G3-01, G3-02, ... Numbering follows the code prefix, so a piece
     that moved out of G3 still holds its number."""
+    if _on_sqlserver():
+        return _sqlserver().next_piece_code(box)
     prefix = f"{box.upper()}-"
     with _conn() as con:
         codes = [r[0] for r in con.execute(
@@ -305,6 +383,8 @@ def next_piece_code(box: str) -> str:
 def add_piece(box: str, photo: str | None = None) -> str:
     """Reserve the next code in `box` and store the piece. Retries if two
     photos race for the same number."""
+    if _on_sqlserver():
+        return _sqlserver().add_piece(box, photo)
     box = box.upper()
     for _ in range(5):
         code = next_piece_code(box)
@@ -335,6 +415,8 @@ def update_piece(code: str, **fields) -> None:
         return
     if isinstance(fields.get("box"), str):
         fields["box"] = fields["box"].upper()
+    if _on_sqlserver():
+        return _sqlserver().update_piece(code, **fields)
     if "info" in fields:
         fields["info"] = json.dumps(fields["info"])
     if fields.get("photo"):
@@ -346,6 +428,8 @@ def update_piece(code: str, **fields) -> None:
 
 
 def get_piece(code: str) -> dict | None:
+    if _on_sqlserver():
+        return _sqlserver().get_piece(code)
     with _conn() as con:
         cur = con.execute("SELECT * FROM pieces WHERE code = ?", (code.upper(),))
         row = cur.fetchone()
@@ -354,6 +438,8 @@ def get_piece(code: str) -> dict | None:
 
 def list_pieces(*, box: str | None = None, item_id: str | None = None,
                 status: str | None = None) -> list[dict]:
+    if _on_sqlserver():
+        return _sqlserver().list_pieces(box=box, item_id=item_id, status=status)
     where, args = [], []
     for col, val in (("box", box), ("item_id", item_id), ("status", status)):
         if val is not None:
@@ -369,11 +455,15 @@ def list_pieces(*, box: str | None = None, item_id: str | None = None,
 
 
 def seen_order_ids() -> set[str]:
+    if _on_sqlserver():
+        return _sqlserver().seen_order_ids()
     with _conn() as con:
         return {r[0] for r in con.execute("SELECT order_id FROM seen_orders")}
 
 
 def mark_orders_seen(order_ids) -> None:
+    if _on_sqlserver():
+        return _sqlserver().mark_orders_seen(order_ids)
     with _conn() as con:
         con.executemany("INSERT OR IGNORE INTO seen_orders (order_id, seen_at) VALUES (?, ?)",
                         [(o, _now()) for o in order_ids])
@@ -382,6 +472,8 @@ def mark_orders_seen(order_ids) -> None:
 def job_run_status(job: str) -> str | None:
     """The status the last attempt at `job` recorded ("ok", "partial", ...), or
     None if it never recorded one."""
+    if _on_sqlserver():
+        return _sqlserver().job_run_status(job)
     with _conn() as con:
         row = con.execute(
             "SELECT status FROM job_runs WHERE job = ?", (job,)
@@ -393,6 +485,8 @@ def last_job_run(job: str) -> datetime | None:
     """When `job` last completed, as an aware UTC datetime, or None if never.
     An attempt recorded with a non-ok status didn't complete, so it reads as
     None too (NULL status is a legacy ok row)."""
+    if _on_sqlserver():
+        return _sqlserver().last_job_run(job)
     with _conn() as con:
         row = con.execute(
             "SELECT last_run_at FROM job_runs WHERE job = ? "
@@ -412,6 +506,8 @@ def record_llm_usage(*, provider: str, model: str, stage: str | None = None,
                      output_tokens: int = 0, cache_read_tokens: int = 0,
                      cache_write_tokens: int = 0, web_searches: int = 0,
                      cost_usd: float | None = None, ts: str | None = None) -> None:
+    if _on_sqlserver():
+        return _sqlserver().record_llm_usage(provider=provider, model=model, stage=stage, item_id=item_id, input_tokens=input_tokens, output_tokens=output_tokens, cache_read_tokens=cache_read_tokens, cache_write_tokens=cache_write_tokens, web_searches=web_searches, cost_usd=cost_usd, ts=ts)
     with _conn() as con:
         con.execute(
             "INSERT INTO llm_usage (ts, provider, model, stage, item_id, input_tokens, "
@@ -424,6 +520,8 @@ def record_llm_usage(*, provider: str, model: str, stage: str | None = None,
 
 def llm_spend_since(since_iso: str, provider: str | None = None) -> float:
     """Total logged cost (USD) from since_iso onward, optionally for one provider."""
+    if _on_sqlserver():
+        return _sqlserver().llm_spend_since(since_iso, provider)
     sql = "SELECT COALESCE(SUM(cost_usd), 0) FROM llm_usage WHERE ts >= ?"
     args: list = [since_iso]
     if provider is not None:
@@ -435,6 +533,8 @@ def llm_spend_since(since_iso: str, provider: str | None = None) -> float:
 
 def llm_usage_breakdown(since_iso: str) -> list[dict]:
     """Spend grouped by provider, model and stage from since_iso onward, dearest first."""
+    if _on_sqlserver():
+        return _sqlserver().llm_usage_breakdown(since_iso)
     with _conn() as con:
         cur = con.execute(
             "SELECT provider, model, COALESCE(stage, '-') AS stage, COUNT(*) AS calls, "
@@ -491,3 +591,158 @@ def match_quantity_to_pieces(item_id: str) -> None:
     if n > 1:
         item = get_item(item_id) or {}
         update_field(item_id, "ebay", {**(item.get("ebay") or {}), "quantity": n})
+
+
+# --- moved here from ebay/, pipeline/ and scripts/ (Q13) --------------------
+# The SQL those modules ran themselves. Same results as before on SQLite; on
+# SQL Server the same functions run on ResaleDB, so no caller opens a SQLite
+# file.
+
+def save_ebay_token(access_token: str, refresh_token: str | None, expires_at: float) -> None:
+    """Store the eBay user token (ebay/auth.py). Without a new refresh token
+    the stored one is kept. expires_at is epoch seconds."""
+    if _on_sqlserver():
+        return _sqlserver().save_ebay_token(access_token, refresh_token, expires_at)
+    with _conn() as con:
+        if refresh_token:
+            con.execute(
+                "INSERT INTO ebay_tokens (id, access_token, refresh_token, expires_at) "
+                "VALUES (1, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "access_token = excluded.access_token, "
+                "refresh_token = excluded.refresh_token, "
+                "expires_at = excluded.expires_at",
+                (access_token, refresh_token, expires_at),
+            )
+        else:
+            con.execute(
+                "INSERT INTO ebay_tokens (id, access_token, refresh_token, expires_at) "
+                "VALUES (1, ?, NULL, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "access_token = excluded.access_token, "
+                "expires_at = excluded.expires_at",
+                (access_token, expires_at),
+            )
+
+
+def load_ebay_token() -> dict | None:
+    """{access_token, refresh_token, expires_at (epoch seconds)} or None."""
+    if _on_sqlserver():
+        return _sqlserver().load_ebay_token()
+    with _conn() as con:
+        row = con.execute(
+            "SELECT access_token, refresh_token, expires_at FROM ebay_tokens WHERE id = 1"
+        ).fetchone()
+    if row is None:
+        return None
+    return {"access_token": row[0], "refresh_token": row[1], "expires_at": row[2]}
+
+
+def taxonomy_cache_get(key: str):
+    """(cached value, fetched_at epoch seconds) or None (ebay/taxonomy.py
+    applies its own TTL)."""
+    if _on_sqlserver():
+        return _sqlserver().taxonomy_cache_get(key)
+    with _conn() as con:
+        row = con.execute(
+            "SELECT payload, fetched_at FROM taxonomy_cache WHERE cache_key = ?", (key,)
+        ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row[0]), row[1]
+
+
+def taxonomy_cache_set(key: str, value, fetched_at: float) -> None:
+    if _on_sqlserver():
+        return _sqlserver().taxonomy_cache_set(key, value, fetched_at)
+    with _conn() as con:
+        con.execute(
+            "INSERT INTO taxonomy_cache (cache_key, payload, fetched_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET "
+            "payload = excluded.payload, fetched_at = excluded.fetched_at",
+            (key, json.dumps(value), fetched_at),
+        )
+
+
+def own_listings() -> list[tuple]:
+    """(eBay listing id, listing title) for every item, either may be None
+    (pipeline/pricing_v2.own_listings builds its sets from these)."""
+    return [((it.get("ebay") or {}).get("listing_id"), (it.get("listing") or {}).get("title"))
+            for it in list_items()]
+
+
+def sold_items_for_calibration() -> list[dict]:
+    """Sold items as {item_id, identification, ebay, receipt}, by item_id
+    (pricing_v2's calibration examples, msrp's sold history)."""
+    return [{"item_id": it["item_id"], "identification": it.get("identification"),
+             "ebay": it.get("ebay"), "receipt": it.get("receipt")}
+            for it in sorted(list_items("sold"), key=lambda it: it["item_id"])]
+
+
+def llm_stage_spend(since_iso: str, stage: str, item_id: str | None = None) -> tuple[float, int]:
+    """(cost USD, calls) for one stage since since_iso, optionally one item."""
+    if _on_sqlserver():
+        return _sqlserver().llm_stage_spend(since_iso, stage, item_id)
+    sql = "SELECT COALESCE(SUM(cost_usd),0), COUNT(*) FROM llm_usage WHERE ts >= ? AND stage = ?"
+    args = [since_iso, stage]
+    if item_id:
+        sql += " AND item_id = ?"
+        args.append(item_id)
+    with _conn() as con:
+        cost, calls = con.execute(sql, args).fetchone()
+    return float(cost), int(calls)
+
+
+def snapshot(label: str) -> str:
+    """A labelled backup before a risky write (scripts/backfill_sales.py).
+    SQLite: the online backup API (WAL-safe) to data/backups/ross-<time>-<label>.db.
+    SQL Server: BACKUP DATABASE ... COPY_ONLY to SQL_BACKUP_DIR (sqlserver.py).
+    Returns where it went."""
+    if _on_sqlserver():
+        import sqlserver
+        return sqlserver.backup_database(config.SQL_DATABASE, label=label)
+    dest_dir = Path(DATA_DIR) / "backups"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"ross-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{label}.db"
+    src, dst = _conn(), sqlite3.connect(str(dest))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    return str(dest)
+
+
+def modify_field(item_id: str, field: str, change) -> bool:
+    """Atomic read-modify-write of one item field: change(value) gets the
+    current value (as get_item returns it) and returns the new one, or None to
+    leave the item alone. True if written. Nothing else can write the item in
+    between (SQLite: BEGIN IMMEDIATE; SQL Server: the item row's UPDLOCK)."""
+    if field not in VALID_FIELDS:
+        raise ValueError(f"Invalid field '{field}'. Must be one of: {VALID_FIELDS}")
+    if _on_sqlserver():
+        return _sqlserver().modify_field(item_id, field, change)
+    con = _conn()
+    con.execute("PRAGMA busy_timeout=30000")
+    con.isolation_level = None
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(f"SELECT {field} FROM items WHERE item_id = ?", (item_id,)).fetchone()
+        if row is None:
+            con.execute("ROLLBACK")
+            return False
+        current = _map_paths(field, json.loads(row[0]), _resolved) if row[0] is not None else None
+        new = change(current)
+        if new is None:
+            con.execute("ROLLBACK")
+            return False
+        con.execute(f"UPDATE items SET {field} = ?, updated_at = ? WHERE item_id = ?",
+                    (json.dumps(_map_paths(field, new, stored_path)), _now(), item_id))
+        con.execute("COMMIT")
+        return True
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()

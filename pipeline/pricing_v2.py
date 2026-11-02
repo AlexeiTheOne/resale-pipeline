@@ -349,18 +349,7 @@ def filter_candidates(cands, own_sellers, own_ids, own_titles):
     return kept, dropped
 
 
-# --- our own catalogue (read-only) -------------------------------------------
-
-def _db_rows(sql: str):
-    path = config.DATA_DIR / "ross.db"
-    if not path.exists():
-        return []
-    con = db.connect_readonly(path)
-    try:
-        return con.execute(sql).fetchall()
-    finally:
-        con.close()
-
+# --- our own catalogue (read-only, through db.py) -----------------------------
 
 _own_cache: tuple | None = None
 
@@ -370,13 +359,11 @@ def own_listings() -> tuple[set, set]:
     global _own_cache
     if _own_cache is None:
         ids, titles = set(), set()
-        for ebay_json, listing_json in _db_rows("SELECT ebay, listing FROM items"):
-            e = json.loads(ebay_json or "{}")
-            lst = json.loads(listing_json or "{}")
-            if e.get("listing_id"):
-                ids.add(str(e["listing_id"]))
-            if lst.get("title"):
-                titles.add(_norm_title(lst["title"]))
+        for listing_id, title in db.own_listings():
+            if listing_id:
+                ids.add(str(listing_id))
+            if title:
+                titles.add(_norm_title(title))
         _own_cache = (ids, titles)
     return _own_cache
 
@@ -389,14 +376,12 @@ def calibration_examples(exclude_item_id: str | None, n: int = 15) -> list[dict]
     prefix is the same from call to call; one spare is drawn so excluding the
     item being priced still leaves n."""
     rows = []
-    for item_id, ident_json, ebay_json in _db_rows(
-            "SELECT item_id, identification, ebay FROM items "
-            "WHERE status = 'sold' ORDER BY item_id"):
-        e = json.loads(ebay_json or "{}")
+    for sold in db.sold_items_for_calibration():   # by item_id
+        e = sold["ebay"] or {}
         if not e.get("sale_price"):
             continue
-        ident = json.loads(ident_json or "{}")
-        rows.append({"item_id": item_id, "brand": ident.get("brand"),
+        ident = sold["identification"] or {}
+        rows.append({"item_id": sold["item_id"], "brand": ident.get("brand"),
                      "item": _clean(ident.get("product_name") or ident.get("item_type"))[:60],
                      "type": _clean(ident.get("item_type"))[:40],
                      "sold_price": round(e["sale_price"] / max(1, e.get("units_sold") or 1), 2)})

@@ -313,6 +313,13 @@ EBAY_SHIP_COST = float(os.getenv("EBAY_SHIP_COST", "7.20"))
 # costing a $110 listing the same as a $30 one. Always presented as an estimate —
 # profit.py flags it, report.py colours the cell orange.
 ASSUMED_COST_RATIO = float(os.getenv("ASSUMED_COST_RATIO", "0.29"))
+# Sales tax paid at Ross on top of the pre-tax price (tag or receipt line).
+# Measured 2026-11-02 on the 107 ReceiptsDB receipts where Subtotal + Tax =
+# Total: median 6.95%, 55 at 6.9-7.0% (7% after per-line rounding), none at 0%.
+# That is Florida 6% + Miami-Dade 1%. Some receipts come out lower (about 6.3%
+# blended), likely tax-exempt items, so 7% slightly overstates a few costs.
+# Used by the SQL Server view v_item_cost (docs/schema-proposal.md).
+SALES_TAX_RATE = float(os.getenv("SALES_TAX_RATE", "0.07"))
 # Smallest NET margin (after eBay fees, ad rate, and shipping) a repricing
 # suggestion may land on — never suggest a cut that sells at a loss.
 REPRICE_MIN_MARGIN_DOLLARS = float(os.getenv("REPRICE_MIN_MARGIN_DOLLARS", "5"))
@@ -339,6 +346,31 @@ REPRICE_HOUR_UTC = int(os.getenv("REPRICE_HOUR_UTC", "14"))
 # daily sync, buyer feedback). Set JOBS_ENABLED=0 on a dev copy so a test bot
 # never acts on the live eBay account on its own.
 JOBS_ENABLED = _env_bool("JOBS_ENABLED", True)
+
+# --- SQL Server (ResaleDB; sqlserver.py, docs/schema-proposal.md) ---
+# Windows auth on the local Express instance. SQL_DATABASE has NO default on
+# purpose: dev (ResaleDB_Dev) and production (ResaleDB) share this instance on
+# the production PC, so a missing setting must fail instead of quietly picking
+# production. Tests use their own ResaleDB_Test_* database (tests/conftest.py).
+SQL_SERVER = os.getenv("SQL_SERVER", r".\SQLEXPRESS")
+SQL_DATABASE = os.getenv("SQL_DATABASE") or None
+SQL_DRIVER = os.getenv("SQL_DRIVER", "ODBC Driver 18 for SQL Server")
+# The local instance has a self-signed certificate: encrypt, but trust it.
+SQL_TRUST_SERVER_CERT = _env_bool("SQL_TRUST_SERVER_CERT", True)
+# Where SQL Server writes BACKUP DATABASE files: a local folder the SQL Server
+# service account can write (doc 7.1, e.g. D:\SQLBackups). Unset = the
+# instance's own Backup folder, which a normal user may not be able to read.
+SQL_BACKUP_DIR = os.getenv("SQL_BACKUP_DIR") or None
+# Where db.py reads from: "sqlite" (data/ross.db, the default and what
+# production runs until cutover) or "sqlserver" (SQL_DATABASE, through
+# db_mssql.py: the same functions, reads and writes).
+DB_BACKEND = (os.getenv("DB_BACKEND") or "sqlite").strip().lower()
+
+# Master switch for every call that changes the eBay account (publish, offers,
+# price/quantity/title edits, ads, offers to watchers, feedback). On by default
+# so production is unchanged. Set EBAY_WRITES_ENABLED=0 on a dev copy: writes
+# are refused with a log line before anything is sent (ebay/guard.py).
+EBAY_WRITES_ENABLED = _env_bool("EBAY_WRITES_ENABLED", True)
 
 # Automatic /sync. Until this existed, /sync was manual-only and nothing else
 # wrote sold orders into the DB, so every money figure (/profit, /report, COGS)

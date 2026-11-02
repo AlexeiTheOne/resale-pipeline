@@ -23,6 +23,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 _TMPDIR = tempfile.mkdtemp(prefix="llmusage_")
+import backend_sql  # noqa: E402
 import db  # noqa: E402
 
 db.DB_PATH = str(Path(_TMPDIR) / "test.db")
@@ -39,9 +40,8 @@ NOV = datetime(2026, 11, 2, 9, tzinfo=timezone.utc)
 
 @pytest.fixture(autouse=True)
 def _clean_tables(monkeypatch):
-    with db._conn() as con:
-        con.execute("DELETE FROM llm_usage")
-        con.execute("DELETE FROM job_runs")
+    backend_sql.execute("DELETE FROM llm_usage")
+    backend_sql.execute("DELETE FROM job_runs")
     monkeypatch.setattr(config, "ANTHROPIC_MONTHLY_BUDGET", 100.0)
     monkeypatch.setattr(config, "ANTHROPIC_BUDGET_WARN_PCT", 0.80)
     monkeypatch.setattr(config, "ANTHROPIC_BUDGET_DOWNGRADE_PCT", 0.95)
@@ -54,10 +54,7 @@ def _spend(usd, when=OCT, provider="anthropic"):
 
 
 def _rows():
-    with db._conn() as con:
-        cur = con.execute("SELECT * FROM llm_usage ORDER BY id")
-        keys = [d[0] for d in cur.description]
-        return [dict(zip(keys, r)) for r in cur.fetchall()]
+    return backend_sql.rows("SELECT * FROM llm_usage ORDER BY id")
 
 
 # --- cost --------------------------------------------------------------------

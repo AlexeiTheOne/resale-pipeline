@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import httpx
 
 from config import EBAY_CURRENCY, EBAY_MARKETPLACE_ID
+from ebay import guard
 from ebay.auth import get_access_token
 
 BASE = "https://api.ebay.com/sell/negotiation/v1"
@@ -103,6 +104,7 @@ def send_offer(listing_id: str, price, message: str | None = None) -> dict:
         # eBay's spec allows 2,000 characters; 250 keeps the note readable.
         body["message"] = message[:250]
 
+    guard.require_writes(f"send offer to watchers of listing {listing_id}")
     r = httpx.post(f"{BASE}/send_offer_to_interested_buyers", headers=_headers(),
                    json=body, timeout=30)
     if r.status_code >= 400:
