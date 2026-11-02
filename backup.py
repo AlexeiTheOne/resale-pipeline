@@ -97,7 +97,7 @@ def backup_sqlserver(dest: Path, require_copy: bool = False) -> Path:
     written by the SQL Server service to SQL_BACKUP_DIR, then copied here as
     ross-<time>.bak so prune() and the offsite folder work as for SQLite.
 
-    The copy is what leaves the machine (D:\SQLBackups is on the same disk as
+    The copy is what leaves the machine (D:\\SQLBackups is on the same disk as
     C:), so with require_copy (the nightly run, --require-copy) a failed copy
     is an error. Without it (the pre-deploy backup) the local backup is enough
     to roll back: warn and return its path rather than block the deploy."""
@@ -135,6 +135,13 @@ def main(argv: list[str] | None = None) -> None:
     run instead of warning."""
     args = sys.argv[1:] if argv is None else argv
     db_only = "--db-only" in args
+    # --expect-backend NAME (deploy.ps1): refuse to back up anything if the
+    # live config isn't on that backend, e.g. a .env that lost DB_BACKEND.
+    if "--expect-backend" in args:
+        i = args.index("--expect-backend")
+        want = args[i + 1] if i + 1 < len(args) else ""
+        if config.DB_BACKEND != want:
+            raise RuntimeError(f"DB_BACKEND is {config.DB_BACKEND!r}, expected {want!r}; check the .env")
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     _sweep_partials(BACKUP_DIR)
 

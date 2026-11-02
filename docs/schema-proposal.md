@@ -710,8 +710,8 @@ Rules:
 | Problem | Count | Plan |
 |---|---|---|
 | **Decimal-loss prices** (e.g. 16998.00 for 169.98) | 31 lines > $500 | **Fix when the evidence agrees, else flag.** Candidate = Price > 500 and Price/100 ≤ 500. Fix automatically only if (a) the receipt's raw text in `storage/raw/{RawFileID}.txt` shows the price with a decimal point, or (b) dividing by 100 brings `items_sum` within $0.05 of Subtotal. Fixed rows keep the old value in `PriceOriginal`. The rest are listed for a person to decide. |
-| **Duplicate receipt** `2211-10-2851-5337-1` | 1 pair (IDs 178: 16 lines, 183: 1 line) | Compare the lines. If 183's line is also in 178, delete 183 and its line. Otherwise move the missing line onto 178. Logged as `duplicate_receipt`. Then add the unique index. |
-| **Duplicate lines** on receipt 195 | 11 (ReceiptID, LineIndex) pairs | Delete exact copies. Renumber lines that differ only in LineIndex. Then add the unique index. |
+| **Duplicate receipt** `2211-10-2851-5337-1` | 1 pair (IDs 178: 16 lines, 183: 1 line) | Keep the copy with the most lines. A line of the other copy whose SKU is already on the kept one is deleted; any other line is moved onto it. Then the copy is deleted. Logged as `duplicate_receipt`. Then add the unique index. (Dry run: 183's one line, with the subtotal as its price, has 178's first SKU, so 183 goes.) |
+| **Duplicate lines** on receipt 195 | 11 (ReceiptID, LineIndex) pairs | *As built:* split the lines into import batches (the line number restarts at each import). Delete a batch only if all its lines (SKU, description, price) are also in the biggest batch; otherwise flag the receipt. Then add the unique index. (Dry run: 195 was imported twice. The earlier 11-line import is inside the later 16-line one, which matches the raw text, so the 11 go.) |
 | **Subtotal mismatches** | 124 of 212 (items ≠ subtotal); 64 total ≠ subtotal + tax | **Flag only, no auto-fix.** `v_receipt_checks` shows the gaps. Many come from the decimal-loss and returns problems, so the count should drop after those. A person sets `ReviewStatus = 'ok'` / `'wrong'`. |
 | **Missing values** | Total NULL 30, Subtotal 37, Tax 52, date 5; 14 lines with no price; 54 with no description | Flag in the view. Fill from raw text only when the parser moves into this repo and can re-parse. |
 | **Returns** | dropped by the parser; only the `contains_returns` flag and 5 rows with `Status='return in progress'` | Flag now (`has_returns`). They can't be rebuilt from the DB. Later, when the parser moves here, re-parse the raw text into a `receipt_returns` table (receipt, SKU, amount) linked to the original purchase line. Out of scope for this migration. |
@@ -878,7 +878,8 @@ from a fresh backup made with `python backup.py --db-only`.
    - Check the ODBC driver, login and language (`us_english`).
    - Check that `READ_COMMITTED_SNAPSHOT` can be set.
 2. **Schema:** create the database if missing and run `migrations.py` (SQL
-   Server steps).
+   Server steps) **up to the baseline only**. Step 2 (the unique receipt
+   indexes) runs after the receipt cleanup.
 3. **Read** the SQLite backup read-only. Parse every JSON column once.
 4. **Normalise times.**
    - Every ISO string goes to UTC `datetime`.
@@ -928,17 +929,19 @@ from a fresh backup made with `python backup.py --db-only`.
 
 8. **Report:** a markdown file in `logs/` with every count, old vs new.
 9. **Rehearse** on `ResaleDB_Migrate_<date>` from a production backup.
-10. **Cutover, receipts first (decided, Q1):**
-    1. Person B stops the receipt bot by hand.
-    2. Copy and verify the receipts (step 6).
-    3. Run the receipt cleanup (section 4).
-    4. Ship the "already saved" change.
-    5. Point `SQL_CONN_STR` at ResaleDB.
-    6. Restart the receipt bot.
+10. **Cutover, both bots in one window (Q1, changed 2026-11-02):**
+    1. Stop both bots and back up.
+    2. Migrate: the script creates ResaleDB at the baseline (step 1 only),
+       copies and verifies everything.
+    3. Receipt cleanup (section 4): dry run, then `--apply`.
+    4. Migration step 2: the unique receipt indexes.
+    5. Switch the `.env` and start the bot.
+    6. Point the receipt bot's `SQL_CONN_STR` at ResaleDB and start it. Its
+       "already saved" change is already in place.
 
-    After that, the bot as a separately agreed step: stop it, back up, migrate,
-    verify, switch `.env`, start. The SQLite file is kept read-only for
-    rollback. ReceiptsDB is kept read-only for 30 days (Q2), then dropped.
+    The SQLite file is kept read-only for rollback. ReceiptsDB is kept
+    read-only for 30 days (Q2), then dropped. Exact steps:
+    `docs/cutover-checklist.md`, section 2.
 
 ### 7.1 Backups (decided, Q15)
 
@@ -987,7 +990,7 @@ answers were relayed by Person B; **Person A to confirm** (marked ⧗).
 
 | # | Question | Decision | By |
 |---|---|---|---|
-| Q1 | Cutover order | Receipts first, then the bot, as separate steps | Person B |
+| Q1 | Cutover order | ~~Receipts first, then the bot, as separate steps~~. **Changed 2026-11-02:** one cutover for both (the migration takes ~10 s and rehearsed clean) | Person B |
 | Q2 | Keep ReceiptsDB | Read-only for 30 days, then drop | Person B |
 | Q3 | Pieces for older items | No placeholder pieces; only where `stock.location` exists | Person B |
 | Q4 | Cost precedence | A confirmed receipt price wins over the tag price | Person B |

@@ -42,6 +42,20 @@ def test_sqlserver_backup_is_copied_and_pruned_like_sqlite(tmp_path, monkeypatch
     assert (out / names[0]).read_bytes() == b"BAK"
 
 
+def test_deploy_backup_insists_on_sql_server(tmp_path, monkeypatch):
+    """deploy.ps1 step 2: --expect-backend sqlserver. A live .env that lost
+    DB_BACKEND must stop the deploy, not back up the frozen SQLite file."""
+    import pytest
+
+    out, made = _fake_backup(tmp_path, monkeypatch)
+    backup.main(["--db-only", "--expect-backend", "sqlserver"])
+    assert made and any(p.suffix == ".bak" for p in out.iterdir())
+    monkeypatch.setattr(config, "DB_BACKEND", "sqlite")
+    with pytest.raises(RuntimeError, match="expected 'sqlserver'"):
+        backup.main(["--db-only", "--expect-backend", "sqlserver"])
+    assert len(made) == 1
+
+
 def test_server_folder_keeps_the_newest_per_database(tmp_path, monkeypatch):
     import os
     folder = tmp_path / "SQLBackups"

@@ -116,23 +116,31 @@ def _receipts_source(name):
         con.close()
 
 
-def _drop(name):
-    con = sqlserver.connect("master", autocommit=True)
-    try:
-        if con.execute("SELECT DB_ID(?)", name).fetchone()[0] is not None:
-            con.execute(f"ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE")
-            con.execute(f"DROP DATABASE [{name}]")
-    finally:
-        con.close()
+def fresh_test_database(*taken) -> str:
+    """A new, unused ResaleDB_Test_* name (the session one is `taken`)."""
+    for s in range(1, 120):
+        name = sqlserver.new_test_database_name(datetime.now(timezone.utc) + timedelta(seconds=s))
+        if name not in taken and not sqlserver.database_exists(name):
+            sqlserver.assert_test_database(name)
+            return name
+    raise RuntimeError("no free test database name")
 
 
 @pytest.fixture
 def receipts_db(mssql_db):
-    name = sqlserver.new_test_database_name(datetime.now(timezone.utc) + timedelta(seconds=1))
-    sqlserver.assert_test_database(name)
-    assert name != mssql_db
-    _drop(name)
+    name = fresh_test_database(mssql_db)
     _receipts_source(name)
+    try:
+        yield name
+    finally:
+        sqlserver.drop_test_database(name)
+
+
+@pytest.fixture
+def target(mssql_db, receipts_db):
+    """An empty database for the migration (the session test database is
+    already past the baseline, at the unique receipt indexes)."""
+    name = fresh_test_database(mssql_db, receipts_db)
     try:
         yield name
     finally:
@@ -183,17 +191,19 @@ def _run(source, mssql_db, receipts_db, tmp_path, monkeypatch, *extra):
                      *extra])
 
 
-def test_full_migration_passes_every_check(source, mssql, mssql_db, receipts_db, tmp_path,
+def test_full_migration_passes_every_check(source, target, receipts_db, tmp_path,
                                            monkeypatch, capsys):
-    assert _run(source, mssql_db, receipts_db, tmp_path, monkeypatch) == 0
+    assert _run(source, target, receipts_db, tmp_path, monkeypatch) == 0
     report = next((tmp_path / "logs").glob("migrate-*.md")).read_text(encoding="utf-8")
     assert "PASSED" in report and "FAIL |" not in report
     assert "secret" not in report and "secret" not in capsys.readouterr().out
     assert "can't become pieces" in report  # 'g3 shelf' is listed as a warning
     assert "llm_usage.item_id: 1 row" in report
 
-    con = sqlserver.connect(mssql_db)
+    con = sqlserver.connect(target)
     try:
+        # stopped at the baseline: the unique receipt indexes come after the cleanup
+        assert con.execute("SELECT MAX(version) FROM dbo.schema_version").fetchone()[0] == 1
         assert tuple(con.execute("SELECT access_token, refresh_token FROM dbo.ebay_tokens").fetchone()) == \
             ("ACCESS-secret", "REFRESH-secret")
         assert [r[0] for r in con.execute("SELECT code FROM dbo.pieces ORDER BY code")] == \
@@ -214,14 +224,35 @@ def test_full_migration_passes_every_check(source, mssql, mssql_db, receipts_db,
         con.close()
 
 
-def test_refuses_a_target_that_holds_rows(source, mssql, mssql_db, receipts_db, tmp_path, monkeypatch):
-    mssql.execute("INSERT INTO dbo.seen_orders (order_id, seen_at) VALUES ('1', SYSUTCDATETIME())")
-    mssql.commit()
+def _prepare(name, upto):
+    import migrations
+    sqlserver.create_database(name)
+    con = sqlserver.connect(name)
+    try:
+        migrations.migrate_mssql(con, upto=upto)
+    finally:
+        con.close()
+
+
+def test_refuses_a_target_that_holds_rows(source, target, receipts_db, tmp_path, monkeypatch):
+    _prepare(target, 1)
+    con = sqlserver.connect(target)
+    try:
+        con.execute("INSERT INTO dbo.seen_orders (order_id, seen_at) VALUES ('1', SYSUTCDATETIME())")
+        con.commit()
+    finally:
+        con.close()
     with pytest.raises(SystemExit, match="already holds rows"):
-        _run(source, mssql_db, receipts_db, tmp_path, monkeypatch)
+        _run(source, target, receipts_db, tmp_path, monkeypatch)
 
 
-def test_a_lost_row_fails_loudly(source, mssql, mssql_db, receipts_db, tmp_path, monkeypatch, capsys):
+def test_refuses_a_target_past_the_baseline(source, target, receipts_db, tmp_path, monkeypatch):
+    _prepare(target, None)  # at the unique receipt indexes already
+    with pytest.raises(SystemExit, match="past 1"):
+        _run(source, target, receipts_db, tmp_path, monkeypatch)
+
+
+def test_a_lost_row_fails_loudly(source, target, receipts_db, tmp_path, monkeypatch, capsys):
     real = mig.loader._insert
 
     def lossy(cur, table, rows, **kw):
@@ -230,7 +261,7 @@ def test_a_lost_row_fails_loudly(source, mssql, mssql_db, receipts_db, tmp_path,
         return real(cur, table, rows, **kw)
 
     monkeypatch.setattr(mig.loader, "_insert", lossy)
-    assert _run(source, mssql_db, receipts_db, tmp_path, monkeypatch) == 1
+    assert _run(source, target, receipts_db, tmp_path, monkeypatch) == 1
     assert "MIGRATION CHECKS FAILED" in capsys.readouterr().err
     report = next((tmp_path / "logs").glob("migrate-*.md")).read_text(encoding="utf-8")
     assert "FAILED" in report

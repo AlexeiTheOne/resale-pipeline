@@ -122,8 +122,8 @@ def cur(mssql):
 # --- builds cleanly ----------------------------------------------------------
 
 def test_baseline_is_recorded_and_rerun_does_nothing(mssql, cur):
-    cur.execute("SELECT version, name FROM dbo.schema_version")
-    assert [tuple(r) for r in cur.fetchall()] == [(1, "resaledb_baseline")]
+    cur.execute("SELECT version, name FROM dbo.schema_version ORDER BY version")
+    assert [tuple(r) for r in cur.fetchall()] == [(1, "resaledb_baseline"), (2, "receipt_unique_indexes")]
     assert migrations.migrate_mssql(mssql) == []
 
 
@@ -436,11 +436,12 @@ def test_a_failed_step_changes_nothing(mssql, cur):
         c.execute("CREATE TABLE dbo.half_done (x INT)")
         raise RuntimeError("boom")
 
-    steps = migrations.MSSQL_MIGRATIONS + [(2, "bad", bad)]
+    last = migrations.MSSQL_MIGRATIONS[-1][0]
+    steps = migrations.MSSQL_MIGRATIONS + [(last + 1, "bad", bad)]
     with pytest.raises(RuntimeError, match="boom"):
         migrations.migrate_mssql(mssql, steps)
     cur.execute("SELECT OBJECT_ID('dbo.half_done'), MAX(version) FROM dbo.schema_version")
-    assert tuple(cur.fetchone()) == (None, 1)
+    assert tuple(cur.fetchone()) == (None, last)
 
 
 def test_runner_refuses_autocommit(mssql):

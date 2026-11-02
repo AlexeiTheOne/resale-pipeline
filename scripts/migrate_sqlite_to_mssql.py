@@ -743,7 +743,15 @@ def main(argv=None) -> int:
                            target).fetchone()[0]
         if not rcsi:
             raise SystemExit(f"READ_COMMITTED_SNAPSHOT is off on {target!r}")
-        migrations.migrate_mssql(con)
+        # Only up to the baseline: the unique receipt indexes (step 2) are
+        # built after scripts/receipts_cleanup.py has removed the duplicates.
+        version = migrations.mssql_current_version(con.cursor())
+        con.commit()
+        if version > migrations.MSSQL_BEFORE_RECEIPT_CLEANUP:
+            raise SystemExit(f"refusing {target!r}: its schema is at version {version}, past "
+                             f"{migrations.MSSQL_BEFORE_RECEIPT_CLEANUP}. The receipts must be copied "
+                             "before the unique receipt indexes; create the database with this script.")
+        migrations.migrate_mssql(con, upto=migrations.MSSQL_BEFORE_RECEIPT_CLEANUP)
         con.commit()
 
         # read

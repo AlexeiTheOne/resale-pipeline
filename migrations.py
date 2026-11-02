@@ -965,10 +965,45 @@ def _mssql_baseline(cur) -> None:
         cur.execute(statement)
 
 
+def mssql_receipt_duplicates(cur) -> dict:
+    """What blocks the unique receipt indexes: {"receipt_numbers": [...],
+    "lines": [(ReceiptID, LineIndex), ...]}. scripts/receipts_cleanup.py
+    resolves them."""
+    cur.execute("SELECT ReceiptNumber FROM dbo.Receipts WHERE ReceiptNumber IS NOT NULL "
+                "GROUP BY ReceiptNumber HAVING COUNT(*) > 1 ORDER BY ReceiptNumber")
+    numbers = [r[0] for r in cur.fetchall()]
+    cur.execute("SELECT ReceiptID, LineIndex FROM dbo.ReceiptItems GROUP BY ReceiptID, LineIndex "
+                "HAVING COUNT(*) > 1 ORDER BY ReceiptID, LineIndex")
+    return {"receipt_numbers": numbers, "lines": [tuple(r) for r in cur.fetchall()]}
+
+
+def _mssql_receipt_unique(cur) -> None:
+    """One row per receipt number, one line per (receipt, line number). The
+    receipt bot already checks before inserting; these catch its double-submit
+    race (it replies "already saved"). Built only once the receipt cleanup has
+    removed today's duplicates: with any left, the step fails and changes
+    nothing."""
+    dups = mssql_receipt_duplicates(cur)
+    if dups["receipt_numbers"] or dups["lines"]:
+        raise RuntimeError(
+            "receipt duplicates remain, so the unique receipt indexes can't be built: "
+            f"{len(dups['receipt_numbers'])} receipt number(s) "
+            f"{dups['receipt_numbers'][:5]}, {len(dups['lines'])} (ReceiptID, LineIndex) pair(s) "
+            f"{dups['lines'][:5]}. Run scripts/receipts_cleanup.py --apply first.")
+    cur.execute("CREATE UNIQUE INDEX UX_Receipts_ReceiptNumber ON dbo.Receipts (ReceiptNumber) "
+                "WHERE ReceiptNumber IS NOT NULL")
+    cur.execute("CREATE UNIQUE INDEX UX_ReceiptItems_ReceiptID_LineIndex "
+                "ON dbo.ReceiptItems (ReceiptID, LineIndex)")
+
+
 # (version, name, function). Append only.
 MSSQL_MIGRATIONS = [
     (1, "resaledb_baseline", _mssql_baseline),
+    (2, "receipt_unique_indexes", _mssql_receipt_unique),
 ]
+# The production migration copies the receipts into a database at this
+# version: the unique indexes (step 2) come after the receipt cleanup.
+MSSQL_BEFORE_RECEIPT_CLEANUP = 1
 
 
 def mssql_current_version(cur) -> int:
@@ -983,15 +1018,18 @@ def mssql_current_version(cur) -> int:
     return cur.fetchone()[0] or 0
 
 
-def migrate_mssql(con, migrations=None) -> list[int]:
+def migrate_mssql(con, migrations=None, upto: int | None = None) -> list[int]:
     """Run every SQL Server step newer than the database's version, each in one
     transaction (DDL included: a failed step changes nothing). An exclusive
     application lock makes a second process wait instead of running the same
-    step twice. `con` must not be in autocommit mode. Returns the versions run."""
+    step twice. `con` must not be in autocommit mode. `upto`: stop after that
+    version (the production migration). Returns the versions run."""
     if con.autocommit:
         raise ValueError("migrate_mssql needs a connection with autocommit off")
     migrations = MSSQL_MIGRATIONS if migrations is None else migrations
     known = max((v for v, _, _ in migrations), default=0)
+    if upto is not None:
+        migrations = [m for m in migrations if m[0] <= upto]
     ran = []
     cur = con.cursor()
     # Session-owned, so it spans the per-step transactions; released below.
