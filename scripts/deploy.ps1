@@ -37,6 +37,8 @@ or any python process except the bot via restart_ebay_bot.ps1.
 param(
     [string]$RepoPath = 'C:\Users\boris\Projects\ebay-list',
     [string]$StagingPath = 'C:\Users\boris\Projects\ebay-list-staging',
+    # The tests' own Python, outside $StagingPath (git clean wipes that).
+    [string]$StagingVenv = 'C:\Users\boris\Projects\ebay-list-staging-venv',
     [string]$RestartScript = 'C:\Users\boris\Projects\restart_ebay_bot.ps1',
     [string]$Branch = 'main',
     [int]$BusyWaitSeconds = 600,
@@ -196,9 +198,21 @@ function Test-InStaging([string]$Sha) {
         Git-Must @('worktree', 'add', '--detach', $StagingPath, $Sha) | Out-Null
     }
 
-    $probe = Invoke-Native $Python @('-c', 'import pytest')
-    if ($probe.Code -ne 0) {
-        throw "pytest is not installed in $Python. Install it once by hand: venv\Scripts\python.exe -m pip install -r requirements-dev.txt"
+    # The tests run in their own venv with the NEW commit's requirements, so a
+    # commit that adds a package can pass. (They used to run in the live venv,
+    # before the install, so a new package always failed: 9428e3a, pyodbc.)
+    # The live venv only changes after the tests pass (Install-Requirements).
+    $testPython = Join-Path $StagingVenv 'Scripts\python.exe'
+    if (-not (Test-Path $testPython)) {
+        $mk = Invoke-Native $Python @('-m', 'venv', $StagingVenv)
+        if ($mk.Code -ne 0) { return @{ Ok = $false; Out = "could not create $StagingVenv`n$($mk.Out)" } }
+    }
+    $reqFile = 'requirements-dev.txt'
+    if (-not (Test-Path (Join-Path $StagingPath $reqFile))) { $reqFile = 'requirements.txt' }
+    Push-Location $StagingPath
+    try { $pip = Invoke-Native $testPython @('-m', 'pip', 'install', '-q', '-r', $reqFile) } finally { Pop-Location }
+    if ($pip.Code -ne 0) {
+        return @{ Ok = $false; Out = "pip install -r $reqFile failed in $StagingVenv`n$(Get-Tail $pip.Out 15)" }
     }
 
     # No API keys in the test process, so a test can never call a real API.
@@ -215,7 +229,7 @@ function Test-InStaging([string]$Sha) {
     $outFile = Join-Path $LogDir 'deploy-pytest.out'
     $errFile = Join-Path $LogDir 'deploy-pytest.err'
     try {
-        $p = Start-Process -FilePath $Python -ArgumentList '-m', 'pytest', '-q' `
+        $p = Start-Process -FilePath $testPython -ArgumentList '-m', 'pytest', '-q' `
             -WorkingDirectory $StagingPath -NoNewWindow -PassThru `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile
         $null = $p.Handle   # keeps ExitCode readable after exit (PS 5.1 quirk)

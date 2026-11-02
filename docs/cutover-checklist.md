@@ -145,8 +145,11 @@ Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) 
   users can read it. A real backup and copy of ResaleDB_Dev were verified.
 - ✅ ODBC Driver 18 is installed (this PC is the production PC).
 - ✅ `pyodbc` and `tzdata` are pinned in `requirements.txt`. deploy.ps1
-  installs them when requirements change; check after the merge with
-  `venv\Scripts\python.exe -c "import pyodbc, tzdata"` in `ebay-list`.
+  installs them into the live venv when requirements change, but only after
+  the tests. Until fix/update-field-revert, the tests ran in the live venv
+  before that install, so the merge (9428e3a) failed its tests on the missing
+  pyodbc and the packages were installed by hand. Now the tests have their own
+  venv (`ebay-list-staging-venv`) with the new commit's requirements.
 - ⬜ **Mixed-mode auth + `resale_reader` login (Q7).** This needs a SQL Server
   service restart, which also drops the receipt bot's connections, so do it
   inside the cutover window. As admin:
