@@ -90,7 +90,7 @@ stay JSON. Their **result** is stored in columns (`listing_specifics`,
 | photo_order_manual | BIT | NO, default 0 | `photo_layout.manual` |
 | photos_as_sent | BIT | NO, default 0 | `photo_layout.as_sent` |
 | price_source_url | NVARCHAR(1000) | yes | the old top-level `price_source_url` column |
-| extra_raw | NVARCHAR(MAX) JSON | yes | keys no mapping knows, as `{group: {key: value}}`. Should stay empty; a test reports it if not. |
+| extra_raw | NVARCHAR(MAX) JSON | yes | the **leftover** of groups without their own `*_raw` column, as `{group: {key: value}}` (see 5, "Leftovers"). Never read for logic. |
 | created_at / updated_at | DATETIME2(6) | NO | UTC |
 | row_ver | ROWVERSION | NO | |
 | seq | BIGINT IDENTITY | NO | insertion order, like SQLite's rowid; `list_items()` returns items in this order |
@@ -150,7 +150,7 @@ Indexes: `(brand)`, `(upc)`, `(item_type)`.
 | retail_price / resale_estimate | DECIMAL(10,2) | copies made at pricing time |
 | comp_warning | NVARCHAR(400) | max seen 251 |
 | query_rung | VARCHAR(20) | (`engine` and `query_used` live on `pricing_runs`) |
-| rungs_tried | VARCHAR(100) | comma list (display only) |
+| rungs_tried | VARCHAR(100) | comma list (display only). The v2 engine stores whole search queries here, which don't fit; those stay in the leftover |
 | stock_image_url | NVARCHAR(1000) | |
 | value_notes | NVARCHAR(2000) | Claude price notes (display) |
 | pricing_raw | NVARCHAR(MAX) JSON | store_estimate, claude_reasoning/evidence, disagreements, dropped, raw_counts, price_evidence, … |
@@ -621,7 +621,7 @@ in that group's `*_raw` column.
 
 | Key | Goes to | Used by |
 |---|---|---|
-| brand, product_name, model, item_type, color, size, material, condition, upc, upc_decoded, style_code / style_number, department, gender, search_query, retail_price, resale_estimate, confidence, product_image_url | **item_identification.\*** | 1–19 files each |
+| brand, product_name, model, item_type, color, size, material, condition, upc, upc_decoded, style_code, department, gender, search_query, retail_price, resale_estimate, confidence, product_image_url | **item_identification.\*** | 1–19 files each |
 | condition_flags[] | **item_flags (kind=`condition`)** | flow, formatting, draft |
 | specifications{} | JSON (prompt input to draft/specifics) | 3 |
 | price_evidence[] | JSON (prompt input to pricing) | 4 |
@@ -633,7 +633,7 @@ in that group's `*_raw` column.
 |---|---|
 | suggested_price, machine_price, manual_price, manual_price_at, claude_price, formula_price, price_basis, confidence, claude_confidence, evidence, needs_review, sold_count, active_count, sold_median, sold_p10, sold_p90, active_floor, raw_active_floor, dispersion, research_resale, retail_price, resale_estimate, comp_warning, query_rung, rungs_tried, stock_image_url, value_notes | **item_pricing.\*** |
 | engine, query_used | **pricing_runs.\*** (the one migrated run per item) |
-| price_source_url | **items.price_source_url** (same value as the old column) |
+| price_source_url | JSON (`pricing_raw`); the item's own `price_source_url` column is the top-level key |
 | review_flags[] | **item_flags (kind=`review`)** |
 | sold_comps[], active_listings[], judged_comps[], reference{} | **pricing_comps (kind)**, under that item's migrated run |
 | comp_suggested, store_estimate{}, claude_price_raw, claude_reasoning, claude_evidence{}, disagreements, judge_model, judge_escalated, thumbnails_used, raw_counts{}, dropped{}, skipped_queries, candidate_count, same_item_sold_count, same_item_active_count, comp_basis, our_shipping, target_total, price_evidence[] | JSON (produced and used inside one pricing run, or display only) |
@@ -651,7 +651,7 @@ in that group's `*_raw` column.
 | Key | Goes to |
 |---|---|
 | sku, offer_id, listing_id, view_item_url, quantity, category_id, category_name, reselected_from, reselected_from_name, published_at, stock_note | **ebay_listings.\*** |
-| source | **items.origin** (`external`) |
+| source | JSON (`ebay_raw`); `items.origin` comes from `stock.source` |
 | image_urls[] | **listing_images** |
 | sales[] | **sales** |
 | sale_price, gross_sale_price, shipping_collected, ebay_fees, shipping_label_cost, ad_fees, refunded, net_proceeds, units_sold, order_id, order_ids[], sold_at, first_sold_at, fees_known | **not stored: rebuilt from `sales` by `v_item_sales`**. The migration checks that each one equals the rebuilt value. |
@@ -722,6 +722,25 @@ Rules:
 
 ## 5. How `db.py` keeps its names and signatures
 
+**Leftovers (how the old dict is rebuilt exactly).** A column only takes a
+value it can give back exactly. Everything else is kept in the group's
+leftover JSON (`identification_raw`, `pricing_raw`, `ebay_raw`, or
+`items.extra_raw[group]`; per comp `comp_raw`, per piece `info_raw`), which wins
+on read:
+
+- `None` values and empty lists (a NULL column can't say "present but None");
+- keys with no column;
+- a value of another type than the column's (an int `118` in a DECIMAL
+  column: the column gets `118.00` for SQL, the leftover keeps the int);
+- legacy timestamps (`...Z`, naive local time): the column gets the UTC time,
+  the leftover keeps the original string;
+- the original spelling when `condition` is normalised (Q10);
+- `__absent__`: keys a NOT NULL column default would otherwise add.
+
+So `join_item(split_item(x)) == x`, types included. The leftover is never
+read for logic, only to rebuild the old dict. Step 2b's writes keep it in step
+(a write to a column drops that key from the leftover).
+
 **Phase 1 (this migration):** every public function in `db.py` keeps its name,
 arguments and return shape. That's what `tests/test_db_contract.py` pins, and
 `reprice`, `ebay/inventory`, `retry_publish` and `telegram_bot` import these
@@ -729,7 +748,7 @@ names directly.
 
 | Today | On SQL Server |
 |---|---|
-| `get_item(id)` → dict with 11 nested groups | Joins the 1:1 tables and loads the child tables, then **builds the same nested dict**. Columns go back to their old keys, the `*_raw` JSON is merged underneath them (columns win), child rows become lists, and `v_item_sales` refills the sale totals inside `ebay`. Paths are resolved as today. |
+| `get_item(id)` → dict with 11 nested groups | Joins the 1:1 tables and loads the child tables, then **builds the same nested dict** (`dbmap.join_item`). Columns go back to their old keys, child rows become lists, the sale totals inside `ebay` are rebuilt from the `sales` rows with ebay/orders.py's own maths, and the leftover is applied last. Paths are resolved as today. Built in step 2a: identical to SQLite on all 162 dev items. |
 | `list_items(status)` | Same output. Uses a few set-based queries (one per table for all ids) rather than one per item. |
 | `update_field(id, field, data)` | Maps `data` to that group's table. **Writes only the columns whose value differs from the current row**, in one transaction with `UPDLOCK`. Child lists are replaced only if they changed. Unknown keys go to `extra_raw`. This shrinks the last-writer-wins window from "the whole blob" to "the same key". |
 | `update_field(id, "pricing", data)` | Writes `item_pricing` as above. When `data` carries comps (a real pricing run), it **inserts a new `pricing_runs` row** with those comps and moves `latest_run_id`. When it doesn't (a manual price, a flag change), it touches `item_pricing` only. `get_item` builds `sold_comps` etc. from the latest run, so `/comps` shows the latest run. |

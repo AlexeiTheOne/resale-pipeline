@@ -834,7 +834,8 @@ _MSSQL_BASELINE = [
     f"""
     CREATE TABLE dbo.taxonomy_cache (
         cache_key   VARCHAR(200)  NOT NULL CONSTRAINT PK_taxonomy_cache PRIMARY KEY,
-        payload_raw NVARCHAR(MAX) NOT NULL {_json_check('taxonomy_cache', 'payload_raw')},
+        -- Any JSON value: some cached payloads are plain strings (category names).
+        payload_raw NVARCHAR(MAX) NOT NULL CONSTRAINT CK_taxonomy_cache_payload_raw_json CHECK (ISJSON(payload_raw, VALUE) = 1),
         fetched_at  DATETIME2(6)  NOT NULL
     )""",
     """
