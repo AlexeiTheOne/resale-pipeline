@@ -976,13 +976,21 @@ answers were relayed by Person B; **Person A to confirm** (marked ⧗).
 | Q15 | Backups | Agreed, with change 4 | Both |
 | Q16 | Location code format | `^[A-Z0-9]+(-[A-Z0-9]+)*$` for now (`LOCATION_CODE_PATTERN`) | Person B |
 
-### Still open
+### Answered from the data
 
-- **Q17 (Person B): do we pay sales tax at Ross?**
-  - If yes, `SALES_TAX_RATE` should be the local rate. Miami-Dade is 7%, the
-    default.
-  - If not (for example, a resale certificate), set it to 0, so
-    `unit_cost_with_tax` = `unit_cost`.
-  - A receipt's own `Tax / Subtotal` can confirm this: the receipts that have
-    both values would show the real rate.
-  - Person A then decides which cost profit reports use.
+- **Q17: do we pay sales tax at Ross? Yes, 7%.** Measured on ReceiptsDB
+  (read-only, 2026-11-02):
+  - Of 160 receipts with both Subtotal and Tax, 107 are self-consistent
+    (Subtotal + Tax = Total within 2¢). The rest are parse errors (fields
+    swapped or lost, ratios up to 150×).
+  - On the 107: median **6.95%**, p25 6.07%, p75 6.99%. 55 sit at 6.9–7.0%
+    (7% after per-line rounding), and 36 are within 1¢ of exactly 7%.
+  - **No consistent receipt has Tax = 0.** The 4 receipts with Tax = 0 are all
+    flagged `subtotal_mismatch` and have a Subtotal that can't match their
+    Total, so they are parse errors.
+  - About 40 receipts come out at 1–6.5% with line items that add up. These are
+    likely partly tax-exempt purchases, which brings the blended rate to about
+    6.3%.
+  - 7% = Florida 6% + Miami-Dade 1% surtax. **`SALES_TAX_RATE = 0.07`** (in
+    config.py); it slightly overstates cost for exempt items.
+  - Person A decides which cost (with or without tax) profit reports use.

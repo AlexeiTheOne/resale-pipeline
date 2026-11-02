@@ -313,6 +313,13 @@ EBAY_SHIP_COST = float(os.getenv("EBAY_SHIP_COST", "7.20"))
 # costing a $110 listing the same as a $30 one. Always presented as an estimate —
 # profit.py flags it, report.py colours the cell orange.
 ASSUMED_COST_RATIO = float(os.getenv("ASSUMED_COST_RATIO", "0.29"))
+# Sales tax paid at Ross on top of the pre-tax price (tag or receipt line).
+# Measured 2026-11-02 on the 107 ReceiptsDB receipts where Subtotal + Tax =
+# Total: median 6.95%, 55 at 6.9-7.0% (7% after per-line rounding), none at 0%.
+# That is Florida 6% + Miami-Dade 1%. Some receipts come out lower (about 6.3%
+# blended), likely tax-exempt items, so 7% slightly overstates a few costs.
+# Used by the SQL Server view v_item_cost (docs/schema-proposal.md).
+SALES_TAX_RATE = float(os.getenv("SALES_TAX_RATE", "0.07"))
 # Smallest NET margin (after eBay fees, ad rate, and shipping) a repricing
 # suggestion may land on — never suggest a cut that sells at a loss.
 REPRICE_MIN_MARGIN_DOLLARS = float(os.getenv("REPRICE_MIN_MARGIN_DOLLARS", "5"))
