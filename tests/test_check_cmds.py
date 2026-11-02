@@ -72,6 +72,33 @@ def test_any_matches_button(env):
     assert [d.split(":")[1] for _, d in tg.last_markup_buttons(ctx)] == ["full", "exact"]
 
 
+def test_quick_no_data_goes_straight_on_to_a_full_check(env, monkeypatch):
+    calls = []
+
+    def pricing(ident, **kw):
+        calls.append({"ident": ident, **kw})
+        if kw.get("sold_cache_only"):      # quick: nothing at all
+            return {"suggested_price": None, "formula_price": None, "raw_active_floor": None,
+                    "judged_comps": [], "review_flags": [], "sold_cache_misses": ["q"],
+                    "timings": {"comps_s": 1.0, "judge_s": 0.0}}
+        return fake_pricing([])(ident, **kw)
+    monkeypatch.setattr(pricing_v2, "get_pricing_v2", pricing)
+    identified = []
+    monkeypatch.setattr(check_cmds, "_identify", lambda p: identified.append(p) or {
+        "brand": "Coach", "product_name": "Tabby 26 bag", "model": "CH857"})
+    monkeypatch.setattr(check_cmds, "_tag_price", lambda p: None)
+    upd, ctx = tg.make_photo_update(caption="/check 14.99")
+    tg.run(check_cmds.photo_check, upd, ctx)
+    texts = tg.sent_texts(ctx)
+    assert any("NO DATA in the quick check" in t and "Checking more sources" in t for t in texts)
+    assert [c["sold_cache_only"] for c in calls] == [True, False]       # quick, then full
+    assert calls[1]["escalate"] is True and calls[1]["ident"] == calls[0]["ident"]
+    assert len(identified) == 1                                       # the photo was identified once
+    assert texts[-1].startswith("✅ BUY") and "Mode: full" in texts[-1]
+    assert check.checks_today(check.TIMINGS_FILE) == 1                # one check toward the cap
+    assert [d.split(":")[1] for _, d in tg.last_markup_buttons(ctx)] == ["any"]   # already full
+
+
 def test_expired_button(env):
     upd, ctx = tg.make_callback_update("chk:full:deadbeef")
     tg.run(check_cmds.check_callback, upd, ctx)

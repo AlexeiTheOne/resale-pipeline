@@ -165,6 +165,28 @@ def test_photo_check_identifies_first(tmp_path):
     assert "identify_s" in res["timings"] and res["photo"] is True
 
 
+def test_quick_with_nothing_at_all_is_no_data_but_full_is_skip():
+    empty = pricing(suggested_price=None, formula_price=None, raw_active_floor=None,
+                    judged_comps=[], sold_median=None)
+    q = check.evaluate(empty, {}, 14.99, exact=True, quick=True)
+    assert q["verdict"] == check.NO_DATA and q["reasons"]
+    assert check.evaluate(empty, {}, 14.99, exact=True, quick=False)["verdict"] == "SKIP"
+    # any data at all (an identical listing) is a real verdict even in quick mode
+    some = pricing(formula_price=None, judged_comps=[])
+    assert check.evaluate(some, {}, 14.99, exact=True, quick=True)["verdict"] != check.NO_DATA
+    res = check.run_check(check.parse_request("/check lego set 9.99"),
+                          pricing_fn=lambda ident, **kw: empty, have_fn=lambda i: [])
+    assert check.format_reply(res).startswith("❓ NO DATA")
+
+
+def test_a_follow_up_reuses_the_identification():
+    seen = []
+    req = {**check.parse_request("/check full 9.99"), "identification": {"brand": "Coach", "model": "CH857"}}
+    check.run_check(req, photo_path="x.jpg", identify_fn=lambda p: seen.append(p) or {},
+                    pricing_fn=lambda ident, **kw: seen.append(ident) or pricing(), have_fn=lambda i: [])
+    assert seen == [{"brand": "Coach", "model": "CH857"}]      # identify_fn not called
+
+
 # --- timings log and daily cap -------------------------------------------------------------
 
 def test_timings_log_and_daily_count(tmp_path):
@@ -175,6 +197,8 @@ def test_timings_log_and_daily_count(tmp_path):
     check.log_timings(res, user_id=1, path=path)
     row = path.read_text(encoding="utf-8").splitlines()[0]
     assert '"mode": "quick"' in row and '"judge_s": 9.0' in row and '"total_s"' in row
+    assert check.checks_today(path) == 2
+    check.log_timings(res, user_id=1, path=path, counted=False)   # a NO_DATA quick run before a full one
     assert check.checks_today(path) == 2
     # 03:59 UTC on Nov 3 is still Nov 2 in New York: yesterday's rows don't count
     tomorrow = datetime(2099, 1, 1, tzinfo=timezone.utc)

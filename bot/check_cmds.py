@@ -63,6 +63,13 @@ def _tag_price(path: str) -> float | None:
         return None
 
 
+def _log(res: dict, user_id: int, counted: bool = True) -> None:
+    try:
+        check.log_timings(res, user_id, counted=counted)
+    except Exception:
+        traceback.print_exc()     # the pilot's timings are nice to have, not essential
+
+
 async def _run(user_id: int, message, req: dict, photo: str | None) -> None:
     """Check limits, say "Checking…", run the check in a thread, edit the
     message with the result."""
@@ -82,21 +89,34 @@ async def _run(user_id: int, message, req: dict, photo: str | None) -> None:
         try:
             res = await asyncio.to_thread(check.run_check, req, photo_path=photo,
                                           identify_fn=_identify if photo else None)
+            if res["verdict"] == check.NO_DATA and not req.get("full"):
+                # Nothing at all in the quick check: go straight on to the full
+                # check. The pair counts as one check (Person B, 2026-11-02).
+                _log(res, user_id, counted=False)
+                note = "❓ NO DATA in the quick check.\nChecking more sources… (full check, about a minute)"
+                if sent:
+                    try:
+                        await sent.edit_text(note)
+                    except Exception:
+                        traceback.print_exc()
+                req = {**req, "full": True, "auto_full": True,
+                       "identification": res["identification"]}
+                res = await asyncio.to_thread(check.run_check, req, photo_path=photo,
+                                              identify_fn=_identify if photo else None)
         except Exception as e:
             traceback.print_exc()
             text = f"⚠️ Check failed: {type(e).__name__}: {str(e)[:200]}"
             await (sent.edit_text(util._scrub(text)) if sent else util._safe_reply(message, text))
             return
-        try:
-            check.log_timings(res, user_id)
-        except Exception:
-            traceback.print_exc()     # the pilot's timings are nice to have, not essential
+        _log(res, user_id)
         text = check.format_reply(res)
         used += 1
         if used >= config.CHECK_DAILY_WARN:
             text += f"\n({used} of {config.CHECK_DAILY_MAX} checks used today)"
         token = secrets.token_hex(4)
-        state.checks[token] = {"req": dict(req), "photo": photo, "user": user_id, "ts": time.time()}
+        saved = {k: v for k, v in req.items() if k != "auto_full"}
+        saved["identification"] = res["identification"]     # buttons don't re-identify
+        state.checks[token] = {"req": saved, "photo": photo, "user": user_id, "ts": time.time()}
         markup = _markup(token, req)
         if sent:
             try:
@@ -155,7 +175,7 @@ async def check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     photo = saved.get("photo")
     if photo and not Path(photo).exists():
         photo = None
-    if not photo and not req.get("description"):
+    if not photo and not req.get("description") and not req.get("identification"):
         await util._safe_reply(query.message, "That photo is gone. Send it again with /check.")
         return
     await _run(update.effective_user.id, query.message, req, photo)

@@ -31,7 +31,12 @@ import config
 EASTERN = ZoneInfo("America/New_York")
 TIMINGS_FILE = Path(config.LOG_DIR) / "check_timings.jsonl"
 VERDICTS = ("BUY", "MAYBE", "BORDERLINE", "SKIP")
-ICON = {"BUY": "✅", "MAYBE": "🟡", "BORDERLINE": "🟠", "SKIP": "❌"}
+# A quick check that found nothing at all (no sales, no identical listing, so
+# no price): not a judgement on the item. The bot goes straight on to a full
+# check (Person B, 2026-11-02). A full check with no price is still SKIP.
+NO_DATA = "NO_DATA"
+ICON = {"BUY": "✅", "MAYBE": "🟡", "BORDERLINE": "🟠", "SKIP": "❌", NO_DATA: "❓"}
+LABEL = {NO_DATA: "NO DATA"}
 
 # --- parsing ------------------------------------------------------------------
 
@@ -236,10 +241,11 @@ def choose_price(pricing: dict, exact: bool) -> dict:
 
 
 def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
-             text: str = "") -> dict:
+             text: str = "", quick: bool = False) -> dict:
     """Price choice, money and verdict from a pricing result. Shared by
     run_check and the backtest (scripts/backtest_check.py), so the backtest
-    scores exactly what /check would say."""
+    scores exactly what /check would say. quick: a quick check that found no
+    data at all is NO_DATA instead of SKIP."""
     pick = choose_price(pricing, exact)
     kind, label = label_for(ident, text)
     money = economics(pick["price"], ross_price, label) if pick["price"] and ross_price else None
@@ -253,6 +259,8 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
                          profit_at_cheapest=at_cheapest["profit"] if at_cheapest else None,
                          low_confidence=pricing.get("claude_confidence") == "low",
                          from_asks=pick["from_asks"], disagrees=pick["disagrees"])
+        if quick and money is None and cheapest is None and pick["sales"] == 0:
+            v, why = NO_DATA, ["the quick check found no recent sales and no identical listing"]
     return {"item_type": kind, "label": label, "verdict": v, "reasons": why, "pick": pick,
             "money": money, "cheapest_total": cheapest, "at_cheapest": at_cheapest}
 
@@ -284,7 +292,11 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
     t0 = time.perf_counter()
     timings = {}
     text = req.get("description") or ""
-    if photo_path and identify_fn is not None:
+    if req.get("identification"):
+        # A follow-up (auto full check, a button) reuses the first identification:
+        # no second photo identification, same search.
+        ident = dict(req["identification"])
+    elif photo_path and identify_fn is not None:
         t = time.perf_counter()
         ident = identify_fn(photo_path) or {}
         timings["identify_s"] = round(time.perf_counter() - t, 2)
@@ -301,7 +313,8 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
     for k, v in (pricing.get("timings") or {}).items():
         if k != "total_s":
             timings[k] = v
-    ev = evaluate(pricing, ident, req.get("ross_price"), bool(req.get("exact", True)), text)
+    ev = evaluate(pricing, ident, req.get("ross_price"), bool(req.get("exact", True)), text,
+                  quick=not full)
     try:
         have = have_fn(ident)
     except Exception:            # advisory only
@@ -325,7 +338,7 @@ def format_reply(res: dict) -> str:
     req, money, pick = res["request"], res["money"], res["pick"]
     ident = res["identification"]
     lines = []
-    head = f"{ICON[res['verdict']]} {res['verdict']}"
+    head = f"{ICON[res['verdict']]} {LABEL.get(res['verdict'], res['verdict'])}"
     if money:
         roi = f"{money['roi']:.0%}" if money["roi"] is not None else "-"
         head += f": profit {_usd(money['profit'])} (ROI {roi})"
@@ -373,11 +386,15 @@ def format_reply(res: dict) -> str:
 
 # --- timings log and daily cap ----------------------------------------------------------
 
-def log_timings(res: dict, user_id: int | None = None, path: Path | None = None) -> None:
+def log_timings(res: dict, user_id: int | None = None, path: Path | None = None,
+                counted: bool = True) -> None:
+    """One line per run. counted=False: a quick run that found NO_DATA and went
+    straight on to the full check; the pair counts once toward the cap."""
     path = Path(path or TIMINGS_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     row = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "user": user_id,
            "mode": "full" if res["request"].get("full") else "quick",
+           "auto_full": bool(res["request"].get("auto_full")), "counted": counted,
            "exact": bool(res["request"].get("exact", True)), "input": "photo" if res["photo"] else "text",
            "verdict": res["verdict"], "escalated": bool(res.get("escalated")), **res["timings"]}
     with path.open("a", encoding="utf-8") as f:
@@ -394,9 +411,10 @@ def checks_today(path: Path | None = None, now: datetime | None = None) -> int:
     n = 0
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
-            ts = datetime.fromisoformat(json.loads(line)["ts"])
+            row = json.loads(line)
+            ts = datetime.fromisoformat(row["ts"])
         except (ValueError, KeyError, TypeError):
             continue
-        if ts.astimezone(EASTERN) >= start:
+        if ts.astimezone(EASTERN) >= start and row.get("counted", True):
             n += 1
     return n

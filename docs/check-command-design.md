@@ -23,6 +23,16 @@ today's code is from `main` at `9428e3a`.
 | **Sold-comps cache** | **7-day max age for `/check`** (approved). Repricing and intake keep today's behaviour (no expiry) until **Person A agrees**; this is noted in the PR. |
 | **Timings** | Every check appends one line to `logs/check_timings.jsonl`: mode, exact, input (text or photo), and seconds for identify, comps, judge and total. The pilot reads it for real response times. The same file counts checks for the daily cap. |
 
+**❓ NO DATA (Person B, 2026-11-02, after the first real runs).** A quick check
+that finds **nothing at all** (no recent sales, no identical listing for sale,
+so no price) gets the status **❓ NO DATA**, not SKIP or MAYBE. The bot then
+**continues straight into the full check**, with no tap needed. It edits its
+message to "Checking more sources…", and the full result replaces it. The
+pair counts as **one** check toward the daily cap (the quick line in
+`logs/check_timings.jsonl` is marked `"counted": false`), and the
+identification is reused, so a photo isn't identified twice. A full check
+that finds no price is still SKIP.
+
 **What quick mode means for the verdict.** BUY needs at least 3 matching
 sales (§5). Quick mode only has sales when a recent cached search exists, so
 a quick check is usually **at most MAYBE**, and the reply says "tap Full check
