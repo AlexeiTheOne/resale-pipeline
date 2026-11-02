@@ -180,7 +180,9 @@ included.
     Keep it for **30 days** (Q2), then take a final backup and drop it.
 15. ⬜ **Re-enable deploys:** `Enable-ScheduledTask EbayBotDeploy`.
 16. ⬜ **Keep the old SQLite file** read-only as the fallback:
-    `attrib +R ebay-list\data\ross.db` (never delete it; CLAUDE.md).
+    `attrib +R ebay-list\data\ross.db` (never delete it; CLAUDE.md). It is
+    the rollback target for the **first day only** (section 3c). Note the
+    switch time: the day starts there.
 17. ⬜ **The morning after the first nightly run: check OneDrive *online*.**
     The local folder alone doesn't prove it left the machine. Open
     onedrive.live.com → *EbayBot-backups* → *db* (or the OneDrive app on a
@@ -198,29 +200,68 @@ included.
 
 ## 3. Rollback
 
-**Before the bot has written anything to ResaleDB** (steps 1–11): nothing
-is lost.
+**Decided (2026-11-02, Person B): fix forward + SQL Server restores. No
+SQLite export will be built.** Going back to SQLite is allowed **only within
+the first day after cutover**, and it accepts losing every write made since
+the switch.
+
+### a) Before the bot has written anything to ResaleDB (steps 1–11)
+Nothing is lost.
 1. Remove `DB_BACKEND=sqlserver` from `ebay-list\.env`.
 2. `attrib -R data\ross.db` if it was set.
 3. Re-enable and start `EbayBot`, re-enable `EbayBotDeploy`.
 4. Receipt bot: point `SQL_CONN_STR` back at ReceiptsDB (or remove it) and
    run `ALTER DATABASE ReceiptsDB SET READ_WRITE`.
 
-**After the bot has run on ResaleDB**: going back to SQLite loses every
-write since the switch (new items, sales syncs, price changes, receipts).
-There is **no SQL Server → SQLite export** (🔧 a decision: build one, or
-accept "fix forward" plus SQL Server restores).
-- Fix forward is the default: deploy a fix, or set `DB_BACKEND` back only if
-  losing the writes since the switch is acceptable.
-- If ResaleDB's data is damaged, restore the latest good backup:
+### b) Default once the bot runs on ResaleDB: fix forward
+- A **code** problem: push a fix (the normal deploy), or let deploy.ps1 roll
+  the code back. A code rollback restores code only, never the DB, so every
+  schema step must work with the previous release for one deploy.
+- **Damaged data**: restore ResaleDB from the latest good backup. Stop the
+  bot and the receipt bot first, as in section 2 steps 2–3.
   ```sql
   ALTER DATABASE ResaleDB SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
   RESTORE DATABASE ResaleDB FROM DISK = 'D:\SQLBackups\ResaleDB-<stamp>.bak' WITH REPLACE, CHECKSUM;
   ALTER DATABASE ResaleDB SET MULTI_USER;
   ```
-  (Stop the bot and the receipt bot first, as in section 2.)
-- A code rollback by deploy.ps1 restores code only, never the DB. Every
-  schema step must work with the previous release for one deploy.
+  If D: is unreadable, take the newest `ross-*.bak` from
+  `OneDrive\EbayBot-backups\db` (download it first if it is cloud-only).
+  Writes after that backup are lost. Then run `/sync` to pull eBay orders
+  back in.
+
+### c) Back to SQLite: within the first day only
+Only if fixing forward isn't possible. Writes made since the switch are
+**lost**, by decision:
+- **Lost:**
+  - items captured or edited since the switch (their photos stay in
+    `data\inbox`);
+  - manual prices and repricing results;
+  - pieces added or moved with `/inv`;
+  - offers sent, feedback records and job stamps.
+- **Recovered:** sold orders, because eBay sync re-pulls them. Run `/sync`
+  right after the switch back.
+- **Check after switching back:**
+  - listings published since the switch exist on eBay but not in
+    `ross.db`; compare with `/health` / the sync report and re-link them;
+  - receipts entered since the switch are in ResaleDB only. Re-load them into
+    ReceiptsDB from `receipt_pipeline\storage\parsed` with
+    `upload_parsed_to_sql.py` (its file names are timestamps; take those after
+    the switch).
+
+Steps:
+1. Stop the bot (section 2, step 2) and the receipt bot (step 3).
+2. Remove `DB_BACKEND=sqlserver` from `ebay-list\.env`.
+   `attrib -R data\ross.db`.
+3. Receipt bot: point `SQL_CONN_STR` back at ReceiptsDB and run
+   `ALTER DATABASE ReceiptsDB SET READ_WRITE`. Start it.
+4. Start `EbayBot` and run `/sync`. Re-enable `EbayBotDeploy`.
+5. Keep ResaleDB as it is (don't drop it): it holds the lost writes for
+   reference. Take a backup first.
+6. Put the nightly backup wrapper back to the SQLite version.
+
+**After the first day:** the SQLite fallback is retired. `data\ross.db`
+stays read-only as an archive (never deleted, CLAUDE.md), and only (b)
+applies.
 
 ---
 
@@ -231,14 +272,20 @@ accept "fix forward" plus SQL Server restores).
 - 💤 Fill `stores` for the 18 store numbers (clean names, city, zip).
 - 💤 Receipt matching (`receipt_matches`): the matcher and its Telegram review.
 - 💤 Drop ReceiptsDB after 30 days (final backup first).
-- 💤 Remove the frozen SQLite migration steps from `migrations.py`, and the
-  SQLite branch of db.py, once rollback to SQLite is no longer wanted.
+- 💤 After the first day, the SQLite fallback is retired (section 3). Then,
+  when convenient: remove the frozen SQLite migration steps from
+  `migrations.py`, the SQLite branch of db.py and backup.py, and the
+  sqlite_only tests.
 - 💤 `.claude/settings.json`: the pre-commit hook also fires on Bash commands
   that contain a `for` loop, not only on `git commit`.
 
 ---
 
 ## Log
+- 2026-11-02: rollback decided (Person B): fix forward + SQL Server
+  restores, no SQLite export. Back to SQLite only within the first day,
+  losing the writes since the switch (eBay sync re-pulls orders). Section 3
+  rewritten with what is lost, what comes back and the steps.
 - 2026-11-02: C: and D: are one physical disk, so OneDrive is the only
   off-machine backup. backup.py gained `--require-copy` (nightly: a failed
   OneDrive copy fails the run) and `SQL_BACKUP_KEEP` (D: keeps 14, OneDrive
