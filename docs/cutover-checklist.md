@@ -80,16 +80,19 @@ Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) 
     deleted.
   - **Receipt 195**, imported twice: the earlier 11-line import is deleted.
     All its lines are in the later import, which matches the raw text (15
-    items sold). The card/auth line 789 ($128.24) stays, as it's not in scope;
-    a person can delete it later.
+    items sold).
+  - **Card/auth line 789** ($128.24, receipt 195): deleted as reason
+    `card_line` (added after the dry run, approved by Person B). It's listed
+    in `APPROVED_CARD_LINES` and deleted only while it still has that SKU and
+    price.
   - **5 prices fixed:** 4 because the lines then add up exactly to the
     subtotal (lines 4547, 4570, 8366, 8428), and 1 because the raw text shows
     $7.49 (line 8297).
   - **26 prices flagged** with no evidence: 12 have no raw text; others show a
     different price, e.g. raw `$0,99` stored as 998.00. They stay as they are,
     for a person.
-- ⬜ **Person B approves the cleanup plan** (the dry-run report above),
-  before it's applied at cutover step 8.
+- ✅ **Cleanup plan approved** (Person B, 2026-11-02), plus deleting card
+  line 789. It's applied at cutover step 8.
 - 🔧 **`SALES_TAX_RATE` sync:** db.py should write `config.SALES_TAX_RATE`
   into `app_settings` at startup. Today the baseline seeds 0.07, which matches
   the config default, so this only matters if the rate changes.
@@ -375,6 +378,10 @@ applies.
 - 💤 Fill `stores` for the 18 store numbers (clean names, city, zip).
 - 💤 Receipt matching (`receipt_matches`): the matcher and its Telegram review.
 - 💤 Drop ReceiptsDB after 30 days (final backup first).
+- 💤 **Person B reviews the 26 flagged prices** (lines over $500 with no
+  evidence for a fix, listed in the cleanup report). They stay as they are
+  until then; `v_receipt_checks.suspect_prices` shows them. Fix each by hand
+  with a `receipt_fixes` row (reason `decimal_loss`, fixed_by the person).
 - 💤 **When receipts merge into the main bot:** disable and delete the
   `ReceiptBot` task, so the old receipt bot can't come back at the next boot.
   From an admin PowerShell:
@@ -391,6 +398,10 @@ applies.
 ---
 
 ## Log
+- 2026-11-02: cleanup plan approved (Person B), plus deleting card line 789
+  (`card_line`). The 26 flagged prices are left for Person B after cutover.
+  `receipt_pipeline` pushed to the private repo BorisMer/receipt-pipeline.
+  Draft PR opened for Person A (not to merge before the cutover day).
 - 2026-11-02: **Q1 changed** (Person B): one cutover for both bots. Built the
   receipts cleanup script, migration step 2 (unique receipt indexes, refused
   while duplicates remain), the receipt bot's "already saved" reply

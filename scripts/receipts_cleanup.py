@@ -14,6 +14,8 @@ What it changes (everything else is only listed for a person):
   batches (the line number restarts at a new import). A batch is deleted
   only when every one of its lines (SKU, description, price) is also in the
   biggest batch. Otherwise the receipt is flagged.
+- Card lines: the payment lines listed in APPROVED_CARD_LINES (reviewed by
+  a person) are deleted, only while still exactly as reviewed.
 - Decimal-loss prices (> $500, and price / 100 <= $500): fixed only with
   evidence: (a) the raw receipt text shows price / 100 after that SKU, or
   (b) dividing brings the line sum within $0.05 of the subtotal. The old
@@ -178,6 +180,30 @@ def plan_duplicate_lines(receipts, lines, actions, flags):
                           "note": "line numbers still repeat inside the kept batch"})
 
 
+# Card/payment lines the parser read as items, reviewed and approved for
+# deletion by a person (Person B, 2026-11-02). Deleted only while the line is
+# still exactly as reviewed; otherwise flagged.
+APPROVED_CARD_LINES = {
+    789: {"ReceiptID": 195, "SKU": "806002004330", "Price": Decimal("128.24")},
+}
+
+
+def plan_card_lines(receipts, lines, actions, flags):
+    for item_id, want in sorted(APPROVED_CARD_LINES.items()):
+        ln = lines.get(item_id)
+        if ln is None:
+            continue  # already deleted
+        if any(ln[k] != v for k, v in want.items()):
+            flags.append({"receipt": ln["ReceiptID"], "line": item_id, "reason": "card_line",
+                          "note": f"{_line_text(ln)} differs from the approved card line {want}; not deleted"})
+            continue
+        actions.append({"op": "delete_line", "table": "ReceiptItems", "row_id": item_id,
+                        "changes": [("*", _line_text(ln), None)], "reason": "card_line",
+                        "why": f"receipt {ln['ReceiptID']}: card/auth line read as an item "
+                               "(approved for deletion by Person B, 2026-11-02)"})
+        del lines[item_id]
+
+
 def _raw_text(raw_dir: Path, receipt) -> str | None:
     for fid in (receipt["RawFileID"], receipt["SourceFile"]):
         if fid and re.fullmatch(r"[\w.-]+", fid):
@@ -244,6 +270,7 @@ def plan(con, raw_dir):
     actions, flags = [], []
     plan_duplicate_receipts(receipts, lines, actions, flags)
     plan_duplicate_lines(receipts, lines, actions, flags)
+    plan_card_lines(receipts, lines, actions, flags)
     plan_decimal_loss(receipts, lines, actions, flags, raw_dir)
     remaining_numbers = [n for n, c in Counter(r["ReceiptNumber"] for r in receipts.values()
                                                if r["ReceiptNumber"] is not None).items() if c > 1]

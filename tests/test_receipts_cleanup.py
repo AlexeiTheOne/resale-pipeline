@@ -175,6 +175,26 @@ def test_unique_indexes_wait_for_the_cleanup(v1, raw_dir, tmp_path):
         con.close()
 
 
+def test_approved_card_line_is_deleted_only_as_reviewed(v1, raw_dir, tmp_path, monkeypatch):
+    # In the fixture the card line of receipt 195 is ItemID 27.
+    monkeypatch.setattr(rc, "APPROVED_CARD_LINES", {
+        27: {"ReceiptID": 195, "SKU": "806002004330", "Price": Decimal("128.24")},
+        31: {"ReceiptID": 196, "SKU": "400000000011", "Price": Decimal("9.99")},  # price differs
+    })
+    _main(v1, raw_dir, tmp_path, "--apply")
+    lines, _, fixes = _state(v1)
+    assert 27 not in lines
+    assert any(f[1] == 27 and f[5] == "card_line" for f in fixes)
+    assert 31 in lines  # not as reviewed: flagged, kept
+    report = sorted((tmp_path / "logs").glob("receipts-cleanup-*.md"))[-1].read_text(encoding="utf-8")
+    assert "| 196 | 31 | card_line |" in report
+
+
+def test_the_approved_production_card_line():
+    assert rc.APPROVED_CARD_LINES == {
+        789: {"ReceiptID": 195, "SKU": "806002004330", "Price": Decimal("128.24")}}
+
+
 def test_apply_stops_if_a_row_changed_after_planning(v1, raw_dir):
     con = sqlserver.connect(v1)
     try:
