@@ -18,6 +18,7 @@ from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
+import profit
 from config import (
     ASSUMED_COST_RATIO, EBAY_AD_FEE_PCT, EBAY_FIXED_FEE, EBAY_FVF_PCT,
     EBAY_SHIP_CHARGED, EBAY_SHIP_COST,
@@ -277,7 +278,7 @@ def build_report(path: str, ad_days: int = 90) -> str:
         L = item.get("listing") or {}
         qty = _report_qty(item)
         unit_price = _unit_price_for(item, qty)
-        paid = (item.get("receipt") or {}).get("reduced_price")
+        paid = profit.paid_with_tax(item)
 
         ws.row_dimensions[r].height = 72
         photos = item.get("photos") or []

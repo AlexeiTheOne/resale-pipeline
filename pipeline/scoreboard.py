@@ -44,6 +44,8 @@ import re
 import statistics
 from datetime import datetime, timezone
 
+import profit as profit_calc  # a local "profit" variable is used below
+
 # --- Verdict thresholds (tuned on the 29 Oct 2026 data; see module docstring) ---
 MIN_UNITS = 4              # units bought before any verdict but "ok"
 MIN_LISTING_DAYS = 60      # exposure before a pause/stop ("doesn't sell" needs time)
@@ -238,7 +240,7 @@ def item_facts(item: dict, now: datetime | None = None, known_brands=()) -> dict
         remaining = 0 if item["status"] == "sold" else 1
     if item["status"] == "sold" and sale["units"] == 0:
         sale["units"] = 1   # marked sold by hand with no record of how many
-    cost = _num((item.get("receipt") or {}).get("reduced_price"))
+    cost = profit_calc.paid_with_tax(item)
     listed = _ts(ebay.get("published_at")) or _ts(item.get("created_at"))
     live = remaining > 0
     end = now if live else (sale["last"] or now)
