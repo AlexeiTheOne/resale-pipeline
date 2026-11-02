@@ -17,3 +17,5 @@ pytesseract==0.3.13
 Pillow==11.3.0
 pyzbar==0.1.9
 openpyxl==3.1.5
+# SQL Server (ResaleDB) through Microsoft ODBC Driver 18, see sqlserver.py.
+pyodbc==5.3.0

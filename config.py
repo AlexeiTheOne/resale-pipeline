@@ -347,6 +347,17 @@ REPRICE_HOUR_UTC = int(os.getenv("REPRICE_HOUR_UTC", "14"))
 # never acts on the live eBay account on its own.
 JOBS_ENABLED = _env_bool("JOBS_ENABLED", True)
 
+# --- SQL Server (ResaleDB; sqlserver.py, docs/schema-proposal.md) ---
+# Windows auth on the local Express instance. SQL_DATABASE has NO default on
+# purpose: dev (ResaleDB_Dev) and production (ResaleDB) share this instance on
+# the production PC, so a missing setting must fail instead of quietly picking
+# production. Tests use their own ResaleDB_Test_* database (tests/conftest.py).
+SQL_SERVER = os.getenv("SQL_SERVER", r".\SQLEXPRESS")
+SQL_DATABASE = os.getenv("SQL_DATABASE") or None
+SQL_DRIVER = os.getenv("SQL_DRIVER", "ODBC Driver 18 for SQL Server")
+# The local instance has a self-signed certificate: encrypt, but trust it.
+SQL_TRUST_SERVER_CERT = _env_bool("SQL_TRUST_SERVER_CERT", True)
+
 # Master switch for every call that changes the eBay account (publish, offers,
 # price/quantity/title edits, ads, offers to watchers, feedback). On by default
 # so production is unchanged. Set EBAY_WRITES_ENABLED=0 on a dev copy: writes

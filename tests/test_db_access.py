@@ -26,6 +26,17 @@ def test_readonly_connection_refuses_writes():
         con.close()
 
 
+def test_only_sqlserver_py_opens_sql_server_connections():
+    offenders = []
+    for path in ROOT.rglob("*.py"):
+        rel = path.relative_to(ROOT).as_posix()
+        if rel.startswith(("tests/", "venv/", ".venv/", "web/", ".claude/")) or rel == "sqlserver.py":
+            continue
+        if "pyodbc.connect(" in path.read_text(encoding="utf-8", errors="ignore"):
+            offenders.append(rel)
+    assert offenders == [], f"use sqlserver.connect() instead: {offenders}"
+
+
 def test_no_new_direct_sqlite_connects():
     offenders = []
     for path in ROOT.rglob("*.py"):
