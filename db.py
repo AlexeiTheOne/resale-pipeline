@@ -5,10 +5,38 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import config
 import migrations
 from config import DATA_DIR, resolve_path, stored_path
 
 DB_PATH = str(DATA_DIR / "ross.db")
+
+
+# --- backend switch (SQL Server migration, docs/schema-proposal.md) ----------
+# config.DB_BACKEND picks where reads come from. "sqlite" (default) is this
+# file as it always was. "sqlserver" sends every read below to db_mssql.py,
+# which returns the same shapes; writes refuse there until step 2b.
+
+class ReadOnlyBackend(RuntimeError):
+    """A write was attempted while DB_BACKEND=sqlserver (reads only so far)."""
+
+
+def _on_sqlserver() -> bool:
+    backend = config.DB_BACKEND
+    if backend not in ("sqlite", "sqlserver"):
+        raise ValueError(f"DB_BACKEND must be 'sqlite' or 'sqlserver', not {backend!r}")
+    return backend == "sqlserver"
+
+
+def _sqlserver():
+    import db_mssql  # only needs pyodbc when the backend is actually used
+    return db_mssql
+
+
+def _refuse_on_sqlserver(name: str) -> None:
+    if _on_sqlserver():
+        raise ReadOnlyBackend(f"DB_BACKEND=sqlserver is read-only for now: refused db.{name}(). "
+                              "Writes on SQL Server come in migration step 2b.")
 
 VALID_STATUSES = [
     "captured", "identified", "priced", "drafted",
@@ -93,6 +121,7 @@ def create_tables() -> None:
 
 
 def create_item(photos: list[str]) -> str:
+    _refuse_on_sqlserver('create_item')
     item_id = str(uuid.uuid4())
     now = _now()
     with _conn() as con:
@@ -104,6 +133,8 @@ def create_item(photos: list[str]) -> str:
 
 
 def get_item(item_id: str) -> dict | None:
+    if _on_sqlserver():
+        return _sqlserver().get_item(item_id)
     with _conn() as con:
         cur = con.execute("SELECT * FROM items WHERE item_id = ?", (item_id,))
         row = cur.fetchone()
@@ -113,6 +144,7 @@ def get_item(item_id: str) -> dict | None:
 
 
 def update_status(item_id: str, status: str) -> None:
+    _refuse_on_sqlserver('update_status')
     if status not in VALID_STATUSES:
         raise ValueError(f"Invalid status '{status}'. Must be one of: {VALID_STATUSES}")
     with _conn() as con:
@@ -123,6 +155,7 @@ def update_status(item_id: str, status: str) -> None:
 
 
 def update_field(item_id: str, field: str, data: dict) -> None:
+    _refuse_on_sqlserver('update_field')
     if field not in VALID_FIELDS:
         raise ValueError(f"Invalid field '{field}'. Must be one of: {VALID_FIELDS}")
     with _conn() as con:
@@ -133,6 +166,8 @@ def update_field(item_id: str, field: str, data: dict) -> None:
 
 
 def list_items(status: str | None = None) -> list[dict]:
+    if _on_sqlserver():
+        return _sqlserver().list_items(status)
     with _conn() as con:
         if status is not None:
             cur = con.execute("SELECT * FROM items WHERE status = ?", (status,))
@@ -143,6 +178,7 @@ def list_items(status: str | None = None) -> list[dict]:
 
 
 def delete_item(item_id: str) -> None:
+    _refuse_on_sqlserver('delete_item')
     with _conn() as con:
         con.execute("DELETE FROM items WHERE item_id = ?", (item_id,))
 
@@ -156,6 +192,7 @@ def record_listing_stats(item_id: str, week: str, *, impressions=None, views=Non
 
     `impressions` is ORGANIC (search + store), its historical meaning;
     `total_impressions` includes promoted placements."""
+    _refuse_on_sqlserver('record_listing_stats')
     with _conn() as con:
         con.execute(
             "INSERT INTO listing_stats (item_id, week, impressions, views, watchers, "
@@ -174,6 +211,7 @@ def record_listing_stats(item_id: str, week: str, *, impressions=None, views=Non
 def record_offer_sent(listing_id: str, offer_price: float, *, item_id: str | None = None,
                       list_price: float | None = None, source: str | None = None) -> None:
     """Note that an offer to watchers went out (see offer_sends)."""
+    _refuse_on_sqlserver('record_offer_sent')
     with _conn() as con:
         con.execute(
             "INSERT INTO offer_sends (item_id, listing_id, list_price, offer_price, source, "
@@ -183,12 +221,15 @@ def record_offer_sent(listing_id: str, offer_price: float, *, item_id: str | Non
 
 def offers_sent_since(since_iso: str) -> set[str]:
     """Listing ids that had an offer to watchers sent at or after `since_iso`."""
+    if _on_sqlserver():
+        return _sqlserver().offers_sent_since(since_iso)
     with _conn() as con:
         return {row[0] for row in con.execute(
             "SELECT DISTINCT listing_id FROM offer_sends WHERE sent_at >= ?", (since_iso,))}
 
 
 def save_offer_plan(rows: list[dict]) -> str:
+    _refuse_on_sqlserver('save_offer_plan')
     plan_id = str(uuid.uuid4())
     with _conn() as con:
         con.execute("INSERT INTO offer_plans (plan_id, rows, created_at) VALUES (?, ?, ?)",
@@ -197,6 +238,8 @@ def save_offer_plan(rows: list[dict]) -> str:
 
 
 def get_offer_plan(plan_id: str) -> dict | None:
+    if _on_sqlserver():
+        return _sqlserver().get_offer_plan(plan_id)
     with _conn() as con:
         row = con.execute("SELECT rows, created_at, used_at FROM offer_plans WHERE plan_id = ?",
                           (plan_id,)).fetchone()
@@ -208,6 +251,7 @@ def get_offer_plan(plan_id: str) -> dict | None:
 
 def claim_offer_plan(plan_id: str) -> bool:
     """Mark a plan used. True only for the one caller that got there first."""
+    _refuse_on_sqlserver('claim_offer_plan')
     with _conn() as con:
         cur = con.execute("UPDATE offer_plans SET used_at = ? WHERE plan_id = ? "
                           "AND used_at IS NULL", (_now(), plan_id))
@@ -216,6 +260,8 @@ def claim_offer_plan(plan_id: str) -> bool:
 
 def stats_history(item_id: str, limit: int = 8) -> list[dict]:
     """Most recent weekly snapshots for an item, newest week first."""
+    if _on_sqlserver():
+        return _sqlserver().stats_history(item_id, limit)
     with _conn() as con:
         cur = con.execute(
             "SELECT * FROM listing_stats WHERE item_id = ? ORDER BY week DESC LIMIT ?",
@@ -239,6 +285,7 @@ def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> N
     A status other than "ok" (e.g. "partial": the weekly price check ran but
     some traffic batches failed) records the attempt without counting it as
     completed — last_job_run ignores it, so the slot is still caught up."""
+    _refuse_on_sqlserver('record_job_run')
     with _conn() as con:
         con.execute(
             "INSERT INTO job_runs (job, last_run_at, status, detail) VALUES (?, ?, ?, ?) "
@@ -250,11 +297,14 @@ def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> N
 
 def known_feedback_failures() -> set[str]:
     """Order lines whose feedback failure has already been reported."""
+    if _on_sqlserver():
+        return _sqlserver().known_feedback_failures()
     with _conn() as con:
         return {r[0] for r in con.execute("SELECT order_line FROM feedback_failures")}
 
 
 def record_feedback_failure(order_line: str, error: str) -> None:
+    _refuse_on_sqlserver('record_feedback_failure')
     with _conn() as con:
         con.execute(
             "INSERT INTO feedback_failures (order_line, first_failed, last_error) "
@@ -263,17 +313,21 @@ def record_feedback_failure(order_line: str, error: str) -> None:
 
 
 def clear_feedback_failure(order_line: str) -> None:
+    _refuse_on_sqlserver('clear_feedback_failure')
     with _conn() as con:
         con.execute("DELETE FROM feedback_failures WHERE order_line = ?", (order_line,))
 
 
 def mark_not_duplicate(item_a: str, item_b: str) -> None:
+    _refuse_on_sqlserver('mark_not_duplicate')
     a, b = sorted((item_a, item_b))
     with _conn() as con:
         con.execute("INSERT OR IGNORE INTO not_duplicates (a, b) VALUES (?, ?)", (a, b))
 
 
 def not_duplicate_pairs() -> set[tuple[str, str]]:
+    if _on_sqlserver():
+        return _sqlserver().not_duplicate_pairs()
     with _conn() as con:
         return {(a, b) for a, b in con.execute("SELECT a, b FROM not_duplicates")}
 
@@ -294,6 +348,8 @@ def _piece_row(row, cursor) -> dict:
 def next_piece_code(box: str) -> str:
     """G3 -> G3-01, G3-02, ... Numbering follows the code prefix, so a piece
     that moved out of G3 still holds its number."""
+    if _on_sqlserver():
+        return _sqlserver().next_piece_code(box)
     prefix = f"{box.upper()}-"
     with _conn() as con:
         codes = [r[0] for r in con.execute(
@@ -305,6 +361,7 @@ def next_piece_code(box: str) -> str:
 def add_piece(box: str, photo: str | None = None) -> str:
     """Reserve the next code in `box` and store the piece. Retries if two
     photos race for the same number."""
+    _refuse_on_sqlserver('add_piece')
     box = box.upper()
     for _ in range(5):
         code = next_piece_code(box)
@@ -325,6 +382,7 @@ _PIECE_COLUMNS = {"box", "item_id", "status", "photo", "info", "value", "cost",
 
 
 def update_piece(code: str, **fields) -> None:
+    _refuse_on_sqlserver('update_piece')
     code = code.upper()
     bad = set(fields) - _PIECE_COLUMNS
     if bad:
@@ -346,6 +404,8 @@ def update_piece(code: str, **fields) -> None:
 
 
 def get_piece(code: str) -> dict | None:
+    if _on_sqlserver():
+        return _sqlserver().get_piece(code)
     with _conn() as con:
         cur = con.execute("SELECT * FROM pieces WHERE code = ?", (code.upper(),))
         row = cur.fetchone()
@@ -354,6 +414,8 @@ def get_piece(code: str) -> dict | None:
 
 def list_pieces(*, box: str | None = None, item_id: str | None = None,
                 status: str | None = None) -> list[dict]:
+    if _on_sqlserver():
+        return _sqlserver().list_pieces(box=box, item_id=item_id, status=status)
     where, args = [], []
     for col, val in (("box", box), ("item_id", item_id), ("status", status)):
         if val is not None:
@@ -369,11 +431,14 @@ def list_pieces(*, box: str | None = None, item_id: str | None = None,
 
 
 def seen_order_ids() -> set[str]:
+    if _on_sqlserver():
+        return _sqlserver().seen_order_ids()
     with _conn() as con:
         return {r[0] for r in con.execute("SELECT order_id FROM seen_orders")}
 
 
 def mark_orders_seen(order_ids) -> None:
+    _refuse_on_sqlserver('mark_orders_seen')
     with _conn() as con:
         con.executemany("INSERT OR IGNORE INTO seen_orders (order_id, seen_at) VALUES (?, ?)",
                         [(o, _now()) for o in order_ids])
@@ -382,6 +447,8 @@ def mark_orders_seen(order_ids) -> None:
 def job_run_status(job: str) -> str | None:
     """The status the last attempt at `job` recorded ("ok", "partial", ...), or
     None if it never recorded one."""
+    if _on_sqlserver():
+        return _sqlserver().job_run_status(job)
     with _conn() as con:
         row = con.execute(
             "SELECT status FROM job_runs WHERE job = ?", (job,)
@@ -393,6 +460,8 @@ def last_job_run(job: str) -> datetime | None:
     """When `job` last completed, as an aware UTC datetime, or None if never.
     An attempt recorded with a non-ok status didn't complete, so it reads as
     None too (NULL status is a legacy ok row)."""
+    if _on_sqlserver():
+        return _sqlserver().last_job_run(job)
     with _conn() as con:
         row = con.execute(
             "SELECT last_run_at FROM job_runs WHERE job = ? "
@@ -412,6 +481,7 @@ def record_llm_usage(*, provider: str, model: str, stage: str | None = None,
                      output_tokens: int = 0, cache_read_tokens: int = 0,
                      cache_write_tokens: int = 0, web_searches: int = 0,
                      cost_usd: float | None = None, ts: str | None = None) -> None:
+    _refuse_on_sqlserver('record_llm_usage')
     with _conn() as con:
         con.execute(
             "INSERT INTO llm_usage (ts, provider, model, stage, item_id, input_tokens, "
@@ -424,6 +494,8 @@ def record_llm_usage(*, provider: str, model: str, stage: str | None = None,
 
 def llm_spend_since(since_iso: str, provider: str | None = None) -> float:
     """Total logged cost (USD) from since_iso onward, optionally for one provider."""
+    if _on_sqlserver():
+        return _sqlserver().llm_spend_since(since_iso, provider)
     sql = "SELECT COALESCE(SUM(cost_usd), 0) FROM llm_usage WHERE ts >= ?"
     args: list = [since_iso]
     if provider is not None:
@@ -435,6 +507,8 @@ def llm_spend_since(since_iso: str, provider: str | None = None) -> float:
 
 def llm_usage_breakdown(since_iso: str) -> list[dict]:
     """Spend grouped by provider, model and stage from since_iso onward, dearest first."""
+    if _on_sqlserver():
+        return _sqlserver().llm_usage_breakdown(since_iso)
     with _conn() as con:
         cur = con.execute(
             "SELECT provider, model, COALESCE(stage, '-') AS stage, COUNT(*) AS calls, "
@@ -454,6 +528,7 @@ create_tables()
 # --- small item queries (moved from telegram_bot.py, cleanup-plan Phase 2) ---
 
 def set_location(item_id: str, loc: str | None) -> None:
+    _refuse_on_sqlserver('set_location')
     if not loc:
         return
     item = get_item(item_id) or {}
@@ -487,6 +562,7 @@ def next_receipt_code() -> str:
 
 def match_quantity_to_pieces(item_id: str) -> None:
     """Before a stocked item is drafted, list as many as were found at home."""
+    _refuse_on_sqlserver('match_quantity_to_pieces')
     n = len(list_pieces(item_id=item_id, status="home"))
     if n > 1:
         item = get_item(item_id) or {}
