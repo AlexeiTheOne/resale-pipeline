@@ -30,7 +30,8 @@ def test_no_new_direct_sqlite_connects():
     offenders = []
     for path in ROOT.rglob("*.py"):
         rel = path.relative_to(ROOT).as_posix()
-        if rel.startswith(("tests/", "venv/", ".venv/", "web/", ".claude/")) or rel in ALLOWED:
+        # legacy/: old standalone tools kept unchanged for reference, never imported
+        if rel.startswith(("tests/", "venv/", ".venv/", "web/", ".claude/", "legacy/")) or rel in ALLOWED:
             continue
         if "sqlite3.connect(" in path.read_text(encoding="utf-8", errors="ignore"):
             offenders.append(rel)
