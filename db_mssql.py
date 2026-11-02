@@ -12,17 +12,16 @@ Writes (docs/schema-proposal.md, section 5):
     queue up; they then write only the rows and columns that changed, with each
     column and its JSON copy computed together by dbmap.split_item;
   - update_field merges: the caller's dict is compared with the version it
-    read, and only the keys the caller changed are applied onto the current
-    row. Two writers changing different keys of one group both survive;
+    last read or wrote (per asyncio task / thread), and only the keys the
+    caller changed are applied onto the current row. Two writers changing
+    different keys of one group both survive; a value set back is written;
   - upserts are UPDATE, then INSERT if nothing was updated, under
     UPDLOCK + SERIALIZABLE (no MERGE); "insert or ignore" catches 2627/2601.
 """
+import contextvars
 import copy
 import json
-import threading
-import time
 import uuid
-from collections import deque
 from datetime import datetime, timezone
 
 import pyodbc
@@ -185,8 +184,7 @@ def _items(where: str, params: tuple) -> list[dict]:
         con.commit()
     finally:
         con.close()
-    for raw in raws:
-        _remember(raw)
+    _remember(*raws)
     return [_resolve(r) for r in raws]
 
 
@@ -202,43 +200,51 @@ def list_items(status: str | None = None) -> list[dict]:
 
 
 # --- what each caller read (for update_field's merge) --------------------------
-# Versions of each (item, group) recently handed out or written, in stored
-# form. update_field takes the one closest to the caller's new dict as the
-# version that caller started from.
+# The version of each (item, group) this caller last read or wrote, in stored
+# form. "This caller" is the current context: every asyncio task (one per
+# Telegram update or job) and every thread has its own, so two handlers never
+# see each other's versions. update_field takes it as the version the caller
+# started from. No version (the caller built the dict without reading) means
+# the current row is the base, so the dict replaces the group, as on SQLite.
+#
+# Earlier this was one shared list of recent versions, and update_field took the
+# one closest to the new dict. That lost undos: setting a price back from 35 to
+# 40 matched the older 40 version exactly, so "nothing changed" and 35 stayed.
 
-_SEEN_MAX = 16
-_SEEN_SECONDS = 3600
-_seen: dict = {}
-_seen_lock = threading.Lock()
+_base: contextvars.ContextVar = contextvars.ContextVar("db_mssql_base", default={})
 
 
-def _remember(raw: dict) -> None:
-    now = time.monotonic()
-    with _seen_lock:
+def _remember(*raws: dict) -> None:
+    # A new dict each time: a task's context is a copy of its parent's, and
+    # mutating the shared dict would leak versions between tasks.
+    seen = dict(_base.get())
+    for raw in raws:
         for field in db.VALID_FIELDS:
             value = raw.get(field)
             if isinstance(value, dict):
-                q = _seen.setdefault((raw["item_id"], field), deque(maxlen=_SEEN_MAX))
-                q.append((now, copy.deepcopy(value)))
+                seen[(raw["item_id"], field)] = copy.deepcopy(value)
+            else:
+                seen.pop((raw["item_id"], field), None)
+    _base.set(seen)
 
 
-def _recent(item_id: str, field: str) -> list[dict]:
-    cutoff = time.monotonic() - _SEEN_SECONDS
-    with _seen_lock:
-        return [v for t, v in _seen.get((item_id, field), ()) if t >= cutoff]
+def _forget() -> None:
+    """Drop this context's remembered versions (tests)."""
+    _base.set({})
 
 
-def _distance(a: dict, b: dict) -> int:
-    return sum(1 for k in set(a) | set(b) if (k in a) != (k in b) or a.get(k) != b.get(k))
+def _read_base(item_id: str, field: str) -> dict | None:
+    return _base.get().get((item_id, field))
 
 
-def merge_group(current, new, seen: list[dict]):
-    """The group to store: `current` plus the keys the caller changed. The
-    caller's base is the seen version (or current) closest to `new`."""
+def merge_group(current, new, base: dict | None):
+    """The group to store: `current` plus the keys the caller changed since
+    `base`, the version it last read or wrote (None: `current`, so `new`
+    replaces the group)."""
     if not isinstance(current, dict) or not isinstance(new, dict):
         return new
-    candidates = list(seen) + [current]
-    base = min(reversed(candidates), key=lambda c: _distance(c, new))
+    if base is None:
+        base = current
     merged = dict(current)
     for k in set(base) | set(new):
         if k not in new:
@@ -404,11 +410,11 @@ def update_field(item_id: str, field: str, data) -> None:
         raise ValueError(f"Invalid field '{field}'. Must be one of: {db.VALID_FIELDS}")
     # Stored form, as SQLite stores it (and a JSON round trip, as SQLite does).
     data = json.loads(json.dumps(db._map_paths(field, data, db.stored_path)))
-    seen = _recent(item_id, field)
+    base = _read_base(item_id, field)
     written = {}
 
     def change(raw):
-        raw[field] = merge_group(raw.get(field), data, seen)
+        raw[field] = merge_group(raw.get(field), data, base)
         raw["updated_at"] = _now()
         written["raw"] = raw
     _write(_rewrite, item_id, change)
