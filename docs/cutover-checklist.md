@@ -12,6 +12,12 @@ data migration, done while the bot is stopped.
 Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) ·
 💤 after cutover.
 
+> **Backups: OneDrive is the only off-machine copy.** C: and D: are the same
+> physical disk, so `D:\SQLBackups` protects against a bad write or a broken
+> database, **not** against losing the disk. The nightly job must copy each
+> SQL Server `.bak` to OneDrive (keep 30), a failed copy must fail the job, and
+> the copy must be seen **online** (section 2, step 17).
+
 ---
 
 ## 1. Before the cutover day
@@ -48,15 +54,31 @@ Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) 
   cutover that file is frozen, so it would quietly back up stale data. Replace
   lines 4–8 with:
   ```powershell
-  $env:BACKUP_DIR = "$dest\db"
-  $env:BACKUP_KEEP = "30"
+  $env:BACKUP_DIR = "$dest\db"     # OneDrive: the only off-machine copy
+  $env:BACKUP_KEEP = "30"           # .bak copies kept in OneDrive
+  $env:SQL_BACKUP_KEEP = "14"       # .bak files kept in D:\SQLBackups (same disk)
   Push-Location $repo
-  & "$repo\venv\Scripts\python.exe" backup.py --db-only
+  & "$repo\venv\Scripts\python.exe" backup.py --db-only --require-copy
+  $code = $LASTEXITCODE
   Pop-Location
+  if ($code -ne 0) { throw "DB backup failed or did not reach OneDrive (exit $code)" }
   ```
   Keep the two robocopy lines (photos). backup.py follows `DB_BACKEND`: on SQL
   Server it runs BACKUP DATABASE into `D:\SQLBackups`, copies the `.bak` to
-  OneDrive and prunes both folders.
+  OneDrive as `ross-<UTC time>.bak` and prunes both folders.
+  - ✅ `--require-copy` (built): a `.bak` that can't be copied to OneDrive
+    fails the run (exit 1) instead of only warning. The pre-deploy backup
+    (deploy.ps1 step 2) still only warns, because the local `.bak` is enough to
+    roll back a deploy.
+  - Old SQLite backups in `OneDrive\EbayBot-backups\db` are named
+    `ross_<day>.db` (underscore). backup.py prunes only `ross-*`, so those
+    stay; delete them by hand once they're no longer wanted.
+  - The `EbayBotBackup` task must run as boris, with the OneDrive client
+    signed in. A copy into the local OneDrive folder is not off-machine until
+    the client has uploaded it.
+  - 🔧 A failed nightly backup should alert on Telegram (scripts/notify),
+    like deploys do. Today the wrapper only exits non-zero, which nobody
+    sees unless they look at Task Scheduler.
 - 🔧 **`prod-logs` skill and `README.md`:** both query
   `data/ross.db` with raw `sqlite3`. Switch them to read-only SQL Server
   queries (`db.connect_readonly()`, or `sqlcmd -K ReadOnly`, or the views
@@ -143,8 +165,10 @@ included.
     It must print without error, and `db.load_ebay_token()` must not be
     None.
 11. ⬜ **Backups:** the new `backup_ebay_bot.ps1` (section 1) is in place.
-    Run it once by hand; a `ross-*.bak` should appear in
-    `OneDrive\EbayBot-backups\db` and a `ResaleDB-*.bak` in `D:\SQLBackups`.
+    Run it once by hand. It must exit 0, a `ResaleDB-*.bak` must appear in
+    `D:\SQLBackups`, and a `ross-*.bak` of the same size in
+    `OneDrive\EbayBot-backups\db`. Check with
+    `Get-FileHash` that the two files match.
 12. ⬜ **Start the bot:** `Enable-ScheduledTask EbayBot; Start-ScheduledTask EbayBot`.
     Watch `logs\heartbeat.json` and `logs\service.out.log`, then try `/health`
     and a read command (`/report`) in Telegram.
@@ -157,6 +181,18 @@ included.
 15. ⬜ **Re-enable deploys:** `Enable-ScheduledTask EbayBotDeploy`.
 16. ⬜ **Keep the old SQLite file** read-only as the fallback:
     `attrib +R ebay-list\data\ross.db` (never delete it; CLAUDE.md).
+17. ⬜ **The morning after the first nightly run: check OneDrive *online*.**
+    The local folder alone doesn't prove it left the machine. Open
+    onedrive.live.com → *EbayBot-backups* → *db* (or the OneDrive app on a
+    phone) and confirm:
+    - a `ross-<date>.bak` from last night is there;
+    - its size matches the `ResaleDB-*.bak` in `D:\SQLBackups` (about 25 MB
+      on dev data).
+    - In Explorer, the local file must show the green "synced" mark, not
+      "sync pending".
+    If it's missing online, the off-machine backup isn't working: fix it
+    before anything else (OneDrive signed in? the task's user? the wrapper's
+    exit code?).
 
 ---
 
@@ -203,6 +239,11 @@ accept "fix forward" plus SQL Server restores).
 ---
 
 ## Log
+- 2026-11-02: C: and D: are one physical disk, so OneDrive is the only
+  off-machine backup. backup.py gained `--require-copy` (nightly: a failed
+  OneDrive copy fails the run) and `SQL_BACKUP_KEEP` (D: keeps 14, OneDrive
+  keeps 30 via BACKUP_KEEP). Added step 17, the online check after the first
+  nightly run, and the Telegram alert item.
 - 2026-11-02: list started.
   - Backups go to `D:\SQLBackups` with pruning (14 per database).
   - The old test backup in the instance's Backup folder was deleted

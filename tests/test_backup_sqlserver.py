@@ -66,6 +66,26 @@ def test_server_folder_keeps_the_newest_per_database(tmp_path, monkeypatch):
     assert sqlserver.prune_backups("ResaleDB", 3) == []                 # no folder set: nothing
 
 
+def test_nightly_run_fails_when_the_offsite_copy_fails(tmp_path, monkeypatch):
+    # D:\SQLBackups is on the same disk as C:; the copy into BACKUP_DIR
+    # (OneDrive) is the only backup that leaves the machine.
+    import pytest
+    _fake_backup(tmp_path, monkeypatch, readable=False)
+    with pytest.raises(RuntimeError, match="could not be copied"):
+        backup.main(["--db-only", "--require-copy"])
+
+
+def test_offsite_and_server_folders_keep_their_own_counts(tmp_path, monkeypatch):
+    out, _ = _fake_backup(tmp_path, monkeypatch)
+    pruned = []
+    monkeypatch.setattr(sqlserver, "prune_backups", lambda name, keep: pruned.append(keep) or [])
+    monkeypatch.setattr(backup, "KEEP", 30)       # BACKUP_KEEP: OneDrive copies
+    monkeypatch.setattr(backup, "SQL_KEEP", 14)   # SQL_BACKUP_KEEP: D:\SQLBackups
+    backup.main(["--db-only", "--require-copy"])
+    assert pruned == [14]
+    assert len(list(out.glob("ross-*.bak"))) == 1
+
+
 def test_a_copy_that_fails_warns_but_does_not_fail(tmp_path, monkeypatch, capsys):
     out, made = _fake_backup(tmp_path, monkeypatch, readable=False)
     backup.main(["--db-only"])

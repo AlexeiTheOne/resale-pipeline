@@ -31,6 +31,8 @@ INBOX = DATA_DIR / "inbox"
 PIECES = DATA_DIR / "pieces"
 BACKUP_DIR = resolve_path(os.getenv("BACKUP_DIR") or DATA_DIR / "backups")
 KEEP = int(os.getenv("BACKUP_KEEP", "14"))  # snapshots of each kind to retain
+# SQL Server's own folder (SQL_BACKUP_DIR, local disk) keeps its own count.
+SQL_KEEP = int(os.getenv("SQL_BACKUP_KEEP", "14"))
 
 
 def _stamp() -> str:
@@ -52,9 +54,9 @@ def _sweep_partials(dest: Path) -> None:
         p.unlink(missing_ok=True)
 
 
-def backup_db(dest: Path) -> Path:
+def backup_db(dest: Path, require_copy: bool = False) -> Path:
     if config.DB_BACKEND == "sqlserver":
-        return backup_sqlserver(dest)
+        return backup_sqlserver(dest, require_copy=require_copy)
     import sqlite3
     if not DB_PATH.exists():
         raise FileNotFoundError(f"{DB_PATH} not found — nothing to back up.")
@@ -90,19 +92,18 @@ def backup_inbox(dest: Path) -> Path | None:
     return out
 
 
-def backup_sqlserver(dest: Path) -> Path:
+def backup_sqlserver(dest: Path, require_copy: bool = False) -> Path:
     """DB_BACKEND=sqlserver: BACKUP DATABASE (COPY_ONLY, CHECKSUM, verified),
     written by the SQL Server service to SQL_BACKUP_DIR, then copied here as
     ross-<time>.bak so prune() and the offsite folder work as for SQLite.
 
-    If this user can't read the server's folder (e.g. SQL_BACKUP_DIR unset, so
-    the instance's own Backup folder), the backup still exists there: say so
-    and return its path, rather than failing the deploy that called us. Set up
-    SQL_BACKUP_DIR as docs/schema-proposal.md 7.1 describes."""
+    The copy is what leaves the machine (D:\SQLBackups is on the same disk as
+    C:), so with require_copy (the nightly run, --require-copy) a failed copy
+    is an error. Without it (the pre-deploy backup) the local backup is enough
+    to roll back: warn and return its path rather than block the deploy."""
     import sqlserver  # not db: importing db runs the migrations
     bak = Path(sqlserver.backup_database(config.SQL_DATABASE))
-    # The server's folder keeps the KEEP newest backups per database too.
-    for old in sqlserver.prune_backups(config.SQL_DATABASE, KEEP):
+    for old in sqlserver.prune_backups(config.SQL_DATABASE, SQL_KEEP):
         print(f"[--] pruned {old}")
     out = dest / f"ross-{_stamp()}.bak"
     tmp = dest / f"{PARTIAL}{out.name}"
@@ -110,8 +111,11 @@ def backup_sqlserver(dest: Path) -> Path:
         shutil.copy2(bak, tmp)
     except OSError as e:
         tmp.unlink(missing_ok=True)
-        print(f"[warn] SQL Server backup made at {bak}, but it could not be copied to {dest} "
-              f"({type(e).__name__}). Set SQL_BACKUP_DIR to a folder this user can read (doc 7.1).")
+        msg = (f"SQL Server backup made at {bak}, but it could not be copied to {dest} "
+               f"({type(e).__name__}: {e}). Set SQL_BACKUP_DIR to a folder this user can read (doc 7.1).")
+        if require_copy:
+            raise RuntimeError(msg) from e
+        print(f"[warn] {msg}")
         return bak
     tmp.replace(out)
     return out
@@ -126,12 +130,15 @@ def prune(dest: Path, prefix: str, keep: int) -> None:
 def main(argv: list[str] | None = None) -> None:
     """Back up the DB and the inbox. With --db-only (used by scripts/deploy.ps1
     before each deploy) only the DB: the inbox zip is ~200 MB and only the
-    nightly run needs it."""
-    db_only = "--db-only" in (sys.argv[1:] if argv is None else argv)
+    nightly run needs it. --require-copy (the nightly run): on SQL Server, a
+    .bak that can't be copied into BACKUP_DIR (the offsite folder) fails the
+    run instead of warning."""
+    args = sys.argv[1:] if argv is None else argv
+    db_only = "--db-only" in args
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     _sweep_partials(BACKUP_DIR)
 
-    db_out = backup_db(BACKUP_DIR)
+    db_out = backup_db(BACKUP_DIR, require_copy="--require-copy" in args)
     size = f" ({db_out.stat().st_size / 1024:.0f} KB)" if db_out.parent == BACKUP_DIR else ""
     print(f"[ok] DB backed up  -> {db_out}{size}")
     if db_only:
