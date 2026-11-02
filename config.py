@@ -358,8 +358,8 @@ SQL_DRIVER = os.getenv("SQL_DRIVER", "ODBC Driver 18 for SQL Server")
 # The local instance has a self-signed certificate: encrypt, but trust it.
 SQL_TRUST_SERVER_CERT = _env_bool("SQL_TRUST_SERVER_CERT", True)
 # Where db.py reads from: "sqlite" (data/ross.db, the default and what
-# production runs until cutover) or "sqlserver" (SQL_DATABASE). On sqlserver
-# only reads work so far (migration step 2a); every write refuses.
+# production runs until cutover) or "sqlserver" (SQL_DATABASE, through
+# db_mssql.py: the same functions, reads and writes).
 DB_BACKEND = (os.getenv("DB_BACKEND") or "sqlite").strip().lower()
 
 # Master switch for every call that changes the eBay account (publish, offers,

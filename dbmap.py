@@ -30,8 +30,10 @@ from zoneinfo import ZoneInfo
 
 from ebay import orders
 
-# Legacy timestamps without an offset were written in local time on the
-# production PC (scripts/backfill_sales.py), which runs on Eastern time.
+# A timestamp without an offset counts as UTC (db.last_job_run reads it so, and
+# SQLite's text comparisons behave so). One exception: items.updated_at, which
+# scripts/backfill_sales.py stamped in local time on the production PC
+# (Eastern) - kind TS_LOCAL.
 LOCAL_TZ = ZoneInfo("America/New_York")
 ABSENT = "__absent__"
 INT_MAX = 2**31 - 1
@@ -51,6 +53,7 @@ def DEC(p, s):
 INT = ("int",)
 BIT = ("bit",)
 TS = ("ts",)            # Python isoformat ('...+00:00'); column = naive UTC
+TS_LOCAL = ("ts_local",)  # as TS, but a naive value is Eastern local time
 TS_EBAY = ("ts_ebay",)  # eBay's '2026-06-22T02:32:12.000Z'
 DATE = ("date",)
 CODE12 = ("code12",)    # Ross 12-digit code, CHAR(12)
@@ -60,7 +63,7 @@ def CSV(n):              # list of strings stored "a,b,c"
     return ("csv", n)
 
 
-def _parse_ts(value):
+def _parse_ts(value, naive_tz=timezone.utc):
     if not isinstance(value, str):
         return None
     try:
@@ -68,7 +71,7 @@ def _parse_ts(value):
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=LOCAL_TZ)
+        dt = dt.replace(tzinfo=naive_tz)
     return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
@@ -111,11 +114,11 @@ def to_db(value, kind):
         return None, False
     if tag == "bit":
         return (value, True) if type(value) is bool else (None, False)
-    if tag in ("ts", "ts_ebay"):
-        dt = _parse_ts(value)
+    if tag in ("ts", "ts_ebay", "ts_local"):
+        dt = _parse_ts(value, LOCAL_TZ if tag == "ts_local" else timezone.utc)
         if dt is None:
             return None, False
-        render = render_ts if tag == "ts" else render_ts_ebay
+        render = render_ts_ebay if tag == "ts_ebay" else render_ts
         return dt, render(dt) == value
     if tag == "date":
         if type(value) is not str:
@@ -146,7 +149,7 @@ def from_db(value, kind):
         return int(value)
     if tag == "bit":
         return bool(value)
-    if tag == "ts":
+    if tag in ("ts", "ts_local"):
         return render_ts(value)
     if tag == "ts_ebay":
         return render_ts_ebay(value)
@@ -318,7 +321,7 @@ ISSUE = {"severity": ("severity", S(10, False)), "field": ("field", S(40, False)
          "message": ("message", S(500))}
 
 ITEM = {"status": ("status", S(20, False)), "created_at": ("created_at", TS),
-        "updated_at": ("updated_at", TS), "price_source_url": ("price_source_url", S(1000))}
+        "updated_at": ("updated_at", TS_LOCAL), "price_source_url": ("price_source_url", S(1000))}
 
 PIECE_INFO = {
     "brand": ("brand", S(100)), "model": ("model", S(150)), "item_type": ("item_type", S(100)),
@@ -526,7 +529,8 @@ def _split_listing_check(item_id, data, out, extra, check_key):
         extra["listing_check"] = left
 
 
-def _split_stock(item_id, data, item_cols, extra, pieces_for_item, new_pieces, units):
+def _split_stock(item_id, data, item_cols, extra, pieces_for_item, new_pieces, units,
+                 create_pieces):
     left = {}
     item_cols.update(split_cols(data, STOCK, left, notnull=STOCK_NOTNULL))
     if "quick_price" in data:
@@ -537,48 +541,34 @@ def _split_stock(item_id, data, item_cols, extra, pieces_for_item, new_pieces, u
             item_cols.update(qcols)
         else:
             left["quick_price"] = qp
-    # location, inventory_photo, added_at: from the item's pieces (created here
-    # when the item has none, one per unit). Whatever the pieces can't say
-    # exactly stays in the leftover.
-    if any(k in data for k in STOCK_ON_PIECES):
-        if pieces_for_item:
-            first = sorted(pieces_for_item, key=lambda p: p["code"])[0]
-            for key, want in (("location", first.get("location_code")),
-                              ("inventory_photo", first.get("photo_path")),
-                              ("added_at", render_ts(first["created_at"]) if first.get("created_at") else None)):
-                if key in data and data[key] != want:
-                    left[key] = data[key]
-                elif key not in data and want is not None:
-                    left.setdefault(ABSENT, []).append(key)
-        else:
-            loc = data.get("location")
-            if type(loc) is str and loc and loc == loc.strip().upper() and len(loc) <= 40:
-                created, exact_added = to_db(data.get("added_at"), TS)
-                photo = data.get("inventory_photo")
-                photo_ok = photo is None or (type(photo) is str and len(photo) <= 400)
-                for n in range(max(units, 1)):
-                    new_pieces.append({"location_code": loc, "item_id": item_id,
-                                       "photo_path": photo if photo_ok else None,
-                                       "created_at": created})
-                if "added_at" in data and not exact_added:
-                    left["added_at"] = data["added_at"]
-                if "added_at" not in data:
-                    left.setdefault(ABSENT, []).append("added_at")
-                if "inventory_photo" in data and (photo is None or not photo_ok):
-                    left["inventory_photo"] = photo
-            else:
-                for k in STOCK_ON_PIECES:
-                    if k in data:
-                        left[k] = data[k]
+    # location, inventory_photo and added_at are the item's own record and are
+    # kept exactly as stored, so writes behave as on SQLite. Pieces hold the
+    # physical location: the migration creates them from stock.location (one
+    # per unit, only where a location exists, never placeholders).
+    for k in STOCK_ON_PIECES:
+        if k in data:
+            left[k] = data[k]
+    loc = data.get("location")
+    if create_pieces and not pieces_for_item and type(loc) is str and loc \
+            and loc == loc.strip().upper() and len(loc) <= 40:
+        created, _ = to_db(data.get("added_at"), TS)
+        photo = data.get("inventory_photo")
+        photo = photo if type(photo) is str and len(photo) <= 400 else None
+        for _n in range(max(units, 1)):
+            new_pieces.append({"location_code": loc, "item_id": item_id,
+                               "photo_path": photo, "created_at": created})
     _rest(data, set(STOCK) | {"quick_price"} | set(STOCK_ON_PIECES), left)
     extra["stock"] = left  # present even when empty: the group exists
 
 
-def split_item(item: dict, *, pieces_for_item=(), seq=None) -> dict:
+def split_item(item: dict, *, pieces_for_item=(), seq=None, create_pieces=False,
+               derive_priced_at=False) -> dict:
     """Rows for one raw item. Child rows that need an id assigned by SQL Server
     (pricing run, listing check) carry a "run_key"/"check_key" the loader
     resolves. New pieces (from stock.location) are listed under "new_pieces"
-    without codes; the loader numbers them."""
+    without codes; the loader numbers them (create_pieces, migration only).
+    derive_priced_at: the migration dates each item's one pricing run from
+    manual_price_at or updated_at; db writes stamp new runs themselves."""
     out = {t: [] for t in ("items", "item_photos", "item_identification", "item_flags",
                            "pricing_runs", "item_pricing", "pricing_comps", "item_listing",
                            "listing_specifics", "ebay_listings", "listing_images", "sales",
@@ -604,7 +594,7 @@ def split_item(item: dict, *, pieces_for_item=(), seq=None) -> dict:
     if item.get("pricing") is not None:
         priced_at = None
         for candidate in ((item["pricing"] or {}).get("manual_price_at"), item.get("updated_at")):
-            priced_at = _parse_ts(candidate)
+            priced_at = _parse_ts(candidate) if derive_priced_at else None
             if priced_at:
                 break
         _split_pricing(item_id, item["pricing"], out, run_key=item_id, priced_at=priced_at)
@@ -630,7 +620,7 @@ def split_item(item: dict, *, pieces_for_item=(), seq=None) -> dict:
         if type(st) is dict:
             units = (item.get("ebay") or {}).get("quantity") if type(item.get("ebay")) is dict else None
             _split_stock(item_id, st, cols, extra, list(pieces_for_item), out["new_pieces"],
-                         units if type(units) is int else 1)
+                         units if type(units) is int else 1, create_pieces)
         else:
             top_left["stock"] = st
     if top_left:
@@ -732,19 +722,34 @@ def join_item(p: dict) -> dict:
         qp = join_cols(row, QUICK_PRICE)
         if qp:
             d["quick_price"] = qp
-        pieces = sorted(p.get("pieces") or [], key=lambda r: r["code"])
-        if pieces:
-            first = pieces[0]
-            d["location"] = first["location_code"]
-            if first.get("photo_path") is not None:
-                d["inventory_photo"] = first["photo_path"]
-            if first.get("created_at") is not None:
-                d["added_at"] = render_ts(first["created_at"])
         item["stock"] = finish(d, extra["stock"])
 
     for k, v in top.items():
         item[k] = v
     return item
+
+
+# --- offer plan rows ---------------------------------------------------------
+
+PLAN_ROW = {"item_id": ("item_id", S(36, False)), "listing_id": ("listing_id", S(20, False)),
+            "price": ("price", DEC(10, 2)), "offer_price": ("offer_price", DEC(10, 2)),
+            "pct": ("pct", DEC(5, 2)), "watchers": ("watchers", INT), "title": ("title", S(80))}
+
+
+def split_plan_row(plan_id: str, position: int, row) -> dict:
+    left = {}
+    if type(row) is not dict:
+        return {"plan_id": plan_id, "position": position, "row_raw": {"__row__": row}}
+    cols = split_cols(row, PLAN_ROW, left)
+    _rest(row, PLAN_ROW, left)
+    return {"plan_id": plan_id, "position": position, **cols, "row_raw": left or None}
+
+
+def join_plan_row(row: dict):
+    raw = row.get("row_raw") or {}
+    if "__row__" in raw:
+        return raw["__row__"]
+    return finish(join_cols(row, PLAN_ROW), raw)
 
 
 # --- pieces ------------------------------------------------------------------
@@ -779,6 +784,81 @@ def join_piece(row: dict) -> dict:
     piece.update(join_cols(row, PIECE))
     piece.update(plain)
     return piece
+
+
+# --- consistency: column vs its JSON copy -------------------------------------
+
+def _check(where: str, row: dict | None, left: dict | None, spec: dict, out: list,
+           notnull=(), normalise=None) -> None:
+    """Where a column and its JSON copy both hold a value, the column must be
+    exactly what to_db() makes of the copy (the copy is the original; the
+    column its best SQL form)."""
+    if not row or not left:
+        return
+    for key, (col, kind) in spec.items():
+        if key not in left or key == ABSENT:
+            continue
+        expected, _ = to_db(left[key], kind)
+        if normalise and key in normalise and expected is not None:
+            expected = normalise[key](expected)
+        actual = row.get(col)
+        if expected is None:
+            if actual is not None and col not in notnull:
+                out.append(f"{where}.{key}: column {col}={actual!r} but the JSON copy is "
+                           f"{left[key]!r}, which the column can't hold")
+        elif actual != expected:
+            out.append(f"{where}.{key}: column {col}={actual!r} != JSON copy {left[key]!r}")
+
+
+def check_item(p: dict) -> list[str]:
+    """Mismatches between columns and JSON copies for one item's rows (same
+    `p` as join_item)."""
+    out = []
+    row = p["item"]
+    item_id = row["item_id"][:8]
+    extra = row.get("extra_raw") or {}
+    ident = p.get("identification")
+    if ident:
+        _check(f"{item_id}.identification", ident, ident.get("identification_raw"), IDENTIFICATION,
+               out, normalise={"condition": normalise_condition})
+    pricing = p.get("pricing")
+    if pricing:
+        _check(f"{item_id}.pricing", pricing, pricing.get("pricing_raw"), PRICING, out)
+        _check(f"{item_id}.pricing(run)", p.get("run"), pricing.get("pricing_raw"), PRICING_RUN, out)
+    for c in p.get("comps") or []:
+        _check(f"{item_id}.comp[{c['kind']} {c['position']}]", c, c.get("comp_raw"), COMP, out)
+    _check(f"{item_id}.listing", p.get("listing"), extra.get("listing"), LISTING, out)
+    eb = p.get("ebay")
+    if eb:
+        _check(f"{item_id}.ebay", eb, eb.get("ebay_raw"), EBAY, out, notnull=EBAY_NOTNULL)
+    _check(f"{item_id}.receipt", p.get("tag"), extra.get("receipt"), TAG, out)
+    _check(f"{item_id}.listing_check", p.get("check"), extra.get("listing_check"), LISTING_CHECK, out,
+           notnull=LISTING_CHECK_NOTNULL)
+    _check(f"{item_id}.photo_layout", row, extra.get("photo_layout"), PHOTO_LAYOUT, out,
+           notnull=PHOTO_LAYOUT_NOTNULL)
+    stock = extra.get("stock")
+    _check(f"{item_id}.stock", row, stock, STOCK, out, notnull=STOCK_NOTNULL)
+    if stock and type(stock.get("quick_price")) is dict:
+        _check(f"{item_id}.stock.quick_price", row, stock["quick_price"], QUICK_PRICE, out)
+    _check(f"{item_id}", row, extra.get("_item"), ITEM, out, notnull=("status", "created_at", "updated_at"))
+    return out
+
+
+def check_piece(row: dict) -> list[str]:
+    out = []
+    raw = dict(row.get("info_raw") or {})
+    plain = raw.pop("__piece__", {})
+    _check(f"piece {row['code']}.info", row, raw, PIECE_INFO, out)
+    _check(f"piece {row['code']}", row, plain, PIECE, out, notnull=("status", "created_at", "updated_at"))
+    return out
+
+
+def check_plan_row(row: dict) -> list[str]:
+    out = []
+    raw = row.get("row_raw") or {}
+    if "__row__" not in raw:
+        _check(f"plan {row['plan_id'][:8]}[{row['position']}]", row, raw, PLAN_ROW, out)
+    return out
 
 
 # --- comparing two results ----------------------------------------------------

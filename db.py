@@ -13,13 +13,9 @@ DB_PATH = str(DATA_DIR / "ross.db")
 
 
 # --- backend switch (SQL Server migration, docs/schema-proposal.md) ----------
-# config.DB_BACKEND picks where reads come from. "sqlite" (default) is this
-# file as it always was. "sqlserver" sends every read below to db_mssql.py,
-# which returns the same shapes; writes refuse there until step 2b.
-
-class ReadOnlyBackend(RuntimeError):
-    """A write was attempted while DB_BACKEND=sqlserver (reads only so far)."""
-
+# config.DB_BACKEND picks the database. "sqlite" (default) is this file as it
+# always was. "sqlserver" sends every public function below to db_mssql.py,
+# which reads and writes ResaleDB and returns the same shapes.
 
 def _on_sqlserver() -> bool:
     backend = config.DB_BACKEND
@@ -33,10 +29,6 @@ def _sqlserver():
     return db_mssql
 
 
-def _refuse_on_sqlserver(name: str) -> None:
-    if _on_sqlserver():
-        raise ReadOnlyBackend(f"DB_BACKEND=sqlserver is read-only for now: refused db.{name}(). "
-                              "Writes on SQL Server come in migration step 2b.")
 
 VALID_STATUSES = [
     "captured", "identified", "priced", "drafted",
@@ -121,7 +113,8 @@ def create_tables() -> None:
 
 
 def create_item(photos: list[str]) -> str:
-    _refuse_on_sqlserver('create_item')
+    if _on_sqlserver():
+        return _sqlserver().create_item(photos)
     item_id = str(uuid.uuid4())
     now = _now()
     with _conn() as con:
@@ -144,7 +137,8 @@ def get_item(item_id: str) -> dict | None:
 
 
 def update_status(item_id: str, status: str) -> None:
-    _refuse_on_sqlserver('update_status')
+    if _on_sqlserver():
+        return _sqlserver().update_status(item_id, status)
     if status not in VALID_STATUSES:
         raise ValueError(f"Invalid status '{status}'. Must be one of: {VALID_STATUSES}")
     with _conn() as con:
@@ -155,7 +149,8 @@ def update_status(item_id: str, status: str) -> None:
 
 
 def update_field(item_id: str, field: str, data: dict) -> None:
-    _refuse_on_sqlserver('update_field')
+    if _on_sqlserver():
+        return _sqlserver().update_field(item_id, field, data)
     if field not in VALID_FIELDS:
         raise ValueError(f"Invalid field '{field}'. Must be one of: {VALID_FIELDS}")
     with _conn() as con:
@@ -178,7 +173,8 @@ def list_items(status: str | None = None) -> list[dict]:
 
 
 def delete_item(item_id: str) -> None:
-    _refuse_on_sqlserver('delete_item')
+    if _on_sqlserver():
+        return _sqlserver().delete_item(item_id)
     with _conn() as con:
         con.execute("DELETE FROM items WHERE item_id = ?", (item_id,))
 
@@ -192,7 +188,8 @@ def record_listing_stats(item_id: str, week: str, *, impressions=None, views=Non
 
     `impressions` is ORGANIC (search + store), its historical meaning;
     `total_impressions` includes promoted placements."""
-    _refuse_on_sqlserver('record_listing_stats')
+    if _on_sqlserver():
+        return _sqlserver().record_listing_stats(item_id, week, impressions=impressions, views=views, watchers=watchers, price=price, verdict=verdict, suggested_price=suggested_price, total_impressions=total_impressions, search_views=search_views)
     with _conn() as con:
         con.execute(
             "INSERT INTO listing_stats (item_id, week, impressions, views, watchers, "
@@ -211,7 +208,8 @@ def record_listing_stats(item_id: str, week: str, *, impressions=None, views=Non
 def record_offer_sent(listing_id: str, offer_price: float, *, item_id: str | None = None,
                       list_price: float | None = None, source: str | None = None) -> None:
     """Note that an offer to watchers went out (see offer_sends)."""
-    _refuse_on_sqlserver('record_offer_sent')
+    if _on_sqlserver():
+        return _sqlserver().record_offer_sent(listing_id, offer_price, item_id=item_id, list_price=list_price, source=source)
     with _conn() as con:
         con.execute(
             "INSERT INTO offer_sends (item_id, listing_id, list_price, offer_price, source, "
@@ -229,7 +227,8 @@ def offers_sent_since(since_iso: str) -> set[str]:
 
 
 def save_offer_plan(rows: list[dict]) -> str:
-    _refuse_on_sqlserver('save_offer_plan')
+    if _on_sqlserver():
+        return _sqlserver().save_offer_plan(rows)
     plan_id = str(uuid.uuid4())
     with _conn() as con:
         con.execute("INSERT INTO offer_plans (plan_id, rows, created_at) VALUES (?, ?, ?)",
@@ -251,7 +250,8 @@ def get_offer_plan(plan_id: str) -> dict | None:
 
 def claim_offer_plan(plan_id: str) -> bool:
     """Mark a plan used. True only for the one caller that got there first."""
-    _refuse_on_sqlserver('claim_offer_plan')
+    if _on_sqlserver():
+        return _sqlserver().claim_offer_plan(plan_id)
     with _conn() as con:
         cur = con.execute("UPDATE offer_plans SET used_at = ? WHERE plan_id = ? "
                           "AND used_at IS NULL", (_now(), plan_id))
@@ -285,7 +285,8 @@ def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> N
     A status other than "ok" (e.g. "partial": the weekly price check ran but
     some traffic batches failed) records the attempt without counting it as
     completed — last_job_run ignores it, so the slot is still caught up."""
-    _refuse_on_sqlserver('record_job_run')
+    if _on_sqlserver():
+        return _sqlserver().record_job_run(job, status, detail)
     with _conn() as con:
         con.execute(
             "INSERT INTO job_runs (job, last_run_at, status, detail) VALUES (?, ?, ?, ?) "
@@ -304,7 +305,8 @@ def known_feedback_failures() -> set[str]:
 
 
 def record_feedback_failure(order_line: str, error: str) -> None:
-    _refuse_on_sqlserver('record_feedback_failure')
+    if _on_sqlserver():
+        return _sqlserver().record_feedback_failure(order_line, error)
     with _conn() as con:
         con.execute(
             "INSERT INTO feedback_failures (order_line, first_failed, last_error) "
@@ -313,13 +315,15 @@ def record_feedback_failure(order_line: str, error: str) -> None:
 
 
 def clear_feedback_failure(order_line: str) -> None:
-    _refuse_on_sqlserver('clear_feedback_failure')
+    if _on_sqlserver():
+        return _sqlserver().clear_feedback_failure(order_line)
     with _conn() as con:
         con.execute("DELETE FROM feedback_failures WHERE order_line = ?", (order_line,))
 
 
 def mark_not_duplicate(item_a: str, item_b: str) -> None:
-    _refuse_on_sqlserver('mark_not_duplicate')
+    if _on_sqlserver():
+        return _sqlserver().mark_not_duplicate(item_a, item_b)
     a, b = sorted((item_a, item_b))
     with _conn() as con:
         con.execute("INSERT OR IGNORE INTO not_duplicates (a, b) VALUES (?, ?)", (a, b))
@@ -361,7 +365,8 @@ def next_piece_code(box: str) -> str:
 def add_piece(box: str, photo: str | None = None) -> str:
     """Reserve the next code in `box` and store the piece. Retries if two
     photos race for the same number."""
-    _refuse_on_sqlserver('add_piece')
+    if _on_sqlserver():
+        return _sqlserver().add_piece(box, photo)
     box = box.upper()
     for _ in range(5):
         code = next_piece_code(box)
@@ -382,7 +387,6 @@ _PIECE_COLUMNS = {"box", "item_id", "status", "photo", "info", "value", "cost",
 
 
 def update_piece(code: str, **fields) -> None:
-    _refuse_on_sqlserver('update_piece')
     code = code.upper()
     bad = set(fields) - _PIECE_COLUMNS
     if bad:
@@ -393,6 +397,8 @@ def update_piece(code: str, **fields) -> None:
         return
     if isinstance(fields.get("box"), str):
         fields["box"] = fields["box"].upper()
+    if _on_sqlserver():
+        return _sqlserver().update_piece(code, **fields)
     if "info" in fields:
         fields["info"] = json.dumps(fields["info"])
     if fields.get("photo"):
@@ -438,7 +444,8 @@ def seen_order_ids() -> set[str]:
 
 
 def mark_orders_seen(order_ids) -> None:
-    _refuse_on_sqlserver('mark_orders_seen')
+    if _on_sqlserver():
+        return _sqlserver().mark_orders_seen(order_ids)
     with _conn() as con:
         con.executemany("INSERT OR IGNORE INTO seen_orders (order_id, seen_at) VALUES (?, ?)",
                         [(o, _now()) for o in order_ids])
@@ -481,7 +488,8 @@ def record_llm_usage(*, provider: str, model: str, stage: str | None = None,
                      output_tokens: int = 0, cache_read_tokens: int = 0,
                      cache_write_tokens: int = 0, web_searches: int = 0,
                      cost_usd: float | None = None, ts: str | None = None) -> None:
-    _refuse_on_sqlserver('record_llm_usage')
+    if _on_sqlserver():
+        return _sqlserver().record_llm_usage(provider=provider, model=model, stage=stage, item_id=item_id, input_tokens=input_tokens, output_tokens=output_tokens, cache_read_tokens=cache_read_tokens, cache_write_tokens=cache_write_tokens, web_searches=web_searches, cost_usd=cost_usd, ts=ts)
     with _conn() as con:
         con.execute(
             "INSERT INTO llm_usage (ts, provider, model, stage, item_id, input_tokens, "
@@ -528,7 +536,6 @@ create_tables()
 # --- small item queries (moved from telegram_bot.py, cleanup-plan Phase 2) ---
 
 def set_location(item_id: str, loc: str | None) -> None:
-    _refuse_on_sqlserver('set_location')
     if not loc:
         return
     item = get_item(item_id) or {}
@@ -562,7 +569,6 @@ def next_receipt_code() -> str:
 
 def match_quantity_to_pieces(item_id: str) -> None:
     """Before a stocked item is drafted, list as many as were found at home."""
-    _refuse_on_sqlserver('match_quantity_to_pieces')
     n = len(list_pieces(item_id=item_id, status="home"))
     if n > 1:
         item = get_item(item_id) or {}

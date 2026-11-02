@@ -151,30 +151,14 @@ def test_unknown_backend_is_an_error(monkeypatch):
         db.get_item("x")
 
 
-WRITES = [
-    ("create_item", ([],)), ("update_status", ("x", "sold")), ("update_field", ("x", "ebay", {})),
-    ("delete_item", ("x",)), ("record_listing_stats", ("x", "2026-07-13")),
-    ("record_offer_sent", ("1", 9.0)), ("save_offer_plan", ([],)), ("claim_offer_plan", ("p",)),
-    ("record_job_run", ("j",)), ("record_feedback_failure", ("o", "e")),
-    ("clear_feedback_failure", ("o",)), ("mark_not_duplicate", ("a", "b")),
-    ("add_piece", ("G3",)), ("update_piece", ("G3-01",)), ("mark_orders_seen", (["o"],)),
-    ("set_location", ("x", "G3")), ("match_quantity_to_pieces", ("x",)),
-]
-
-
-@pytest.mark.parametrize("name,args", WRITES, ids=[w[0] for w in WRITES])
-def test_writes_refuse_on_sqlserver(monkeypatch, name, args):
-    monkeypatch.setattr(config, "DB_BACKEND", "sqlserver")
-    with pytest.raises(db.ReadOnlyBackend, match="read-only"):
-        getattr(db, name)(*args)
-
-
-def test_record_llm_usage_refuses_on_sqlserver(monkeypatch):
-    monkeypatch.setattr(config, "DB_BACKEND", "sqlserver")
-    with pytest.raises(db.ReadOnlyBackend):
-        db.record_llm_usage(provider="p", model="m")
-
-
 def test_sqlite_is_the_default():
-    # Production behaves exactly as before until cutover.
-    assert config.DB_BACKEND == "sqlite"
+    # Production behaves exactly as before until cutover. A fresh process, so
+    # this run's own DB_BACKEND doesn't matter.
+    import os
+    import subprocess
+    import sys
+    env = {k: v for k, v in os.environ.items() if k != "DB_BACKEND"}
+    env["ROSS_SKIP_DOTENV"] = "1"
+    out = subprocess.run([sys.executable, "-c", "import config; print(config.DB_BACKEND)"],
+                         cwd=Path(__file__).parent.parent, env=env, capture_output=True, text=True)
+    assert out.stdout.strip() == "sqlite", out.stderr

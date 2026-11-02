@@ -18,7 +18,7 @@ def _as_stored(rows):
 
 
 def roundtrip(item, pieces=()):
-    out = dbmap.split_item(copy.deepcopy(item), pieces_for_item=pieces)
+    out = dbmap.split_item(copy.deepcopy(item), pieces_for_item=pieces, create_pieces=True)
     run = out["pricing_runs"][0] if out["pricing_runs"] else None
     check = out["listing_checks"][0] if out["listing_checks"] else None
     new_pieces = [{"code": f"{p['location_code']}-{i:02d}", **p}

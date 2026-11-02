@@ -32,7 +32,7 @@ ITEM_TABLE_ORDER = ["items", "item_photos", "item_identification", "item_flags",
                     "ebay_listings", "listing_images", "sales", "item_tags", "listing_checks",
                     "listing_check_issues"]
 _JSON_COLS = {"extra_raw", "identification_raw", "pricing_raw", "ebay_raw", "comp_raw", "info_raw",
-              "payload_raw"}
+              "payload_raw", "row_raw"}
 
 
 # --- read the SQLite file ----------------------------------------------------
@@ -133,7 +133,8 @@ def load(src: dict, con) -> dict:
     rows = {t: [] for t in ITEM_TABLE_ORDER}
     new_pieces = []
     for seq, item in enumerate(src["items"], start=1):
-        out = dbmap.split_item(item, pieces_for_item=pieces_by_item.get(item["item_id"], ()))
+        out = dbmap.split_item(item, pieces_for_item=pieces_by_item.get(item["item_id"], ()),
+                               create_pieces=True, derive_priced_at=True)
         for t in ITEM_TABLE_ORDER:
             rows[t] += out[t]
         new_pieces += out["new_pieces"]
@@ -205,14 +206,8 @@ def load(src: dict, con) -> dict:
         _insert(cur, "offer_plans", [{"plan_id": plan["plan_id"],
                                       "created_at": _ts(plan["created_at"], report, "offer_plans.created_at"),
                                       "used_at": _ts(plan["used_at"], report, "offer_plans.used_at")}])
-        plan_rows = []
-        for pos, pr in enumerate(json.loads(plan["rows"])):
-            left = {}
-            cols = dbmap.split_cols(pr, db_mssql.PLAN_ROW, left)
-            if left or set(pr) - set(db_mssql.PLAN_ROW):
-                report["lossy"]["offer_plan_rows"] += 1
-            plan_rows.append({"plan_id": plan["plan_id"], "position": pos, **cols})
-        _insert(cur, "offer_plan_rows", plan_rows)
+        _insert(cur, "offer_plan_rows", [dbmap.split_plan_row(plan["plan_id"], pos, pr)
+                                         for pos, pr in enumerate(json.loads(plan["rows"]))])
     _insert(cur, "job_runs", [{"job": r["job"], "last_run_at": _ts(r["last_run_at"], report, "job_runs.last_run_at"),
                                "status": r["status"], "detail": r["detail"]} for r in src["job_runs"]])
     _insert(cur, "feedback_failures", [{
@@ -341,6 +336,11 @@ def main(argv=None) -> int:
         for k, n in sorted(report["lossy"].items()):
             print(f"  {k:40} {n}")
 
+    config.SQL_DATABASE = args.target
+    mismatches = db_mssql.consistency_report()
+    print(f"Columns vs their JSON copies: {'consistent' if not mismatches else f'{len(mismatches)} mismatch(es)'}")
+    for m in mismatches[:20]:
+        print(f"      {m}")
     results = verify(args.source, args.target, report["new_pieces"])
     total = 0
     print("Round trip, SQLite vs SQL Server:")
@@ -351,8 +351,9 @@ def main(argv=None) -> int:
             print(f"      {d}")
         if len(diffs) > 20:
             print(f"      ... {len(diffs) - 20} more")
-    print("RESULT:", "identical" if total == 0 else f"{total} difference(s)")
-    return 0 if total == 0 else 1
+    print("RESULT:", "identical" if total == 0 else f"{total} difference(s)",
+          "| consistent" if not mismatches else f"| {len(mismatches)} column/JSON mismatch(es)")
+    return 0 if total == 0 and not mismatches else 1
 
 
 if __name__ == "__main__":
