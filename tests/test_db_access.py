@@ -14,6 +14,7 @@ ALLOWED = {
     "backup.py": "must work even when the app code is broken",
     "scripts/backfill_sales.py": "writes a backup copy to a new file",
     "scripts/sqlite_to_mssql.py": "reads the raw stored JSON of a source file, read-only, for migration",
+    "scripts/migrate_sqlite_to_mssql.py": "snapshots the live file read-only (backup API) for migration",
 }
 
 

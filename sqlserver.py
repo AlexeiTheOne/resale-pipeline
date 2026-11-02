@@ -7,6 +7,8 @@ infrastructure, see docs/schema-proposal.md).
 Safety: dev (ResaleDB_Dev), production (ResaleDB) and ReceiptsDB share one
 instance on the production PC. Only databases named ResaleDB_Test_* can be
 dropped from here, and only those get created on the fly by tests.
+ResaleDB_Migrate_* rehearsal copies can't be opened at all unless the
+migration script unlocks them (they hold the real eBay token).
 """
 import os
 import re
@@ -17,16 +19,45 @@ import pyodbc
 import config
 
 TEST_PREFIX = "ResaleDB_Test_"
+# Migration rehearsals: a copy of PRODUCTION data, including the real eBay
+# token. Only the migration script may open one (allow_migrate_database); the
+# bot, the tests and every other script are refused in connect().
+MIGRATE_PREFIX = "ResaleDB_Migrate_"
+PRODUCTION_DATABASE = "ResaleDB"
+_MIGRATE_RE = re.compile(r"^ResaleDB_Migrate_\d{8}$")
 # Letters, digits, underscore. Database names are put into DDL in [brackets],
 # so anything else is refused rather than escaped.
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,99}$")
 _TEST_STAMP_RE = re.compile(r"^ResaleDB_Test_\d+_(\d{14})$")
+_MIGRATE_ALLOWED: set[str] = set()
 
 
 def _check_name(name: str) -> str:
     if not isinstance(name, str) or not _NAME_RE.match(name):
         raise ValueError(f"not a safe database name: {name!r}")
     return name
+
+
+def is_migrate_database(name: str) -> bool:
+    """A rehearsal copy of production. Case-insensitive, like the server."""
+    return isinstance(name, str) and name.casefold().startswith(MIGRATE_PREFIX.casefold())
+
+
+def allow_migrate_database(name: str) -> None:
+    """Unlock one ResaleDB_Migrate_* database for this process. Only
+    scripts/migrate_sqlite_to_mssql.py calls this."""
+    _check_name(name)
+    if not _MIGRATE_RE.match(name):
+        raise ValueError(f"not a rehearsal database name (ResaleDB_Migrate_<yyyymmdd>): {name!r}")
+    _MIGRATE_ALLOWED.add(name.casefold())
+
+
+def _guard_migrate(database: str) -> None:
+    if is_migrate_database(database) and database.casefold() not in _MIGRATE_ALLOWED:
+        raise RuntimeError(
+            f"refusing to open {database!r}: rehearsal databases hold production data and the "
+            "real eBay token. Only scripts/migrate_sqlite_to_mssql.py may open them; "
+            "point SQL_DATABASE at ResaleDB_Dev.")
 
 
 def conn_str(database: str | None = None) -> str:
@@ -36,6 +67,7 @@ def conn_str(database: str | None = None) -> str:
         raise RuntimeError("SQL_DATABASE is not set. Add it to .env "
                            "(ResaleDB_Dev on a dev copy).")
     _check_name(database)
+    _guard_migrate(database)
     parts = [
         f"Driver={{{config.SQL_DRIVER}}}",
         f"Server={config.SQL_SERVER}",

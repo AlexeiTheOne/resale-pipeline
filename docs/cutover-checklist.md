@@ -23,16 +23,29 @@ Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) 
 ## 1. Before the cutover day
 
 ### Code still to build
-- 🔧 **Production migration script.** `scripts/sqlite_to_mssql.py` is a dev
-  loader. It refuses `ResaleDB`, never copies eBay tokens and has no receipts.
-  The production version must:
-  - write `ResaleDB` behind an explicit `--production` flag;
-  - **copy `ebay_tokens`** (otherwise the bot loses eBay access);
-  - copy `Receipts` and `ReceiptItems` from ReceiptsDB with `IDENTITY_INSERT`,
-    reseed the identities, and convert `CreatedAt` from Eastern time to UTC;
-  - write the verification report (counts, money totals, round trip,
-    consistency) to `logs/`;
-  - refuse to run if the target already holds rows.
+- ✅ **Production migration script:** `scripts/migrate_sqlite_to_mssql.py`
+  (built 2026-11-02 on top of the dev loader).
+  - **Targets:** only `ResaleDB_Migrate_<yyyymmdd>`, or `ResaleDB` with
+    `--production`. It refuses a target that already holds rows (the
+    bootstrap's `schema_version` / `app_settings` rows aside).
+  - **Copies everything:** items, pieces as they are, operations tables,
+    **`ebay_tokens`**, and the receipts (same ids with `IDENTITY_INSERT`,
+    identities reseeded to ReceiptsDB's last value, `CreatedAt` Eastern → UTC).
+    New pieces only where `stock.location` exists and the item has none.
+  - **Runs every section 7 check:** the full `get_item` round trip on every
+    item and every other db.py read, columns vs JSON, row counts, list
+    lengths, pricing runs, pieces, money sums, sale totals vs `v_item_sales`,
+    constraints, orphans, identity, receipts row by row, the token (never
+    printed), unmapped keys.
+  - **Output:** a markdown report in `logs/`, exit 1 with a loud message on any
+    failed check, and the time each phase takes.
+  - `--snapshot-from <live ross.db>` takes a copy first with SQLite's online
+    backup API, opened read-only, safe while the bot runs.
+- ✅ **Rehearsal databases are locked.** `sqlserver.connect()` refuses
+  `ResaleDB_Migrate_*` (any case) unless the migration script unlocked it in
+  its own process. The bot, the tests and every other script fail at the first
+  DB call, so a dev `.env` naming a rehearsal database can't start the bot on
+  the real eBay token.
 - 🔧 **Receipts cleanup script** (schema-proposal section 4): decimal-loss
   prices (31), the duplicate receipt, receipt 195's duplicate lines, every
   change logged in `receipt_fixes`, with a dry run first.
@@ -115,9 +128,28 @@ Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) 
   reviews). This is safe before cutover: production stays on SQLite until its
   `.env` changes. The deploy then runs the SQL Server tests on this PC, in
   per-run `ResaleDB_Test_*` databases.
-- ⬜ **Rehearsal.** Back up production `ross.db`, then run the production
-  migration script into `ResaleDB_Migrate_<date>` and read the report:
-  round trip identical, columns consistent, counts and money totals equal.
+- ✅ **Rehearsal 1 (2026-11-02): every check passed.** From `resale-dev`:
+  `venv\Scripts\python.exe scripts\migrate_sqlite_to_mssql.py --snapshot-from C:\Users\boris\Projects\ebay-list\data\ross.db --compare-dev data\ross.db`
+  into `ResaleDB_Migrate_20261102`. The report is
+  `resale-dev\logs\migrate-ResaleDB_Migrate_20261102-20261102-140028.md`.
+  - **Data:** 163 items, 1 piece, 214 receipts, 2,717 receipt lines, 1,075
+    `listing_stats` rows, 314 `llm_usage` rows, 83 sales and the token.
+  - **Results:** round trip 0 differences, all money sums equal.
+  - **Time:** about 7 s to copy and 3 s to verify, so **about 10 s of
+    downtime** for the migration itself.
+  - **Pieces:** production has 1 piece (`O1W-01`), linked to the only
+    `stocked` item, so no pieces were created from `stock.location`.
+  - **Production-only keys** (not in the dev copy): only from that `/inv`
+    item (`stock.*`, `identification.source`, `piece.info.*`). All are kept
+    exactly.
+- ⬜ **Rehearse again shortly before the cutover** (same command, the next
+  day's date), especially after any deploy that changes stored data.
+- ⬜ **Clean up the rehearsal copies before the cutover.** They hold the
+  real eBay token.
+  - Drop each `ResaleDB_Migrate_*` from an admin `sqlcmd`:
+    `DROP DATABASE [ResaleDB_Migrate_20261102]` (nothing in the code can open
+    them).
+  - Delete `resale-dev\data\rehearsal\*`.
 - 💤 **Person A:** install SQL Server Express on their machine (Q12) and
   confirm the Person A answers (Q8–Q14) that Person B relayed.
 
@@ -155,8 +187,13 @@ included.
 6. ⬜ **Create ResaleDB:**
    `python scripts/init_sqlserver_db.py ResaleDB --production` (from
    `ebay-list`, with its `.env`).
-7. ⬜ **Migrate:** the production migration script, SQLite + ReceiptsDB →
-   ResaleDB. **Stop here if the report shows any difference.**
+7. ⬜ **Migrate:** SQLite + ReceiptsDB → ResaleDB. Run it in `ebay-list`
+   with the bot and the receipt bot stopped:
+   `venv\Scripts\python.exe scripts\migrate_sqlite_to_mssql.py --source <the ross.db backup from step 4> --target ResaleDB --production`.
+   It must end with "All checks passed" (exit 0); read the report in
+   `logs\migrate-ResaleDB-*.md`, especially the leftover keys and warnings.
+   **Stop here if any check failed.** Then drop ResaleDB and fix before
+   retrying; the script refuses a target with rows.
 8. ⬜ **Receipts cleanup** (dry run, review, apply), then the migration step
    with the unique indexes (`init_sqlserver_db.py ResaleDB --production`
    runs pending steps).
@@ -297,6 +334,11 @@ applies.
 ---
 
 ## Log
+- 2026-11-02: production migration script built
+  (`scripts/migrate_sqlite_to_mssql.py`). `ResaleDB_Migrate_*` databases are
+  locked in `sqlserver.connect()`. Rehearsal 1 from a read-only snapshot of
+  live `ross.db` passed every check: about 10 s of migration downtime, 1
+  piece, 0 created from `stock.location`.
 - 2026-11-02: the receipt bot gets its own scheduled task, `ReceiptBot`
   (Person B). It is a copy of EbayBot's settings: boot trigger, runs whether
   logged on or not, no time limit, restart on failure. It runs
