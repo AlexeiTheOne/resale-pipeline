@@ -310,6 +310,12 @@ included.
        lines.
     3. Paste that new receipt again: "already saved", and no new rows.
 
+    **Status 2026-11-02:** test 1 ✅ (reply "already saved", no rows
+    written). **⬜ Tests 2 and 3 are pending** until Person B's next shopping
+    trip (no new receipt that day). They are also the proof the receipt bot
+    writes to ResaleDB: ReceiptsDB is read-only, so a save there would fail
+    loudly.
+
     `receipt_pipeline` commits: `8f16893` (duplicate-key race) and `9372f1c`
     (a receipt pasted again; before it, the bot wrote nothing but replied
     "saved successfully").
@@ -317,8 +323,10 @@ included.
     Done 2026-11-02 at about 16:10, before step 13's test: anything still
     pointed at ReceiptsDB now fails loudly instead of saving there.
     Keep it for **30 days** (Q2), then take a final backup and drop it.
-15. ⬜ **Re-enable deploys:** `Enable-ScheduledTask EbayBotDeploy`.
-16. ⬜ **Keep the old SQLite file** read-only as the fallback:
+15. ✅ **Re-enable deploys:** `Enable-ScheduledTask EbayBotDeploy` (2026-11-02,
+    about 17:05; nothing new on `main`, so nothing deployed).
+16. ✅ **Keep the old SQLite file** read-only as the fallback (2026-11-02
+    16:21; unchanged since 15:18, sha256 `B12FEA95…`):
     `attrib +R ebay-list\data\ross.db` (never delete it; CLAUDE.md). It is
     the rollback target for the **first day only** (section 3c). Note the
     switch time: the day starts there.
@@ -472,6 +480,20 @@ applies.
     again. Nothing was written: the bot found it and skipped. Fixed in
     `9372f1c`, and the test is corrected.
   - 14: done before step 13's retest.
+  - 13 retest: test 1 ✅ ("already saved", nothing written); tests 2–3
+    pending (no new receipt today).
+  - 15, 16 ✅.
+  - **Final checks:**
+    - eBay bot: `/health` all green, `/report` OK, 0 errors in the log
+      since the switch.
+    - First write to ResaleDB: the eBay token was refreshed about 16:40 and
+      stored there.
+    - Jobs are scheduled. Their last runs were migrated; the next daily sync
+      is 11:00 UTC.
+    - `EbayBotBackup` ran under its own account: exit 0,
+      `ResaleDB-20261102-212122.bak` copied to OneDrive.
+  - Still open: step 17 (OneDrive *online*, the morning after the first
+    02:00 run) and step 13 tests 2–3.
 - 2026-11-02 cutover day:
   - Rehearsal (Phase A) passed: migration about 12 s, cleanup 19 changes,
     unique indexes built, every check after them passed.
