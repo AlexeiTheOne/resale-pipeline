@@ -93,9 +93,8 @@ Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) 
     for a person.
 - ✅ **Cleanup plan approved** (Person B, 2026-11-02), plus deleting card
   line 789. It's applied at cutover step 8.
-- 🔧 **`SALES_TAX_RATE` sync:** db.py should write `config.SALES_TAX_RATE`
-  into `app_settings` at startup. Today the baseline seeds 0.07, which matches
-  the config default, so this only matters if the rate changes.
+- 💤 **`SALES_TAX_RATE` sync:** moved to after cutover (Person B,
+  2026-11-02); see section 4.
 - ✅ **`scripts/deploy.ps1`** (Person A's area; on the branch only, live with
   the cutover merge):
   - Staging tests run with `DB_BACKEND=sqlserver` and
@@ -126,10 +125,8 @@ Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) 
   - The `EbayBotBackup` task must run as boris, with the OneDrive client
     signed in. A copy into the local OneDrive folder is not off-machine until
     the client has uploaded it.
-- 🔧 **`prod-logs` skill and `README.md`:** both query
-  `data/ross.db` with raw `sqlite3`. Switch them to read-only SQL Server
-  queries (`db.connect_readonly()`, or `sqlcmd -K ReadOnly`, or the views
-  `v_items` / `v_item_sales`).
+- 💤 **`prod-logs` skill and `README.md` on SQL Server:** moved to after
+  cutover (Person B, 2026-11-02); see section 4.
 - ✅ **Receipt bot "already saved"** (Person B sign-off). `receipt_pipeline`
   is now a local git repo:
   - `0c8cf36`: the code as it ran, tracked first. `.env`, the venvs and the
@@ -144,12 +141,12 @@ Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) 
 - ✅ `D:\SQLBackups` exists. `NT Service\MSSQL$SQLEXPRESS` can modify it and
   users can read it. A real backup and copy of ResaleDB_Dev were verified.
 - ✅ ODBC Driver 18 is installed (this PC is the production PC).
-- ✅ `pyodbc` and `tzdata` are pinned in `requirements.txt`. deploy.ps1
-  installs them when requirements change; check after the merge with
-  `venv\Scripts\python.exe -c "import pyodbc, tzdata"` in `ebay-list`.
-- ⬜ **Mixed-mode auth + `resale_reader` login (Q7).** This needs a SQL Server
-  service restart, which also drops the receipt bot's connections, so do it
-  inside the cutover window. As admin:
+- ✅ `pyodbc` and `tzdata` are pinned in `requirements.txt`. Installed into
+  production's venv by hand on 2026-11-02, **before** the merge's deploy (see
+  the merge item below).
+- 💤 **Mixed-mode auth + `resale_reader` login (Q7).** Skipped at cutover,
+  to be done after it (Person B, 2026-11-02); see section 4. This needs a SQL
+  Server service restart, which also drops both bots' connections. As admin:
   ```sql
   EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE',
        N'Software\Microsoft\MSSQLServer\MSSQLServer', N'LoginMode', REG_DWORD, 2;
@@ -160,11 +157,33 @@ Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) 
   ALTER ROLE db_datareader ADD MEMBER resale_reader;
   ```
   Then point `db.connect_readonly()` at it (🔧 a small code change).
-- ⬜ **Login language.** The receipt bot sends `MM/DD/YY` text dates, so
-  boris's login must stay `us_english`. Check:
+- ✅ **Login language.** The receipt bot sends `MM/DD/YY` text dates, so
+  boris's login must stay `us_english`. The migration script checks
+  `@@LANGUAGE` before copying (`us_english` on every rehearsal). Check by
+  hand with:
   `SELECT name, default_language_name FROM sys.server_principals WHERE name LIKE '%boris%'`.
-- ⬜ **Merge `sqlserver-migration` into `main` on the cutover day, right
-  before section 2** (through a PR that Person A reviews).
+- ⬜ **Before the merge is deployed: install the new requirements into
+  production's venv.** *(Missing until 2026-11-02.)* `deploy.ps1` runs the
+  staging tests **before** its `pip install`, with production's venv. So
+  tests that import a new package fail, and the deploy stops.
+  - **What happened 2026-11-02:** the merge's first deploy failed this way
+    (`No module named 'pyodbc'`).
+  - **Do this:** for every new or changed pin, from `ebay-list`:
+    `venv\Scripts\python.exe -m pip install "pyodbc==5.3.0" "tzdata==2026.6"`.
+    The running bot isn't affected.
+  - **Retrying a failed commit: don't run `deploy.ps1 -Force` from a normal
+    PowerShell.** The deploy task's S4U logon gets the full admin token, and
+    files it creates in `ebay-list-staging` (e.g. `.pytest_cache`) can't be
+    removed by a non-elevated session (`git clean` fails). Instead:
+    1. Back up `ebay-list\logs\deploy-state.json`.
+    2. Set its `"failed"` and `"alert"` to `""`.
+    3. Run `Start-ScheduledTask EbayBotDeploy`.
+    4. Follow `logs\deploy.log`.
+- ✅ **Merge `sqlserver-migration` into `main` on the cutover day, right
+  before section 2** (PR #1, Person A reviewed). Merged 2026-11-02 15:18 as
+  `9428e3a`. After the requirements fix above, it was deployed at 15:37 by
+  the deploy task. The bot came up on the new code, still on SQLite, with no
+  errors.
   - **Why that day:** the merge commit is still deployed by the old live
     `deploy.ps1` (SQLite backup, ordinary tests), so the bot comes back on the
     new code, still on SQLite. Wait for the ✅ on Telegram.
@@ -227,7 +246,8 @@ included.
    - `python backup.py --db-only` in `ebay-list` (SQLite);
    - a copy-only backup of ReceiptsDB:
      `BACKUP DATABASE ReceiptsDB TO DISK = 'D:\SQLBackups\ReceiptsDB-<stamp>-pre-cutover.bak' WITH COPY_ONLY, CHECKSUM`.
-5. ⬜ **Mixed mode + `resale_reader`** (section 1), if not done earlier.
+5. ~~Mixed mode + `resale_reader`~~: **skipped**, done after cutover
+   (section 4).
 6. ⬜ **Don't create ResaleDB by hand.** The migration script (step 7) creates
    it at the baseline. `init_sqlserver_db.py` would also build the unique
    receipt indexes, and the migration would then refuse the database.
@@ -372,6 +392,18 @@ applies.
 ---
 
 ## 4. After cutover
+- 💤 **Mixed-mode auth + `resale_reader` login (Q7)**, with the commands in
+  section 1. It needs a SQL Server service restart, so plan a quiet moment
+  and stop both bots first. Then point `db.connect_readonly()` at the login
+  (a small code change).
+- 💤 **`SALES_TAX_RATE` sync:** db.py writes `config.SALES_TAX_RATE` into
+  `app_settings` at startup. The baseline seeds 0.07, which matches the
+  config default, so this only matters if the rate changes.
+- 💤 **`prod-logs` skill and `README.md` on SQL Server:** both query
+  `data/ross.db` with raw `sqlite3`, which is frozen after cutover. Switch
+  them to read-only SQL Server queries (`db.connect_readonly()`, `sqlcmd -K
+  ReadOnly`, or the views `v_items` / `v_item_sales`). Until then,
+  `prod-logs` DB answers are stale.
 - 💤 Phase 2 (Q14): targeted writers (`set_list_price`, `add_sale`,
   `move_piece`), and `stock.location` moved onto pieces at runtime, one path at
   a time.
@@ -398,6 +430,14 @@ applies.
 ---
 
 ## Log
+- 2026-11-02 cutover day:
+  - Rehearsal (Phase A) passed: migration about 12 s, cleanup 19 changes,
+    unique indexes built, every check after them passed.
+  - The merge's first deploy failed: production's venv had no `pyodbc`.
+    Fixed by installing the new requirements by hand and retrying through
+    the deploy task; deployed at 15:37. The step is added to section 1.
+  - Step 5 (mixed mode), the `SALES_TAX_RATE` sync and prod-logs/README
+    moved to after cutover.
 - 2026-11-02: cleanup plan approved (Person B), plus deleting card line 789
   (`card_line`). The 26 flagged prices are left for Person B after cutover.
   `receipt_pipeline` pushed to the private repo BorisMer/receipt-pipeline.
