@@ -101,6 +101,9 @@ def backup_sqlserver(dest: Path) -> Path:
     SQL_BACKUP_DIR as docs/schema-proposal.md 7.1 describes."""
     import sqlserver  # not db: importing db runs the migrations
     bak = Path(sqlserver.backup_database(config.SQL_DATABASE))
+    # The server's folder keeps the KEEP newest backups per database too.
+    for old in sqlserver.prune_backups(config.SQL_DATABASE, KEEP):
+        print(f"[--] pruned {old}")
     out = dest / f"ross-{_stamp()}.bak"
     tmp = dest / f"{PARTIAL}{out.name}"
     try:

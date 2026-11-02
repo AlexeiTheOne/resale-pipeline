@@ -182,6 +182,27 @@ def backup_database(name: str, *, label: str | None = None, path: str | None = N
     return path
 
 
+def prune_backups(name: str, keep: int, folder: str | None = None) -> list[str]:
+    """Delete all but the `keep` newest backups of database `name` in `folder`
+    (default config.SQL_BACKUP_DIR). Only files named as backup_database names
+    them (<name>-<yyyymmdd>-<hhmmss>[-label].bak) count, so ResaleDB and
+    ResaleDB_Dev never prune each other. Returns the deleted paths."""
+    import re
+    from pathlib import Path
+    _check_name(name)
+    folder = folder or config.SQL_BACKUP_DIR
+    if not folder or keep < 1:
+        return []
+    pattern = re.compile(rf"^{re.escape(name)}-\d{{8}}-\d{{6}}(-[A-Za-z0-9_-]+)?\.bak$", re.IGNORECASE)
+    files = [p for p in Path(folder).iterdir() if p.is_file() and pattern.match(p.name)]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    deleted = []
+    for old in files[keep:]:
+        old.unlink()
+        deleted.append(str(old))
+    return deleted
+
+
 def stale_test_databases(names, now: datetime | None = None,
                          older_than: timedelta = timedelta(hours=24)) -> list[str]:
     """Which of `names` are ResaleDB_Test_* databases older than `older_than`,

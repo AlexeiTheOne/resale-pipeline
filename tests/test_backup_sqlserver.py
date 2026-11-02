@@ -42,6 +42,30 @@ def test_sqlserver_backup_is_copied_and_pruned_like_sqlite(tmp_path, monkeypatch
     assert (out / names[0]).read_bytes() == b"BAK"
 
 
+def test_server_folder_keeps_the_newest_per_database(tmp_path, monkeypatch):
+    import os
+    folder = tmp_path / "SQLBackups"
+    folder.mkdir()
+    names = ([f"ResaleDB-20261101-0000{n:02d}.bak" for n in range(5)]
+             + ["ResaleDB-20261101-000099-pre-backfill-sales.bak"]
+             + [f"ResaleDB_Dev-20261101-0000{n:02d}.bak" for n in range(3)]
+             + ["ResaleDB-notes.txt", "Other-20261101-000000.bak"])
+    for i, n in enumerate(names):
+        (folder / n).write_bytes(b"x")
+        os.utime(folder / n, (1_000_000 + i, 1_000_000 + i))      # later in the list = newer
+    deleted = sqlserver.prune_backups("ResaleDB", 3, str(folder))
+    left = sorted(p.name for p in folder.iterdir())
+    assert sorted(os.path.basename(d) for d in deleted) == [
+        "ResaleDB-20261101-000000.bak", "ResaleDB-20261101-000001.bak", "ResaleDB-20261101-000002.bak"]
+    assert [n for n in left if n.startswith("ResaleDB-") and n.endswith(".bak")] == [
+        "ResaleDB-20261101-000003.bak", "ResaleDB-20261101-000004.bak",
+        "ResaleDB-20261101-000099-pre-backfill-sales.bak"]
+    assert sum(n.startswith("ResaleDB_Dev-") for n in left) == 3        # other database untouched
+    assert "ResaleDB-notes.txt" in left and "Other-20261101-000000.bak" in left
+    monkeypatch.setattr(config, "SQL_BACKUP_DIR", None)
+    assert sqlserver.prune_backups("ResaleDB", 3) == []                 # no folder set: nothing
+
+
 def test_a_copy_that_fails_warns_but_does_not_fail(tmp_path, monkeypatch, capsys):
     out, made = _fake_backup(tmp_path, monkeypatch, readable=False)
     backup.main(["--db-only"])
