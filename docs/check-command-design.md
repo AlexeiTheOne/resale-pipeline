@@ -1,10 +1,33 @@
-# `/check`: pre-buy check in Telegram (design, plan only)
+# `/check`: pre-buy check in Telegram (design)
 
-Status: **design for review, no code yet.** Written 2026-11-02 for Person B
-(owner) and Person A, who owns pricing. Builds on proposal (b) in
+Status: **reviewed by Person B on 2026-11-02; v1 is being built on branch
+`check-command`.** Written for Person B (owner) and Person A, who owns
+pricing and reviews the PR. Builds on proposal (b) in
 `docs/legacy-tools-assessment.md` and the logic in `legacy/comps.py` and
 `legacy/comps_app.py` (both on branch `post-cutover-ideas`). Every fact about
 today's code is from `main` at `9428e3a`.
+
+## 0. Decisions (Person B's review, 2026-11-02). These override the sections below.
+
+| Topic | Decision |
+|---|---|
+| Thresholds | As proposed in §5. **Backtested on our real sold items before they're trusted**, with the hit rate reported per verdict (`scripts/backtest_check.py`, §5). |
+| Text input | Plain text, no LLM (v1). |
+| **Mode** | **Quick is the default**, aiming at about 20 s. It uses live active comps (Browse text, GTIN, and image when there's a photo), plus sold comps **only from the cache and only if under 7 days old** (no new Apify call), and the judge **without escalation**. A **"Full check" button** runs the full pricing: live sold queries, escalation allowed. |
+| **Matches** | **Exact matches only is the default**: price, counts and "cheapest identical" use the judge's same_item comps. An **"Any matches" button** (or `any` in the message) widens to Claude's price, which also leans on variants. |
+| **Label cost** | **By item type** (bags, jewelry, shoes, clothing, other). Configurable with `CHECK_LABEL_COSTS`. Starting values in §4. |
+| Daily cap | **50 checks a day**, with a warning at **40** (`CHECK_DAILY_MAX`, `CHECK_DAILY_WARN`). The day is US Eastern. |
+| Access | Person B and Person A only: the bot's existing allowed-users guard (`TELEGRAM_ALLOWED_USER_IDS`) already covers every update. |
+| Add to stock | v2, later. |
+| Builder | Person B with Claude; **Person A reviews** (pricing is Person A's area). |
+| **Sold-comps cache** | **7-day max age for `/check`** (approved). Repricing and intake keep today's behaviour (no expiry) until **Person A agrees**; this is noted in the PR. |
+| **Timings** | Every check appends one line to `logs/check_timings.jsonl`: mode, exact, input (text or photo), and seconds for identify, comps, judge and total. The pilot reads it for real response times. The same file counts checks for the daily cap. |
+
+**What quick mode means for the verdict.** BUY needs at least 3 matching
+sales (§5). Quick mode only has sales when a recent cached search exists, so
+a quick check is usually **at most MAYBE**, and the reply says "tap Full check
+for sales". It still shows the money at the cheapest identical listing, and
+break-even.
 
 ## 1. What it does
 
@@ -119,6 +142,18 @@ C = $16.04 → **profit $16.21, ROI 101%**, break-even T = $29.59 (item $19.71).
 (it includes eBay's fee on the sales tax the buyer pays). `EBAY_AD_FEE_PCT`
 4.6% assumes every listing is promoted at the default rate, as today.
 
+**Label cost by item type** (`CHECK_LABEL_COSTS`; these are starting
+estimates, to be corrected from real label costs). The type comes from the
+identification's `item_type` / product name, or from words in the text.
+
+| Type | Matches (examples) | Label |
+|---|---|---:|
+| bags | bag, tote, backpack, purse, handbag, crossbody, wallet, luggage | $11.00 |
+| jewelry | necklace, bracelet, earring, ring, watch, jewelry | $4.50 |
+| shoes | shoe, sneaker, boot, sandal, heel, loafer, slipper | $12.00 |
+| clothing | shirt, dress, jacket, hoodie, pants, jeans, sweater, top, shorts, skirt | $7.20 |
+| other | anything else | $7.20 (`EBAY_SHIP_COST`, the measured average) |
+
 ## 5. Verdict rules (proposed numbers; all settings)
 
 | Verdict | Rule (all must hold) |
@@ -153,6 +188,27 @@ pricing would have given, then compare it with what happened:
 - whether it is still unsold after 60 days.
 
 Tune the four numbers so that BUY rarely meets a loss or a stale item.
+
+**Hit rate per verdict (as built: `scripts/backtest_check.py`).** It
+replays the verdict for every item that has a Ross tag price and stored
+pricing, using the stored suggested price, the judged comps and the cheapest
+identical listing, in both exact and any mode. It then compares each verdict
+with what happened:
+
+- **win:** sold, with an actual profit (`net_proceeds` − cost with tax) of at
+  least $15;
+- **ok:** sold, with a profit of $0–15;
+- **loss:** sold at a loss;
+- **stale:** unsold more than 60 days after publishing;
+- **open:** unsold for less than that (left out).
+
+**Hit rate:**
+- for BUY: wins / (all decided);
+- for SKIP: (loss + stale + ok) / decided, i.e. "skipping didn't miss a win";
+- for MAYBE and BORDERLINE: the plain outcome mix.
+
+Caveat: these are items we **did** buy, so the backtest can't show what a
+SKIP would have saved on items we passed over.
 
 ## 6. Cost and response time
 
