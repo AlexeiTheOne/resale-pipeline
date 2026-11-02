@@ -693,6 +693,26 @@ def llm_stage_spend(since_iso: str, stage: str, item_id: str | None = None) -> t
     return float(cost), int(calls)
 
 
+def snapshot(label: str) -> str:
+    """A labelled backup before a risky write (scripts/backfill_sales.py).
+    SQLite: the online backup API (WAL-safe) to data/backups/ross-<time>-<label>.db.
+    SQL Server: BACKUP DATABASE ... COPY_ONLY to SQL_BACKUP_DIR (sqlserver.py).
+    Returns where it went."""
+    if _on_sqlserver():
+        import sqlserver
+        return sqlserver.backup_database(config.SQL_DATABASE, label=label)
+    dest_dir = Path(DATA_DIR) / "backups"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"ross-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{label}.db"
+    src, dst = _conn(), sqlite3.connect(str(dest))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    return str(dest)
+
+
 def modify_field(item_id: str, field: str, change) -> bool:
     """Atomic read-modify-write of one item field: change(value) gets the
     current value (as get_item returns it) and returns the new one, or None to

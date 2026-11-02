@@ -357,6 +357,10 @@ SQL_DATABASE = os.getenv("SQL_DATABASE") or None
 SQL_DRIVER = os.getenv("SQL_DRIVER", "ODBC Driver 18 for SQL Server")
 # The local instance has a self-signed certificate: encrypt, but trust it.
 SQL_TRUST_SERVER_CERT = _env_bool("SQL_TRUST_SERVER_CERT", True)
+# Where SQL Server writes BACKUP DATABASE files: a local folder the SQL Server
+# service account can write (doc 7.1, e.g. D:\SQLBackups). Unset = the
+# instance's own Backup folder, which a normal user may not be able to read.
+SQL_BACKUP_DIR = os.getenv("SQL_BACKUP_DIR") or None
 # Where db.py reads from: "sqlite" (data/ross.db, the default and what
 # production runs until cutover) or "sqlserver" (SQL_DATABASE, through
 # db_mssql.py: the same functions, reads and writes).

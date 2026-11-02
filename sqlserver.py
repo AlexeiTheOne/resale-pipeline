@@ -142,6 +142,46 @@ def reset_database(name: str) -> None:
     create_database(name)
 
 
+def default_backup_dir() -> str:
+    """config.SQL_BACKUP_DIR, else the instance's own backup folder (which the
+    SQL Server service can write, but a normal Windows user may not read)."""
+    if config.SQL_BACKUP_DIR:
+        return config.SQL_BACKUP_DIR
+    con = connect("master", autocommit=True)
+    try:
+        return con.execute("SELECT CAST(SERVERPROPERTY('InstanceDefaultBackupPath') AS NVARCHAR(400))"
+                           ).fetchone()[0]
+    finally:
+        con.close()
+
+
+def backup_database(name: str, *, label: str | None = None, path: str | None = None) -> str:
+    """BACKUP DATABASE `name` WITH COPY_ONLY, CHECKSUM (no COMPRESSION: Express
+    doesn't have it), then RESTORE VERIFYONLY. The file is written by the SQL
+    Server service, so the folder must be one it can write (doc 7.1). Returns
+    the file path. `path` overrides the file ("NUL" writes nothing: tests)."""
+    _check_name(name)
+    if label is not None and not _NAME_RE.match(label.replace("-", "_")):
+        raise ValueError(f"not a safe backup label: {label!r}")
+    if path is None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        folder = default_backup_dir().rstrip("\\/")
+        path = f"{folder}\\{name}-{stamp}{'-' + label if label else ''}.bak"
+    con = connect("master", autocommit=True)
+    try:
+        cur = con.cursor()
+        cur.execute(f"BACKUP DATABASE [{name}] TO DISK = ? WITH COPY_ONLY, CHECKSUM, INIT", path)
+        while cur.nextset():   # let the server finish and report every message
+            pass
+        if path.upper() != "NUL":
+            cur.execute("RESTORE VERIFYONLY FROM DISK = ? WITH CHECKSUM", path)
+            while cur.nextset():
+                pass
+    finally:
+        con.close()
+    return path
+
+
 def stale_test_databases(names, now: datetime | None = None,
                          older_than: timedelta = timedelta(hours=24)) -> list[str]:
     """Which of `names` are ResaleDB_Test_* databases older than `older_than`,

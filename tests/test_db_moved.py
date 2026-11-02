@@ -89,6 +89,58 @@ def test_modify_field_is_a_checked_write(backend):
     assert db.modify_field("no-such-item", "ebay", lambda e: {}) is False
 
 
+def _script(name):
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).parent.parent / "scripts" / f"{name}.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_backfill_apply_writes_checked_and_in_utc(backend):
+    bf = _script("backfill_sales")
+    item = db.create_item([])
+    db.update_field(item, "ebay", {"sale_price": 40.0, "net_proceeds": 30.0, "order_ids": ["25-1"]})
+    changed = db.create_item([])
+    db.update_field(changed, "ebay", {"sale_price": 50.0, "order_ids": ["25-2"]})
+    rows = [
+        {"item_id": item, "before": {"sale_price": 40.0, "net_proceeds": 30.0, "order_ids": ["25-1"]},
+         "after": {"sale_price": 40.0, "net_proceeds": 28.5, "order_ids": ["25-1"]}, "published_at": None},
+        {"item_id": changed, "before": {"sale_price": 49.0, "order_ids": ["25-2"]},   # stale plan
+         "after": {"sale_price": 51.0, "order_ids": ["25-2"]}, "published_at": None},
+    ]
+    assert bf.apply(rows) == 1
+    assert db.get_item(item)["ebay"]["net_proceeds"] == 28.5
+    assert db.get_item(item)["updated_at"].endswith("+00:00")    # was local time
+    assert db.get_item(changed)["ebay"]["sale_price"] == 50.0     # skipped, untouched
+
+
+def test_snapshot_on_sqlite(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DB_BACKEND", "sqlite")
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "ross.db"))
+    monkeypatch.setattr(db, "DATA_DIR", tmp_path)
+    db.create_tables()
+    item = db.create_item([])
+    out = db.snapshot("pre-test")
+    assert out.endswith("-pre-test.db")
+    import sqlite3
+    con = sqlite3.connect(out)
+    try:
+        assert con.execute("SELECT item_id FROM items").fetchall() == [(item,)]
+    finally:
+        con.close()
+
+
+def test_sql_server_backup_runs(mssql_db):
+    import sqlserver
+    assert sqlserver.backup_database(mssql_db, path="NUL") == "NUL"   # BACKUP ran, wrote nothing
+    with pytest.raises(ValueError):
+        sqlserver.backup_database("x]; DROP DATABASE ResaleDB; --", path="NUL")
+    with pytest.raises(ValueError):
+        sqlserver.backup_database(mssql_db, label="a b", path="NUL")
+
+
 def test_readonly_connection_refuses_writes(backend):
     item = db.create_item([])
     con = db.connect_readonly()

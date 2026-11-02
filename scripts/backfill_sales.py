@@ -20,13 +20,13 @@ Trading GetItem. Nothing on eBay is changed.
 
 Usage (from the repo root):
     python scripts/backfill_sales.py            # dry run: print before/after
-    python scripts/backfill_sales.py --apply    # back up data/ross.db, then write
+    python scripts/backfill_sales.py --apply    # back up the DB, then write
+
+The DB is reached only through db.py, so this works on either backend
+(DB_BACKEND). Writes stamp updated_at in UTC, like every other db.py write.
 """
 import argparse
-import json
-import sqlite3
 import sys
-from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -35,14 +35,7 @@ sys.path.insert(0, str(ROOT))
 
 import db  # noqa: E402
 
-BACKUPS = ROOT / "data" / "backups"
 DAYS = 700   # every order this account has (first sale May 2026); eBay caps at 2 years
-
-
-def _connect() -> sqlite3.Connection:
-    con = db.connect()
-    con.execute("PRAGMA busy_timeout=30000")
-    return con
 
 
 def _known_orders(ebay: dict) -> list[str]:
@@ -69,15 +62,15 @@ def _start_time(listing_id: str) -> str | None:
     return None
 
 
-def plan(con: sqlite3.Connection, sold_map: dict, *, fetch_published: bool = True) -> list[dict]:
+def plan(sold_map: dict, *, fetch_published: bool = True) -> list[dict]:
     """[{item_id, title, before, after, published_at}] for every row that changes."""
     from ebay.orders import SALE_DB_FIELDS, sale_db_fields, totals_from_sales
 
     changes = []
-    for item_id, status, ebay_json, listing_json in con.execute(
-            "SELECT item_id, status, ebay, listing FROM items ORDER BY created_at"):
-        ebay = json.loads(ebay_json or "{}")
-        title = (json.loads(listing_json or "{}").get("title") or "")[:40]
+    for it in sorted(db.list_items(), key=lambda it: it["created_at"]):
+        item_id, status = it["item_id"], it["status"]
+        ebay = it.get("ebay") or {}
+        title = ((it.get("listing") or {}).get("title") or "")[:40]
         row = {"item_id": item_id, "title": title, "status": status,
                "before": {k: ebay.get(k) for k in SALE_DB_FIELDS if k in ebay},
                "after": None, "published_at": None, "note": None}
@@ -110,7 +103,7 @@ def _money(v) -> str:
     return "—" if v is None else f"{v:.2f}"
 
 
-def print_plan(rows: list[dict], con: sqlite3.Connection) -> None:
+def print_plan(rows: list[dict]) -> None:
     print(f"{'item':8}  {'title':40}  {'net before':>10} {'net after':>10} {'Δ':>8}  "
           f"{'ads':>6} {'refund':>7}")
     d_net = d_ads = d_refund = 0.0
@@ -137,8 +130,8 @@ def print_plan(rows: list[dict], con: sqlite3.Connection) -> None:
     total_before = total_after = 0.0
     n_sold = 0
     after_by_id = {r["item_id"]: r["after"] for r in rows if r["after"]}
-    for item_id, ebay_json in con.execute("SELECT item_id, ebay FROM items"):
-        ebay = json.loads(ebay_json or "{}")
+    for it in db.list_items():
+        item_id, ebay = it["item_id"], it.get("ebay") or {}
         if ebay.get("sale_price") is None:
             continue
         n_sold += 1
@@ -153,50 +146,38 @@ def print_plan(rows: list[dict], con: sqlite3.Connection) -> None:
           f"({total_after - total_before:+.2f})")
 
 
-def backup() -> Path:
-    """Copy the live DB with sqlite's backup API: consistent under WAL while the
-    bot keeps writing (a plain file copy can miss the -wal contents)."""
-    BACKUPS.mkdir(parents=True, exist_ok=True)
-    dest = BACKUPS / f"ross-{datetime.now().strftime('%Y%m%d-%H%M%S')}-pre-backfill-sales.db"
-    # The backup target is a new file, not the bot's DB, so raw sqlite3.
-    src, dst = _connect(), sqlite3.connect(str(dest))
-    try:
-        src.backup(dst)
-    finally:
-        dst.close()
-        src.close()
-    return dest
+def backup() -> str:
+    """A labelled backup before writing (db.snapshot: SQLite's WAL-safe backup
+    API, or BACKUP DATABASE on SQL Server)."""
+    return db.snapshot("pre-backfill-sales")
 
 
 def apply(rows: list[dict]) -> int:
     """Write each row in its own short transaction, re-reading the row first so a
     concurrent write by the live bot (a price or quantity sync) is kept: only the
-    sale keys and a missing published_at are replaced."""
+    sale keys and a missing published_at are replaced (db.modify_field)."""
     from ebay.orders import SALE_DB_FIELDS
-    con = _connect()
     written = 0
-    try:
-        for r in rows:
-            if not (r["after"] or r["published_at"]):
-                continue
-            con.execute("BEGIN IMMEDIATE")
-            (ebay_json,) = con.execute("SELECT ebay FROM items WHERE item_id = ?",
-                                       (r["item_id"],)).fetchone()
-            ebay = json.loads(ebay_json or "{}")
+    for r in rows:
+        if not (r["after"] or r["published_at"]):
+            continue
+        skipped = []
+
+        def change(ebay, r=r, skipped=skipped):
+            ebay = dict(ebay or {})
             if r["after"]:
                 if {k: ebay.get(k) for k in SALE_DB_FIELDS if k in ebay} != r["before"]:
-                    con.execute("ROLLBACK")
-                    print(f"  skipped {r['item_id'][:8]}: its sale changed since the plan was made")
-                    continue
+                    skipped.append(True)
+                    return None
                 ebay.update(r["after"])
             if r["published_at"] and not ebay.get("published_at"):
                 ebay["published_at"] = r["published_at"]
-            con.execute("UPDATE items SET ebay = ?, updated_at = ? WHERE item_id = ?",
-                        (json.dumps(ebay), datetime.now().isoformat(), r["item_id"]))
-            con.execute("COMMIT")
+            return ebay
+
+        if db.modify_field(r["item_id"], "ebay", change):
             written += 1
-    finally:
-        con.close()
+        elif skipped:
+            print(f"  skipped {r['item_id'][:8]}: its sale changed since the plan was made")
     return written
 
 
@@ -207,8 +188,6 @@ def main() -> None:
                     help="skip the published_at fill (no GetItem calls)")
     args = ap.parse_args()
 
-    import os
-    os.chdir(ROOT)   # db.py / ebay/auth.py use the relative data/ross.db
     from ebay.orders import get_orders, get_transactions, sales_by_item
 
     print(f"Reading eBay orders + transactions ({DAYS}d, read-only)...")
@@ -219,12 +198,8 @@ def main() -> None:
                       for r in v["sales"]}.values())
     print(f"  eBay cash ledger: net proceeds {ledger_net:.2f} across all orders\n")
 
-    con = _connect()
-    try:
-        rows = plan(con, sold_map, fetch_published=not args.no_published)
-        print_plan(rows, con)
-    finally:
-        con.close()
+    rows = plan(sold_map, fetch_published=not args.no_published)
+    print_plan(rows)
 
     if not args.apply:
         print("\nDry run — nothing written. Re-run with --apply to write.")
