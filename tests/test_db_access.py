@@ -17,7 +17,7 @@ ALLOWED = {
 }
 
 
-@pytest.mark.sqlite_only('db.connect_readonly() is a SQLite connection (Q13: external SQL not moved yet)')
+@pytest.mark.sqlite_only("SQLite's own read-only error; both backends: test_db_moved.py")
 def test_readonly_connection_refuses_writes():
     con = db.connect_readonly()
     try:

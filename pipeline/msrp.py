@@ -11,7 +11,7 @@ The MSRP is the brand's retail price as found by research. It is NOT the Ross
 tag's original_price: that is Ross's own pre-markdown price, not retail, so an
 MSRP equal to it is flagged as suspicious (research may have read the tag).
 
-Read-only on data/ross.db.
+Read-only, through db.py (either backend).
 """
 import json
 import re

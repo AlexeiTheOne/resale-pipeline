@@ -33,6 +33,43 @@ config.PRICING_V2_CACHE_DIR = str(config.DATA_DIR / "cache" / "pricing_v2")
 # No SQL Server database unless a test asks for its own (see mssql_db).
 config.SQL_DATABASE = None
 
+# With DB_BACKEND=sqlserver nothing may open a SQLite file. sqlite3.connect is
+# wrapped for the whole run: a call while the backend is SQL Server is recorded
+# (and raises), and the session fails at the end if anything was recorded or a
+# ross.db appeared. Tests that switch to SQLite on purpose (to build a source
+# for the migration loader) set config.DB_BACKEND = "sqlite" first.
+SQLITE_OPENED: list[str] = []
+if config.DB_BACKEND == "sqlserver":
+    import sqlite3 as _sqlite3
+    import traceback as _traceback
+
+    _real_sqlite_connect = _sqlite3.connect
+
+    def _no_sqlite(*args, **kwargs):
+        if config.DB_BACKEND == "sqlserver":
+            where = "".join(_traceback.format_stack(limit=6)[:-1])
+            SQLITE_OPENED.append(f"{args[0] if args else kwargs.get('database')!r}\n{where}")
+            raise AssertionError(f"DB_BACKEND=sqlserver, but SQLite was opened: {args[:1]}")
+        return _real_sqlite_connect(*args, **kwargs)
+
+    _sqlite3.connect = _no_sqlite
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if config.DB_BACKEND != "sqlserver":
+        return
+    leftovers = [p for p in (config.DATA_DIR / "ross.db",) if p.exists()]
+    if SQLITE_OPENED or leftovers:
+        print("\nSQLite was used during a DB_BACKEND=sqlserver run:")
+        for entry in SQLITE_OPENED[:10]:
+            print(entry)
+        for p in leftovers:
+            print(f"  file present: {p}")
+        session.exitstatus = 1
+    else:
+        print(f"\nNo SQLite file was opened; {config.DATA_DIR / 'ross.db'} does not exist.")
+
+
 _MSSQL_FIXTURES = {"mssql_db", "mssql"}
 # Kept between tests: the migration record and the seeded settings.
 _KEEP_TABLES = {"schema_version", "app_settings"}

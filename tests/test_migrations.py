@@ -5,6 +5,9 @@ import pytest
 
 import migrations
 
+# SQLite's numbered migrations; SQL Server's: test_mssql_schema.py.
+pytestmark = pytest.mark.sqlite_only("SQLite's migrations on SQLite files")
+
 
 def _con(tmp_path, name="m.db"):
     return sqlite3.connect(tmp_path / name)

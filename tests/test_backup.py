@@ -1,7 +1,12 @@
 """backup.py: --db-only (used before each deploy) skips the inbox zip."""
 import sqlite3
 
+import pytest
+
 import backup
+
+# The SQLite backup (its online backup API); SQL Server: test_backup_sqlserver.py.
+pytestmark = pytest.mark.sqlite_only("backs up a SQLite file")
 
 
 def _setup(monkeypatch, tmp_path):

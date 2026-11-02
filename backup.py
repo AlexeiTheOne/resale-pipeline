@@ -16,13 +16,14 @@ bot is live — a plain file copy of a WAL database can miss committed rows stil
 sitting in the -wal file. The online backup takes a consistent snapshot instead.
 """
 import os
-import sqlite3
+import shutil
 import sys
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+import config  # noqa: E402
 from config import DATA_DIR, resolve_path  # noqa: E402
 
 DB_PATH = DATA_DIR / "ross.db"
@@ -52,6 +53,9 @@ def _sweep_partials(dest: Path) -> None:
 
 
 def backup_db(dest: Path) -> Path:
+    if config.DB_BACKEND == "sqlserver":
+        return backup_sqlserver(dest)
+    import sqlite3
     if not DB_PATH.exists():
         raise FileNotFoundError(f"{DB_PATH} not found — nothing to back up.")
     out = dest / f"ross-{_stamp()}.db"
@@ -86,6 +90,30 @@ def backup_inbox(dest: Path) -> Path | None:
     return out
 
 
+def backup_sqlserver(dest: Path) -> Path:
+    """DB_BACKEND=sqlserver: BACKUP DATABASE (COPY_ONLY, CHECKSUM, verified),
+    written by the SQL Server service to SQL_BACKUP_DIR, then copied here as
+    ross-<time>.bak so prune() and the offsite folder work as for SQLite.
+
+    If this user can't read the server's folder (e.g. SQL_BACKUP_DIR unset, so
+    the instance's own Backup folder), the backup still exists there: say so
+    and return its path, rather than failing the deploy that called us. Set up
+    SQL_BACKUP_DIR as docs/schema-proposal.md 7.1 describes."""
+    import sqlserver  # not db: importing db runs the migrations
+    bak = Path(sqlserver.backup_database(config.SQL_DATABASE))
+    out = dest / f"ross-{_stamp()}.bak"
+    tmp = dest / f"{PARTIAL}{out.name}"
+    try:
+        shutil.copy2(bak, tmp)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        print(f"[warn] SQL Server backup made at {bak}, but it could not be copied to {dest} "
+              f"({type(e).__name__}). Set SQL_BACKUP_DIR to a folder this user can read (doc 7.1).")
+        return bak
+    tmp.replace(out)
+    return out
+
+
 def prune(dest: Path, prefix: str, keep: int) -> None:
     snaps = sorted(dest.glob(f"{prefix}*"), key=lambda p: p.stat().st_mtime, reverse=True)
     for old in snaps[keep:]:
@@ -101,7 +129,8 @@ def main(argv: list[str] | None = None) -> None:
     _sweep_partials(BACKUP_DIR)
 
     db_out = backup_db(BACKUP_DIR)
-    print(f"[ok] DB backed up  -> {db_out} ({db_out.stat().st_size / 1024:.0f} KB)")
+    size = f" ({db_out.stat().st_size / 1024:.0f} KB)" if db_out.parent == BACKUP_DIR else ""
+    print(f"[ok] DB backed up  -> {db_out}{size}")
     if db_only:
         prune(BACKUP_DIR, "ross-", KEEP)
         print(f"[--] DB only. Kept the {KEEP} most recent DB backups in {BACKUP_DIR}.")
