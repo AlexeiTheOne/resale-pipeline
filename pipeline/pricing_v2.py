@@ -108,14 +108,23 @@ def _cache_path(kind: str, key: str) -> Path:
     return _cache_dir() / kind / f"{hashlib.sha1(key.encode()).hexdigest()[:20]}.json"
 
 
-def _cached(kind: str, key: str, fetch):
+def _cached(kind: str, key: str, fetch, *, max_age_s: float | None = None,
+            cache_only: bool = False):
     """Rows for `key` from disk, else fetch() and store them. Failures raise
-    and are NOT cached, so a transient error is retried on the next run."""
+    and are NOT cached, so a transient error is retried on the next run.
+    max_age_s: an older cached copy is ignored (None = any age, as intake and
+    repricing use it). cache_only: never fetch; None when nothing usable is
+    cached (/check's quick mode)."""
     path = _cache_path(kind, key)
     if path.exists():
-        with _lock:
-            apify_spend["cache_hits"] += kind == "sold"
-        return json.loads(path.read_text(encoding="utf-8"))["rows"]
+        data = json.loads(path.read_text(encoding="utf-8"))
+        age = time.time() - float(data.get("fetched_at") or path.stat().st_mtime)
+        if max_age_s is None or age <= max_age_s:
+            with _lock:
+                apify_spend["cache_hits"] += kind == "sold"
+            return data["rows"]
+    if cache_only:
+        return None
     rows = fetch()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"key": key, "fetched_at": time.time(), "rows": rows}),
@@ -133,7 +142,9 @@ def sold_is_cached(query: str, count: int | None = None) -> bool:
     return _cache_path("sold", _sold_key(query, count or config.PRICING_V2_SOLD_COUNT)).exists()
 
 
-def fetch_sold(query: str, count: int | None = None) -> list[dict]:
+def fetch_sold(query: str, count: int | None = None, *, max_age_s: float | None = None,
+               cache_only: bool = False) -> list[dict] | None:
+    """Sold rows for `query`. None only with cache_only and nothing usable cached."""
     count = count or config.PRICING_V2_SOLD_COUNT
     payload = {"keyword": query, "count": count}
 
@@ -160,25 +171,27 @@ def fetch_sold(query: str, count: int | None = None) -> list[dict]:
             apify_spend["usd"] += _apify_estimate(len(rows)) - worst
         return rows
 
-    return _cached("sold", _sold_key(query, count), go)
+    return _cached("sold", _sold_key(query, count), go, max_age_s=max_age_s,
+                   cache_only=cache_only)
 
 
-def fetch_active(query: str | None = None, gtin: str | None = None) -> list[dict]:
+def fetch_active(query: str | None = None, gtin: str | None = None, *,
+                 max_age_s: float | None = None) -> list[dict]:
     from ebay import browse
     params = {"q": query or "", "gtin": gtin or "", "limit": config.PRICING_V2_ACTIVE_COUNT,
               "zip": config.PRICING_V2_SHIP_TO_ZIP, "cond": list(NEW_CONDITION_IDS)}
     return _cached("active", json.dumps(params, sort_keys=True), lambda: browse.search_active(
         query, gtin=gtin, limit=params["limit"], condition_ids=NEW_CONDITION_IDS,
-        ship_to_zip=params["zip"]))
+        ship_to_zip=params["zip"]), max_age_s=max_age_s)
 
 
-def fetch_by_image(photo_path) -> list[dict]:
+def fetch_by_image(photo_path, *, max_age_s: float | None = None) -> list[dict]:
     from ebay import browse
     digest = hashlib.sha1(Path(photo_path).read_bytes()).hexdigest()
     params = {"image_sha1": digest, "limit": config.PRICING_V2_IMAGE_COUNT,
               "zip": config.PRICING_V2_SHIP_TO_ZIP}
     return _cached("image", json.dumps(params, sort_keys=True), lambda: browse.search_by_image(
-        photo_path, limit=params["limit"], ship_to_zip=params["zip"]))
+        photo_path, limit=params["limit"], ship_to_zip=params["zip"]), max_age_s=max_age_s)
 
 
 # --- identity and queries ---------------------------------------------------
@@ -486,9 +499,11 @@ def build_judge_request(identity: dict, cands: list[dict], photo: bytes | None,
     return system, content
 
 
-def judge(identity, cands, photo, calibration, *, item_id=None, ask=None) -> dict:
-    """One Claude call, escalated once on low confidence. Returns the parsed
-    answer plus model / escalated / thumbnails_used."""
+def judge(identity, cands, photo, calibration, *, item_id=None, ask=None,
+          stage: str = JUDGE_STAGE, escalate: bool = True) -> dict:
+    """One Claude call, escalated once on low confidence (unless escalate is
+    False: /check's quick mode). Returns the parsed answer plus model /
+    escalated / thumbnails_used. `stage` is the llm_usage label."""
     import anthropic
     import claude_llm
     ask = ask or claude_llm.ask
@@ -498,7 +513,7 @@ def judge(identity, cands, photo, calibration, *, item_id=None, ask=None) -> dic
         if note:
             content.append({"type": "text", "text": note})
         judge_stats["calls"] += 1
-        return ask(JUDGE_STAGE, [{"role": "user", "content": content}], model=model,
+        return ask(stage, [{"role": "user", "content": content}], model=model,
                    system=system, max_tokens=8000, effort=config.PRICING_JUDGE_EFFORT,
                    output_schema=JUDGE_SCHEMA, item_id=item_id)
 
@@ -514,7 +529,7 @@ def judge(identity, cands, photo, calibration, *, item_id=None, ask=None) -> dic
         thumbnails = False
         out = call(model, False)
     escalated = False
-    if out.get("confidence") == "low" and config.PRICING_ESCALATE_ON_LOW:
+    if out.get("confidence") == "low" and config.PRICING_ESCALATE_ON_LOW and escalate:
         judge_stats["escalations"] += 1
         escalated = True
         model = config.PRICING_ESCALATE_MODEL
@@ -590,35 +605,46 @@ def _resolve(p) -> str | None:
     return str(path) if path.exists() else None
 
 
-def gather_candidates(ident: dict, photo_paths=None) -> dict:
+def gather_candidates(ident: dict, photo_paths=None, *, sold_max_age_s: float | None = None,
+                      sold_cache_only: bool = False,
+                      active_max_age_s: float | None = None) -> dict:
     """Fetch (cached) and normalise every candidate. Returns candidates plus
-    per-source counts, the queries used and any fetch errors."""
+    per-source counts, the queries used and any fetch errors.
+    The freshness arguments are for /check (pipeline/check.py); intake and
+    repricing leave them at their defaults (any cached copy, live fetches)."""
     our_ship = config.EBAY_SHIP_CHARGED
     queries = sold_queries(ident)
     aq, gtin = active_query(ident), upc_of(ident)
     photo = next((p for p in map(_resolve, photo_paths or []) if p), None)
     errors, skipped = [], []
-    if uncached_sold_queries is not None and queries:
+    if uncached_sold_queries is not None and queries and not sold_cache_only:
         allowed = set(uncached_sold_queries)
         if not any(n in allowed for n, _ in queries):
             allowed.add(queries[0][0])      # always at least one live query
         kept_q = [(n, q) for n, q in queries if n in allowed or sold_is_cached(q)]
         skipped = [q for n, q in queries if (n, q) not in kept_q]
         queries = kept_q
-    jobs = {f"sold:{name}": (fetch_sold, (q,)) for name, q in queries}
+    # Only set options are passed, so the default call stays fetch_sold(q) etc.
+    sold_kw = {k: v for k, v in (("max_age_s", sold_max_age_s),
+                                 ("cache_only", sold_cache_only)) if v not in (None, False)}
+    act_kw = {"max_age_s": active_max_age_s} if active_max_age_s is not None else {}
+    jobs = {f"sold:{name}": (fetch_sold, (q,), sold_kw) for name, q in queries}
     if aq:
-        jobs["active:text"] = (fetch_active, (aq, None))
+        jobs["active:text"] = (fetch_active, (aq, None), act_kw)
     if gtin:
-        jobs["active:gtin"] = (fetch_active, (None, gtin))
+        jobs["active:gtin"] = (fetch_active, (None, gtin), act_kw)
     if photo:
-        jobs["image"] = (fetch_by_image, (photo,))
-    raw = {}
+        jobs["image"] = (fetch_by_image, (photo,), act_kw)
+    raw, cache_misses = {}, []
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        futs = {pool.submit(fn, *args): name for name, (fn, args) in jobs.items()}
+        futs = {pool.submit(fn, *args, **kw): name for name, (fn, args, kw) in jobs.items()}
         for f in concurrent.futures.as_completed(futs):
             name = futs[f]
             try:
                 raw[name] = f.result()
+                if raw[name] is None:       # cache_only and nothing fresh cached
+                    raw[name] = []
+                    cache_misses.append(dict(queries).get(name.split(":", 1)[-1], name))
             except ApifyBudgetExceeded as e:
                 errors.append(f"{name}: skipped, {e}")
                 skipped.append(dict(queries).get(name.split(":", 1)[-1], name))
@@ -645,6 +671,7 @@ def gather_candidates(ident: dict, photo_paths=None) -> dict:
         c["id"] = f"{p}{counters[p]}"
     return {"candidates": pooled, "dropped": dropped, "errors": errors,
             "queries": [q for _, q in queries], "skipped_queries": skipped,
+            "sold_cache_misses": cache_misses,
             "active_query": aq, "gtin": gtin,
             "photo": photo, "raw_counts": {k: len(v) for k, v in raw.items()}}
 
@@ -663,13 +690,20 @@ def price_item(item: dict) -> dict:
     """Price a stored item: the one entry point for the intake price stage
     (pipeline/stages.py) and the weekly repricer (pipeline/reprice.py).
     Nothing is stored here."""
-    return get_pricing_v2(item.get("identification") or {},
-                          photo_paths=item.get("photos") or [],
-                          receipt=item.get("receipt"), item_id=item.get("item_id"))
+    res = get_pricing_v2(item.get("identification") or {},
+                         photo_paths=item.get("photos") or [],
+                         receipt=item.get("receipt"), item_id=item.get("item_id"))
+    # Run diagnostics for /check; a stored item's pricing keeps its usual shape.
+    res.pop("timings", None)
+    res.pop("sold_cache_misses", None)
+    return res
 
 
 def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
-                   item_id: str | None = None, ask=None) -> dict:
+                   item_id: str | None = None, ask=None, stage: str = JUDGE_STAGE,
+                   escalate: bool = True, sold_max_age_s: float | None = None,
+                   sold_cache_only: bool = False,
+                   active_max_age_s: float | None = None) -> dict:
     """Claude's price is the suggested price. The formula over same_item sold
     comps is a cross-check: only computed with >= PRICE_THIN_MIN_COMPS of them,
     and a gap over FORMULA_DISAGREE_PCT is flagged for review with both numbers.
@@ -677,6 +711,7 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
     formula-first price existed for none of them, while Claude's was within 20%
     of the owner's on 7.)"""
     from pipeline import msrp as msrp_mod
+    t_start = time.perf_counter()
     ident = identification or {}
     identity = identity_record(ident, receipt)
     # The store's MSRP range is NEVER shown to the judge: shown as an estimate
@@ -687,16 +722,21 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
         store = msrp_mod.store_estimate(ident, receipt, exclude_item_id=item_id)
     except Exception as e:      # history is advisory; never lose the item over it
         store = {"error": f"{type(e).__name__}: {e}"}
-    g = gather_candidates(ident, photo_paths)
+    t = time.perf_counter()
+    g = gather_candidates(ident, photo_paths, sold_max_age_s=sold_max_age_s,
+                          sold_cache_only=sold_cache_only, active_max_age_s=active_max_age_s)
+    timings = {"comps_s": round(time.perf_counter() - t, 2)}
     cands = g["candidates"]
     warnings, flags = list(g["errors"]), []
     if g["dropped"]["own"]:
         warnings.append(f"dropped {g['dropped']['own']} of our own listings from the comps")
 
     verdict_map, j = {}, None
+    t = time.perf_counter()
     if cands:
         photo = _photo_bytes(g["photo"]) if g["photo"] else None
-        j = judge(identity, cands, photo, calibration_examples(item_id), item_id=item_id, ask=ask)
+        j = judge(identity, cands, photo, calibration_examples(item_id), item_id=item_id, ask=ask,
+                  stage=stage, escalate=escalate)
         verdict_map = {x["id"]: x["verdict"] for x in j.get("judgments", [])}
         missing = [c["id"] for c in cands if c["id"] not in verdict_map]
         if missing:
@@ -705,6 +745,7 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
         flags.append("no_comps")
         warnings.append("no comps found at all: type a price")
 
+    timings["judge_s"] = round(time.perf_counter() - t, 2)
     priced = price_from_judged(cands, verdict_map)
     warnings += priced["warnings"]
     for c in cands:
@@ -816,4 +857,6 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
         "judge_escalated": bool(j and j.get("escalated")),
         "thumbnails_used": bool(j and j.get("thumbnails_used")),
         "raw_counts": g["raw_counts"],
+        "sold_cache_misses": g.get("sold_cache_misses") or [],
+        "timings": {**timings, "total_s": round(time.perf_counter() - t_start, 2)},
     }
