@@ -25,6 +25,7 @@ from xml.sax.saxutils import escape
 
 import httpx
 
+from ebay import guard
 from ebay.listings import TRADING_URL, _headers, _strip_ns, _text
 from ebay.orders import get_orders
 
@@ -39,6 +40,7 @@ def _trading(call_name: str, inner: str) -> ET.Element:
         f'<{call_name}Request xmlns="urn:ebay:apis:eBLBaseComponents">'
         f"{inner}</{call_name}Request>"
     )
+    guard.require_trading_write(call_name)
     r = httpx.post(TRADING_URL, headers=_headers(call_name),
                    content=body.encode(), timeout=60)
     if r.status_code != 200:

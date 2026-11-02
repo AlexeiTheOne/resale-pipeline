@@ -340,6 +340,12 @@ REPRICE_HOUR_UTC = int(os.getenv("REPRICE_HOUR_UTC", "14"))
 # never acts on the live eBay account on its own.
 JOBS_ENABLED = _env_bool("JOBS_ENABLED", True)
 
+# Master switch for every call that changes the eBay account (publish, offers,
+# price/quantity/title edits, ads, offers to watchers, feedback). On by default
+# so production is unchanged. Set EBAY_WRITES_ENABLED=0 on a dev copy: writes
+# are refused with a log line before anything is sent (ebay/guard.py).
+EBAY_WRITES_ENABLED = _env_bool("EBAY_WRITES_ENABLED", True)
+
 # Automatic /sync. Until this existed, /sync was manual-only and nothing else
 # wrote sold orders into the DB, so every money figure (/profit, /report, COGS)
 # silently understated whenever a sync was overdue — on 2026-09-03 the DB was

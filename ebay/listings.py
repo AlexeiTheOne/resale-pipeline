@@ -21,6 +21,7 @@ from xml.sax.saxutils import escape
 
 import httpx
 
+from ebay import guard
 from ebay.auth import get_access_token
 
 TRADING_URL = "https://api.ebay.com/ws/api.dll"
@@ -172,6 +173,7 @@ def _trading_call(call_name: str, inner_xml: str, timeout: int = 60):
     body = (f'<?xml version="1.0" encoding="utf-8"?>'
             f'<{call_name}Request xmlns="urn:ebay:apis:eBLBaseComponents">'
             f'{inner_xml}</{call_name}Request>')
+    guard.require_trading_write(call_name)
     r = httpx.post(TRADING_URL, headers=_headers(call_name),
                    content=body.encode("utf-8"), timeout=timeout)
     if r.status_code != 200:
