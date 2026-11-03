@@ -28,6 +28,12 @@ Caveats, printed in the report too:
 - To keep it cheap: one sold query per item (--one-sold-query, default on) and
   no escalation, like /check's quick judge; results are cached, so a rerun
   costs nothing.
+- --full-check adds what a full /check searches: the UPC and "brand + type"
+  sold queries, and no image search when a UPC or style code is known.
+
+A second section scores MSRP x ratio (ladder level 4) against what every
+sold item with an MSRP really sold for, leaving each item's own sale out.
+It needs no API calls.
 
 Read-only on items. Writes: llm_usage rows (stage check_backtest), the comps
 cache, and the report in logs/ plus a CSV in data/cache/backtest/.
@@ -127,6 +133,77 @@ def hit_rates(rows: list[dict], mode: str) -> dict:
     return out
 
 
+def _errors(pairs) -> dict | None:
+    """pairs of (estimate, actual) -> n, median |error| %, median signed error %
+    (+ = too high), share within 20%."""
+    errs = [(est - act) / act for est, act in pairs if est and act]
+    if not errs:
+        return None
+    return {"n": len(errs), "mae": statistics.median(abs(e) for e in errs), "bias": statistics.median(errs),
+            "within20": sum(abs(e) <= 0.20 for e in errs) / len(errs)}
+
+
+def _err_row(label: str, s: dict | None) -> str:
+    if not s:
+        return f"| {label} | 0 | - | - | - |"
+    return f"| {label} | {s['n']} | {s['mae']:.0%} | {s['bias']:+.0%} | {s['within20']:.0%} |"
+
+
+def price_accuracy(rows: list[dict]) -> list[str]:
+    """The exact-mode ladder price vs the item price we really sold at, by the levels used."""
+    sold = [r for r in rows if r.get("sold_item_price") and r.get("exact_price")]
+    w = ["## Ladder price vs actual sale price (exact mode, sold items)\n",
+         "| levels used | n | median miss | median bias | within ±20% |", "|---|---:|---:|---:|---:|",
+         _err_row("all", _errors((r["exact_price"], r["sold_item_price"]) for r in sold))]
+    for used in sorted({r["exact_used"] for r in sold}):
+        w.append(_err_row(used, _errors((r["exact_price"], r["sold_item_price"]) for r in sold
+                                        if r["exact_used"] == used)))
+    w.append("\nMiss = |ladder − actual| / actual; bias + means the ladder was too high.\n")
+    return w
+
+
+def msrp_rows() -> list[dict]:
+    """Every sold item with an MSRP: level 4 as /check computes it (leave-one-out)
+    against its actual item price. Read only."""
+    from pipeline import msrp
+    cal = db.sold_items_for_calibration()
+    history = check.load_our_sales()
+    out = []
+    for s in cal:
+        h = next((x for x in history if x["item_id"] == s["item_id"]), None)
+        if not h or not h.get("msrp"):
+            continue
+        ident = s["identification"] if isinstance(s["identification"], dict) else {}
+        try:
+            est = msrp.store_estimate(ident, s.get("receipt"), exclude_item_id=s["item_id"], history=history)
+        except Exception:
+            continue
+        if est.get("estimate"):
+            out.append({"item": s["item_id"][:8], "brand": h["brand"], "bucket": h["bucket"], "msrp": h["msrp"],
+                        "actual": h["sold"], "estimate": est["estimate"], "level": est.get("level"),
+                        "key": est.get("key"), "n": est.get("n"), "flags": bool(est.get("msrp_flags"))})
+    return out
+
+
+def msrp_section(rows: list[dict], title: str) -> list[str]:
+    usable = [r for r in rows if not r["flags"]]
+    w = [f"## {title}\n",
+         "| ratio from | n | median miss | median bias | within ±20% |", "|---|---:|---:|---:|---:|",
+         _err_row("all", _errors((r["estimate"], r["actual"]) for r in usable))]
+    for level in ("brand", "type", "global"):
+        w.append(_err_row(level + (" (not used by /check)" if level == "global" else ""),
+                          _errors((r["estimate"], r["actual"]) for r in usable if r["level"] == level)))
+    w.append(f"\n{len(rows) - len(usable)} item(s) skipped: MSRP flagged as doubtful. Each item's own sale "
+             "is left out of its ratio.\n")
+    w.append("| item | brand | type | MSRP | ratio from | estimate | sold at | miss |")
+    w.append("|---|---|---|---:|---|---:|---:|---:|")
+    for r in sorted(usable, key=lambda r: abs(r["estimate"] - r["actual"]) / r["actual"], reverse=True):
+        w.append(f"| {r['item']} | {r['brand']} | {r['bucket']} | {r['msrp']:.2f} | {r['level']} {r['key']} ({r['n']}) "
+                 f"| {r['estimate']:.2f} | {r['actual']:.2f} | {(r['estimate'] - r['actual']) / r['actual']:+.0%} |")
+    w.append("")
+    return w
+
+
 def write_report(path: Path, rows: list[dict], stopped: str | None, spend: dict) -> None:
     w = []
     w.append(f"# /check verdict backtest ({datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC)\n")
@@ -154,13 +231,17 @@ def write_report(path: Path, rows: list[dict], stopped: str | None, spend: dict)
              f"≥ ${config.CHECK_BUY_MIN_PROFIT:.0f}; stale = unsold {STALE_DAYS}+ days.\n")
     w.append("Caveats: look-ahead (today's comps include later sales); only items we bought; no "
              "escalation; each item's own sale is left out of levels 3-4 (leave-one-out).\n")
+    w.extend(price_accuracy(rows))
+    w.extend(msrp_section(msrp_rows(), "MSRP × ratio (level 4) vs actual sale price, every sold item"))
     w.append("## Items\n")
-    w.append("| item | brand | outcome | actual profit | exact | any | exact price | any price | sales (exact/any) |")
-    w.append("|---|---|---|---:|---|---|---:|---:|---|")
+    w.append("| item | brand | outcome | actual profit | sold at | exact | levels | exact price | any | any price "
+             "| sales (exact/any) | competition |")
+    w.append("|---|---|---|---:|---:|---|---|---:|---|---:|---|---|")
     for r in rows:
         w.append(f"| {r['item']} | {r['brand'] or ''} | {r['outcome']} | {r['actual_profit'] if r['actual_profit'] is not None else '-'} "
-                 f"| {r['exact_verdict']} | {r['any_verdict']} | {r['exact_price'] or '-'} | {r['any_price'] or '-'} "
-                 f"| {r['exact_sales']}/{r['any_sales']} |")
+                 f"| {r.get('sold_item_price') or '-'} | {r['exact_verdict']} | {r.get('exact_used', '-')} "
+                 f"| {r['exact_price'] or '-'} | {r['any_verdict']} | {r['any_price'] or '-'} "
+                 f"| {r['exact_sales']}/{r['any_sales']} | {r.get('competition', '')} |")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(w) + "\n", encoding="utf-8")
 
@@ -171,6 +252,8 @@ def main(argv=None) -> int:
     ap.add_argument("--limit", type=int)
     ap.add_argument("--claude-cap", type=float, default=3.0)
     ap.add_argument("--apify-cap", type=float, default=3.0)
+    ap.add_argument("--full-check", action="store_true",
+                    help="also the UPC and brand + type sold searches, as a full /check")
     ap.add_argument("--all-sold-queries", action="store_true",
                     help="send every sold query to Apify (default: only search_query when uncached)")
     args = ap.parse_args(argv)
@@ -182,8 +265,7 @@ def main(argv=None) -> int:
     if not args.all_sold_queries:
         v2.uncached_sold_queries = {"search_query"}
     start = datetime.now(timezone.utc).isoformat()
-    from pipeline import msrp
-    history = msrp.load_history()       # once; each item leaves its own sale out
+    history = check.load_our_sales()    # once; each item leaves its own sale out
     rows, stopped = [], None
     for it in items:
         spent, _ = db.llm_stage_spend(start, STAGE)
@@ -192,8 +274,11 @@ def main(argv=None) -> int:
             break
         photos = [p for p in it.get("photos") or [] if p][:1]
         try:
-            pricing = v2.get_pricing_v2(it["identification"], photo_paths=photos, receipt=it.get("receipt"),
-                                        item_id=it["item_id"], stage=STAGE, escalate=False)
+            ident = it["identification"]
+            extra = {"extra_sold_queries": check.similar_queries(ident),
+                     "image_search": not (v2.upc_of(ident) or v2.style_code(ident))} if args.full_check else {}
+            pricing = v2.get_pricing_v2(ident, photo_paths=photos, receipt=it.get("receipt"),
+                                        item_id=it["item_id"], stage=STAGE, escalate=False, **extra)
         except v2.ApifyBudgetExceeded as e:
             stopped = f"Apify cap: {e}"
             break
@@ -206,7 +291,12 @@ def main(argv=None) -> int:
         an = check.evaluate(pricing, it["identification"], ross, False, history=history,
                             exclude_item_id=it["item_id"])
         o = it["_outcome"]
+        e = it.get("ebay") or {}
+        sold_item = round(e["sale_price"] / max(1, e.get("units_sold") or 1), 2) \
+            if o["kind"] != "stale" and e.get("sale_price") else None
         row = {"item": it["item_id"][:8], "brand": it["identification"].get("brand"),
+               "sold_item_price": sold_item, "exact_used": "+".join(map(str, ex["pick"]["used"])) or "-",
+               "competition": ex["pick"].get("competition_note") or "",
                "outcome": o["kind"], "actual_profit": o["profit"], "days": o["days"],
                "ross": ross, "item_type": ex["item_type"],
                "exact_verdict": ex["verdict"], "exact_price": ex["pick"]["price"], "exact_sales": ex["pick"]["sales"],

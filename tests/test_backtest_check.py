@@ -43,3 +43,18 @@ def test_hit_rates():
     assert hr["SKIP"]["hit"] == 0.5 and hr["SKIP"]["stale"] == 1
     assert hr["MAYBE"]["hit"] is None and hr["MAYBE"]["ok"] == 1 and hr["BORDERLINE"]["n"] == 0
     assert hr["BUY"]["avg_days"] == 17.5 and hr["NO_DATA"]["n"] == 0
+
+
+def test_price_errors_and_the_msrp_table():
+    s = bt._errors([(50.0, 40.0), (30.0, 40.0), (44.0, 40.0), (None, 10.0)])
+    assert s["n"] == 3 and s["mae"] == 0.25 and s["bias"] == 0.10 and round(s["within20"], 2) == 0.33
+    assert bt._errors([]) is None
+    rows = [{"item": "a", "brand": "coach", "bucket": "bag", "msrp": 100.0, "actual": 40.0, "estimate": 47.0,
+             "level": "type", "key": "bag", "n": 15, "flags": False},
+            {"item": "b", "brand": "coach", "bucket": "bag", "msrp": 300.0, "actual": 40.0, "estimate": 141.0,
+             "level": "type", "key": "bag", "n": 15, "flags": True}]
+    text = "\n".join(bt.msrp_section(rows, "MSRP"))
+    assert "| all | 1 | 18% | +18% | 100% |" in text and "1 item(s) skipped" in text
+    acc = "\n".join(bt.price_accuracy([{"sold_item_price": 40.0, "exact_price": 39.99, "exact_used": "1"},
+                                       {"sold_item_price": None, "exact_price": 20.0, "exact_used": "4"}]))
+    assert "| all | 1 | 0% | -0% | 100% |" in acc and "| 1 | 1 |" in acc
