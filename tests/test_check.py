@@ -625,6 +625,9 @@ def test_an_estimate_with_failing_money_is_borderline_never_skip():
     assert v == "BORDERLINE"
     # real sales behind the price: SKIP stays
     assert check.verdict(profit=-0.63, roi=-0.05, sales=4, profit_at_cheapest=2.0)[0] == "SKIP"
+    # our own sales (level 3) are real sold prices too (Person B, 2026-11-03)
+    assert check.verdict(profit=1.0, roi=0.1, sales=0, profit_at_cheapest=None, estimated=True,
+                         own_sales=True)[0] == "SKIP"
     assert check.verdict(profit=3.0, roi=0.2, sales=2, profit_at_cheapest=-1.0)[0] == "SKIP"
 
 
@@ -642,6 +645,18 @@ def test_check5_vans_sling_is_borderline_estimated_with_a_small_bag_label(monkey
     assert "MSRP×47% $21 (other brands)" in lines[4]
     details = check.format_details(res)
     assert "label $5.50 (bags, small)" in details and "ratio from other brands" in details
+
+
+def test_skip_backed_by_our_own_sales_of_the_brand_and_type():
+    """Backtest: 9 of the 12 right SKIPs (all unsold 60+ days) had level 3."""
+    cheap = [{"item_id": f"e{i}", "brand": "ed hardy", "bucket": "bag", "msrp": None, "sold": s, "ratio": None}
+             for i, s in enumerate((24.0, 26.0, 28.0))]
+    ed = {"brand": "Ed Hardy", "item_type": "Tote Bag", "product_name": "Tiger Tote"}
+    ev = check.evaluate(pricing(raw_active_floor=None, judged_comps=[]), ed, 24.99, exact=True, history=cheap)
+    assert ev["pick"]["used"] == [3] and ev["verdict"] == "SKIP"
+    msrp_only = check.evaluate(pricing(raw_active_floor=None, judged_comps=[]), VANS, 24.99, exact=True,
+                               history=BAGS)
+    assert msrp_only["pick"]["used"] == [4] and msrp_only["verdict"] == "BORDERLINE"
 
 
 def test_bag_size_from_dimensions_then_name():

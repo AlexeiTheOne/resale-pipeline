@@ -218,7 +218,7 @@ def economics(item_price: float, ross_price: float, label: float,
 def verdict(*, profit: float | None, roi: float | None, sales: int,
             profit_at_cheapest: float | None, low_confidence: bool = False,
             from_asks: bool = False, disagrees: bool = False,
-            estimated: bool = False) -> tuple[str, list[str]]:
+            estimated: bool = False, own_sales: bool = False) -> tuple[str, list[str]]:
     """BUY / MAYBE / BORDERLINE / SKIP and the reasons, from config thresholds."""
     if profit is None:
         return "SKIP", ["no price found"]
@@ -242,9 +242,10 @@ def verdict(*, profit: float | None, roi: float | None, sales: int,
         return "BUY", reasons
     if money_buy:
         return "MAYBE", evidence
-    # SKIP only when real sold prices back it (Person B, 2026-11-02): an
-    # estimate (levels 2-4, asking prices) with failing money is BORDERLINE.
-    backed = sales >= L1_MIN_SALES and not estimated and not from_asks
+    # SKIP only when real sold prices back it (Person B, 2026-11-03): 2+ eBay
+    # sales of the same item, or our own sales (level 3). An estimate from
+    # MSRP x ratio or a same-model sale alone with failing money is BORDERLINE.
+    backed = (sales >= L1_MIN_SALES and not estimated and not from_asks) or own_sales
     if profit_at_cheapest is not None and profit_at_cheapest < 0 and sales < config.CHECK_MIN_SALES:
         why = [f"a loss at the cheapest identical listing ({_usd(profit_at_cheapest)})"] + evidence
         return ("SKIP", why) if backed else ("BORDERLINE", why)
@@ -637,7 +638,7 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
                          profit_at_cheapest=at_cheapest["profit"] if at_cheapest else None,
                          low_confidence=pricing.get("claude_confidence") == "low",
                          from_asks=pick["from_asks"], disagrees=pick["disagrees"],
-                         estimated=pick.get("estimated", False))
+                         estimated=pick.get("estimated", False), own_sales=3 in (pick.get("used") or []))
         if money is None:
             # No price at all is not evidence against the item (Person B,
             # 2026-11-02: in the backtest 14 of 20 such SKIPs were winners).

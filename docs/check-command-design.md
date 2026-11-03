@@ -207,8 +207,11 @@ charge.
 Check #5 (Vans Detached Sling Bag VN000Q9BFS8, Ross $12.99, MSRP $45) said
 ❌ SKIP from MSRP × 47% alone, with 0 sales.
 
-- **SKIP only when real sold prices back it:** 2+ same-item sales (level 1).
-  An estimate (levels 2–4) with failing money is 🟠 BORDERLINE, and the
+- **SKIP only when real sold prices back it:** 2+ same-item sales (level 1)
+  **or our own sales** of the brand + type (level 3; approved 2026-11-03,
+  after the backtest showed 9 of its 12 right SKIPs had level 3). An
+  estimate from MSRP × ratio or a single same-model sale with failing
+  money is 🟠 BORDERLINE, and the
   headline says "(estimated)" for every estimated verdict, e.g.
   "🟠 BORDERLINE (estimated): no sales found, 2 listings".
 - **Label by bag size:** `small_bags` in `CHECK_LABEL_COSTS` ($5.50, Ground
