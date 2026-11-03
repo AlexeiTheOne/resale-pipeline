@@ -323,9 +323,53 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
     return {"request": dict(req), "photo": bool(photo_path), "identification": ident,
             **ev, "already_have": have, "timings": timings,
             "sold_cache_misses": pricing.get("sold_cache_misses") or [],
+            # up to 5 identical comps, saved with the check (comps_summary)
+            "comps": [{k: c.get(k) for k in ("source", "verdict", "title", "total", "url")}
+                      for c in (pricing.get("judged_comps") or [])
+                      if c.get("verdict") in ("same_item", "variant")][:5],
             "same_item_active": pricing.get("same_item_active_count"),
             "reference": pricing.get("reference"), "warnings": pricing.get("comp_warning"),
             "judge_model": pricing.get("judge_model"), "escalated": pricing.get("judge_escalated")}
+
+
+def check_fields(res: dict) -> dict:
+    """A result as checks-table columns (db.update_check)."""
+    money, pick, req = res.get("money") or {}, res["pick"], res["request"]
+    return {"identification": res["identification"], "mode": "full" if req.get("full") else "quick",
+            "exact": bool(req.get("exact", True)), "verdict": res["verdict"],
+            "suggested_price": pick.get("price"), "profit": money.get("profit"), "roi": money.get("roi"),
+            "break_even": money.get("break_even_item"), "cheapest_identical": res.get("cheapest_total"),
+            "sold_count": pick.get("sales"),
+            "comps_summary": {"basis": pick.get("basis"), "sales": pick.get("sales"),
+                              "sold_median": pick.get("sold_median"), "item_type": res.get("item_type"),
+                              "label": res.get("label"), "reasons": res.get("reasons"),
+                              "comps": res.get("comps") or [],
+                              "warnings": (res.get("warnings") or "")[:500] or None}}
+
+
+def photo_roles(paths: list[str], decode=None) -> dict:
+    """Which photo is the Ross tag: the first whose barcode reads as a Ross
+    code (12-digit SKU + price in cents). No AI. Returns the SKU, the price,
+    the tag photo and the photos for identification (the tag too when it is
+    the only photo)."""
+    if decode is None:
+        import ross_tag
+
+        def decode(p):
+            return ross_tag.parse_barcode(ross_tag.decode_barcode(p))
+    tag, sku, price = None, None, None
+    for p in paths:
+        try:
+            parsed = decode(p) or {}
+        except Exception:
+            parsed = {}
+        code = parsed.get("code")
+        if code and len(str(code)) == 12:
+            tag, sku, price = p, str(code), parsed.get("reduced_price")
+            break
+    others = [p for p in paths if p != tag]
+    return {"tag": tag, "sku": sku, "price": price, "identify": others or ([tag] if tag else []),
+            "scan": list(paths)}
 
 
 # --- reply -------------------------------------------------------------------------------

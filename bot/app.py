@@ -246,12 +246,19 @@ def register_handlers(app: Application) -> None:
     app.add_error_handler(error_handler)
     # Auth gate first (group -1): blocks unauthorized users before any handler below.
     app.add_handler(TypeHandler(Update, _auth_guard), group=-1)
-    # A photo captioned /check is a pre-buy check, never a new item: before intake.
+    # Shopping mode (/shop): every photo is a pre-buy check, never a new item.
+    # A photo captioned /check is one too. Both before intake.
+    app.add_handler(MessageHandler(filters.PHOTO & check_cmds.SHOPPING, check_cmds.shop_photo))
     app.add_handler(MessageHandler(filters.PHOTO & filters.CaptionRegex(r"^/check(@\w+)?(\s|$)"),
                                    check_cmds.photo_check))
     app.add_handler(MessageHandler(filters.PHOTO, intake.photo_handler))
+    # A bare number while a check waits for its Ross price (before text_router).
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & check_cmds.AWAITING_PRICE,
+                                   check_cmds.price_text))
+    app.add_handler(CallbackQueryHandler(check_cmds.price_callback, pattern=r"^chkp:"))
     app.add_handler(CallbackQueryHandler(check_cmds.check_callback, pattern=r"^chk:"))
     app.add_handler(CommandHandler("check", check_cmds.check_command))
+    app.add_handler(CommandHandler("shop", check_cmds.shop_command))
     app.add_handler(CallbackQueryHandler(flow.confirm_callback, pattern=r"^confirm:"))
     app.add_handler(CallbackQueryHandler(flow.review_callback, pattern=r"^review:"))
     app.add_handler(CallbackQueryHandler(listing_cmds.reprice_callback, pattern=r"^reprice:"))

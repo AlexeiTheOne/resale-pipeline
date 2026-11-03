@@ -26,8 +26,12 @@ inv_album = {}      # (user_id, media_group_id) -> {"code", "n", "sent", "task"}
 list_after_photos = {}  # user_id -> item_id: /list waiting for real listing photos
 haul_mode = set()   # user_ids whose next photo batch is a multi-item haul to be split on Ross tags
 check_running = set()  # user_ids with a /check in progress (one at a time per user)
-checks = {}         # token -> {"req", "photo", "user", "ts"}: a /check result's buttons (Full check,
-                    # Any/Exact) for 30 min; nothing else about a check is kept
+checks = {}         # token -> {"req", "photo", "user", "ts", "check_id"}: a /check reply's buttons
+                    # (Full check, Any/Exact, Bought) for 30 min; the check itself is in the DB
+shop_mode = {}      # user_id -> {"until": epoch, "task"}: /shop is on (every photo is a check)
+shop_batch = {}     # user_id -> {"photos": [bytes], "message", "task", "price"}: an album being collected
+shop_price_wait = {}  # user_id -> {"check_id", "roles", "ident_task", "message", "ts"}: no Ross tag,
+                      # waiting for the price (a button or one typed number)
 # message_id of a gate/draft the bot sent -> the item it was about. A haul puts
 # several drafts on screen at once, so "which item did you mean?" can't be
 # answered by a single most-recent pointer: replying to a specific message is how
