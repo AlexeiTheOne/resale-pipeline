@@ -96,6 +96,21 @@ def test_extra_sold_queries_are_added_once(cache, monkeypatch):
     assert "885919782199" not in asked
 
 
+def test_image_search_can_be_switched_off(cache, monkeypatch, tmp_path):
+    photo = tmp_path / "p.jpg"
+    photo.write_bytes(b"x")
+    calls = []
+    monkeypatch.setattr(v2, "fetch_sold", lambda q, count=None, **kw: [])
+    monkeypatch.setattr(v2, "fetch_active", lambda q=None, gtin=None, **kw: [])
+    monkeypatch.setattr(v2, "fetch_by_image", lambda p, **kw: calls.append(p) or [])
+    monkeypatch.setattr(v2, "own_listings", lambda: (set(), set()))
+    ident = {"brand": "Juicy", "product_name": "tote", "search_query": "juicy tote"}
+    v2.gather_candidates(ident, [str(photo)], image_search=False)
+    assert calls == []
+    v2.gather_candidates(ident, [str(photo)])                      # default: on, as intake uses it
+    assert calls == [str(photo)]
+
+
 def test_stored_item_pricing_has_no_check_diagnostics(monkeypatch):
     monkeypatch.setattr(v2, "get_pricing_v2", lambda *a, **k: {
         "suggested_price": 10, "timings": {"total_s": 1}, "sold_cache_misses": []})

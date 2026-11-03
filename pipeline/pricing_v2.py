@@ -608,7 +608,8 @@ def _resolve(p) -> str | None:
 def gather_candidates(ident: dict, photo_paths=None, *, sold_max_age_s: float | None = None,
                       sold_cache_only: bool = False,
                       active_max_age_s: float | None = None,
-                      extra_sold_queries: list | None = None) -> dict:
+                      extra_sold_queries: list | None = None,
+                      image_search: bool = True) -> dict:
     """Fetch (cached) and normalise every candidate. Returns candidates plus
     per-source counts, the queries used and any fetch errors.
     The freshness arguments and extra_sold_queries ([(name, query)], e.g. the
@@ -641,7 +642,7 @@ def gather_candidates(ident: dict, photo_paths=None, *, sold_max_age_s: float | 
         jobs["active:text"] = (fetch_active, (aq, None), act_kw)
     if gtin:
         jobs["active:gtin"] = (fetch_active, (None, gtin), act_kw)
-    if photo:
+    if photo and image_search:
         jobs["image"] = (fetch_by_image, (photo,), act_kw)
     raw, cache_misses = {}, []
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
@@ -712,7 +713,8 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
                    escalate: bool = True, sold_max_age_s: float | None = None,
                    sold_cache_only: bool = False,
                    active_max_age_s: float | None = None,
-                   extra_sold_queries: list | None = None) -> dict:
+                   extra_sold_queries: list | None = None,
+                   image_search: bool = True) -> dict:
     """Claude's price is the suggested price. The formula over same_item sold
     comps is a cross-check: only computed with >= PRICE_THIN_MIN_COMPS of them,
     and a gap over FORMULA_DISAGREE_PCT is flagged for review with both numbers.
@@ -734,7 +736,7 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
     t = time.perf_counter()
     g = gather_candidates(ident, photo_paths, sold_max_age_s=sold_max_age_s,
                           sold_cache_only=sold_cache_only, active_max_age_s=active_max_age_s,
-                          extra_sold_queries=extra_sold_queries)
+                          extra_sold_queries=extra_sold_queries, image_search=image_search)
     timings = {"comps_s": round(time.perf_counter() - t, 2)}
     cands = g["candidates"]
     warnings, flags = list(g["errors"]), []

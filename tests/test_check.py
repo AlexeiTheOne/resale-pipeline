@@ -351,6 +351,36 @@ def test_similar_sales_are_level2_in_exact_and_level1_in_any_mode():
     assert "L1 sold 3 $25.12✓" in check.format_reply(res_any)
 
 
+# --- Person B's approved fixes from the check #2 trace -----------------------------------------
+
+def test_image_search_is_skipped_when_a_upc_or_style_code_is_known():
+    seen = []
+    for ident in ({"brand": "Juicy Couture", "upc": "885919782199"}, {"brand": "Juicy", "model": "11JCDA0JC-JTL"},
+                  {"brand": "Juicy", "product_name": "weekender tote"}):
+        req = {**check.parse_request("/check full 9.99"), "identification": ident}
+        check.run_check(req, photo_path="x.jpg", pricing_fn=lambda i, **kw: seen.append(kw) or pricing(),
+                        have_fn=lambda *a: [])
+    assert [kw["image_search"] for kw in seen] == [False, False, True]
+
+
+def test_sold_link_uses_the_product_name_not_the_long_query():
+    res = {"identification": {"brand": "Juicy Couture", "product_name": "Juicy To Go Weekender Tote",
+                              "search_query": "Juicy Couture Juicy To Go Weekender Tote Bag Liquorice Black NWT"},
+           "request": {}}
+    sold = check.search_links(res)["sold"]
+    assert "_nkw=Juicy+Couture+Juicy+To+Go+Weekender+Tote&" in sold and "Liquorice" not in sold
+
+
+def test_judge_verdict_counts_are_logged(tmp_path):
+    judged = [{"source": "sold", "verdict": v, "total": 30.0} for v in ("same_item", "variant", "wrong", "wrong")]
+    res = check.run_check(check.parse_request("/check coach tabby 14.99"),
+                          pricing_fn=lambda i, **kw: pricing(judged_comps=judged), have_fn=lambda *a: [])
+    assert res["verdicts"] == {"same_item": 1, "variant": 1, "wrong": 2}
+    path = tmp_path / "t.jsonl"
+    check.log_timings(res, user_id=1, path=path)
+    assert '"judge_verdicts": {"same_item": 1, "variant": 1, "wrong": 2}' in path.read_text(encoding="utf-8")
+
+
 # --- in-stock warning: items AND pieces (production has piece O1W-01) ---------------------------
 
 def _mk_piece():

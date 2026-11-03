@@ -22,6 +22,7 @@ import json
 import re
 import statistics
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -439,7 +440,10 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
         ident, photo_paths=[photo_path] if photo_path else None, item_id=None,
         stage="check_judge" if full else "check_quick_judge", escalate=full,
         sold_cache_only=not full, sold_max_age_s=config.CHECK_SOLD_CACHE_DAYS * 86400,
-        active_max_age_s=0, extra_sold_queries=similar_queries(ident) if full else None)
+        active_max_age_s=0, extra_sold_queries=similar_queries(ident) if full else None,
+        # A UPC or style code already pins the item; image search on a dark
+        # photo only adds noise (check #2: 16 Hugo Boss bags).
+        image_search=not (pricing_v2.upc_of(ident) or pricing_v2.style_code(ident)))
     for k, v in (pricing.get("timings") or {}).items():
         if k != "total_s":
             timings[k] = v
@@ -460,7 +464,9 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
                       if c.get("verdict") in ("same_item", "variant")][:5],
             "same_item_active": pricing.get("same_item_active_count"),
             "reference": pricing.get("reference"), "warnings": pricing.get("comp_warning"),
-            "judge_model": pricing.get("judge_model"), "escalated": pricing.get("judge_escalated")}
+            "judge_model": pricing.get("judge_model"), "escalated": pricing.get("judge_escalated"),
+            # how the judge labelled every candidate (logged: quick vs full agreement)
+            "verdicts": dict(Counter(c.get("verdict") or "unjudged" for c in pricing.get("judged_comps") or []))}
 
 
 def check_fields(res: dict) -> dict:
@@ -616,8 +622,9 @@ def search_links(res: dict) -> dict:
     """eBay sold / active searches a person can open (as legacy/comps.py)."""
     from urllib.parse import urlencode
     ident = res["identification"]
-    q = ident.get("search_query") or " ".join(
-        str(ident.get(k)) for k in ("brand", "product_name") if ident.get(k)) or res["request"].get("description")
+    # The product name, not the long search query (check #2's long query found nothing).
+    q = " ".join(str(ident.get(k)) for k in ("brand", "product_name") if ident.get(k)) \
+        or ident.get("search_query") or res["request"].get("description")
     if not q:
         return {}
     base = {"_nkw": q, "LH_ItemCondition": "1000|1500", "LH_PrefLoc": 1}
@@ -748,7 +755,8 @@ def log_timings(res: dict, user_id: int | None = None, path: Path | None = None,
            "mode": "full" if res["request"].get("full") else "quick",
            "auto_full": bool(res["request"].get("auto_full")), "counted": counted,
            "exact": bool(res["request"].get("exact", True)), "input": "photo" if res["photo"] else "text",
-           "verdict": res["verdict"], "escalated": bool(res.get("escalated")), **res["timings"]}
+           "verdict": res["verdict"], "escalated": bool(res.get("escalated")),
+           "judge_verdicts": res.get("verdicts") or {}, **res["timings"]}
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row) + "\n")
 
