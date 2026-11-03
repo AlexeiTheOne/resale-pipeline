@@ -119,7 +119,7 @@ def test_quick_text_check_passes_quick_options_and_stores_nothing():
         return pricing(sold_cache_misses=["coach tabby 26"], formula_price=None)
 
     res = check.run_check(check.parse_request("/check Coach Tabby 26 CH857 bag 14.99"),
-                          pricing_fn=fake_pricing, have_fn=lambda ident: [])
+                          pricing_fn=fake_pricing, have_fn=lambda *a: [])
     assert seen["sold_cache_only"] is True and seen["escalate"] is False
     assert seen["sold_max_age_s"] == 7 * 86400 and seen["active_max_age_s"] == 0
     assert seen["stage"] == "check_quick_judge" and seen["item_id"] is None
@@ -131,7 +131,10 @@ def test_quick_text_check_passes_quick_options_and_stores_nothing():
     assert res["verdict"] == "BORDERLINE"
     assert "priced from asking prices, not sales" in res["reasons"]
     text = check.format_reply(res)
-    assert "Tap Full check" in text and "exact matches" in text and "Break-even" in text
+    assert len(text.splitlines()) <= 5 and "quick · exact" in text
+    assert "sell ~$31.99 (asking) · profit ~$6.01 (asking)" in text and "ROI" not in text
+    details = check.format_details(res)
+    assert "break-even" in details and "Quick check: no recent sold data" in details
 
 
 def test_full_any_check_can_say_buy():
@@ -142,15 +145,15 @@ def test_full_any_check_can_say_buy():
         return pricing(suggested_price=44.99)
 
     res = check.run_check(check.parse_request("/check any full Coach Tabby 26 CH857 14.99"),
-                          pricing_fn=fake_pricing, have_fn=lambda ident: ["3f2a1b2c (published)"])
+                          pricing_fn=fake_pricing, have_fn=lambda *a: ["item 3f2a1b2c (published)"])
     assert seen["sold_cache_only"] is False and seen["escalate"] is True and seen["stage"] == "check_judge"
     assert res["verdict"] == "BUY", res["reasons"]
-    assert "Already in our items: 3f2a1b2c" in check.format_reply(res)
+    assert "⚠️ in stock: item 3f2a1b2c" in check.format_reply(res)
 
 
 def test_missing_ross_price_is_a_skip_with_a_hint():
     res = check.run_check(check.parse_request("/check coach tabby"),
-                          pricing_fn=lambda ident, **kw: pricing(), have_fn=lambda i: [])
+                          pricing_fn=lambda ident, **kw: pricing(), have_fn=lambda *a: [])
     assert res["verdict"] == "SKIP" and "Ross price missing" in check.format_reply(res)
 
 
@@ -160,7 +163,7 @@ def test_photo_check_identifies_first(tmp_path):
     res = check.run_check(check.parse_request("/check 24.99"), photo_path=str(photo),
                           identify_fn=lambda p: {"brand": "Coach", "product_name": "Tabby 26",
                                                  "item_type": "Shoulder Bag"},
-                          pricing_fn=lambda ident, **kw: pricing(), have_fn=lambda i: [])
+                          pricing_fn=lambda ident, **kw: pricing(), have_fn=lambda *a: [])
     assert res["identification"]["brand"] == "Coach" and res["item_type"] == "bags"
     assert "identify_s" in res["timings"] and res["photo"] is True
 
@@ -175,7 +178,7 @@ def test_quick_with_nothing_at_all_is_no_data_but_full_is_skip():
     some = pricing(formula_price=None, judged_comps=[])
     assert check.evaluate(some, {}, 14.99, exact=True, quick=True)["verdict"] != check.NO_DATA
     res = check.run_check(check.parse_request("/check lego set 9.99"),
-                          pricing_fn=lambda ident, **kw: empty, have_fn=lambda i: [])
+                          pricing_fn=lambda ident, **kw: empty, have_fn=lambda *a: [])
     assert check.format_reply(res).startswith("❓ NO DATA")
 
 
@@ -183,8 +186,86 @@ def test_a_follow_up_reuses_the_identification():
     seen = []
     req = {**check.parse_request("/check full 9.99"), "identification": {"brand": "Coach", "model": "CH857"}}
     check.run_check(req, photo_path="x.jpg", identify_fn=lambda p: seen.append(p) or {},
-                    pricing_fn=lambda ident, **kw: seen.append(ident) or pricing(), have_fn=lambda i: [])
+                    pricing_fn=lambda ident, **kw: seen.append(ident) or pricing(), have_fn=lambda *a: [])
     assert seen == [{"brand": "Coach", "model": "CH857"}]      # identify_fn not called
+
+
+# --- reply format (Person B's feedback on the MKJ3969710 test) --------------------------------
+
+def mkj_pricing(**kw):
+    """The real full check of 'Michael Kors pave necklace MKJ3969710': no sales,
+    one $160.19 listing the judge wasn't sure about."""
+    return pricing(suggested_price=139.99, formula_price=None, raw_active_floor=160.19, sold_median=None,
+                   judged_comps=[{"source": "active", "verdict": "same_item", "total": 160.19,
+                                  "title": "MK pave necklace", "url": "https://ebay.com/itm/1"}],
+                   review_flags=["priced_from_asks", "judge_low_confidence"], claude_confidence="low",
+                   same_item_active_count=1, **kw)
+
+
+def test_headline_is_verdict_and_evidence_and_profit_is_marked_asking():
+    res = check.run_check(check.parse_request("/check full Michael Kors pave necklace MKJ3969710 14.99"),
+                          pricing_fn=lambda ident, **kw: mkj_pricing(), have_fn=lambda *a: [])
+    text = check.format_reply(res, check_id=12)
+    lines = text.splitlines()
+    assert len(lines) <= 5
+    assert lines[0] == "🟡 MAYBE: no sales found, 1 uncertain listing"
+    assert lines[1] == "Michael Kors pave necklace MKJ3969710"            # model not repeated
+    # asking only: the cheapest ask x 0.98 (measured) x 0.95 (undercut) - our shipping
+    assert res["pick"]["price"] == check._charm(160.19 * 0.98 * 0.95 - 9.88) == 138.99
+    assert lines[2].startswith("Ross $14.99 · sell ~$138.99 (asking) · profit ~$") and "(asking)" in lines[2]
+    assert lines[3] == "Evidence: sold 0 · for sale 1 identical (cheapest $160.19) · match uncertain"
+    assert lines[4].startswith("#12 · ⏱") and "full · exact" in lines[4]
+    assert "no sales found" in res["reasons"] and not any("only 0" in r for r in res["reasons"])
+    details = check.format_details(res, check_id=12)
+    assert "×0.98" in details and "Fees + ads" in details and "label $4.50 (jewelry)" in details
+    assert "https://ebay.com/itm/1" in details and "LH_Sold=1" in details
+
+
+def test_item_links_lose_their_tracking():
+    long = ("https://www.ebay.com/itm/276922449344?_skw=Michael+Kors&hash=item4079dd3dc0:g:C6MAAOSw"
+            "&amdata=enc%3AAQALAAAB")
+    assert check.short_url(long) == "https://www.ebay.com/itm/276922449344"
+    assert check.short_url("https://www.ebay.com/itm/some-title/123456789012") == \
+        "https://www.ebay.com/itm/123456789012"
+    assert check.short_url(None) == ""
+
+
+def test_any_mode_from_asks_is_discounted_too():
+    pick = check.choose_price(mkj_pricing(), exact=False)
+    assert pick["from_asks"] and pick["price"] == check._charm(139.99 * 0.98) and pick["ask_discount"] == 0.98
+
+
+def test_sale_wording():
+    assert check.verdict(profit=20, roi=1, sales=1, profit_at_cheapest=None)[1] == ["only 1 sale (need 3)"]
+    assert check.verdict(profit=20, roi=1, sales=2, profit_at_cheapest=None)[1] == ["only 2 sales (need 3)"]
+
+
+# --- in-stock warning: items AND pieces (production has piece O1W-01) ---------------------------
+
+def _mk_piece():
+    import db
+    code = db.add_piece("O1W")
+    db.update_piece(code, info={"brand": "Michael Kors", "item_type": "necklace", "style_code": "MKJ3969710",
+                                "upc": "796483413276", "ross_code": "400289769542"})
+    return code
+
+
+def test_in_stock_warning_finds_a_piece_by_style_code_upc_or_ross_sku():
+    code = _mk_piece()
+    by_code = check.already_have(check.build_identification("Michael Kors pave necklace MKJ3969710"))
+    assert by_code and by_code[0].startswith(f"piece {code}") and "Michael Kors necklace" in by_code[0]
+    assert check.already_have({"upc": "796483413276"})
+    assert check.already_have({}, "400289769542")                      # the Ross tag's SKU
+    assert check.already_have({"brand": "Coach", "model": "CH857"}) == []
+
+
+def test_in_stock_warning_finds_an_item_and_shows_in_the_reply():
+    import db
+    item = db.create_item([])
+    db.update_field(item, "identification", {"brand": "Michael Kors", "model": "MKJ3969710"})
+    res = check.run_check(check.parse_request("/check Michael Kors pave necklace MKJ3969710 14.99"),
+                          pricing_fn=lambda ident, **kw: mkj_pricing())
+    assert f"item {item[:8]}" in check.format_reply(res).splitlines()[1]
 
 
 # --- timings log and daily cap -------------------------------------------------------------
@@ -192,7 +273,7 @@ def test_a_follow_up_reuses_the_identification():
 def test_timings_log_and_daily_count(tmp_path):
     path = tmp_path / "check_timings.jsonl"
     res = check.run_check(check.parse_request("/check coach tabby 14.99"),
-                          pricing_fn=lambda ident, **kw: pricing(), have_fn=lambda i: [])
+                          pricing_fn=lambda ident, **kw: pricing(), have_fn=lambda *a: [])
     check.log_timings(res, user_id=1, path=path)
     check.log_timings(res, user_id=1, path=path)
     row = path.read_text(encoding="utf-8").splitlines()[0]

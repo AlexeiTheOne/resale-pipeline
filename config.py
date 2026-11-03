@@ -329,6 +329,11 @@ CHECK_BUY_MIN_ROI = float(os.getenv("CHECK_BUY_MIN_ROI", "0.75"))
 CHECK_MIN_SALES = int(os.getenv("CHECK_MIN_SALES", "3"))
 CHECK_MIN_PROFIT = float(os.getenv("CHECK_MIN_PROFIT", "5"))
 CHECK_MIN_PROFIT_AT_CHEAPEST = float(os.getenv("CHECK_MIN_PROFIT_AT_CHEAPEST", "5"))
+# A price resting only on asking prices (no sales) is discounted by this, on
+# top of the usual UNDERCUT_V2_PCT. Measured 2026-11-02 on our own 44 sold
+# items: sold price / asking price, mean 0.98 (84% sold at the full ask).
+# Revisit with pilot outcomes from the checks table.
+CHECK_ASK_DISCOUNT = float(os.getenv("CHECK_ASK_DISCOUNT", "0.98"))
 # Checks per day (US Eastern), and when to warn.
 CHECK_DAILY_MAX = int(os.getenv("CHECK_DAILY_MAX", "50"))
 CHECK_DAILY_WARN = int(os.getenv("CHECK_DAILY_WARN", "40"))

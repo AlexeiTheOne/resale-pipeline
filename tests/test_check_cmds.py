@@ -37,7 +37,7 @@ def env(tmp_path, monkeypatch):
     tg.reset_bot_state(None)
     calls = []
     monkeypatch.setattr(pricing_v2, "get_pricing_v2", fake_pricing(calls))
-    monkeypatch.setattr(check, "already_have", lambda ident: [])
+    monkeypatch.setattr(check, "already_have", lambda *a: [])
     monkeypatch.setattr(check, "TIMINGS_FILE", tmp_path / "check_timings.jsonl")
     monkeypatch.setattr(check_cmds, "CHECKS_DIR", tmp_path / "checks")
     monkeypatch.setattr(check_cmds, "ALBUM_WAIT_S", 0.0)
@@ -96,8 +96,11 @@ def test_album_with_a_tag_is_one_saved_check_and_no_item(env, monkeypatch):
     b, ctx = tg.make_photo_update(context=ctx, media_group_id="g1")
     tg.run_steps((check_cmds.shop_photo, a), (check_cmds.shop_photo, b), ctx=ctx)
     texts = tg.sent_texts(ctx)
-    assert texts[-1].startswith("🛒 Check #") and "Ross tag: $14.99 · SKU 400289769542" in texts[-1]
-    assert "✅ BUY" in texts[-1]
+    assert texts[-1].startswith("🛒 ✅ BUY: 3 sales, 1 listing") and len(texts[-1].splitlines()) <= 5
+    details = next(d for _, d in tg.last_markup_buttons(ctx) if d.startswith("chk:details:"))
+    upd, ctx = tg.make_callback_update(details, context=ctx)
+    tg.run(check_cmds.check_callback, upd, ctx)
+    assert "SKU 400289769542" in tg.sent_texts(ctx)[-1] and "Fees + ads" in tg.sent_texts(ctx)[-1]
     assert len(env) == 1 and env[0]["sold_cache_only"] is True        # one quick pricing run
     c = db.list_checks(limit=1)[0]
     assert (c["ross_sku"], c["ross_price"], c["verdict"], c["status"]) == ("400289769542", 14.99, "BUY", "checked")
@@ -106,7 +109,7 @@ def test_album_with_a_tag_is_one_saved_check_and_no_item(env, monkeypatch):
     assert (check_cmds.CHECKS_DIR / str(c["check_id"]) / "2.jpg").exists()
     assert len(db.list_items()) == before                          # not an item
     labels = [d.split(":")[1] for _, d in tg.last_markup_buttons(ctx)]
-    assert labels == ["full", "any", "bought"]
+    assert labels == ["full", "any", "bought", "details"]
 
 
 def test_no_tag_asks_the_price_then_a_typed_number_runs_the_check(env, monkeypatch):
@@ -185,7 +188,7 @@ def test_quick_no_data_goes_straight_on_to_full_and_counts_once(env, monkeypatch
 def test_typed_check_is_saved_too(env):
     upd, ctx = tg.make_text_update("/check Coach Tabby 26 CH857 shoulder bag 14.99")
     tg.run(check_cmds.check_command, upd, ctx)
-    assert "Check #" in tg.sent_texts(ctx)[-1] and "Mode: quick · exact matches" in tg.sent_texts(ctx)[-1]
+    assert "#" in tg.sent_texts(ctx)[-1] and "quick · exact" in tg.sent_texts(ctx)[-1]
     c = db.list_checks(limit=1)[0]
     assert c["ross_price"] == 14.99 and c["verdict"] and c["photos"] is None
 
@@ -197,7 +200,7 @@ def test_full_and_any_buttons_update_the_same_check(env):
     full = next(d for _, d in tg.last_markup_buttons(ctx) if d.startswith("chk:full:"))
     upd2, ctx = tg.make_callback_update(full, context=ctx)
     tg.run(check_cmds.check_callback, upd2, ctx)
-    assert env[-1]["sold_cache_only"] is False and tg.sent_texts(ctx)[-1].count("Mode: full") == 1
+    assert env[-1]["sold_cache_only"] is False and "full · exact" in tg.sent_texts(ctx)[-1]
     assert [c["check_id"] for c in db.list_checks(limit=5)].count(cid) == 1 and db.get_check(cid)["mode"] == "full"
     anyb = next(d for _, d in tg.last_markup_buttons(ctx) if d.startswith("chk:any:"))
     upd3, ctx = tg.make_callback_update(anyb, context=ctx)

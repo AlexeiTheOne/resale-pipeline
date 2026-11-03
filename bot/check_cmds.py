@@ -154,10 +154,10 @@ async def _close_batch(user_id: int, wait: float) -> None:
     if roles["price"] is None:
         await _ask_price(user_id, message, check_id, roles, note)
         return
-    req = {"description": "", "ross_price": roles["price"], "exact": True, "full": False}
-    tag = f"\n🏷 Ross tag: ${roles['price']:.2f} · SKU {roles['sku']}" if roles["sku"] else ""
+    req = {"description": "", "ross_price": roles["price"], "ross_sku": roles["sku"], "exact": True,
+           "full": False}
     await _run(user_id, message, req, _pricing_photo(roles), check_id=check_id, roles=roles,
-               note=note + tag, guard=False)
+               note=note, guard=False)
 
 
 def _pricing_photo(roles: dict) -> str | None:
@@ -195,7 +195,8 @@ async def _price_given(user_id: int, message, check_id: int, price: float) -> No
         except Exception:
             traceback.print_exc()
     await asyncio.to_thread(db.update_check, check_id, ross_price=price)
-    req = {"description": "", "ross_price": price, "exact": True, "full": False}
+    req = {"description": "", "ross_price": price, "ross_sku": w["roles"].get("sku"), "exact": True,
+           "full": False}
     if ident:
         req["identification"] = ident
     await _run(user_id, w["message"], req, _pricing_photo(w["roles"]), check_id=check_id, roles=w["roles"],
@@ -236,7 +237,7 @@ def _markup(token: str, req: dict, bought: bool = False) -> InlineKeyboardMarkup
                                     callback_data=f"chk:{'any' if req.get('exact', True) else 'exact'}:{token}"))
     if not bought:
         row.append(InlineKeyboardButton("🛍 Bought", callback_data=f"chk:bought:{token}"))
-    return InlineKeyboardMarkup([row])
+    return InlineKeyboardMarkup([row, [InlineKeyboardButton("Details", callback_data=f"chk:details:{token}")]])
 
 
 def _identify_one(path: str) -> dict:
@@ -301,15 +302,18 @@ async def _run(user_id: int, message, req: dict, photo: str | None, *, check_id:
             await asyncio.to_thread(db.update_check, check_id, **check.check_fields(res))
         except Exception:
             traceback.print_exc()
-        text = f"{shop}Check #{check_id}{note}\n" + check.format_reply(res)
         used += 1
+        footer = note.strip(" ()")
         if used >= config.CHECK_DAILY_WARN:
-            text += f"\n({used} of {config.CHECK_DAILY_MAX} checks used today)"
+            footer = " · ".join(x for x in (footer, f"{used}/{config.CHECK_DAILY_MAX} today") if x)
+        text = check.format_reply(res, check_id=check_id, prefix=shop, footer=footer)
         token = secrets.token_hex(4)
         saved = {k: v for k, v in req.items() if k != "auto_full"}
         saved["identification"] = res["identification"]     # buttons don't re-identify
         state.checks[token] = {"req": saved, "photo": photo, "user": user_id, "ts": time.time(),
-                               "check_id": check_id}
+                               "check_id": check_id,
+                               "details": check.format_details(res, check_id=check_id,
+                                                               sku=req.get("ross_sku"))}
         markup = _markup(token, req)
         if sent:
             try:
@@ -347,6 +351,7 @@ async def photo_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         req["ross_price"] = roles["price"]
     await asyncio.to_thread(db.update_check, check_id, photos=[config.stored_path(p) for p in paths],
                             ross_sku=roles["sku"], ross_price=req["ross_price"])
+    req["ross_sku"] = roles["sku"]
     await _run(user_id, message, req, paths[0], check_id=check_id, roles=roles)
 
 
@@ -364,6 +369,10 @@ async def check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     saved = state.checks.get(token)
     if not saved:
         await util._safe_reply(query.message, "That check has expired. Send it again.")
+        return
+    if action == "details":
+        await util._safe_reply(query.message, saved.get("details") or "No details kept for this check.",
+                               disable_web_page_preview=True)
         return
     if action == "bought":
         await asyncio.to_thread(db.set_check_status, saved["check_id"], "bought")

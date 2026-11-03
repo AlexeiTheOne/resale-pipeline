@@ -184,7 +184,8 @@ def verdict(*, profit: float | None, roi: float | None, sales: int,
                       or profit_at_cheapest >= config.CHECK_MIN_PROFIT_AT_CHEAPEST))
     evidence = []
     if sales < config.CHECK_MIN_SALES:
-        evidence.append(f"only {sales} matching sale(s) (need {config.CHECK_MIN_SALES})")
+        evidence.append("no sales found" if sales == 0 else
+                        f"only {sales} sale{'s' if sales > 1 else ''} (need {config.CHECK_MIN_SALES})")
     if from_asks:
         evidence.append("priced from asking prices, not sales")
     if low_confidence:
@@ -224,20 +225,29 @@ def choose_price(pricing: dict, exact: bool) -> dict:
         sold = sorted(c["total"] for c in judged if c.get("source") == "sold"
                       and c.get("verdict") == "same_item" and c.get("total"))
         out = {"price": price, "basis": "same-item sales", "sales": len(sold), "from_asks": False,
-               "sold_median": pricing.get("sold_median"), "disagrees": False}
+               "sold_median": pricing.get("sold_median"), "disagrees": False, "ask_discount": None}
         if price is None and pricing.get("raw_active_floor"):
-            item = pricing["raw_active_floor"] * (1 - config.UNDERCUT_V2_PCT) - ship
+            # Asking prices only: the cheapest identical ask, less the measured
+            # ask-to-sold gap (CHECK_ASK_DISCOUNT) and our usual undercut.
+            item = (pricing["raw_active_floor"] * config.CHECK_ASK_DISCOUNT
+                    * (1 - config.UNDERCUT_V2_PCT) - ship)
             if item > 0:
                 out.update(price=_charm(item), basis="cheapest identical listing (asking price)",
-                           from_asks=True)
+                           from_asks=True, ask_discount=config.CHECK_ASK_DISCOUNT)
         return out
     sold = sorted(c["total"] for c in judged if c.get("source") == "sold"
                   and c.get("verdict") in ("same_item", "variant") and c.get("total"))
     flags = pricing.get("review_flags") or []
-    return {"price": pricing.get("suggested_price"), "basis": "Claude's estimate (same item + variants)",
-            "sales": len(sold), "from_asks": "priced_from_asks" in flags,
+    from_asks = "priced_from_asks" in flags
+    price = pricing.get("suggested_price")
+    if from_asks and price:
+        price = _charm(price * config.CHECK_ASK_DISCOUNT)
+    return {"price": price, "basis": "Claude's estimate (same item + variants)"
+                                     + (" from asking prices" if from_asks else ""),
+            "sales": len(sold), "from_asks": from_asks,
             "sold_median": round(statistics.median(sold), 2) if sold else None,
-            "disagrees": "formula_disagrees" in flags}
+            "disagrees": "formula_disagrees" in flags,
+            "ask_discount": config.CHECK_ASK_DISCOUNT if from_asks else None}
 
 
 def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
@@ -265,19 +275,57 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
             "money": money, "cheapest_total": cheapest, "at_cheapest": at_cheapest}
 
 
-def already_have(ident: dict) -> list[str]:
-    """Our items with the same UPC or brand + model (read only)."""
-    from pipeline import stages
+def _norm_code(v) -> str:
+    return re.sub(r"\W", "", str(v or "")).lower()
+
+
+def stock_keys(*, upc=None, model=None, brand=None, sku=None) -> set:
+    """What makes two things the same product for the in-stock warning: the
+    UPC, a style/model code (it looks like one: digits and letters), brand +
+    model, or the Ross SKU (Ross reuses SKUs now and then, so that one says
+    "similar", see stages.same_item_keys)."""
+    from pipeline import gtin as gtin_mod
+    keys = set()
+    gtin = gtin_mod.product_gtin(upc)
+    if gtin:
+        keys.add(("UPC", gtin))
+    code = _norm_code(model)
+    if len(code) >= 5 and _looks_like_code(code):
+        keys.add(("code", code))
+    b = _norm_code(brand)
+    if b and len(code) >= 4:
+        keys.add(("model", f"{b}:{code}"))
+    if sku and len(str(sku)) == 12:
+        keys.add(("Ross SKU", str(sku)))
+    return keys
+
+
+def already_have(ident: dict, sku: str | None = None) -> list[str]:
+    """Items and pieces (home inventory) that look like the same product: an
+    in-stock warning before buying another (read only)."""
     import db
-    mine = stages.same_item_keys({"identification": ident})
+    mine = stock_keys(upc=ident.get("upc"), model=ident.get("model") or ident.get("style_code"),
+                      brand=ident.get("brand"), sku=sku)
     if not mine:
         return []
     out = []
-    for other in db.list_items():
-        if other.get("status") in ("rejected", "failed"):
+    for p in db.list_pieces():
+        if p.get("status") in ("sold", "donated"):
             continue
-        if mine & stages.same_item_keys(other):
-            out.append(f"{other['item_id'][:8]} ({other.get('status')})")
+        info = p.get("info") or {}
+        theirs = stock_keys(upc=info.get("upc"), model=info.get("style_code") or info.get("model"),
+                            brand=info.get("brand"), sku=info.get("ross_code"))
+        if mine & theirs:
+            what = " ".join(str(info[k]) for k in ("brand", "item_type") if info.get(k))
+            out.append(f"piece {p['code']}" + (f" ({what}, {p.get('status')})" if what else ""))
+    for it in db.list_items():
+        if it.get("status") in ("rejected", "failed"):
+            continue
+        i = it.get("identification") or {}
+        theirs = stock_keys(upc=i.get("upc"), model=i.get("model") or i.get("style_code"),
+                            brand=i.get("brand"), sku=(it.get("receipt") or {}).get("code"))
+        if mine & theirs:
+            out.append(f"item {it['item_id'][:8]} ({it.get('status')})")
     return out
 
 
@@ -316,12 +364,13 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
     ev = evaluate(pricing, ident, req.get("ross_price"), bool(req.get("exact", True)), text,
                   quick=not full)
     try:
-        have = have_fn(ident)
+        have = have_fn(ident, req.get("ross_sku"))
     except Exception:            # advisory only
         have = []
     timings["total_s"] = round(time.perf_counter() - t0, 2)
     return {"request": dict(req), "photo": bool(photo_path), "identification": ident,
             **ev, "already_have": have, "timings": timings,
+            "confidence": pricing.get("claude_confidence"),
             "sold_cache_misses": pricing.get("sold_cache_misses") or [],
             # up to 5 identical comps, saved with the check (comps_summary)
             "comps": [{k: c.get(k) for k in ("source", "verdict", "title", "total", "url")}
@@ -378,54 +427,133 @@ def _usd(x) -> str:
     return "-" if x is None else f"${x:,.2f}"
 
 
-def format_reply(res: dict) -> str:
-    req, money, pick = res["request"], res["money"], res["pick"]
-    ident = res["identification"]
-    lines = []
-    head = f"{ICON[res['verdict']]} {LABEL.get(res['verdict'], res['verdict'])}"
-    if money:
-        roi = f"{money['roi']:.0%}" if money["roi"] is not None else "-"
-        head += f": profit {_usd(money['profit'])} (ROI {roi})"
-    lines.append(head)
+CERTAINTY = {"high": "certain", "medium": "likely", "low": "uncertain"}
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def _sales_phrase(n: int) -> str:
+    return "no sales found" if not n else _plural(n, "sale")
+
+
+def _listings_phrase(res: dict) -> str:
+    m = res.get("same_item_active") or 0
+    if not m:
+        return "no identical listing for sale"
+    sure = "uncertain " if res.get("confidence") == "low" else ""
+    return f"{m} {sure}listing{'' if m == 1 else 's'}"
+
+
+def _item_name(res: dict) -> str:
+    ident, req = res["identification"], res["request"]
     name = " ".join(str(ident.get(k)) for k in ("brand", "product_name") if ident.get(k)) \
         or req.get("description") or "item"
-    lines.append(name[:120] + (f" ({ident['model']})" if ident.get("model") else ""))
-    mode = ("full" if req.get("full") else "quick") + " · " + ("exact matches" if req.get("exact", True) else "any matches")
-    lines.append(f"Mode: {mode}")
+    model = ident.get("model")
+    if model and _norm_code(model) not in _norm_code(name):    # no duplicated model number
+        name += f" ({model})"
+    return name[:90]
+
+
+def short_url(url: str | None) -> str:
+    """An eBay item link without its tracking: https://www.ebay.com/itm/<id>."""
+    m = re.search(r"/itm/(?:[^/?#]+/)?(\d{9,})", url or "")
+    return f"https://www.ebay.com/itm/{m.group(1)}" if m else (url or "")
+
+
+def search_links(res: dict) -> dict:
+    """eBay sold / active searches a person can open (as legacy/comps.py)."""
+    from urllib.parse import urlencode
+    ident = res["identification"]
+    q = ident.get("search_query") or " ".join(
+        str(ident.get(k)) for k in ("brand", "product_name") if ident.get(k)) or res["request"].get("description")
+    if not q:
+        return {}
+    base = {"_nkw": q, "LH_ItemCondition": "1000|1500", "LH_PrefLoc": 1}
+    return {"sold": "https://www.ebay.com/sch/i.html?" + urlencode({**base, "LH_Sold": 1, "LH_Complete": 1}),
+            "for sale": "https://www.ebay.com/sch/i.html?" + urlencode({**base, "_sop": 15})}
+
+
+def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", footer: str = "") -> str:
+    """At most 5 lines: verdict + why / item / cost · sell · profit /
+    evidence / check number, time, mode. The rest: format_details."""
+    req, money, pick = res["request"], res["money"], res["pick"]
+    v = res["verdict"]
+    sales = pick.get("sales") or 0
     if req.get("ross_price") is None:
-        lines.append("Ross price missing: add it as the last number, e.g. /check coach tabby 26 49.99")
+        why = "Ross price missing"
     else:
-        lines.append(f"Ross {_usd(req['ross_price'])} → cost {_usd(round(req['ross_price'] * (1 + config.SALES_TAX_RATE), 2))} "
-                     f"with {config.SALES_TAX_RATE:.0%} tax")
+        why = f"{_sales_phrase(sales)}, {_listings_phrase(res)}"
+    lines = [f"{prefix}{ICON[v]} {LABEL.get(v, v)}: {why}"]
+    line2 = _item_name(res)
+    if res.get("already_have"):
+        line2 += " · ⚠️ in stock: " + ", ".join(res["already_have"][:2])
+    lines.append(line2)
+    ross = req.get("ross_price")
     if money:
-        lines.append(f"Sell at {_usd(money['item_price'])} + {_usd(money['ship_charged'])} shipping "
-                     f"(buyer pays {_usd(money['total'])}); price from {pick['basis']}")
-        lines.append(f"  fees + ads {_usd(money['fees'])} · label {_usd(money['label'])} ({res['item_type']}) "
-                     f"· you keep {_usd(money['keep'])}")
-        lines.append(f"Break-even: {_usd(money['break_even_item'])} + shipping")
-    elif req.get("ross_price") is not None:
-        lines.append("No price: no matching sales or identical listings found.")
-    if res["cheapest_total"]:
-        line = f"Cheapest identical listing now: {_usd(res['cheapest_total'])} total"
-        if res["at_cheapest"]:
-            line += f" → profit there {_usd(res['at_cheapest']['profit'])}"
-        lines.append(line)
+        asks = pick.get("from_asks")
+        approx, tag = ("~", " (asking)") if asks else ("", "")
+        roi = f", ROI {money['roi']:.0%}" if money.get("roi") is not None and not asks else ""
+        lines.append(f"Ross {_usd(ross)} · sell {approx}{_usd(money['item_price'])}{tag} · "
+                     f"profit {approx}{_usd(money['profit'])}{tag}{roi}")
+    elif ross is not None:
+        lines.append(f"Ross {_usd(ross)} · no price found")
     else:
-        lines.append("No identical listing for sale right now.")
-    sales_kind = "same item" if req.get("exact", True) else "same item + variants"
-    sold_line = f"Sold ({sales_kind}): {pick['sales']}"
-    if pick.get("sold_median"):
-        sold_line += f" · median {_usd(pick['sold_median'])} total"
-    lines.append(sold_line)
-    if not req.get("full") and res["sold_cache_misses"]:
-        lines.append("Quick check: no recent sold data cached. Tap Full check for sales.")
-    for r in res["reasons"]:
-        lines.append(f"• {r}")
-    if res["already_have"]:
-        lines.append("⚠️ Already in our items: " + ", ".join(res["already_have"][:3]))
-    t = res["timings"]
-    lines.append(f"⏱ {t.get('total_s', 0):.0f}s")
+        lines.append("Add the Ross price as the last number, e.g. /check coach tabby 26 49.99")
+    cheapest = f" (cheapest {_usd(res['cheapest_total'])})" if res.get("cheapest_total") else ""
+    match = CERTAINTY.get(res.get("confidence"), "-")
+    lines.append(f"Evidence: sold {sales} · for sale {res.get('same_item_active') or 0} identical"
+                 f"{cheapest} · match {match}")
+    t = res["timings"].get("total_s", 0)
+    mode = ("full" if req.get("full") else "quick") + " · " + ("exact" if req.get("exact", True) else "any")
+    lines.append(" · ".join(x for x in (f"#{check_id}" if check_id else "", f"⏱ {t:.0f}s", mode, footer) if x))
     return "\n".join(lines)
+
+
+def format_details(res: dict, *, check_id: int | None = None, sku: str | None = None) -> str:
+    """Everything the short reply leaves out (the Details button)."""
+    req, money, pick = res["request"], res["money"], res["pick"]
+    ross = req.get("ross_price")
+    out = [f"Details{f' for check #{check_id}' if check_id else ''}: {_item_name(res)}"]
+    if ross is not None:
+        out.append(f"Ross {_usd(ross)}" + (f" · SKU {sku}" if sku else "")
+                   + f" → cost {_usd(round(ross * (1 + config.SALES_TAX_RATE), 2))} with "
+                     f"{config.SALES_TAX_RATE:.0%} tax")
+    if money:
+        out.append(f"Sell at {_usd(money['item_price'])} + {_usd(money['ship_charged'])} shipping "
+                   f"(buyer pays {_usd(money['total'])}), price from {pick['basis']}")
+        if pick.get("ask_discount"):
+            out.append(f"  asking prices only: ×{pick['ask_discount']} (our sold/ask gap)"
+                       + (f" and −{config.UNDERCUT_V2_PCT:.0%} undercut" if "cheapest" in pick['basis'] else ""))
+        out.append(f"Fees + ads {_usd(money['fees'])} ({_fee_rate():.1%} + ${config.EBAY_FIXED_FEE:.2f}) · "
+                   f"label {_usd(money['label'])} ({res.get('item_type')}) · you keep {_usd(money['keep'])}")
+        roi = f"{money['roi']:.0%}" if money.get("roi") is not None else "-"
+        out.append(f"Profit {_usd(money['profit'])} · ROI {roi} · break-even {_usd(money['break_even_item'])} "
+                   f"+ shipping")
+    if res.get("cheapest_total"):
+        at = res.get("at_cheapest") or {}
+        out.append(f"Cheapest identical for sale: {_usd(res['cheapest_total'])} total"
+                   + (f" → profit there {_usd(at.get('profit'))}" if at else ""))
+    if pick.get("sold_median"):
+        out.append(f"Sold median: {_usd(pick['sold_median'])} total")
+    for r in res.get("reasons") or []:
+        out.append(f"• {r}")
+    for c in (res.get("comps") or [])[:3]:
+        out.append(f"• {c.get('source')} {_usd(c.get('total'))} ({c.get('verdict')}): "
+                   f"{(c.get('title') or '')[:60]} {short_url(c.get('url'))}".rstrip())
+    links = search_links(res)
+    if links:
+        out.append("eBay: " + " · ".join(f"{k} {u}" for k, u in links.items()))
+    t = res["timings"]
+    parts = [f"{k[:-2]} {v:.0f}s" for k, v in t.items() if k.endswith("_s") and k != "total_s"]
+    model = res.get("judge_model") or "-"
+    out.append(f"Time: {' · '.join(parts) or '-'} · model {model}{' (escalated)' if res.get('escalated') else ''}")
+    if not req.get("full") and res.get("sold_cache_misses"):
+        out.append("Quick check: no recent sold data cached; Full check searches sales.")
+    if res.get("warnings"):
+        out.append(f"Warnings: {str(res['warnings'])[:300]}")
+    return "\n".join(out)
 
 
 # --- timings log and daily cap ----------------------------------------------------------
