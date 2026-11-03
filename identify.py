@@ -122,9 +122,17 @@ RESEARCH_PROMPT = (
     "   - color code (often a 3-digit suffix after the style number, e.g. '971' = a "
     "specific color combo)\n"
     "   - size, material, and any printed retail/original price.\n"
+    "   - SEWN-IN LABELS too (size, care and content labels inside shoes, collars, "
+    "seams), above all when there is no hang tag. They often print the style code "
+    "and the brand's own short product name on one line, e.g. "
+    "'AB01234567/AB RUNNER W' = style AB01234567, brand initials AB, product "
+    "'Runner', W = women's. The style code there counts as the SKU/Style number. "
+    "Factory or lot lines (e.g. 'J027-0526-CITY', 'RN 12345', 'CA 01234') are "
+    "not style codes. Brand initials are a lead: confirm the brand by searching "
+    "the style code.\n"
     "2. Look it up, UPC first. Search the UPC barcode number against product "
     "databases to get the exact product name. Then search the style number + color "
-    "code, then the brand + visual features on eBay. Determine the real product "
+    "code (also from a sewn-in label), then the brand + visual features on eBay. Determine the real product "
     "line / marketing name buyers actually use (e.g. 'Large Summer Spring Tote "
     "Crossbody', 'Shopper Tote') — never settle for a generic description like "
     "'Canvas Tote Bag' if a real product name exists. Combine the tag codes with "
@@ -178,7 +186,7 @@ FORMAT_INSTRUCTIONS = (
     "{\n"
     '  "brand": "brand name or null",\n'
     '  "item_type": "e.g. handbag, sneakers, blanket, blouse",\n'
-    '  "model": "style/SKU number if known or null",\n'
+    '  "model": "style/SKU number (from a hang tag or a sewn-in label) if known or null",\n'
     '  "upc": "manufacturer UPC/EAN from the product label (digits only) or null; '
     'never the Ross price-tag code starting 400",\n'
     '  "product_name": "the real product-line / marketing name buyers search for, '

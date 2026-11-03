@@ -223,9 +223,44 @@ def _baseline(con: sqlite3.Connection) -> None:
     """)
 
 
+def _checks_table(con: sqlite3.Connection) -> None:
+    """/check pre-buy checks (docs/check-command-design.md, section 00). Not
+    items: one row per thing looked at in a shop."""
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS checks (
+            check_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id            INTEGER,
+            created_at         TEXT NOT NULL,
+            updated_at         TEXT NOT NULL,
+            ross_sku           TEXT,
+            ross_price         REAL,
+            photos             TEXT,
+            identification     TEXT,
+            mode               TEXT,
+            exact              INTEGER,
+            verdict            TEXT,
+            suggested_price    REAL,
+            profit             REAL,
+            roi                REAL,
+            break_even         REAL,
+            cheapest_identical REAL,
+            sold_count         INTEGER,
+            comps_summary      TEXT,
+            status             TEXT NOT NULL DEFAULT 'checked'
+                               CHECK (status IN ('checked', 'bought', 'skipped')),
+            status_at          TEXT,
+            receipt_item_id    INTEGER,
+            item_id            TEXT
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_checks_sku ON checks (ross_sku)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_checks_created ON checks (created_at)")
+
+
 # (version, name, function). Append only.
 MIGRATIONS = [
     (1, "baseline", _baseline),
+    (2, "checks_table", _checks_table),
 ]
 
 
@@ -996,10 +1031,45 @@ def _mssql_receipt_unique(cur) -> None:
                 "ON dbo.ReceiptItems (ReceiptID, LineIndex)")
 
 
+def _mssql_checks_table(cur) -> None:
+    """/check pre-buy checks (docs/schema-proposal.md 1E, check-command-design
+    section 00). No FKs: a check outlives a deleted item or receipt line, like
+    listing_stats; receipt_item_id / item_id are filled by later steps."""
+    cur.execute("""
+    CREATE TABLE dbo.checks (
+        check_id           INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_checks PRIMARY KEY,
+        user_id            BIGINT        NULL,
+        created_at         DATETIME2(6)  NOT NULL CONSTRAINT DF_checks_created_at DEFAULT SYSUTCDATETIME(),
+        updated_at         DATETIME2(6)  NOT NULL CONSTRAINT DF_checks_updated_at DEFAULT SYSUTCDATETIME(),
+        ross_sku           VARCHAR(20)   NULL,
+        ross_price         DECIMAL(10,2) NULL,
+        photos             NVARCHAR(MAX) NULL CONSTRAINT CK_checks_photos_json CHECK (ISJSON(photos) = 1),
+        identification     NVARCHAR(MAX) NULL CONSTRAINT CK_checks_ident_json CHECK (ISJSON(identification) = 1),
+        mode               VARCHAR(10)   NULL,
+        exact              BIT           NULL,
+        verdict            VARCHAR(12)   NULL,
+        suggested_price    DECIMAL(10,2) NULL,
+        profit             DECIMAL(10,2) NULL,
+        roi                DECIMAL(8,2)  NULL,
+        break_even         DECIMAL(10,2) NULL,
+        cheapest_identical DECIMAL(10,2) NULL,
+        sold_count         INT           NULL,
+        comps_summary      NVARCHAR(MAX) NULL CONSTRAINT CK_checks_comps_json CHECK (ISJSON(comps_summary) = 1),
+        status             VARCHAR(10)   NOT NULL CONSTRAINT DF_checks_status DEFAULT 'checked'
+                           CONSTRAINT CK_checks_status CHECK (status IN ('checked', 'bought', 'skipped')),
+        status_at          DATETIME2(6)  NULL,
+        receipt_item_id    INT           NULL,
+        item_id            VARCHAR(36)   NULL
+    )""")
+    cur.execute("CREATE INDEX IX_checks_ross_sku ON dbo.checks (ross_sku)")
+    cur.execute("CREATE INDEX IX_checks_created_at ON dbo.checks (created_at)")
+
+
 # (version, name, function). Append only.
 MSSQL_MIGRATIONS = [
     (1, "resaledb_baseline", _mssql_baseline),
     (2, "receipt_unique_indexes", _mssql_receipt_unique),
+    (3, "checks_table", _mssql_checks_table),
 ]
 # The production migration copies the receipts into a database at this
 # version: the unique indexes (step 2) come after the receipt cleanup.

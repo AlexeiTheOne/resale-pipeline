@@ -160,7 +160,7 @@ def test_unique_indexes_wait_for_the_cleanup(v1, raw_dir, tmp_path):
     try:
         con.execute("DELETE FROM dbo.ReceiptItems WHERE ItemID = 31")  # the person's decision on 196
         con.commit()
-        assert migrations.migrate_mssql(con) == [2]
+        assert migrations.migrate_mssql(con)[0] == 2      # the unique indexes, then any later steps
         # the receipt bot's double submit now hits the index (it replies "already saved")
         with pytest.raises(pyodbc.IntegrityError) as e:
             con.execute("INSERT INTO dbo.Receipts (ReceiptNumber) VALUES ('0433-01-6531-6002-2')")

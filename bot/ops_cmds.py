@@ -346,6 +346,13 @@ HELP_SECTIONS = [
         ("(free text)", "At a gate: correct it (e.g. 'brand is Tommy Jeans, color navy'). At review: approve, reject, or a correction"),
         ("/cancel", "Discard photos being captured, or drop out of a gate"),
     ]),
+    ("Buying", [
+        ("/shop [off]", "Shopping mode for 3 h: every photo or album (item + Ross tag) is a pre-buy "
+                        "check, never a new item. /shop off to end"),
+        ("/check <item> <Ross $>", "Before buying: worth it? BUY/MAYBE/BORDERLINE/SKIP with profit after "
+                                   "fees, label and tax. Quick and exact matches by default; buttons for "
+                                   "Full check / Any matches. Or send a photo with caption /check <Ross $>"),
+    ]),
     ("Items", [
         ("/status [status|n|all]", "List items and their stage — the 20 most recent by default. "
                                    "Filter (/status published), widen (/status 50, /status all)"),

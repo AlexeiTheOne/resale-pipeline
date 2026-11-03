@@ -26,7 +26,7 @@ EXPECTED_COMMANDS = {
     "refreshdesc", "photos", "cover", "arrange", "stockphoto", "offers",
     "setprice", "setqty", "sync", "feedback", "activate", "promote",
     "pricecheck", "retry", "photocheck", "health", "usage", "auth", "whoami",
-    "help", "cancel",
+    "help", "cancel", "check", "shop",
 }
 # pattern -> callback function name
 EXPECTED_CALLBACKS = {
@@ -35,9 +35,14 @@ EXPECTED_CALLBACKS = {
     r"^reprice:": "reprice_callback",
     r"^qa:": "quick_add_callback",
     r"^invpost:": "inv_post_callback",
+    r"^chk:": "check_callback",
+    r"^chkp:": "price_callback",
 }
 # callback name -> substrings that must appear in the lowercased filters repr
 EXPECTED_MESSAGE_HANDLERS = {
+    "shop_photo": ("photo",),              # /shop mode, first
+    "photo_check": ("photo", "caption"),   # /check caption, before photo_handler
+    "price_text": ("text", "command"),     # a typed Ross price, before text_handler
     "photo_handler": ("photo",),
     "text_handler": ("text", "command", "inverted"),
 }

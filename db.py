@@ -294,6 +294,101 @@ def latest_stats(item_id: str) -> dict | None:
     return history[0] if history else None
 
 
+# --- /check pre-buy checks (docs/check-command-design.md, section 00) -----------
+# Not items: one row per thing looked at in a shop. Both backends return the
+# same dict: JSON columns decoded, money as float, exact as bool, times as UTC
+# ISO strings.
+
+CHECK_FIELDS = ("user_id", "ross_sku", "ross_price", "photos", "identification", "mode", "exact",
+                "verdict", "suggested_price", "profit", "roi", "break_even", "cheapest_identical",
+                "sold_count", "comps_summary", "status", "status_at", "receipt_item_id", "item_id")
+CHECK_JSON = ("photos", "identification", "comps_summary")
+CHECK_STATUSES = ("checked", "bought", "skipped")
+
+
+def _check_fields(fields: dict) -> dict:
+    bad = set(fields) - set(CHECK_FIELDS)
+    if bad:
+        raise ValueError(f"unknown check field(s): {sorted(bad)}")
+    if "status" in fields and fields["status"] not in CHECK_STATUSES:
+        raise ValueError(f"bad check status {fields['status']!r}")
+    return fields
+
+
+def _check_row(row: dict | None) -> dict | None:
+    if row is None:
+        return None
+    out = dict(row)
+    for k in CHECK_JSON:
+        if isinstance(out.get(k), str):
+            out[k] = json.loads(out[k])
+    if out.get("exact") is not None:
+        out["exact"] = bool(out["exact"])
+    return out
+
+
+def add_check(**fields) -> int:
+    """Save a new check; returns its check_id."""
+    if _on_sqlserver():
+        return _sqlserver().add_check(**fields)
+    _check_fields(fields)
+    now = _now()
+    row = {k: (json.dumps(v) if k in CHECK_JSON and v is not None else v) for k, v in fields.items()}
+    row.update(created_at=now, updated_at=now)
+    with _conn() as con:
+        cur = con.execute(f"INSERT INTO checks ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
+                          tuple(row.values()))
+        return cur.lastrowid
+
+
+def update_check(check_id: int, **fields) -> None:
+    """Change a check (a rerun's results, photos, status...)."""
+    if _on_sqlserver():
+        return _sqlserver().update_check(check_id, **fields)
+    _check_fields(fields)
+    if not fields:
+        return
+    row = {k: (json.dumps(v) if k in CHECK_JSON and v is not None else v) for k, v in fields.items()}
+    row["updated_at"] = _now()
+    with _conn() as con:
+        con.execute(f"UPDATE checks SET {', '.join(f'{k} = ?' for k in row)} WHERE check_id = ?",
+                    (*row.values(), check_id))
+
+
+def set_check_status(check_id: int, status: str) -> None:
+    update_check(check_id, status=status, status_at=_now())
+
+
+def get_check(check_id: int) -> dict | None:
+    if _on_sqlserver():
+        return _sqlserver().get_check(check_id)
+    with _conn() as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT * FROM checks WHERE check_id = ?", (check_id,)).fetchone()
+    return _check_row(dict(row) if row else None)
+
+
+def list_checks(*, user_id: int | None = None, status: str | None = None, sku: str | None = None,
+                since: str | None = None, limit: int = 100) -> list[dict]:
+    """Newest first. since: an ISO time (UTC)."""
+    if _on_sqlserver():
+        return _sqlserver().list_checks(user_id=user_id, status=status, sku=sku, since=since, limit=limit)
+    where, args = [], []
+    for col, val in (("user_id", user_id), ("status", status), ("ross_sku", sku)):
+        if val is not None:
+            where.append(f"{col} = ?")
+            args.append(val)
+    if since:
+        where.append("created_at >= ?")
+        args.append(datetime.fromisoformat(since.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat())
+    sql = "SELECT * FROM checks" + (" WHERE " + " AND ".join(where) if where else "") + \
+          " ORDER BY check_id DESC LIMIT ?"
+    with _conn() as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(sql, (*args, int(limit))).fetchall()
+    return [_check_row(dict(r)) for r in rows]
+
+
 
 def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> None:
     """Stamp a scheduled job as having just completed. Called after the work,

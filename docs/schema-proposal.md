@@ -458,6 +458,7 @@ Because it's a view, a flag clears by itself once the data is fixed.
 | taxonomy_cache | cache_key VARCHAR(200) PK, payload_raw NVARCHAR(MAX) JSON, fetched_at | | external API cache; JSON is fine |
 | schema_version | version INT PK, name VARCHAR(100), applied_at | | restarts at 1 for SQL Server |
 | app_settings | name VARCHAR(40) PK, value NVARCHAR(200), updated_at | | new. `db.py` writes `SALES_TAX_RATE` (config, default `0.07`) here at startup so views can use it. config.py stays the source of truth. |
+| checks | check_id INT IDENTITY PK, user_id BIGINT, created_at, updated_at, ross_sku VARCHAR(20), ross_price DECIMAL(10,2), photos NVARCHAR(MAX) JSON, identification NVARCHAR(MAX) JSON, mode VARCHAR(10), exact BIT, verdict VARCHAR(12), suggested_price, profit, break_even, cheapest_identical DECIMAL(10,2), roi DECIMAL(8,2), sold_count INT, comps_summary NVARCHAR(MAX) JSON, status VARCHAR(10) NOT NULL default checked, status_at, receipt_item_id INT null, item_id VARCHAR(36) null | index (ross_sku), (created_at); CHECK status IN (checked, bought, skipped) | new (migration step 3): every `/check` pre-buy check, not an item. `receipt_item_id` / `item_id` stay NULL until receipt matching and stock creation (docs/check-command-design.md) |
 
 `items.processed` is dropped: never written, NULL on all rows in dev. The
 migration checks that this is also true in production.

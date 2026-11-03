@@ -219,3 +219,22 @@ def search_by_image(image_path, *, limit: int = 50, category_ids=None,
     body = _call("POST", IMAGE_PATH, params=params,
                  json_body={"image": _encode_image(image_path)}, ship_to_zip=ship_to_zip)
     return [_normalise(s) for s in body.get("itemSummaries") or []]
+
+
+ITEM_PATH = "/buy/browse/v1/item/get_item_by_legacy_id"
+
+
+def listing_details(legacy_item_id: str) -> dict:
+    """One active listing's demand and seller facts (read only, app token):
+    when it was listed, units sold, the seller's feedback and the category
+    path. eBay does not give watchers for other sellers' listings."""
+    d = _call("GET", ITEM_PATH, params={"legacy_item_id": str(legacy_item_id)})
+    seller = d.get("seller") or {}
+    sold = None
+    for a in d.get("estimatedAvailabilities") or []:
+        if a.get("estimatedSoldQuantity") is not None:
+            sold = (sold or 0) + int(a["estimatedSoldQuantity"])
+    return {"legacy_item_id": str(legacy_item_id), "created": d.get("itemCreationDate"),
+            "sold_quantity": sold, "seller_feedback": seller.get("feedbackScore"),
+            "seller_username": seller.get("username"), "category_path": d.get("categoryPath") or "",
+            "title": d.get("title") or ""}

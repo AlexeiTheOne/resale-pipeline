@@ -320,6 +320,49 @@ ASSUMED_COST_RATIO = float(os.getenv("ASSUMED_COST_RATIO", "0.29"))
 # blended), likely tax-exempt items, so 7% slightly overstates a few costs.
 # Used by the SQL Server view v_item_cost (docs/schema-proposal.md).
 SALES_TAX_RATE = float(os.getenv("SALES_TAX_RATE", "0.07"))
+
+# --- /check: the pre-buy check (docs/check-command-design.md) ---------------
+# Verdict thresholds (design §5; Person B, 2026-11-02). Backtest them with
+# scripts/backtest_check.py before trusting them.
+CHECK_BUY_MIN_PROFIT = float(os.getenv("CHECK_BUY_MIN_PROFIT", "15"))
+CHECK_BUY_MIN_ROI = float(os.getenv("CHECK_BUY_MIN_ROI", "0.75"))
+CHECK_MIN_SALES = int(os.getenv("CHECK_MIN_SALES", "3"))
+CHECK_MIN_PROFIT = float(os.getenv("CHECK_MIN_PROFIT", "5"))
+CHECK_MIN_PROFIT_AT_CHEAPEST = float(os.getenv("CHECK_MIN_PROFIT_AT_CHEAPEST", "5"))
+# A price resting only on asking prices (no sales) is discounted by this, on
+# top of the usual UNDERCUT_V2_PCT. Measured 2026-11-02 on our own 44 sold
+# items: sold price / asking price, mean 0.98 (84% sold at the full ask).
+# Revisit with pilot outcomes from the checks table.
+CHECK_ASK_DISCOUNT = float(os.getenv("CHECK_ASK_DISCOUNT", "0.98"))
+# Checks per day (US Eastern), and when to warn.
+CHECK_DAILY_MAX = int(os.getenv("CHECK_DAILY_MAX", "50"))
+CHECK_DAILY_WARN = int(os.getenv("CHECK_DAILY_WARN", "40"))
+# Cached sold rows older than this are not used by /check (pricing for stored
+# items keeps any age until Person A agrees otherwise).
+CHECK_SOLD_CACHE_DAYS = float(os.getenv("CHECK_SOLD_CACHE_DAYS", "7"))
+# Dropship-style listings (copied Amazon titles, huge sellers, wrong
+# category): flagged on 2 signals, kept out of the sold evidence, still a
+# ceiling. A seller at or above this feedback score counts as one signal.
+CHECK_DROPSHIP_FEEDBACK = int(os.getenv("CHECK_DROPSHIP_FEEDBACK", "10000"))
+# Full check: look up this many identical listings (listing age, units sold).
+CHECK_DEMAND_LISTINGS = int(os.getenv("CHECK_DEMAND_LISTINGS", "3"))
+# Best Offer from the /check estimate (Person B, 2026-11-02): list at
+# estimate x LIST, auto-accept at x ACCEPT, auto-decline under x DECLINE.
+CHECK_BO_LIST = float(os.getenv("CHECK_BO_LIST", "1.25"))
+CHECK_BO_ACCEPT = float(os.getenv("CHECK_BO_ACCEPT", "1.05"))
+CHECK_BO_DECLINE = float(os.getenv("CHECK_BO_DECLINE", "0.90"))
+# Shipping label we pay, by item type: "type=dollars,..." Starting estimates;
+# correct them from real label costs. small_bags: slings, crossbodies, minis,
+# wallets (Person B, 2026-11-02: ~$5-6 Ground Advantage); bags: totes,
+# weekenders, duffels and any bag of unknown size. "other" is EBAY_SHIP_COST, the measured
+# average.
+CHECK_LABEL_COSTS = os.getenv(
+    "CHECK_LABEL_COSTS", f"bags=11.00,small_bags=5.50,jewelry=4.50,shoes=12.00,clothing=7.20,"
+                         f"other={EBAY_SHIP_COST:.2f}")
+# A bag counts as small (Ground Advantage, small_bags label) when no side is
+# over this many inches, or by name: sling, crossbody, mini, wallet ...
+CHECK_SMALL_BAG_MAX_IN = float(os.getenv("CHECK_SMALL_BAG_MAX_IN", "11"))
+
 # Smallest NET margin (after eBay fees, ad rate, and shipping) a repricing
 # suggestion may land on — never suggest a cut that sells at a loss.
 REPRICE_MIN_MARGIN_DOLLARS = float(os.getenv("REPRICE_MIN_MARGIN_DOLLARS", "5"))

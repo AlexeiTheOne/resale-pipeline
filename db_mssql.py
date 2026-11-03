@@ -464,6 +464,79 @@ def record_listing_stats(item_id, week, *, impressions=None, views=None, watcher
     _write(_upsert, "listing_stats", {"item_id": item_id, "week": dbmap.to_db(week, dbmap.DATE)[0]}, values)
 
 
+# --- /check pre-buy checks -------------------------------------------------------
+
+_CHECK_MONEY = ("ross_price", "suggested_price", "profit", "roi", "break_even", "cheapest_identical")
+_CHECK_TIMES = ("created_at", "updated_at", "status_at")
+
+
+def _check_encode(fields: dict) -> dict:
+    db._check_fields(fields)
+    row = {}
+    for k, v in fields.items():
+        if k in db.CHECK_JSON and v is not None:
+            v = json.dumps(v)
+        elif k == "status_at" and v is not None:
+            v = _ts(v)
+        row[k] = v
+    return row
+
+
+def _check_decode(row: dict | None) -> dict | None:
+    if row is None:
+        return None
+    out = dict(row)
+    for k in _CHECK_MONEY:
+        if out.get(k) is not None:
+            out[k] = float(out[k])
+    for k in _CHECK_TIMES:
+        if out.get(k) is not None:
+            out[k] = out[k].replace(tzinfo=timezone.utc).isoformat()
+    return db._check_row(out)
+
+
+def add_check(**fields) -> int:
+    row = _check_encode(fields)
+
+    def go(cur):
+        cols = ", ".join(row) if row else None
+        if cols:
+            cur.execute(f"INSERT INTO dbo.checks ({cols}) OUTPUT INSERTED.check_id "
+                        f"VALUES ({', '.join('?' * len(row))})", *row.values())
+        else:
+            cur.execute("INSERT INTO dbo.checks OUTPUT INSERTED.check_id DEFAULT VALUES")
+        return int(cur.fetchone()[0])
+    return _write(go)
+
+
+def update_check(check_id: int, **fields) -> None:
+    row = _check_encode(fields)
+    if not row:
+        return
+    _write(lambda cur: cur.execute(
+        f"UPDATE dbo.checks SET {', '.join(f'{k} = ?' for k in row)}, updated_at = SYSUTCDATETIME() "
+        "WHERE check_id = ?", *row.values(), check_id))
+
+
+def get_check(check_id: int) -> dict | None:
+    rows = _query("SELECT * FROM dbo.checks WHERE check_id = ?", check_id)
+    return _check_decode(rows[0]) if rows else None
+
+
+def list_checks(*, user_id=None, status=None, sku=None, since=None, limit: int = 100) -> list[dict]:
+    where, args = [], []
+    for col, val in (("user_id", user_id), ("status", status), ("ross_sku", sku)):
+        if val is not None:
+            where.append(f"{col} = ?")
+            args.append(val)
+    if since:
+        where.append("created_at >= ?")
+        args.append(_ts(since))
+    sql = (f"SELECT TOP ({int(limit)}) * FROM dbo.checks"
+           + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY check_id DESC")
+    return [_check_decode(r) for r in _query(sql, *args)]
+
+
 def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> None:
     _write(_upsert, "job_runs", {"job": job}, {"last_run_at": _ts(_now()), "status": status, "detail": detail})
 

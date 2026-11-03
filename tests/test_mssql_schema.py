@@ -123,7 +123,7 @@ def cur(mssql):
 
 def test_baseline_is_recorded_and_rerun_does_nothing(mssql, cur):
     cur.execute("SELECT version, name FROM dbo.schema_version ORDER BY version")
-    assert [tuple(r) for r in cur.fetchall()] == [(1, "resaledb_baseline"), (2, "receipt_unique_indexes")]
+    assert [tuple(r) for r in cur.fetchall()] == [(v, n) for v, n, _ in migrations.MSSQL_MIGRATIONS]
     assert migrations.migrate_mssql(mssql) == []
 
 
@@ -142,7 +142,7 @@ def test_every_constraint_is_trusted_and_enabled(cur):
 
 def test_doc_parser_sees_the_whole_design():
     tables, views = parse_doc_tables()
-    assert len(tables) == 35, sorted(tables)  # 34 + schema_version
+    assert len(tables) == 36, sorted(tables)  # 34 + schema_version + checks (step 3)
     assert set(views) == {"v_item_sales", "v_item_cost", "v_items", "v_receipt_checks"}
     # Every table's columns are parsed, except the receipt tables, which the doc
     # defines as "same as ReceiptsDB" (checked against RECEIPTSDB below).

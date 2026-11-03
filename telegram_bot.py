@@ -66,6 +66,9 @@ from bot.inventory_cmds import (  # noqa: E402,F401  (re-export)
     inv_command, _inv_photo, _inv_process, inv_post_callback, _inv_done, where_command, move_command,
     mark_command, ghosts_command, list_command,
 )
+from bot.check_cmds import (  # noqa: E402,F401  (re-export)
+    check_command, photo_check, check_callback, shop_command, shop_photo, price_callback, price_text,
+)
 from bot.photos_cmds import (  # noqa: E402,F401  (re-export)
     _resync_photos, _send_photo_index, photos_command, _apply_photo_order, _photo_args,
     cover_command, arrange_command, stockphoto_command, photocheck_command,
