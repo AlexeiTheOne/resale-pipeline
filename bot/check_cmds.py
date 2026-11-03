@@ -148,6 +148,8 @@ async def _close_batch(user_id: int, wait: float) -> None:
     await asyncio.to_thread(db.update_check, check_id, photos=[config.stored_path(p) for p in paths],
                             ross_sku=roles["sku"], ross_price=roles["price"])
     note = f" (only the first {MAX_PHOTOS} photos are used; {extra} ignored)" if extra > 0 else ""
+    if roles.get("price_source") == "vision":
+        note += " (Ross price read from the tag by AI: check it)"
     if roles["price"] is None and batch.get("price"):
         roles["price"] = batch["price"]
         await asyncio.to_thread(db.update_check, check_id, ross_price=roles["price"])

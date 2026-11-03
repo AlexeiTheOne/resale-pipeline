@@ -607,13 +607,21 @@ def _resolve(p) -> str | None:
 
 def gather_candidates(ident: dict, photo_paths=None, *, sold_max_age_s: float | None = None,
                       sold_cache_only: bool = False,
-                      active_max_age_s: float | None = None) -> dict:
+                      active_max_age_s: float | None = None,
+                      extra_sold_queries: list | None = None) -> dict:
     """Fetch (cached) and normalise every candidate. Returns candidates plus
     per-source counts, the queries used and any fetch errors.
-    The freshness arguments are for /check (pipeline/check.py); intake and
-    repricing leave them at their defaults (any cached copy, live fetches)."""
+    The freshness arguments and extra_sold_queries ([(name, query)], e.g. the
+    UPC and a similar-items query) are for /check (pipeline/check.py); intake
+    and repricing leave them at their defaults."""
     our_ship = config.EBAY_SHIP_CHARGED
     queries = sold_queries(ident)
+    seen_q = {q.lower() for _, q in queries}
+    for name, q in extra_sold_queries or []:
+        q = _clean(q)
+        if q and q.lower() not in seen_q:
+            seen_q.add(q.lower())
+            queries.append((name, q))
     aq, gtin = active_query(ident), upc_of(ident)
     photo = next((p for p in map(_resolve, photo_paths or []) if p), None)
     errors, skipped = [], []
@@ -703,7 +711,8 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
                    item_id: str | None = None, ask=None, stage: str = JUDGE_STAGE,
                    escalate: bool = True, sold_max_age_s: float | None = None,
                    sold_cache_only: bool = False,
-                   active_max_age_s: float | None = None) -> dict:
+                   active_max_age_s: float | None = None,
+                   extra_sold_queries: list | None = None) -> dict:
     """Claude's price is the suggested price. The formula over same_item sold
     comps is a cross-check: only computed with >= PRICE_THIN_MIN_COMPS of them,
     and a gap over FORMULA_DISAGREE_PCT is flagged for review with both numbers.
@@ -724,7 +733,8 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
         store = {"error": f"{type(e).__name__}: {e}"}
     t = time.perf_counter()
     g = gather_candidates(ident, photo_paths, sold_max_age_s=sold_max_age_s,
-                          sold_cache_only=sold_cache_only, active_max_age_s=active_max_age_s)
+                          sold_cache_only=sold_cache_only, active_max_age_s=active_max_age_s,
+                          extra_sold_queries=extra_sold_queries)
     timings = {"comps_s": round(time.perf_counter() - t, 2)}
     cands = g["candidates"]
     warnings, flags = list(g["errors"]), []

@@ -217,6 +217,28 @@ def _charm(x: float) -> float:
     return round(max(round(x) - 0.01, 0.99), 2)
 
 
+def similar_queries(ident: dict) -> list[tuple[str, str]]:
+    """Extra sold searches for a full check: the brand's UPC, then similar
+    items (brand + item type, e.g. "Juicy Couture Weekender Tote Bag")."""
+    out = []
+    upc = re.sub(r"\D", "", str(ident.get("upc") or ""))
+    if len(upc) in (12, 13, 14):
+        out.append(("upc", upc))
+    brand, kind = (str(ident.get(k) or "").strip() for k in ("brand", "item_type"))
+    if brand and kind:
+        out.append(("similar", f"{brand} {kind}"))
+    return out
+
+
+def similar_sold(pricing: dict) -> dict:
+    """Sold comps the judge called a variant (same line, other colour/size):
+    the similar-items figures, shown next to exact matches."""
+    t = sorted(c["total"] for c in pricing.get("judged_comps") or []
+               if c.get("source") == "sold" and c.get("verdict") == "variant" and c.get("total"))
+    return {"n": len(t), "median": round(statistics.median(t), 2) if t else None,
+            "low": t[0] if t else None, "high": t[-1] if t else None}
+
+
 def choose_price(pricing: dict, exact: bool) -> dict:
     """Which price, which sales count, from the pricing result (design §3)."""
     judged = pricing.get("judged_comps") or []
@@ -277,7 +299,8 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
             v, why = NO_DATA, (["the quick check found no recent sales and no identical listing"] if quick
                                else ["no sales and no identical listing found: not enough data for a verdict"])
     return {"item_type": kind, "label": label, "verdict": v, "reasons": why, "pick": pick,
-            "money": money, "cheapest_total": cheapest, "at_cheapest": at_cheapest}
+            "money": money, "cheapest_total": cheapest, "at_cheapest": at_cheapest,
+            "similar": similar_sold(pricing)}
 
 
 def _norm_code(v) -> str:
@@ -362,7 +385,7 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
         ident, photo_paths=[photo_path] if photo_path else None, item_id=None,
         stage="check_judge" if full else "check_quick_judge", escalate=full,
         sold_cache_only=not full, sold_max_age_s=config.CHECK_SOLD_CACHE_DAYS * 86400,
-        active_max_age_s=0)
+        active_max_age_s=0, extra_sold_queries=similar_queries(ident) if full else None)
     for k, v in (pricing.get("timings") or {}).items():
         if k != "total_s":
             timings[k] = v
@@ -401,17 +424,69 @@ def check_fields(res: dict) -> dict:
                               "warnings": (res.get("warnings") or "")[:500] or None}}
 
 
-def photo_roles(paths: list[str], decode=None) -> dict:
-    """Which photo is the Ross tag: the first whose barcode reads as a Ross
-    code (12-digit SKU + price in cents). No AI. Returns the SKU, the price,
-    the tag photo and the photos for identification (the tag too when it is
-    the only photo)."""
-    if decode is None:
-        import ross_tag
+# Barcode angles to try, most likely first: a tag photographed sideways (90/270),
+# upside down, or a markdown sticker stuck on at a slant. Check #2's REDUCED
+# sticker read only at 30-45 degrees.
+BARCODE_ANGLES = (0, 90, 270, 180, 30, -30, 45, -45, 15, -15, 60, -60)
+BARCODE_BUDGET_S = 6.0
 
-        def decode(p):
-            return ross_tag.parse_barcode(ross_tag.decode_barcode(p))
-    tag, sku, price = None, None, None
+
+def read_ross_barcode(path: str, budget_s: float = BARCODE_BUDGET_S) -> dict:
+    """{"code", "reduced_price"} from a Ross barcode anywhere in the photo, or
+    {}. Plain decode first (ross_tag.decode_barcode), then rotations of the
+    whole photo, then at double size, until the time budget runs out. Local,
+    no AI."""
+    import ross_tag
+    digits = ross_tag.decode_barcode(path)
+    if not digits:
+        try:
+            from PIL import Image, ImageOps
+            img = ImageOps.grayscale(ImageOps.exif_transpose(Image.open(path)))
+        except Exception:
+            return {}
+        deadline = time.perf_counter() + budget_s
+        for scale in (1, 2):
+            base = img if scale == 1 else img.resize((img.size[0] * 2, img.size[1] * 2))
+            for angle in BARCODE_ANGLES:
+                if time.perf_counter() > deadline:
+                    break
+                try:
+                    found = ross_tag._zbar_decode(base.rotate(angle, expand=True, fillcolor=255),
+                                                  symbols=ross_tag._TAG_ZBAR_SYMBOLS)
+                except Exception:
+                    continue
+                for res in found:
+                    d = re.sub(r"\D", "", res.data.decode("utf-8", "ignore"))
+                    if len(d) >= 12:
+                        digits = d
+                        break
+                if digits:
+                    break
+            if digits:
+                break
+    parsed = ross_tag.parse_barcode(digits) if digits else {}
+    return parsed if parsed.get("code") else {}
+
+
+def read_ross_vision(path: str) -> dict:
+    """Last resort: the vision model reads the printed tag (ross_tag's own
+    fallback). Its prompt takes the REDUCED price over "Original $"."""
+    import ross_tag
+    return ross_tag.vision_read_tag(path) or {}
+
+
+def photo_roles(paths: list[str], decode=None, vision=None) -> dict:
+    """Which photo is the Ross tag, the SKU and the Ross price.
+    1. Barcode (read_ross_barcode, with rotations; no AI) on every photo: the
+       first that reads as a Ross code (12-digit SKU + price in cents) wins.
+    2. None read: the vision model reads the printed prices (REDUCED sticker
+       over "Original $") on each photo, tag-looking ones first, until one
+       gives a price.
+    The other photos go to identification (the tag too when it's the only
+    photo); all photos are scanned for UPC/style codes."""
+    decode = decode or read_ross_barcode
+    vision = vision or read_ross_vision
+    tag, sku, price, source = None, None, None, None
     for p in paths:
         try:
             parsed = decode(p) or {}
@@ -419,11 +494,27 @@ def photo_roles(paths: list[str], decode=None) -> dict:
             parsed = {}
         code = parsed.get("code")
         if code and len(str(code)) == 12:
-            tag, sku, price = p, str(code), parsed.get("reduced_price")
+            tag, sku, price, source = p, str(code), parsed.get("reduced_price"), "barcode"
             break
+    if price is None:
+        def tagness(p):
+            try:
+                import ross_tag
+                return 0 if ross_tag.looks_like_tag(p) else 1
+            except Exception:
+                return 1
+        for p in ([tag] if tag else sorted(paths, key=tagness)):
+            try:
+                got = vision(p) or {}
+            except Exception:
+                got = {}
+            if got.get("reduced_price"):
+                tag, price, source = p, got["reduced_price"], "vision"
+                sku = sku or got.get("code")
+                break
     others = [p for p in paths if p != tag]
-    return {"tag": tag, "sku": sku, "price": price, "identify": others or ([tag] if tag else []),
-            "scan": list(paths)}
+    return {"tag": tag, "sku": sku, "price": price, "price_source": source,
+            "identify": others or ([tag] if tag else []), "scan": list(paths)}
 
 
 # --- reply -------------------------------------------------------------------------------
@@ -508,8 +599,13 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
         lines.append("Add the Ross price as the last number, e.g. /check coach tabby 26 49.99")
     cheapest = f" (cheapest {_usd(res['cheapest_total'])})" if res.get("cheapest_total") else ""
     match = CERTAINTY.get(res.get("confidence"), "-")
+    sim = res.get("similar") or {}
+    similar = ""
+    if req.get("exact", True) and sim.get("n"):
+        rng = (f"{_usd(sim['low'])}–{_usd(sim['high'])}, " if sim["n"] > 1 else "")
+        similar = f" · similar sold {sim['n']} ({rng}median {_usd(sim['median'])})"
     lines.append(f"Evidence: sold {sales} · for sale {res.get('same_item_active') or 0} identical"
-                 f"{cheapest} · match {match}")
+                 f"{cheapest}{similar} · match {match}")
     t = res["timings"].get("total_s", 0)
     mode = ("full" if req.get("full") else "quick") + " · " + ("exact" if req.get("exact", True) else "any")
     lines.append(" · ".join(x for x in (f"#{check_id}" if check_id else "", f"⏱ {t:.0f}s", mode, footer) if x))

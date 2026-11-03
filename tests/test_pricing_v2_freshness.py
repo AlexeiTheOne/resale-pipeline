@@ -79,6 +79,23 @@ def test_quick_mode_uses_only_cached_sold_rows(cache, monkeypatch):
     assert g["candidates"] == [] and g["sold_cache_misses"] and not g["errors"]
 
 
+def test_extra_sold_queries_are_added_once(cache, monkeypatch):
+    asked = []
+    monkeypatch.setattr(v2, "fetch_sold", lambda q, count=None, **kw: asked.append(q) or [])
+    monkeypatch.setattr(v2, "fetch_active", lambda q=None, gtin=None, **kw: [])
+    monkeypatch.setattr(v2, "own_listings", lambda: (set(), set()))
+    ident = {"brand": "Juicy Couture", "product_name": "Juicy To Go Weekender Tote",
+             "search_query": "juicy to go weekender tote"}
+    g = v2.gather_candidates(ident, extra_sold_queries=[("upc", "885919782199"),
+                                                        ("similar", "Juicy Couture Weekender Tote Bag"),
+                                                        ("dup", "JUICY TO GO WEEKENDER TOTE")])
+    assert "885919782199" in asked and "Juicy Couture Weekender Tote Bag" in asked
+    assert len(asked) == len(set(q.lower() for q in asked)) and len(g["queries"]) == len(asked)
+    asked.clear()
+    v2.gather_candidates(ident)                                   # intake/repricing: unchanged
+    assert "885919782199" not in asked
+
+
 def test_stored_item_pricing_has_no_check_diagnostics(monkeypatch):
     monkeypatch.setattr(v2, "get_pricing_v2", lambda *a, **k: {
         "suggested_price": 10, "timings": {"total_s": 1}, "sold_cache_misses": []})

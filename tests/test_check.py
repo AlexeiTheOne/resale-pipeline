@@ -241,6 +241,66 @@ def test_sale_wording():
     assert check.verdict(profit=20, roi=1, sales=2, profit_at_cheapest=None)[1] == ["only 2 sales (need 3)"]
 
 
+# --- reading the Ross tag (check #2's real photo is the fixture) ---------------------------------
+
+FIXTURE = config.BASE_DIR / "test_images" / "check_ross_tag_rotated_juicy.jpg"
+
+
+def test_rotated_reduced_sticker_barcode_is_read_without_ai():
+    """Check #2: the main tag is turned 90 degrees and the REDUCED sticker is at
+    an angle; the plain decoder read nothing. The sticker's barcode reads once
+    rotated: SKU 400303734907, $9.99 (not the 'Original $44.99')."""
+    pytest.importorskip("pyzbar")
+    import ross_tag
+    assert ross_tag.decode_barcode(str(FIXTURE)) is None           # what failed before
+    assert check.read_ross_barcode(str(FIXTURE)) == {"code": "400303734907", "reduced_price": 9.99}
+
+
+def test_vision_reads_the_price_only_when_no_barcode_reads(tmp_path):
+    a, b = str(tmp_path / "item.jpg"), str(tmp_path / "tag.jpg")
+    seen = []
+
+    def vision(p):
+        seen.append(p)
+        return {"reduced_price": 9.99, "original_price": 44.99} if p == b else {}
+    roles = check.photo_roles([a, b], decode=lambda p: {}, vision=vision)
+    assert (roles["price"], roles["price_source"], roles["tag"], roles["identify"]) == (9.99, "vision", b, [a])
+    seen.clear()
+    roles = check.photo_roles([a, b], decode=lambda p: {"code": "400303734907", "reduced_price": 9.99}
+                              if p == b else {}, vision=vision)
+    assert roles["price_source"] == "barcode" and seen == []          # no AI when the barcode reads
+
+
+# --- full check: UPC and similar-items searches, the similar line -------------------------------
+
+def test_full_check_searches_the_upc_and_similar_items():
+    ident = {"brand": "Juicy Couture", "item_type": "Weekender Tote Bag", "upc": "885919782199",
+             "model": "11JCDA0JC-JTL", "product_name": "Juicy To Go Weekender Tote"}
+    assert check.similar_queries(ident) == [("upc", "885919782199"),
+                                            ("similar", "Juicy Couture Weekender Tote Bag")]
+    seen = []
+    req = {**check.parse_request("/check full 9.99"), "identification": ident}
+    check.run_check(req, pricing_fn=lambda i, **kw: seen.append(kw) or pricing(), have_fn=lambda *a: [])
+    check.run_check({**req, "full": False}, pricing_fn=lambda i, **kw: seen.append(kw) or pricing(),
+                    have_fn=lambda *a: [])
+    assert seen[0]["extra_sold_queries"] == check.similar_queries(ident)
+    assert seen[1]["extra_sold_queries"] is None                       # quick: cache only, no new searches
+
+
+def test_similar_items_line_in_exact_mode():
+    judged = [{"source": "sold", "verdict": "variant", "total": t} for t in (30.49, 35.0, 42.0)] + \
+             [{"source": "active", "verdict": "same_item", "total": 104.05}]
+    res = check.run_check(check.parse_request("/check full juicy to go weekender tote 9.99"),
+                          pricing_fn=lambda i, **kw: pricing(formula_price=None, raw_active_floor=104.05,
+                                                             judged_comps=judged),
+                          have_fn=lambda *a: [])
+    evidence = check.format_reply(res).splitlines()[3]
+    assert "similar sold 3 ($30.49–$42.00, median $35.00)" in evidence
+    res_any = check.run_check(check.parse_request("/check any full juicy to go weekender tote 9.99"),
+                              pricing_fn=lambda i, **kw: pricing(judged_comps=judged), have_fn=lambda *a: [])
+    assert "similar sold" not in check.format_reply(res_any)      # any mode already counts them
+
+
 # --- in-stock warning: items AND pieces (production has piece O1W-01) ---------------------------
 
 def _mk_piece():

@@ -60,7 +60,8 @@ def tag_on(monkeypatch, tag_index=None, sku="400289769542", price=14.99):
         if tag_index is not None and path.endswith(f"{tag_index}.jpg"):
             return {"code": sku, "reduced_price": price}
         return {"code": None, "reduced_price": None}
-    monkeypatch.setattr(check, "photo_roles", lambda paths, decode_=None: real(paths, decode=decode))
+    monkeypatch.setattr(check, "photo_roles",
+                        lambda paths, decode_=None: real(paths, decode=decode, vision=lambda p: {}))
 
 
 def shop_on(ctx=None):
