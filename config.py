@@ -340,6 +340,12 @@ CHECK_DAILY_WARN = int(os.getenv("CHECK_DAILY_WARN", "40"))
 # Cached sold rows older than this are not used by /check (pricing for stored
 # items keeps any age until Person A agrees otherwise).
 CHECK_SOLD_CACHE_DAYS = float(os.getenv("CHECK_SOLD_CACHE_DAYS", "7"))
+# Dropship-style listings (copied Amazon titles, huge sellers, wrong
+# category): flagged on 2 signals, kept out of the sold evidence, still a
+# ceiling. A seller at or above this feedback score counts as one signal.
+CHECK_DROPSHIP_FEEDBACK = int(os.getenv("CHECK_DROPSHIP_FEEDBACK", "10000"))
+# Full check: look up this many identical listings (listing age, units sold).
+CHECK_DEMAND_LISTINGS = int(os.getenv("CHECK_DEMAND_LISTINGS", "3"))
 # Shipping label we pay, by item type: "type=dollars,..." Starting estimates;
 # correct them from real label costs. "other" is EBAY_SHIP_COST, the measured
 # average.

@@ -101,6 +101,8 @@ def pricing(**kw):
 def no_history(monkeypatch):
     """Our own sales (levels 3-4) come from the DB; tests pass them in explicitly."""
     monkeypatch.setattr(check, "load_our_sales", lambda: [])
+    from ebay import browse
+    monkeypatch.setattr(browse, "listing_details", lambda i: (_ for _ in ()).throw(AssertionError("Browse")))
 
 
 def test_ladder_level1_same_item_sales_median_and_the_ceiling():
@@ -396,6 +398,89 @@ def test_judge_verdict_counts_are_logged(tmp_path):
     path = tmp_path / "t.jsonl"
     check.log_timings(res, user_id=1, path=path)
     assert '"judge_verdicts": {"same_item": 1, "variant": 1, "wrong": 2}' in path.read_text(encoding="utf-8")
+
+
+# --- comps with dates, demand, dropship flag (Person B's part C) ---------------------------------
+
+DROPSHIP_JUICY = {"ebay_id": "117471801433", "source": "active", "verdict": "same_item", "total": 104.05,
+                  "title": "Juicy Couture Men's Juicy To Go Weekender Bag, Stylish & Versatile Tote for E...",
+                  "seller": "buytheworld999", "seller_feedback": 16206,
+                  "url": "https://www.ebay.com/itm/117471801433?hash=x"}
+DROPSHIP_DETAILS = {"117471801433": {"created": "2026-06-08T10:00:00.000Z", "sold_quantity": 0,
+                                     "seller_feedback": 16208, "category_path": "Baby|Diapering|Diaper Bags",
+                                     "title": DROPSHIP_JUICY["title"]}}
+NOW = check.datetime(2026, 11, 2, tzinfo=check.timezone.utc)
+
+
+def test_dropship_signals_on_the_two_real_listings():
+    juicy = {**DROPSHIP_JUICY, "category_path": "Baby|Diapering|Diaper Bags"}
+    assert check.dropship_signals(juicy, "bags") == ["copied title", "seller 16,206 feedback",
+                                                     "category Diapering > Diaper Bags"]
+    assert check.is_dropship(juicy, "bags")
+    hey_dude = {"title": "Hey Dude Wendy Sequin Slip On Shoes Women's Size 8 Silver", "seller_feedback": 4267,
+                "category_path": "Clothing, Shoes & Accessories|Women|Women's Shoes|Flats"}
+    assert check.dropship_signals(hey_dude, "shoes") == [] and not check.is_dropship(hey_dude, "shoes")
+    # one signal alone is not a flag: big sellers are not all dropshippers
+    assert not check.is_dropship({"title": "Coach Tabby 26", "seller_feedback": 50000}, "bags")
+
+
+def test_dropship_sales_are_left_out_of_the_price():
+    fake = {"source": "sold", "verdict": "same_item", "total": 30.0, "seller_feedback": 20000,
+            "title": "Juicy Couture Weekender Bag for Women, Large Capacity Travel Tote"}
+    real = [{"source": "sold", "verdict": "same_item", "total": t} for t in (60.0, 70.0)]
+    pick = check.choose_price(pricing(raw_active_floor=None, judged_comps=real + [fake]), exact=True, ident=JUICY)
+    assert pick["sales"] == 2 and pick["levels"][1]["value"] == 55.12 and pick["dropship_excluded"] == 1
+
+
+def test_demand_lookup_reads_the_cheapest_identical_listings_only():
+    judged = [{"ebay_id": str(i), "source": "active", "verdict": "same_item", "total": t}
+              for i, t in ((1, 90.0), (2, 70.0), (3, 80.0), (4, 60.0))] +              [{"ebay_id": "9", "source": "active", "verdict": "variant", "total": 10.0},
+              {"ebay_id": "8", "source": "sold", "verdict": "same_item", "total": 5.0}]
+    asked = []
+
+    def details(i):
+        asked.append(i)
+        if i == "3":
+            raise RuntimeError("404")
+        return {"created": "2026-10-01T00:00:00Z", "sold_quantity": 1}
+    got = check.demand_lookup({"judged_comps": judged}, details_fn=details)
+    assert sorted(asked) == ["2", "3", "4"] and sorted(got) == ["2", "4"]
+
+
+def test_comp_list_sold_newest_first_then_listings_cheapest_with_flags():
+    judged = [{"ebay_id": "a", "source": "sold", "verdict": "variant", "total": 30.49, "date": "2026-09-01T00:00:00Z"},
+              {"ebay_id": "b", "source": "sold", "verdict": "same_item", "total": 61.0, "date": "2026-10-12T00:00:00Z"},
+              {"ebay_id": "c", "source": "sold", "verdict": "wrong", "total": 5.0},
+              DROPSHIP_JUICY,
+              {"ebay_id": "d", "source": "image", "verdict": "same_item", "total": 99.0, "title": "Juicy tote"}]
+    rows = check.comp_list({"judged_comps": judged}, "bags", True, DROPSHIP_DETAILS)
+    assert [r["ebay_id"] for r in rows] == ["b", "a", "d", "117471801433"]
+    assert rows[3]["dropship"] and not rows[2]["dropship"] and rows[3]["units_sold"] == 0
+    assert check.demand_summary(rows, now=NOW) == "1 for sale 146d, 0 sold"
+    line = check.comp_line(rows[3], now=NOW)
+    assert line.startswith("for sale $104.05 · listed 146d, 0 sold · same item · ⚠️ dropship? copied title, "
+                           "seller 16,208 feedback, category Diapering > Diaper Bags (ceiling only)")
+    assert line.endswith("https://www.ebay.com/itm/117471801433")
+    assert check.comp_line(rows[0]).startswith("sold $61.00 · 2026-10-12 · same item")
+
+
+def test_full_check_shows_demand_and_every_comp_quick_looks_nothing_up():
+    judged = [{"ebay_id": "a", "source": "sold", "verdict": "variant", "total": 30.49,
+               "date": "2026-09-01T00:00:00Z", "url": "https://www.ebay.com/itm/111111111111"},
+              DROPSHIP_JUICY]
+    asked = []
+    run = lambda text: check.run_check(  # noqa: E731
+        check.parse_request(text), pricing_fn=lambda i, **kw: pricing(raw_active_floor=104.05, judged_comps=judged),
+        have_fn=lambda *a: [], details_fn=lambda i: asked.append(i) or DROPSHIP_DETAILS[i])
+    quick = run("/check juicy to go weekender tote bag 9.99")
+    assert asked == [] and quick["demand"] is None
+    res = run("/check full juicy to go weekender tote bag 9.99")
+    assert asked == ["117471801433"] and res["demand"].startswith("1 for sale ")
+    assert res["demand"] in check.format_reply(res).splitlines()[3]
+    details = check.format_details(res)
+    assert "Comps used" in details and "sold $30.49 · 2026-09-01 · same model" in details
+    assert "⚠️ dropship?" in details and "https://www.ebay.com/itm/111111111111" in details
+    assert res["comps"][1]["dropship"] is True and res["comps"][0]["date"] == "2026-09-01T00:00:00Z"
 
 
 # --- in-stock warning: items AND pieces (production has piece O1W-01) ---------------------------

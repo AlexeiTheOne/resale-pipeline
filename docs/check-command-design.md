@@ -116,10 +116,32 @@ charge.
 - **Any mode:** variants count as level 1.
 - **BUY** still needs `CHECK_MIN_SALES` eBay sales. A price estimated from
   levels 2–4 says so ("~ … (est.)") and gives at most MAYBE.
-- **The evidence line** shows each level found, with ✓ on the ones used:
-  "L1 sold 0 · L2 similar $20.61 (1)✓ · L4 MSRP×ratio $50.99✓ · L5 ask ≤$92.09".
-  Details lists every level with its numbers.
+- **The evidence line** shows each level found, in plain words and whole
+  dollars: "0 sold same · 1 sold same model $21 · our Juicy Couture bags ~$58
+  (12d) · MSRP×47% $51 · ask ≤$92 · 1 for sale 146d, 0 sold". Level 3 adds
+  our median days to sell. Details lists every level with its numbers.
 - **The backtest** leaves each item's own sale out of levels 3–4.
+
+### Comps, demand and dropship listings (part C)
+
+- **Details lists every comp used**, each with its link: eBay sold (same
+  item and same model, newest first, with the sale date), then identical
+  listings for sale (cheapest first). At most 12 lines, then "… and N more".
+- **Demand (full check only):** eBay's item lookup (Browse, app token, read
+  only, free) on the `CHECK_DEMAND_LISTINGS` (3) cheapest identical listings
+  gives the listing date, units sold, seller feedback and category. The
+  evidence line ends with "N for sale 12–146d, 0 sold". **eBay gives no
+  watcher counts** for other sellers' listings: not in Browse, not in Trading
+  GetItem (tested on 117471801433 and 298394126856), and the listing page
+  blocks scripts.
+- **Dropship-style listings** are flagged on **2 of 3 signals**: a copied
+  title (ends in "..." or has two Amazon phrases like "for women", "large
+  capacity", "stylish & versatile"); a seller with at least
+  `CHECK_DROPSHIP_FEEDBACK` (10,000) feedback; a category outside the item's
+  department (a bag under Baby > Diaper Bags). Sold rows have no category, so
+  they need both of the other two. Flagged sales are left out of levels 1–2;
+  flagged listings still count for the ceiling. Details shows the flag and
+  its signals.
 
 ## 0. Decisions (Person B's review, 2026-11-02). These override the sections below.
 

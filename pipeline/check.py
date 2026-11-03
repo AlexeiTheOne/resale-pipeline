@@ -243,6 +243,116 @@ def similar_sold(pricing: dict) -> dict:
             "low": t[0] if t else None, "high": t[-1] if t else None}
 
 
+# --- dropship-style listings and demand (Person B, 2026-11-02) ---------------------------
+
+# Phrases of titles copied from Amazon (two of them make one signal).
+_AMAZON_PHRASES = ("for women", "for men", "for girls", "for boys", "large capacity", "gift for",
+                   "gifts for", "perfect for", "suitable for", "ideal for", "stylish & versatile",
+                   "stylish and versatile", "multi-pocket", "with multiple", "with compartments")
+# Where an item of each label kind belongs on eBay (the first part of the category path).
+_ROOTS = {"bags": "clothing, shoes & accessories", "shoes": "clothing, shoes & accessories",
+          "clothing": "clothing, shoes & accessories", "jewelry": "jewelry & watches"}
+
+
+def dropship_signals(comp: dict, kind: str) -> list[str]:
+    """Why a listing looks dropshipped (2+ signals = flagged): a copied title
+    (cut off with "..." or Amazon phrases), a very high-volume seller, a
+    category that does not fit the item (a bag under Baby > Diaper Bags)."""
+    out = []
+    title = (comp.get("title") or "").strip()
+    low = title.lower()
+    if title.endswith(("...", "…")) or sum(p in low for p in _AMAZON_PHRASES) >= 2:
+        out.append("copied title")
+    fb = comp.get("seller_feedback")
+    if fb is not None and fb >= config.CHECK_DROPSHIP_FEEDBACK:
+        out.append(f"seller {fb:,} feedback")
+    path = (comp.get("category_path") or "").strip()
+    root = _ROOTS.get(kind)
+    if path and root and path.split("|")[0].strip().lower() != root:
+        out.append("category " + " > ".join(x.strip() for x in path.split("|")[-2:]))
+    return out
+
+
+def is_dropship(comp: dict, kind: str) -> bool:
+    return len(dropship_signals(comp, kind)) >= 2
+
+
+def _age_days(iso, now: datetime | None = None):
+    try:
+        t = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return max(0, int(((now or datetime.now(timezone.utc)) - t).total_seconds() // 86400))
+
+
+def demand_lookup(pricing: dict, *, details_fn=None, limit: int | None = None) -> dict:
+    """Full check: eBay's facts on the cheapest identical listings (listed
+    since, units sold, seller, category), by legacy id. Read only, app token;
+    a failed lookup is skipped. eBay gives no watcher counts for listings
+    that are not ours."""
+    from concurrent.futures import ThreadPoolExecutor
+    from ebay import browse
+    details_fn = details_fn or browse.listing_details
+    limit = config.CHECK_DEMAND_LISTINGS if limit is None else limit
+    ids = []
+    for c in sorted((c for c in pricing.get("judged_comps") or []
+                     if c.get("source") != "sold" and c.get("verdict") == "same_item" and c.get("total")),
+                    key=lambda c: c["total"]):
+        if c.get("ebay_id") and c["ebay_id"] not in ids:
+            ids.append(c["ebay_id"])
+    ids = ids[:limit]
+
+    def one(i):
+        try:
+            return i, details_fn(i)
+        except Exception:
+            return i, None
+    if not ids:
+        return {}
+    with ThreadPoolExecutor(max_workers=len(ids)) as pool:
+        return {i: d for i, d in pool.map(one, ids) if d}
+
+
+def comp_list(pricing: dict, kind: str, exact: bool, details: dict | None = None) -> list[dict]:
+    """Every comp the price used: sold same item and same model (newest
+    first), then identical listings for sale (cheapest first). Dropship-style
+    listings are flagged: out of the sold evidence, still in the ceiling."""
+    details = details or {}
+    sold_v = ("same_item", "variant")
+    out = []
+    for c in pricing.get("judged_comps") or []:
+        src = "sold" if c.get("source") == "sold" else "active"
+        if not c.get("total") or (src == "sold" and c.get("verdict") not in sold_v)                 or (src == "active" and c.get("verdict") != "same_item"):
+            continue
+        d = details.get(c.get("ebay_id")) or {}
+        row = {k: c.get(k) for k in ("ebay_id", "verdict", "title", "total", "url", "date",
+                                     "seller", "seller_feedback")}
+        row["status"] = src
+        if d:
+            row.update(title=d.get("title") or row["title"], category_path=d.get("category_path"),
+                       listed=d.get("created"), units_sold=d.get("sold_quantity"),
+                       seller_feedback=d.get("seller_feedback") if d.get("seller_feedback") is not None
+                       else row["seller_feedback"])
+            row["date"] = row["date"] or d.get("created")
+        row["signals"] = dropship_signals(row, kind)
+        row["dropship"] = len(row["signals"]) >= 2
+        out.append(row)
+    sold = sorted((r for r in out if r["status"] == "sold"), key=lambda r: str(r.get("date") or ""), reverse=True)
+    active = sorted((r for r in out if r["status"] == "active"), key=lambda r: r["total"])
+    return sold + active
+
+
+def demand_summary(comps: list[dict], now: datetime | None = None) -> str | None:
+    """"3 for sale 12–147d, 0 sold" from the looked-up identical listings."""
+    rows = [r for r in comps if r["status"] == "active" and r.get("listed")]
+    if not rows:
+        return None
+    ages = sorted(a for a in (_age_days(r["listed"], now) for r in rows) if a is not None)
+    sold = sum(r.get("units_sold") or 0 for r in rows)
+    span = f"{ages[0]}d" if len(ages) == 1 else f"{ages[0]}–{ages[-1]}d"
+    return f"{len(rows)} for sale {span}, {sold} sold"
+
+
 LEVEL_NAMES = {1: "eBay sold, same item", 2: "eBay sold, same model other colour/size",
                3: "our own sales, same brand + type", 4: "MSRP × brand ratio",
                5: "eBay asking prices (ceiling only)"}
@@ -293,7 +403,11 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
     the cheapest identical listing). Any mode counts variants as level 1."""
     from pipeline import msrp
     ident = ident or {}
-    judged = pricing.get("judged_comps") or []
+    kind = item_type_of(ident)
+    all_judged = pricing.get("judged_comps") or []
+    # Dropship-style sold rows are not evidence of what a buyer pays us.
+    judged = [c for c in all_judged if c.get("source") != "sold" or not is_dropship(c, kind)]
+    dropped = len(all_judged) - len(judged)
     ship = config.EBAY_SHIP_CHARGED
     same_v = ("same_item", "variant") if not exact else ("same_item",)
     same = sorted(c["total"] for c in judged if c.get("source") == "sold"
@@ -351,7 +465,8 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
     return {"price": price, "basis": basis + (", capped at the asking-price ceiling" if capped else ""),
             "levels": levels, "used": used, "capped": capped, "range": spread,
             "sales": len(same), "from_asks": False, "estimated": bool(used) and 1 not in used,
-            "sold_median": _median(same), "disagrees": False, "ask_discount": None}
+            "sold_median": _median(same), "disagrees": False, "ask_discount": None,
+            "dropship_excluded": dropped}
 
 
 def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
@@ -441,7 +556,7 @@ def already_have(ident: dict, sku: str | None = None) -> list[str]:
 
 
 def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, identify_fn=None,
-              have_fn=None) -> dict:
+              have_fn=None, details_fn=None) -> dict:
     """Identify (photo or text), price, money, verdict. Returns everything the
     reply and the timings log need. Raises only on programming errors; API
     failures come back as pricing warnings."""
@@ -477,6 +592,12 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
             timings[k] = v
     ev = evaluate(pricing, ident, req.get("ross_price"), bool(req.get("exact", True)), text,
                   quick=not full)
+    details = {}
+    if full:           # listing age and units sold of the cheapest identical listings
+        t = time.perf_counter()
+        details = demand_lookup(pricing, details_fn=details_fn)
+        timings["demand_s"] = round(time.perf_counter() - t, 2)
+    comps = comp_list(pricing, ev["item_type"], bool(req.get("exact", True)), details)
     try:
         have = have_fn(ident, req.get("ross_sku"))
     except Exception:            # advisory only
@@ -486,10 +607,11 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
             **ev, "already_have": have, "timings": timings,
             "confidence": pricing.get("claude_confidence"),
             "sold_cache_misses": pricing.get("sold_cache_misses") or [],
-            # up to 5 identical comps, saved with the check (comps_summary)
-            "comps": [{k: c.get(k) for k in ("source", "verdict", "title", "total", "url")}
-                      for c in (pricing.get("judged_comps") or [])
-                      if c.get("verdict") in ("same_item", "variant")][:5],
+            # every comp used (Details); the first 5 are saved with the check
+            "comp_list": comps, "demand": demand_summary(comps),
+            "comps": [{"source": c["status"], **{k: c.get(k) for k in ("verdict", "title", "total", "url",
+                                                                       "date", "dropship")}}
+                      for c in comps][:5],
             "same_item_active": pricing.get("same_item_active_count"),
             "reference": pricing.get("reference"), "warnings": pricing.get("comp_warning"),
             "judge_model": pricing.get("judge_model"), "escalated": pricing.get("judge_escalated"),
@@ -686,6 +808,8 @@ def ladder_line(pick: dict, res: dict) -> str:
         parts.append(f"MSRP×{r:.0%} {_whole(levels[4]['value'])}" if r else f"MSRP×ratio {_whole(levels[4]['value'])}")
     if 5 in levels:
         parts.append(f"ask ≤{_whole(levels[5]['value'])}" + (" (cap)" if pick.get("capped") else ""))
+    if res.get("demand"):
+        parts.append(res["demand"])
     return " · ".join(parts)
 
 
@@ -725,6 +849,28 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
     mode = ("full" if req.get("full") else "quick") + " · " + ("exact" if req.get("exact", True) else "any")
     lines.append(" · ".join(x for x in (f"#{check_id}" if check_id else "", f"⏱ {t:.0f}s", mode, footer) if x))
     return "\n".join(lines)
+
+
+COMP_LINES = 12
+VERDICT_WORDS = {"same_item": "same item", "variant": "same model"}
+
+
+def comp_line(c: dict, now: datetime | None = None) -> str:
+    """"sold $30.49 · 2026-10-12 · same model · <title> <link>"; listings for
+    sale add their age and units sold, and a dropship flag."""
+    bits = [f"{'sold' if c.get('status') == 'sold' else 'for sale'} {_usd(c.get('total'))}"]
+    if c.get("status") == "sold":
+        if c.get("date"):
+            bits.append(str(c["date"])[:10])
+    else:
+        age = _age_days(c.get("listed"), now)
+        if age is not None:
+            bits.append(f"listed {age}d" + (f", {c['units_sold']} sold" if c.get("units_sold") is not None else ""))
+    bits.append(VERDICT_WORDS.get(c.get("verdict"), c.get("verdict") or "-"))
+    if c.get("dropship"):
+        bits.append("⚠️ dropship? " + ", ".join(c.get("signals") or [])
+                    + (" (left out)" if c.get("status") == "sold" else " (ceiling only)"))
+    return " · ".join(bits) + f" · {(c.get('title') or '')[:50]} {short_url(c.get('url'))}".rstrip()
 
 
 def format_details(res: dict, *, check_id: int | None = None, sku: str | None = None) -> str:
@@ -767,9 +913,17 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
         out.append(f"Sold median: {_usd(pick['sold_median'])} total")
     for r in res.get("reasons") or []:
         out.append(f"• {r}")
-    for c in (res.get("comps") or [])[:3]:
-        out.append(f"• {c.get('source')} {_usd(c.get('total'))} ({c.get('verdict')}): "
-                   f"{(c.get('title') or '')[:60]} {short_url(c.get('url'))}".rstrip())
+    rows = res.get("comp_list")
+    if rows is None:            # an older saved result
+        rows = [{"status": c.get("source"), **c} for c in res.get("comps") or []]
+    if rows:
+        out.append("Comps used (totals with shipping; tap to open):")
+    for c in rows[:COMP_LINES]:
+        out.append("  " + comp_line(c))
+    if len(rows) > COMP_LINES:
+        out.append(f"  … and {len(rows) - COMP_LINES} more")
+    if pick.get("dropship_excluded"):
+        out.append(f"  {pick['dropship_excluded']} dropship-style sale(s) left out of the price")
     links = search_links(res)
     if links:
         out.append("eBay: " + " · ".join(f"{k} {u}" for k, u in links.items()))
