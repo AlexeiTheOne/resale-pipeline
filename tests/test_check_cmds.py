@@ -100,7 +100,8 @@ def test_album_with_a_tag_is_one_saved_check_and_no_item(env, monkeypatch):
     b, ctx = tg.make_photo_update(context=ctx, media_group_id="g1")
     tg.run_steps((check_cmds.shop_photo, a), (check_cmds.shop_photo, b), ctx=ctx)
     texts = tg.sent_texts(ctx)
-    assert texts[-1].startswith("🛒 ✅ BUY: 3 sales, 1 listing") and len(texts[-1].splitlines()) <= 5
+    assert texts[-1].startswith("🛒 ✅ BUY: 3 sales, 1 listing") and len(texts[-1].splitlines()) <= 8
+    assert '🔎 <a href="https://www.ebay.com/sch/' in texts[-1]          # sent as HTML, links tappable
     details = next(d for _, d in tg.last_markup_buttons(ctx) if d.startswith("chk:details:"))
     upd, ctx = tg.make_callback_update(details, context=ctx)
     tg.run(check_cmds.check_callback, upd, ctx)

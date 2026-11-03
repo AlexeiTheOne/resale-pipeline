@@ -308,6 +308,8 @@ async def _run(user_id: int, message, req: dict, photo: str | None, *, check_id:
         footer = note.strip(" ()")
         if used >= config.CHECK_DAILY_WARN:
             footer = " · ".join(x for x in (footer, f"{used}/{config.CHECK_DAILY_MAX} today") if x)
+        # HTML so the links have short labels ("🔗 Sold $30.49 (pink)"); plain text if Telegram refuses it
+        html = check.format_reply(res, check_id=check_id, prefix=shop, footer=footer, html=True)
         text = check.format_reply(res, check_id=check_id, prefix=shop, footer=footer)
         token = secrets.token_hex(4)
         saved = {k: v for k, v in req.items() if k != "auto_full"}
@@ -319,11 +321,14 @@ async def _run(user_id: int, message, req: dict, photo: str | None, *, check_id:
         markup = _markup(token, req)
         if sent:
             try:
-                await sent.edit_text(util._scrub(text), reply_markup=markup)
+                await sent.edit_text(util._scrub(html), reply_markup=markup, parse_mode="HTML",
+                                     disable_web_page_preview=True)
                 return
             except Exception:
                 traceback.print_exc()
-        await util._safe_reply(message, text, reply_markup=markup)
+        if not await util._safe_reply(message, html, reply_markup=markup, parse_mode="HTML",
+                                      disable_web_page_preview=True):
+            await util._safe_reply(message, text, reply_markup=markup, disable_web_page_preview=True)
     finally:
         if guard:
             state.check_running.discard(user_id)

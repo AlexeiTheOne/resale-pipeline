@@ -346,6 +346,11 @@ CHECK_SOLD_CACHE_DAYS = float(os.getenv("CHECK_SOLD_CACHE_DAYS", "7"))
 CHECK_DROPSHIP_FEEDBACK = int(os.getenv("CHECK_DROPSHIP_FEEDBACK", "10000"))
 # Full check: look up this many identical listings (listing age, units sold).
 CHECK_DEMAND_LISTINGS = int(os.getenv("CHECK_DEMAND_LISTINGS", "3"))
+# Best Offer from the /check estimate (Person B, 2026-11-02): list at
+# estimate x LIST, auto-accept at x ACCEPT, auto-decline under x DECLINE.
+CHECK_BO_LIST = float(os.getenv("CHECK_BO_LIST", "1.25"))
+CHECK_BO_ACCEPT = float(os.getenv("CHECK_BO_ACCEPT", "1.05"))
+CHECK_BO_DECLINE = float(os.getenv("CHECK_BO_DECLINE", "0.90"))
 # Shipping label we pay, by item type: "type=dollars,..." Starting estimates;
 # correct them from real label costs. "other" is EBAY_SHIP_COST, the measured
 # average.

@@ -143,6 +143,35 @@ charge.
   flagged listings still count for the ceiling. Details shows the flag and
   its signals.
 
+### Competition, Best Offer and links in the reply (Person B, 2026-11-02)
+
+- **Competition:** an identical listing for sale that is not dropship-style
+  counts as competition (dropship-style ones stay the ceiling).
+  - **None, and level 2 or 3 shows demand:** the price is the **upper end**
+    of levels 2–4; the evidence line says "no competition, unique".
+  - **None, and no demand signal:** the median stays; "no competition, no
+    demand data".
+  - **With competition:** the median, never above the cheapest identical
+    listing (level 5).
+  - Level 1 (2+ same-item sales) is unchanged; with no competition it adds
+    "no competition".
+- **Best Offer line:** from the estimate, rounded to .99:
+  list × `CHECK_BO_LIST` (1.25), auto-accept × `CHECK_BO_ACCEPT` (1.05),
+  auto-decline under × `CHECK_BO_DECLINE` (0.90). For example "List $49.99 BO
+  (auto-accept $41.99, decline < $35.99) or $39.99 fixed". Profit is shown
+  at the fixed price. Setting Best Offer when publishing is a later idea for
+  Person A (`docs/legacy-tools-assessment.md` §8, branch
+  `post-cutover-ideas`).
+- **Links under the evidence line:** up to 2 best matches (sold first, same
+  item before same model; then identical listings, real sellers before
+  dropship-style), labelled like "🔗 Sold $30.49 (pink)". Then always "🔎 Sold
+  on eBay" and "🔎 For sale on eBay" searches for the product name (else the
+  style code), even with no data. The reply is sent as Telegram HTML so the
+  labels are tappable; plain text if Telegram refuses it.
+- **The reply is now up to 8 lines** (this replaces the 5-line limit):
+  verdict, item, Ross · sell · profit, Best Offer, evidence, best matches,
+  searches, check number · time · mode. Details keeps every comp.
+
 ## 0. Decisions (Person B's review, 2026-11-02). These override the sections below.
 
 | Topic | Decision |

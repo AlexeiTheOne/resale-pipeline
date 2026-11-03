@@ -221,6 +221,15 @@ def _charm(x: float) -> float:
     return round(max(round(x) - 0.01, 0.99), 2)
 
 
+def best_offer(price: float | None) -> dict | None:
+    """Best Offer from the fixed-price estimate (all .99): list x CHECK_BO_LIST,
+    auto-accept x CHECK_BO_ACCEPT, auto-decline under x CHECK_BO_DECLINE."""
+    if not price:
+        return None
+    return {"fixed": price, "list": _charm(price * config.CHECK_BO_LIST),
+            "accept": _charm(price * config.CHECK_BO_ACCEPT), "decline": _charm(price * config.CHECK_BO_DECLINE)}
+
+
 def similar_queries(ident: dict) -> list[tuple[str, str]]:
     """Extra sold searches for a full check: the brand's UPC, then similar
     items (brand + item type, e.g. "Juicy Couture Weekender Tote Bag")."""
@@ -277,6 +286,17 @@ def is_dropship(comp: dict, kind: str) -> bool:
     return len(dropship_signals(comp, kind)) >= 2
 
 
+def with_details(c: dict, details: dict | None) -> dict:
+    """A comp plus what the item lookup found (category, seller feedback)."""
+    d = (details or {}).get(c.get("ebay_id")) or {}
+    if not d:
+        return c
+    fb = d.get("seller_feedback")
+    return {**c, "category_path": d.get("category_path"), "listed": d.get("created"),
+            "units_sold": d.get("sold_quantity"), "title": d.get("title") or c.get("title"),
+            "seller_feedback": fb if fb is not None else c.get("seller_feedback")}
+
+
 def _age_days(iso, now: datetime | None = None):
     try:
         t = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
@@ -324,16 +344,10 @@ def comp_list(pricing: dict, kind: str, exact: bool, details: dict | None = None
         src = "sold" if c.get("source") == "sold" else "active"
         if not c.get("total") or (src == "sold" and c.get("verdict") not in sold_v)                 or (src == "active" and c.get("verdict") != "same_item"):
             continue
-        d = details.get(c.get("ebay_id")) or {}
-        row = {k: c.get(k) for k in ("ebay_id", "verdict", "title", "total", "url", "date",
-                                     "seller", "seller_feedback")}
+        m = with_details(c, details)
+        row = {k: m.get(k) for k in ("ebay_id", "verdict", "title", "total", "url", "date", "seller",
+                                     "seller_feedback", "category_path", "listed", "units_sold")}
         row["status"] = src
-        if d:
-            row.update(title=d.get("title") or row["title"], category_path=d.get("category_path"),
-                       listed=d.get("created"), units_sold=d.get("sold_quantity"),
-                       seller_feedback=d.get("seller_feedback") if d.get("seller_feedback") is not None
-                       else row["seller_feedback"])
-            row["date"] = row["date"] or d.get("created")
         row["signals"] = dropship_signals(row, kind)
         row["dropship"] = len(row["signals"]) >= 2
         out.append(row)
@@ -390,7 +404,8 @@ def _median(xs):
 
 
 def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history: list | None = None,
-                 receipt: dict | None = None, exclude_item_id: str | None = None) -> dict:
+                 receipt: dict | None = None, exclude_item_id: str | None = None,
+                 details: dict | None = None) -> dict:
     """The evidence ladder (Person B, 2026-11-02). Every level is an ITEM price
     (eBay totals minus the shipping we charge):
       1 eBay sold, same item: 2+ sales -> their median, done.
@@ -400,7 +415,11 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
         too few sales; never the all-sales fallback).
       5 eBay asking prices x CHECK_ASK_DISCOUNT: a ceiling, never the price.
     No level 1: the median of levels 2-4. Capped at level 5 (so never above
-    the cheapest identical listing). Any mode counts variants as level 1."""
+    the cheapest identical listing). Any mode counts variants as level 1.
+    Competition (Person B, 2026-11-02): no identical listing for sale
+    (dropship-style ones don't count) and demand shown by level 2 or 3 ->
+    the upper end of levels 2-4 ("no competition, unique"); no demand
+    either -> the median stays ("no competition, no demand data")."""
     from pipeline import msrp
     ident = ident or {}
     kind = item_type_of(ident)
@@ -449,6 +468,16 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
                      "detail": f"cheapest identical ${cheapest:.2f} total × {config.CHECK_ASK_DISCOUNT}"}
     used = [1] if 1 in levels else [k for k in (2, 3, 4) if k in levels]
     raw = levels[1]["value"] if 1 in levels else _median([levels[k]["value"] for k in used])
+    competitors = [c for c in all_judged if c.get("source") != "sold" and c.get("verdict") == "same_item"
+                   and c.get("total") and not is_dropship(with_details(c, details), kind)]
+    note, upper = None, False
+    if not competitors and used:
+        if 1 in used:
+            note = "no competition"
+        elif 2 in levels or 3 in levels:
+            raw, upper, note = max(levels[k]["value"] for k in used), True, "no competition, unique"
+        else:
+            note = "no competition, no demand data"
     capped = False
     if raw is not None and 5 in levels and levels[5]["value"] < raw:
         raw, capped = levels[5]["value"], True
@@ -459,24 +488,26 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
     if 1 in used:
         basis = "eBay sales of the same item (level 1)"
     elif used:
-        basis = "median of levels " + ", ".join(str(k) for k in used) + " (no same-item sales)"
+        basis = ("upper end" if upper else "median") + " of levels " + ", ".join(str(k) for k in used)             + " (no same-item sales)"
     else:
         basis = "no level 1-4 evidence"
     return {"price": price, "basis": basis + (", capped at the asking-price ceiling" if capped else ""),
             "levels": levels, "used": used, "capped": capped, "range": spread,
             "sales": len(same), "from_asks": False, "estimated": bool(used) and 1 not in used,
             "sold_median": _median(same), "disagrees": False, "ask_discount": None,
-            "dropship_excluded": dropped}
+            "dropship_excluded": dropped, "competitors": len(competitors), "competition_note": note,
+            "upper_end": upper}
 
 
 def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
              text: str = "", quick: bool = False, history: list | None = None,
-             exclude_item_id: str | None = None) -> dict:
+             exclude_item_id: str | None = None, details: dict | None = None) -> dict:
     """Price choice, money and verdict from a pricing result. Shared by
     run_check and the backtest (scripts/backtest_check.py), so the backtest
     scores exactly what /check would say. quick: a quick check that found no
     data at all is NO_DATA instead of SKIP."""
-    pick = choose_price(pricing, exact, ident, history=history, exclude_item_id=exclude_item_id)
+    pick = choose_price(pricing, exact, ident, history=history, exclude_item_id=exclude_item_id,
+                        details=details)
     kind, label = label_for(ident, text)
     money = economics(pick["price"], ross_price, label) if pick["price"] and ross_price else None
     cheapest = pricing.get("raw_active_floor")
@@ -498,7 +529,7 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
                                else ["no sales and no identical listing found: not enough data for a verdict"])
     return {"item_type": kind, "label": label, "verdict": v, "reasons": why, "pick": pick,
             "money": money, "cheapest_total": cheapest, "at_cheapest": at_cheapest,
-            "similar": similar_sold(pricing)}
+            "similar": similar_sold(pricing), "offer": best_offer(pick["price"])}
 
 
 def _norm_code(v) -> str:
@@ -590,13 +621,13 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
     for k, v in (pricing.get("timings") or {}).items():
         if k != "total_s":
             timings[k] = v
-    ev = evaluate(pricing, ident, req.get("ross_price"), bool(req.get("exact", True)), text,
-                  quick=not full)
     details = {}
-    if full:           # listing age and units sold of the cheapest identical listings
+    if full:           # listing age, units sold, category of the cheapest identical listings
         t = time.perf_counter()
         details = demand_lookup(pricing, details_fn=details_fn)
         timings["demand_s"] = round(time.perf_counter() - t, 2)
+    ev = evaluate(pricing, ident, req.get("ross_price"), bool(req.get("exact", True)), text,
+                  quick=not full, details=details)
     comps = comp_list(pricing, ev["item_type"], bool(req.get("exact", True)), details)
     try:
         have = have_fn(ident, req.get("ross_sku"))
@@ -768,18 +799,24 @@ def short_url(url: str | None) -> str:
     return f"https://www.ebay.com/itm/{m.group(1)}" if m else (url or "")
 
 
-def search_links(res: dict) -> dict:
-    """eBay sold / active searches a person can open (as legacy/comps.py)."""
+def search_links(res: dict, labels: bool = False) -> dict:
+    """eBay sold / active searches a person can open (as legacy/comps.py):
+    the product name, else the style code, else what was typed. labels: the
+    reply's wording ("Sold on eBay")."""
     from urllib.parse import urlencode
     ident = res["identification"]
     # The product name, not the long search query (check #2's long query found nothing).
     q = " ".join(str(ident.get(k)) for k in ("brand", "product_name") if ident.get(k)) \
-        or ident.get("search_query") or res["request"].get("description")
+        or ident.get("model") or ident.get("style_code") or ident.get("search_query") \
+        or res["request"].get("description")
     if not q:
         return {}
     base = {"_nkw": q, "LH_ItemCondition": "1000|1500", "LH_PrefLoc": 1}
-    return {"sold": "https://www.ebay.com/sch/i.html?" + urlencode({**base, "LH_Sold": 1, "LH_Complete": 1}),
-            "for sale": "https://www.ebay.com/sch/i.html?" + urlencode({**base, "_sop": 15})}
+    sold = "https://www.ebay.com/sch/i.html?" + urlencode({**base, "LH_Sold": 1, "LH_Complete": 1})
+    active = "https://www.ebay.com/sch/i.html?" + urlencode({**base, "_sop": 15})
+    if labels:
+        return {"Sold on eBay": sold, "For sale on eBay": active}
+    return {"sold": sold, "for sale": active}
 
 
 LEVEL_SHORT = {1: "sold", 2: "similar", 3: "ours", 4: "MSRP×ratio", 5: "ask ≤"}
@@ -810,12 +847,17 @@ def ladder_line(pick: dict, res: dict) -> str:
         parts.append(f"ask ≤{_whole(levels[5]['value'])}" + (" (cap)" if pick.get("capped") else ""))
     if res.get("demand"):
         parts.append(res["demand"])
+    if pick.get("competition_note"):
+        parts.append(pick["competition_note"])
     return " · ".join(parts)
 
 
-def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", footer: str = "") -> str:
-    """At most 5 lines: verdict + why / item / cost · sell · profit /
-    evidence / check number, time, mode. The rest: format_details."""
+def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", footer: str = "",
+                 html: bool = False) -> str:
+    """Verdict + why / item / cost · sell · profit / Best Offer prices /
+    evidence / up to 2 best matches / eBay sold and for-sale searches / check
+    number, time, mode. The rest: format_details. html: Telegram HTML with
+    short link labels (the bot); plain text shows the URLs."""
     req, money, pick = res["request"], res["money"], res["pick"]
     v = res["verdict"]
     sales = pick.get("sales") or 0
@@ -842,13 +884,58 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
         lines.append(f"Ross {_usd(ross)} · no price found")
     else:
         lines.append("Add the Ross price as the last number, e.g. /check coach tabby 26 49.99")
-    cheapest = f" (cheapest {_usd(res['cheapest_total'])})" if res.get("cheapest_total") else ""
+    offer = res.get("offer")
+    if money and offer:
+        lines.append(offer_line(offer))
     match = CERTAINTY.get(res.get("confidence"), "-")
     lines.append("Evidence: " + ladder_line(pick, res) + f" · match {match}")
     t = res["timings"].get("total_s", 0)
     mode = ("full" if req.get("full") else "quick") + " · " + ("exact" if req.get("exact", True) else "any")
-    lines.append(" · ".join(x for x in (f"#{check_id}" if check_id else "", f"⏱ {t:.0f}s", mode, footer) if x))
-    return "\n".join(lines)
+    last = " · ".join(x for x in (f"#{check_id}" if check_id else "", f"⏱ {t:.0f}s", mode, footer) if x)
+    links = [best_links(res), [("🔎", k, u) for k, u in search_links(res, labels=True).items()]]
+    if not html:
+        return "\n".join(lines + [" · ".join(f"{i} {k} {u}" for i, k, u in row) for row in links if row] + [last])
+    from html import escape
+    linked = [" · ".join(f'{i} <a href="{escape(u)}">{escape(k)}</a>' for i, k, u in row) for row in links if row]
+    return "\n".join([escape(x) for x in lines] + linked + [escape(last)])
+
+
+def offer_line(offer: dict) -> str:
+    """"List $49.99 BO (auto-accept $41.99, decline < $35.99) or $39.99 fixed"."""
+    return (f"List {_usd(offer['list'])} BO (auto-accept {_usd(offer['accept'])}, "
+            f"decline < {_usd(offer['decline'])}) or {_usd(offer['fixed'])} fixed")
+
+
+COLOURS = ("black", "white", "pink", "blush", "red", "blue", "navy", "green", "olive", "yellow", "orange",
+           "purple", "lilac", "brown", "tan", "beige", "cream", "ivory", "grey", "gray", "silver", "gold",
+           "teal", "burgundy", "coral", "camel", "khaki", "denim", "leopard", "paisley", "floral", "plaid")
+
+
+def _comp_tag(c: dict, ident: dict) -> str:
+    """What sets a comp apart, for its link: a colour our item doesn't have
+    ("pink"), else how the judge matched it; "dropship?" when flagged."""
+    if c.get("dropship"):
+        return "dropship?"
+    ours = " ".join(str(ident.get(k) or "") for k in ("color", "product_name", "search_query")).lower()
+    for w in re.findall(r"[a-z]+", (c.get("title") or "").lower()):
+        if w in COLOURS and w not in ours:
+            return w
+    return VERDICT_WORDS.get(c.get("verdict"), c.get("verdict") or "")
+
+
+def best_links(res: dict, n: int = 2) -> list[tuple[str, str, str]]:
+    """Up to n best matches to tap: sold first (same item, then same model,
+    newest first), then identical listings (real sellers before dropship-style
+    ones, cheapest first)."""
+    rows = [c for c in res.get("comp_list") or [] if c.get("url")]
+    sold = sorted((c for c in rows if c["status"] == "sold"), key=lambda c: c.get("verdict") != "same_item")
+    active = sorted((c for c in rows if c["status"] != "sold"), key=lambda c: bool(c.get("dropship")))
+    out = []
+    for c in (sold + active)[:n]:
+        tag = _comp_tag(c, res.get("identification") or {})
+        what = "Sold" if c["status"] == "sold" else "For sale"
+        out.append(("🔗", f"{what} {_usd(c.get('total'))}" + (f" ({tag})" if tag else ""), short_url(c["url"])))
+    return out
 
 
 COMP_LINES = 12
@@ -905,6 +992,13 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
         roi = f"{money['roi']:.0%}" if money.get("roi") is not None else "-"
         out.append(f"Profit {_usd(money['profit'])} · ROI {roi} · break-even {_usd(money['break_even_item'])} "
                    f"+ shipping")
+        if res.get("offer"):
+            o = res["offer"]
+            out.append(offer_line(o) + f" (×{config.CHECK_BO_LIST} / ×{config.CHECK_BO_ACCEPT} / "
+                                       f"×{config.CHECK_BO_DECLINE} of the estimate)")
+    if pick.get("competition_note"):
+        out.append(f"Competition: {pick.get('competitors', 0)} identical listing(s) besides dropship-style ones"
+                   f" → {pick['competition_note']}" + (", priced at the upper end" if pick.get("upper_end") else ""))
     if res.get("cheapest_total"):
         at = res.get("at_cheapest") or {}
         out.append(f"Cheapest identical for sale: {_usd(res['cheapest_total'])} total"

@@ -146,9 +146,11 @@ def test_level3_our_own_sales_same_brand_and_type_with_leave_one_out():
                     "ratio": None},
                    {"item_id": "j2", "brand": "juicy couture", "bucket": "bag", "msrp": None, "sold": 69.99,
                     "ratio": None}]
-    p = pricing(raw_active_floor=None, judged_comps=[])
+    rival = [{"source": "active", "verdict": "same_item", "total": 120.0, "title": "Juicy Couture tote"}]
+    p = pricing(raw_active_floor=120.0, judged_comps=rival)
     pick = check.choose_price(p, exact=True, ident=JUICY, history=hist)
     assert pick["levels"][3]["value"] == 64.99 and pick["used"] == [3, 4] and pick["price"] == 57.99
+    assert pick["competition_note"] is None and pick["competitors"] == 1
     assert check.choose_price(p, exact=True, ident=JUICY, history=hist,
                               exclude_item_id="j1")["levels"][3]["value"] == 69.99
 
@@ -171,7 +173,7 @@ def test_quick_text_check_passes_quick_options_and_stores_nothing():
     assert res["item_type"] == "bags" and res["label"] == 11.0
     assert res["pick"]["used"] == [1]                 # 2 same-item sales in the fake comps
     text = check.format_reply(res)
-    assert len(text.splitlines()) <= 5 and "quick · exact" in text and "Evidence: 2 sold same $42" in text
+    assert len(text.splitlines()) <= 8 and "quick · exact" in text and "Evidence: 2 sold same $42" in text
     details = check.format_details(res)
     assert "Evidence ladder" in details and "break-even" in details
     assert "Quick check: no recent sold data" in details
@@ -256,14 +258,21 @@ def test_headline_is_verdict_and_evidence_and_the_estimate_is_marked(monkeypatch
     req = {**check.parse_request("/check full 14.99"), "identification": MK_IDENT}
     res = check.run_check(req, pricing_fn=lambda ident, **kw: mkj_pricing(), have_fn=lambda *a: [])
     lines = check.format_reply(res, check_id=12).splitlines()
-    assert len(lines) <= 5
+    assert len(lines) == 8
     assert lines[0] == "🟡 MAYBE: no sales found, 1 uncertain listing"
     assert lines[1] == "Michael Kors pave necklace (MKJ3969710)"
     # level 3: our two Michael Kors sales ($40, $46); the $160.19 listing is only a ceiling
     assert res["pick"]["used"] == [3] and res["pick"]["price"] == 42.99
     assert lines[2] == "Ross $14.99 · sell ~$42.99 (est.) · profit ~$21.30"
-    assert lines[3] == "Evidence: 0 sold same · our Michael Kors items ~$43 · ask ≤$147 · match uncertain"
-    assert lines[4].startswith("#12 · ⏱") and "full · exact" in lines[4]
+    assert lines[3] == "List $53.99 BO (auto-accept $44.99, decline < $38.99) or $42.99 fixed"
+    assert lines[4] == "Evidence: 0 sold same · our Michael Kors items ~$43 · ask ≤$147 · match uncertain"
+    assert lines[5] == "🔗 For sale $160.19 (same item) https://ebay.com/itm/1"
+    assert lines[6].startswith("🔎 Sold on eBay https://www.ebay.com/sch/") and "LH_Sold=1" in lines[6]
+    assert " · 🔎 For sale on eBay https://" in lines[6]
+    assert lines[7].startswith("#12 · ⏱") and "full · exact" in lines[7]
+    html = check.format_reply(res, check_id=12, html=True).splitlines()
+    assert html[5] == '🔗 <a href="https://ebay.com/itm/1">For sale $160.19 (same item)</a>'
+    assert html[6].startswith('🔎 <a href="https://www.ebay.com/sch/i.html?_nkw=Michael') and "&amp;LH_Sold=1" in html[6]
     assert "no sales found" in res["reasons"] and not any("only 0" in r for r in res["reasons"])
     details = check.format_details(res, check_id=12)
     assert "L3 our own sales, same brand + type: $43.00" in details and "L1 eBay sold, same item: none" in details
@@ -343,7 +352,7 @@ def test_similar_sales_are_level2_in_exact_and_level1_in_any_mode():
     res = check.run_check(check.parse_request("/check full juicy to go weekender tote 9.99"),
                           pricing_fn=lambda i, **kw: pricing(raw_active_floor=104.05, judged_comps=judged),
                           have_fn=lambda *a: [])
-    evidence = check.format_reply(res).splitlines()[3]
+    evidence = check.format_reply(res).splitlines()[4]
     assert evidence.startswith("Evidence: 0 sold same · 3 sold same model $25 · ask ≤$92")
     res_any = check.run_check(check.parse_request("/check any full juicy to go weekender tote 9.99"),
                               pricing_fn=lambda i, **kw: pricing(raw_active_floor=104.05, judged_comps=judged),
@@ -476,11 +485,87 @@ def test_full_check_shows_demand_and_every_comp_quick_looks_nothing_up():
     assert asked == [] and quick["demand"] is None
     res = run("/check full juicy to go weekender tote bag 9.99")
     assert asked == ["117471801433"] and res["demand"].startswith("1 for sale ")
-    assert res["demand"] in check.format_reply(res).splitlines()[3]
+    assert res["demand"] in check.format_reply(res).splitlines()[4]
     details = check.format_details(res)
     assert "Comps used" in details and "sold $30.49 · 2026-09-01 · same model" in details
     assert "⚠️ dropship?" in details and "https://www.ebay.com/itm/111111111111" in details
     assert res["comps"][1]["dropship"] is True and res["comps"][0]["date"] == "2026-09-01T00:00:00Z"
+
+
+# --- competition, Best Offer, reply links (Person B's additions after part C) ----------------------
+
+LUV = {"brand": "Luv Betsey by Betsey Johnson", "item_type": "Tote Bag", "model": "LB104065",
+       "product_name": "LBAVERY Extra Large Canvas Tote", "retail_price": 98.0, "color": "Light Blue"}
+CAT_TOTE = {"source": "sold", "verdict": "variant", "total": 39.66, "date": "2026-10-20T00:00:00Z",
+            "title": "Luv Betsey by Betsey Johnson Tote Bag, Large Cat Face Fluffy Faux Fur",
+            "url": "https://www.ebay.com/itm/377563627161?nordt=true"}
+
+
+def test_luv_betsey_reduced_sticker_is_read_without_ai():
+    got = check.read_ross_barcode(str(FIXTURE.with_name("check_ross_tag_luv_betsey.jpg")))
+    assert got == {"code": "400308434185", "reduced_price": 8.99}
+
+
+def test_no_competition_with_demand_prices_at_the_upper_end():
+    """Check #3: no identical listing, one similar sale, MSRP $98 x our bag ratio."""
+    p = pricing(raw_active_floor=None, judged_comps=[CAT_TOTE])
+    pick = check.choose_price(p, exact=True, ident=LUV, history=BAGS)
+    assert pick["levels"][2]["value"] == 29.78 and pick["levels"][4]["value"] == 45.99
+    assert pick["competition_note"] == "no competition, unique" and pick["upper_end"]
+    assert pick["price"] == 45.99 and pick["basis"].startswith("upper end of levels 2, 4")
+
+
+def test_no_competition_and_no_demand_keeps_the_median():
+    pick = check.choose_price(pricing(raw_active_floor=None, judged_comps=[]), exact=True, ident=LUV, history=BAGS)
+    assert pick["used"] == [4] and pick["price"] == 45.99
+    assert pick["competition_note"] == "no competition, no demand data" and not pick["upper_end"]
+
+
+def test_a_real_identical_listing_keeps_the_median_and_the_ceiling():
+    rival = {"source": "active", "verdict": "same_item", "total": 52.0, "title": "Luv Betsey LBAVERY tote"}
+    pick = check.choose_price(pricing(raw_active_floor=52.0, judged_comps=[CAT_TOTE, rival]), exact=True,
+                              ident=LUV, history=BAGS)
+    assert pick["competitors"] == 1 and pick["competition_note"] is None
+    assert pick["price"] == 37.99 and not pick["capped"]          # median of 29.78 and 45.99, under 52x0.98-9.88
+
+
+def test_dropship_listings_are_not_competition_but_stay_the_ceiling():
+    """Check #2: the only identical listings are dropship-style (copied title,
+    16k seller, Diaper Bags): no real competition, the pink sale shows demand."""
+    pink = {"source": "sold", "verdict": "variant", "total": 30.49, "title": "Juicy Couture Powder Blush Pink Juicy"}
+    p = pricing(raw_active_floor=104.05, judged_comps=[pink, DROPSHIP_JUICY])
+    pick = check.choose_price(p, exact=True, ident=JUICY, history=BAGS, details=DROPSHIP_DETAILS)
+    assert pick["competitors"] == 0 and pick["competition_note"] == "no competition, unique"
+    assert pick["price"] == 50.99 and pick["levels"][5]["value"] == 92.09 and not pick["capped"]
+    low_cap = pricing(raw_active_floor=50.0, judged_comps=[pink, {**DROPSHIP_JUICY, "total": 50.0}])
+    assert check.choose_price(low_cap, exact=True, ident=JUICY, history=BAGS, details=DROPSHIP_DETAILS)["capped"]
+
+
+def test_best_offer_prices_from_the_estimate():
+    assert check.best_offer(39.99) == {"fixed": 39.99, "list": 49.99, "accept": 41.99, "decline": 35.99}
+    assert check.offer_line(check.best_offer(39.99)) == \
+        "List $49.99 BO (auto-accept $41.99, decline < $35.99) or $39.99 fixed"
+    assert check.best_offer(None) is None
+
+
+def test_reply_links_best_matches_sold_first_and_always_the_searches():
+    req = {**check.parse_request("/check full 8.99"), "identification": LUV}
+    pink = {**CAT_TOTE, "title": "Luv Betsey Pink Canvas Tote", "url": "https://www.ebay.com/itm/222222222222"}
+    rows = [pink, {"source": "active", "verdict": "same_item", "total": 61.0, "title": "Luv Betsey LBAVERY",
+                   "url": "https://www.ebay.com/itm/333333333333?x=1"}, CAT_TOTE]
+    res = check.run_check(req, have_fn=lambda *a: [],
+                          pricing_fn=lambda i, **kw: pricing(raw_active_floor=61.0, judged_comps=rows))
+    assert check.best_links(res) == [("🔗", "Sold $39.66 (pink)", "https://www.ebay.com/itm/222222222222"),
+                                     ("🔗", "Sold $39.66 (same model)", "https://www.ebay.com/itm/377563627161")]
+    lines = check.format_reply(res).splitlines()
+    assert lines[5].startswith("🔗 Sold $39.66 (pink) https://www.ebay.com/itm/222222222222 · 🔗 Sold $39.66")
+    nothing = check.run_check(req, have_fn=lambda *a: [],
+                              pricing_fn=lambda i, **kw: pricing(raw_active_floor=None, judged_comps=[]))
+    nothing = {**nothing, "pick": {**nothing["pick"], "levels": {}, "used": [], "price": None},
+               "money": None, "verdict": check.NO_DATA, "offer": None}
+    text = check.format_reply(nothing, html=True)
+    assert "List " not in text and '🔎 <a href="https://www.ebay.com/sch/i.html?_nkw=Luv+Betsey' in text
+    assert "For sale on eBay</a>" in text
 
 
 # --- in-stock warning: items AND pieces (production has piece O1W-01) ---------------------------
