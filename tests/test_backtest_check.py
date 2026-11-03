@@ -42,3 +42,4 @@ def test_hit_rates():
     assert hr["BUY"]["hit"] == 0.5 and hr["BUY"]["avg_profit"] == 9.0
     assert hr["SKIP"]["hit"] == 0.5 and hr["SKIP"]["stale"] == 1
     assert hr["MAYBE"]["hit"] is None and hr["MAYBE"]["ok"] == 1 and hr["BORDERLINE"]["n"] == 0
+    assert hr["BUY"]["avg_days"] == 17.5 and hr["NO_DATA"]["n"] == 0

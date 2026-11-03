@@ -173,7 +173,8 @@ def test_quick_with_nothing_at_all_is_no_data_but_full_is_skip():
                     judged_comps=[], sold_median=None)
     q = check.evaluate(empty, {}, 14.99, exact=True, quick=True)
     assert q["verdict"] == check.NO_DATA and q["reasons"]
-    assert check.evaluate(empty, {}, 14.99, exact=True, quick=False)["verdict"] == "SKIP"
+    # a full check with no price is NO DATA too: SKIP needs real prices behind it
+    assert check.evaluate(empty, {}, 14.99, exact=True, quick=False)["verdict"] == check.NO_DATA
     # any data at all (an identical listing) is a real verdict even in quick mode
     some = pricing(formula_price=None, judged_comps=[])
     assert check.evaluate(some, {}, 14.99, exact=True, quick=True)["verdict"] != check.NO_DATA

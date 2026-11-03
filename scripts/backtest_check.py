@@ -108,7 +108,7 @@ def hit_rates(rows: list[dict], mode: str) -> dict:
         if r.get(f"{mode}_verdict"):
             by[r[f"{mode}_verdict"]].append(r)
     out = {}
-    for v in check.VERDICTS:
+    for v in (*check.VERDICTS, check.NO_DATA):
         rs = by.get(v, [])
         c = Counter(r["outcome"] for r in rs)
         n = len(rs)
@@ -122,6 +122,7 @@ def hit_rates(rows: list[dict], mode: str) -> dict:
         out[v] = {"n": n, **{k: c[k] for k in ("win", "ok", "loss", "stale")},
                   "hit": round(hit, 2) if hit is not None else None,
                   "avg_profit": round(statistics.mean(profits), 2) if profits else None,
+                  "avg_days": round(statistics.mean(days), 1) if days else None,
                   "median_days": statistics.median(days) if days else None}
     return out
 
@@ -139,13 +140,15 @@ def write_report(path: Path, rows: list[dict], stopped: str | None, spend: dict)
     for mode in ("exact", "any"):
         hr = hit_rates(rows, mode)
         w.append(f"## {mode} matches\n")
-        w.append("| Verdict | n | win | ok | loss | stale | hit rate | avg actual profit | median days to sell |")
-        w.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        w.append("| Verdict | n | win | ok | loss | stale | hit rate | avg profit (sold) | avg days to sell | median days |")
+        w.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for v, s in hr.items():
             hit = "-" if s["hit"] is None else f"{s['hit']:.0%}"
             ap = "-" if s["avg_profit"] is None else f"${s['avg_profit']}"
+            ad = "-" if s["avg_days"] is None else f"{s['avg_days']:.0f}"
             md = "-" if s["median_days"] is None else f"{s['median_days']:.0f}"
-            w.append(f"| {v} | {s['n']} | {s['win']} | {s['ok']} | {s['loss']} | {s['stale']} | {hit} | {ap} | {md} |")
+            w.append(f"| {v} | {s['n']} | {s['win']} | {s['ok']} | {s['loss']} | {s['stale']} | {hit} "
+                     f"| {ap} | {ad} | {md} |")
         w.append("")
     w.append("Hit rate: BUY = wins / scored; SKIP = (ok + loss + stale) / scored. win = actual profit "
              f"≥ ${config.CHECK_BUY_MIN_PROFIT:.0f}; stale = unsold {STALE_DAYS}+ days.\n")

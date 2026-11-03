@@ -117,8 +117,12 @@ so no price) gets the status **❓ NO DATA**, not SKIP or MAYBE. The bot then
 message to "Checking more sources…", and the full result replaces it. The
 pair counts as **one** check toward the daily cap (the quick line in
 `logs/check_timings.jsonl` is marked `"counted": false`), and the
-identification is reused, so a photo isn't identified twice. A full check
-that finds no price is still SKIP.
+identification is reused, so a photo isn't identified twice.
+
+**Changed (Person B, 2026-11-02, after the backtest):** a **full** check that
+finds no price is also **❓ NO DATA**, not SKIP. In the backtest, 14 of 20
+such SKIPs were winners, while the 7 SKIPs backed by real prices had no
+winners. **SKIP is only given when real prices back it.**
 
 **What quick mode means for the verdict.** BUY needs at least 3 matching
 sales (§5). Quick mode only has sales when a recent cached search exists, so

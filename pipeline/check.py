@@ -31,9 +31,10 @@ import config
 EASTERN = ZoneInfo("America/New_York")
 TIMINGS_FILE = Path(config.LOG_DIR) / "check_timings.jsonl"
 VERDICTS = ("BUY", "MAYBE", "BORDERLINE", "SKIP")
-# A quick check that found nothing at all (no sales, no identical listing, so
-# no price): not a judgement on the item. The bot goes straight on to a full
-# check (Person B, 2026-11-02). A full check with no price is still SKIP.
+# No price at all (no sales, no identical listing): not a judgement on the
+# item. After a quick check the bot goes straight on to a full check; a full
+# check with no price stays NO_DATA (Person B, 2026-11-02). SKIP only when
+# real prices back it.
 NO_DATA = "NO_DATA"
 ICON = {"BUY": "✅", "MAYBE": "🟡", "BORDERLINE": "🟠", "SKIP": "❌", NO_DATA: "❓"}
 LABEL = {NO_DATA: "NO DATA"}
@@ -269,8 +270,12 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
                          profit_at_cheapest=at_cheapest["profit"] if at_cheapest else None,
                          low_confidence=pricing.get("claude_confidence") == "low",
                          from_asks=pick["from_asks"], disagrees=pick["disagrees"])
-        if quick and money is None and cheapest is None and pick["sales"] == 0:
-            v, why = NO_DATA, ["the quick check found no recent sales and no identical listing"]
+        if money is None:
+            # No price at all is not evidence against the item (Person B,
+            # 2026-11-02: in the backtest 14 of 20 such SKIPs were winners).
+            # SKIP is only given when real prices back it.
+            v, why = NO_DATA, (["the quick check found no recent sales and no identical listing"] if quick
+                               else ["no sales and no identical listing found: not enough data for a verdict"])
     return {"item_type": kind, "label": label, "verdict": v, "reasons": why, "pick": pick,
             "money": money, "cheapest_total": cheapest, "at_cheapest": at_cheapest}
 
