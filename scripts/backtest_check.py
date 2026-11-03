@@ -152,8 +152,8 @@ def write_report(path: Path, rows: list[dict], stopped: str | None, spend: dict)
         w.append("")
     w.append("Hit rate: BUY = wins / scored; SKIP = (ok + loss + stale) / scored. win = actual profit "
              f"≥ ${config.CHECK_BUY_MIN_PROFIT:.0f}; stale = unsold {STALE_DAYS}+ days.\n")
-    w.append("Caveats: look-ahead (today's comps include later sales); only items we bought; one "
-             "sold query per item and no escalation (cheaper than a real Full check).\n")
+    w.append("Caveats: look-ahead (today's comps include later sales); only items we bought; no "
+             "escalation; each item's own sale is left out of levels 3-4 (leave-one-out).\n")
     w.append("## Items\n")
     w.append("| item | brand | outcome | actual profit | exact | any | exact price | any price | sales (exact/any) |")
     w.append("|---|---|---|---:|---|---|---:|---:|---|")
@@ -182,6 +182,8 @@ def main(argv=None) -> int:
     if not args.all_sold_queries:
         v2.uncached_sold_queries = {"search_query"}
     start = datetime.now(timezone.utc).isoformat()
+    from pipeline import msrp
+    history = msrp.load_history()       # once; each item leaves its own sale out
     rows, stopped = [], None
     for it in items:
         spent, _ = db.llm_stage_spend(start, STAGE)
@@ -199,8 +201,10 @@ def main(argv=None) -> int:
             print(f"  {it['item_id'][:8]}: {type(e).__name__}: {str(e)[:120]}")
             continue
         ross = it["receipt"]["reduced_price"]
-        ex = check.evaluate(pricing, it["identification"], ross, True)
-        an = check.evaluate(pricing, it["identification"], ross, False)
+        ex = check.evaluate(pricing, it["identification"], ross, True, history=history,
+                            exclude_item_id=it["item_id"])
+        an = check.evaluate(pricing, it["identification"], ross, False, history=history,
+                            exclude_item_id=it["item_id"])
         o = it["_outcome"]
         row = {"item": it["item_id"][:8], "brand": it["identification"].get("brand"),
                "outcome": o["kind"], "actual_profit": o["profit"], "days": o["days"],

@@ -97,16 +97,59 @@ def pricing(**kw):
     return {**base, **kw}
 
 
-def test_exact_uses_the_same_item_formula_and_any_uses_claude():
-    e = check.choose_price(pricing(), exact=True)
-    assert (e["price"], e["sales"], e["from_asks"]) == (37.99, 2, False)
-    a = check.choose_price(pricing(), exact=False)
-    assert (a["price"], a["sales"], a["sold_median"]) == (39.99, 3, 50.0)
+@pytest.fixture(autouse=True)
+def no_history(monkeypatch):
+    """Our own sales (levels 3-4) come from the DB; tests pass them in explicitly."""
+    from pipeline import msrp
+    monkeypatch.setattr(msrp, "load_history", lambda: [])
 
 
-def test_exact_without_sales_prices_from_the_cheapest_identical_listing():
-    e = check.choose_price(pricing(formula_price=None), exact=True)
-    assert e["from_asks"] and e["price"] == check._charm(44.5 * 0.95 - 9.88)
+def test_ladder_level1_same_item_sales_median_and_the_ceiling():
+    p = pricing(raw_active_floor=None)
+    e = check.choose_price(p, exact=True)
+    assert e["used"] == [1] and e["sales"] == 2 and e["levels"][1]["value"] == 42.12 and e["price"] == 41.99
+    a = check.choose_price(p, exact=False)           # any: variants count as level 1
+    assert a["sales"] == 3 and a["levels"][1]["value"] == 40.12 and a["price"] == 39.99
+    capped = check.choose_price(pricing(), exact=True)  # cheapest identical 44.50 x 0.98 - 9.88 = 33.73
+    assert capped["capped"] and capped["price"] == 33.99
+
+
+def test_asking_prices_are_never_the_price():
+    p = pricing(judged_comps=[{"source": "active", "verdict": "same_item", "total": 44.5}])
+    e = check.choose_price(p, exact=True)
+    assert e["price"] is None and e["used"] == [] and e["levels"][5]["value"] == 33.73
+    assert check.evaluate(p, {}, 14.99, exact=True)["verdict"] == check.NO_DATA
+
+
+JUICY = {"brand": "Juicy Couture", "item_type": "Weekender Tote Bag", "retail_price": 109.0,
+         "product_name": "Juicy To Go Weekender Tote", "model": "11JCDA0JC-JTL"}
+BAGS = [{"item_id": f"b{i}", "brand": "coach", "bucket": "bag", "msrp": 100.0, "sold": 47.0, "ratio": 0.47}
+        for i in range(3)]
+
+
+def test_check2_ladder_levels_2_and_4_median_with_range():
+    """Check #2 as it really came out: one pink variant sale ($30.49 total),
+    no Juicy sales of our own, MSRP $109 x our bag ratio 0.47."""
+    p = pricing(raw_active_floor=104.05,
+                judged_comps=[{"source": "sold", "verdict": "variant", "total": 30.49},
+                              {"source": "active", "verdict": "same_item", "total": 104.05}])
+    pick = check.choose_price(p, exact=True, ident=JUICY, history=BAGS)
+    assert pick["levels"][2]["value"] == 20.61 and pick["levels"][4]["value"] == 50.99
+    assert 3 not in pick["levels"]                    # we never sold a Juicy Couture bag
+    assert pick["used"] == [2, 4] and pick["price"] == 35.99 and pick["range"] == (20.61, 50.99)
+    assert pick["levels"][5]["value"] == 92.09 and not pick["capped"] and pick["estimated"]
+
+
+def test_level3_our_own_sales_same_brand_and_type_with_leave_one_out():
+    hist = BAGS + [{"item_id": "j1", "brand": "juicy couture", "bucket": "bag", "msrp": None, "sold": 59.99,
+                    "ratio": None},
+                   {"item_id": "j2", "brand": "juicy couture", "bucket": "bag", "msrp": None, "sold": 69.99,
+                    "ratio": None}]
+    p = pricing(raw_active_floor=None, judged_comps=[])
+    pick = check.choose_price(p, exact=True, ident=JUICY, history=hist)
+    assert pick["levels"][3]["value"] == 64.99 and pick["used"] == [3, 4] and pick["price"] == 57.99
+    assert check.choose_price(p, exact=True, ident=JUICY, history=hist,
+                              exclude_item_id="j1")["levels"][3]["value"] == 69.99
 
 
 # --- the orchestrator -------------------------------------------------------------------
@@ -125,16 +168,12 @@ def test_quick_text_check_passes_quick_options_and_stores_nothing():
     assert seen["stage"] == "check_quick_judge" and seen["item_id"] is None
     assert seen["ident"]["model"] == "CH857"
     assert res["item_type"] == "bags" and res["label"] == 11.0
-    # no same-item sales: priced from the cheapest identical ask ($31.99), which
-    # with a bag's $11 label leaves $6.01
-    assert res["pick"]["from_asks"] and res["money"]["profit"] == 6.01
-    assert res["verdict"] == "BORDERLINE"
-    assert "priced from asking prices, not sales" in res["reasons"]
+    assert res["pick"]["used"] == [1]                 # 2 same-item sales in the fake comps
     text = check.format_reply(res)
-    assert len(text.splitlines()) <= 5 and "quick · exact" in text
-    assert "sell ~$31.99 (asking) · profit ~$6.01 (asking)" in text and "ROI" not in text
+    assert len(text.splitlines()) <= 5 and "quick · exact" in text and "Evidence: L1 sold 2" in text
     details = check.format_details(res)
-    assert "break-even" in details and "Quick check: no recent sold data" in details
+    assert "Evidence ladder" in details and "break-even" in details
+    assert "Quick check: no recent sold data" in details
 
 
 def test_full_any_check_can_say_buy():
@@ -142,7 +181,9 @@ def test_full_any_check_can_say_buy():
 
     def fake_pricing(ident, **kw):
         seen.update(kw)
-        return pricing(suggested_price=44.99)
+        return pricing(raw_active_floor=80.0, judged_comps=[
+            *({"source": "sold", "verdict": "same_item", "total": t} for t in (52.0, 54.0, 56.0)),
+            {"source": "active", "verdict": "same_item", "total": 80.0}])
 
     res = check.run_check(check.parse_request("/check any full Coach Tabby 26 CH857 14.99"),
                           pricing_fn=fake_pricing, have_fn=lambda *a: ["item 3f2a1b2c (published)"])
@@ -175,9 +216,9 @@ def test_quick_with_nothing_at_all_is_no_data_but_full_is_skip():
     assert q["verdict"] == check.NO_DATA and q["reasons"]
     # a full check with no price is NO DATA too: SKIP needs real prices behind it
     assert check.evaluate(empty, {}, 14.99, exact=True, quick=False)["verdict"] == check.NO_DATA
-    # any data at all (an identical listing) is a real verdict even in quick mode
-    some = pricing(formula_price=None, judged_comps=[])
-    assert check.evaluate(some, {}, 14.99, exact=True, quick=True)["verdict"] != check.NO_DATA
+    # an identical listing alone is only a ceiling (level 5), never a price: still NO DATA
+    some = pricing(judged_comps=[{"source": "active", "verdict": "same_item", "total": 44.5}])
+    assert check.evaluate(some, {}, 14.99, exact=True, quick=True)["verdict"] == check.NO_DATA
     res = check.run_check(check.parse_request("/check lego set 9.99"),
                           pricing_fn=lambda ident, **kw: empty, have_fn=lambda *a: [])
     assert check.format_reply(res).startswith("❓ NO DATA")
@@ -203,23 +244,37 @@ def mkj_pricing(**kw):
                    same_item_active_count=1, **kw)
 
 
-def test_headline_is_verdict_and_evidence_and_profit_is_marked_asking():
-    res = check.run_check(check.parse_request("/check full Michael Kors pave necklace MKJ3969710 14.99"),
-                          pricing_fn=lambda ident, **kw: mkj_pricing(), have_fn=lambda *a: [])
-    text = check.format_reply(res, check_id=12)
-    lines = text.splitlines()
+MK_IDENT = {"brand": "Michael Kors", "product_name": "pave necklace", "model": "MKJ3969710",
+            "item_type": "necklace"}
+MK_SALES = [{"item_id": f"m{i}", "brand": "michael kors", "bucket": "other", "msrp": None, "sold": s,
+             "ratio": None} for i, s in enumerate((40.0, 46.0))]
+
+
+def test_headline_is_verdict_and_evidence_and_the_estimate_is_marked(monkeypatch):
+    from pipeline import msrp
+    monkeypatch.setattr(msrp, "load_history", lambda: MK_SALES)
+    req = {**check.parse_request("/check full 14.99"), "identification": MK_IDENT}
+    res = check.run_check(req, pricing_fn=lambda ident, **kw: mkj_pricing(), have_fn=lambda *a: [])
+    lines = check.format_reply(res, check_id=12).splitlines()
     assert len(lines) <= 5
     assert lines[0] == "🟡 MAYBE: no sales found, 1 uncertain listing"
-    assert lines[1] == "Michael Kors pave necklace MKJ3969710"            # model not repeated
-    # asking only: the cheapest ask x 0.98 (measured) x 0.95 (undercut) - our shipping
-    assert res["pick"]["price"] == check._charm(160.19 * 0.98 * 0.95 - 9.88) == 138.99
-    assert lines[2].startswith("Ross $14.99 · sell ~$138.99 (asking) · profit ~$") and "(asking)" in lines[2]
-    assert lines[3] == "Evidence: sold 0 · for sale 1 identical (cheapest $160.19) · match uncertain"
+    assert lines[1] == "Michael Kors pave necklace (MKJ3969710)"
+    # level 3: our two Michael Kors sales ($40, $46); the $160.19 listing is only a ceiling
+    assert res["pick"]["used"] == [3] and res["pick"]["price"] == 42.99
+    assert lines[2] == "Ross $14.99 · sell ~$42.99 (est.) · profit ~$21.30"
+    assert lines[3] == "Evidence: L1 sold 0 · L3 ours $43.00 (2)✓ · L5 ask ≤$147.11 · match uncertain"
     assert lines[4].startswith("#12 · ⏱") and "full · exact" in lines[4]
     assert "no sales found" in res["reasons"] and not any("only 0" in r for r in res["reasons"])
     details = check.format_details(res, check_id=12)
-    assert "×0.98" in details and "Fees + ads" in details and "label $4.50 (jewelry)" in details
+    assert "L3 our own sales, same brand + type: $43.00" in details and "L1 eBay sold, same item: none" in details
+    assert "Fees + ads" in details and "label $4.50 (jewelry)" in details
     assert "https://ebay.com/itm/1" in details and "LH_Sold=1" in details
+
+
+def test_model_number_not_repeated_when_typed():
+    res = check.run_check(check.parse_request("/check full Michael Kors pave necklace MKJ3969710 14.99"),
+                          pricing_fn=lambda ident, **kw: mkj_pricing(), have_fn=lambda *a: [])
+    assert check.format_reply(res).splitlines()[1] == "Michael Kors pave necklace MKJ3969710"
 
 
 def test_item_links_lose_their_tracking():
@@ -229,11 +284,6 @@ def test_item_links_lose_their_tracking():
     assert check.short_url("https://www.ebay.com/itm/some-title/123456789012") == \
         "https://www.ebay.com/itm/123456789012"
     assert check.short_url(None) == ""
-
-
-def test_any_mode_from_asks_is_discounted_too():
-    pick = check.choose_price(mkj_pricing(), exact=False)
-    assert pick["from_asks"] and pick["price"] == check._charm(139.99 * 0.98) and pick["ask_discount"] == 0.98
 
 
 def test_sale_wording():
@@ -287,18 +337,18 @@ def test_full_check_searches_the_upc_and_similar_items():
     assert seen[1]["extra_sold_queries"] is None                       # quick: cache only, no new searches
 
 
-def test_similar_items_line_in_exact_mode():
+def test_similar_sales_are_level2_in_exact_and_level1_in_any_mode():
     judged = [{"source": "sold", "verdict": "variant", "total": t} for t in (30.49, 35.0, 42.0)] + \
              [{"source": "active", "verdict": "same_item", "total": 104.05}]
     res = check.run_check(check.parse_request("/check full juicy to go weekender tote 9.99"),
-                          pricing_fn=lambda i, **kw: pricing(formula_price=None, raw_active_floor=104.05,
-                                                             judged_comps=judged),
+                          pricing_fn=lambda i, **kw: pricing(raw_active_floor=104.05, judged_comps=judged),
                           have_fn=lambda *a: [])
     evidence = check.format_reply(res).splitlines()[3]
-    assert "similar sold 3 ($30.49–$42.00, median $35.00)" in evidence
+    assert "L1 sold 0" in evidence and "L2 similar $25.12 (3)✓" in evidence and "L5 ask ≤$92.09" in evidence
     res_any = check.run_check(check.parse_request("/check any full juicy to go weekender tote 9.99"),
-                              pricing_fn=lambda i, **kw: pricing(judged_comps=judged), have_fn=lambda *a: [])
-    assert "similar sold" not in check.format_reply(res_any)      # any mode already counts them
+                              pricing_fn=lambda i, **kw: pricing(raw_active_floor=104.05, judged_comps=judged),
+                              have_fn=lambda *a: [])
+    assert "L1 sold 3 $25.12✓" in check.format_reply(res_any)
 
 
 # --- in-stock warning: items AND pieces (production has piece O1W-01) ---------------------------

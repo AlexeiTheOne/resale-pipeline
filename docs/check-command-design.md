@@ -94,6 +94,33 @@ up in `checks.ross_sku`:
 - Receipt matching, as above.
 - Stock creation from a bought check (v2).
 
+## 000. Pricing: the evidence ladder (Person B, 2026-11-02). This replaces the price choice in §3 and §0.
+
+Every level is an **item price**: eBay totals minus the $9.88 shipping we
+charge.
+
+| Level | Evidence | Rule |
+|---|---|---|
+| 1 | eBay sold, **same item** (the judge's `same_item`) | **2+ sales: their median, done** |
+| 2 | eBay sold, same model in another colour or size (the judge's `variant`) | 1+ counts |
+| 3 | **Our own sales** (ResaleDB), same brand + type bucket | their median |
+| 4 | **MSRP × brand ratio**: median sold/MSRP over our sold items | the type bucket when the brand has fewer than 3 sales; never the all-sales fallback; skipped when the MSRP looks wrong |
+| 5 | eBay **asking prices**: the cheapest identical listing × `CHECK_ASK_DISCOUNT` | **a ceiling only, never the price** |
+
+- **No level 1:** the price is the **median of levels 2–4** that exist.
+- **Ceiling:** the price is never above level 5, so never above the
+  cheapest identical listing.
+- **Range:** when the levels used differ by more than 40%, the reply shows
+  the range.
+- **No level 1–4 at all:** ❓ NO DATA; asking prices alone never set a price.
+- **Any mode:** variants count as level 1.
+- **BUY** still needs `CHECK_MIN_SALES` eBay sales. A price estimated from
+  levels 2–4 says so ("~ … (est.)") and gives at most MAYBE.
+- **The evidence line** shows each level found, with ✓ on the ones used:
+  "L1 sold 0 · L2 similar $20.61 (1)✓ · L4 MSRP×ratio $50.99✓ · L5 ask ≤$92.09".
+  Details lists every level with its numbers.
+- **The backtest** leaves each item's own sale out of levels 3–4.
+
 ## 0. Decisions (Person B's review, 2026-11-02). These override the sections below.
 
 | Topic | Decision |

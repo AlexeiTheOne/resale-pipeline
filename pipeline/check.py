@@ -175,7 +175,8 @@ def economics(item_price: float, ross_price: float, label: float,
 
 def verdict(*, profit: float | None, roi: float | None, sales: int,
             profit_at_cheapest: float | None, low_confidence: bool = False,
-            from_asks: bool = False, disagrees: bool = False) -> tuple[str, list[str]]:
+            from_asks: bool = False, disagrees: bool = False,
+            estimated: bool = False) -> tuple[str, list[str]]:
     """BUY / MAYBE / BORDERLINE / SKIP and the reasons, from config thresholds."""
     if profit is None:
         return "SKIP", ["no price found"]
@@ -189,6 +190,8 @@ def verdict(*, profit: float | None, roi: float | None, sales: int,
                         f"only {sales} sale{'s' if sales > 1 else ''} (need {config.CHECK_MIN_SALES})")
     if from_asks:
         evidence.append("priced from asking prices, not sales")
+    if estimated:
+        evidence.append("estimated from similar items and our own data, not same-item sales")
     if low_confidence:
         evidence.append("the judge isn't sure these are the same item")
     if disagrees:
@@ -239,47 +242,97 @@ def similar_sold(pricing: dict) -> dict:
             "low": t[0] if t else None, "high": t[-1] if t else None}
 
 
-def choose_price(pricing: dict, exact: bool) -> dict:
-    """Which price, which sales count, from the pricing result (design §3)."""
+LEVEL_NAMES = {1: "eBay sold, same item", 2: "eBay sold, same model other colour/size",
+               3: "our own sales, same brand + type", 4: "MSRP × brand ratio",
+               5: "eBay asking prices (ceiling only)"}
+LADDER_SPREAD = 1.40      # levels further apart than this: show the range
+L1_MIN_SALES = 2
+
+
+def _median(xs):
+    return round(statistics.median(xs), 2) if xs else None
+
+
+def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history: list | None = None,
+                 receipt: dict | None = None, exclude_item_id: str | None = None) -> dict:
+    """The evidence ladder (Person B, 2026-11-02). Every level is an ITEM price
+    (eBay totals minus the shipping we charge):
+      1 eBay sold, same item: 2+ sales -> their median, done.
+      2 eBay sold, same model other colour/size (the judge's variants), 1+.
+      3 our own sales, same brand + type (median sold price).
+      4 MSRP x brand ratio (our sold/MSRP; type bucket when the brand has
+        too few sales; never the all-sales fallback).
+      5 eBay asking prices x CHECK_ASK_DISCOUNT: a ceiling, never the price.
+    No level 1: the median of levels 2-4. Capped at level 5 (so never above
+    the cheapest identical listing). Any mode counts variants as level 1."""
+    from pipeline import msrp
+    ident = ident or {}
     judged = pricing.get("judged_comps") or []
     ship = config.EBAY_SHIP_CHARGED
-    if exact:
-        price = pricing.get("formula_price")
-        sold = sorted(c["total"] for c in judged if c.get("source") == "sold"
-                      and c.get("verdict") == "same_item" and c.get("total"))
-        out = {"price": price, "basis": "same-item sales", "sales": len(sold), "from_asks": False,
-               "sold_median": pricing.get("sold_median"), "disagrees": False, "ask_discount": None}
-        if price is None and pricing.get("raw_active_floor"):
-            # Asking prices only: the cheapest identical ask, less the measured
-            # ask-to-sold gap (CHECK_ASK_DISCOUNT) and our usual undercut.
-            item = (pricing["raw_active_floor"] * config.CHECK_ASK_DISCOUNT
-                    * (1 - config.UNDERCUT_V2_PCT) - ship)
-            if item > 0:
-                out.update(price=_charm(item), basis="cheapest identical listing (asking price)",
-                           from_asks=True, ask_discount=config.CHECK_ASK_DISCOUNT)
-        return out
-    sold = sorted(c["total"] for c in judged if c.get("source") == "sold"
-                  and c.get("verdict") in ("same_item", "variant") and c.get("total"))
-    flags = pricing.get("review_flags") or []
-    from_asks = "priced_from_asks" in flags
-    price = pricing.get("suggested_price")
-    if from_asks and price:
-        price = _charm(price * config.CHECK_ASK_DISCOUNT)
-    return {"price": price, "basis": "Claude's estimate (same item + variants)"
-                                     + (" from asking prices" if from_asks else ""),
-            "sales": len(sold), "from_asks": from_asks,
-            "sold_median": round(statistics.median(sold), 2) if sold else None,
-            "disagrees": "formula_disagrees" in flags,
-            "ask_discount": config.CHECK_ASK_DISCOUNT if from_asks else None}
+    same_v = ("same_item", "variant") if not exact else ("same_item",)
+    same = sorted(c["total"] for c in judged if c.get("source") == "sold"
+                  and c.get("verdict") in same_v and c.get("total"))
+    variant = [] if not exact else sorted(c["total"] for c in judged if c.get("source") == "sold"
+                                          and c.get("verdict") == "variant" and c.get("total"))
+    levels = {}
+    if len(same) >= L1_MIN_SALES:
+        levels[1] = {"value": round(_median(same) - ship, 2), "n": len(same),
+                     "detail": f"median of {len(same)} sales ({_median(same):.2f} total)"}
+    if variant:
+        levels[2] = {"value": round(_median(variant) - ship, 2), "n": len(variant),
+                     "detail": f"median of {len(variant)} sale(s) ({_median(variant):.2f} total)"}
+    if history is None:
+        try:
+            history = msrp.load_history()
+        except Exception:
+            history = []
+    bk, tb = msrp.brand_key(ident.get("brand")), msrp.type_bucket(ident.get("item_type"))
+    ours = [h["sold"] for h in history if bk and h["brand"] == bk and h["bucket"] == tb
+            and not (exclude_item_id and h["item_id"].startswith(exclude_item_id))]
+    if ours:
+        levels[3] = {"value": _median(ours), "n": len(ours),
+                     "detail": f"median of {len(ours)} of our {bk} {tb} sale(s)"}
+    try:
+        est = msrp.store_estimate(ident, receipt, exclude_item_id=exclude_item_id, history=history)
+    except Exception:
+        est = {}
+    if est.get("estimate") and not est.get("msrp_flags") and est.get("level") in ("brand", "type"):
+        levels[4] = {"value": est["estimate"], "n": est.get("n"),
+                     "detail": f"MSRP ${est['msrp']:.2f} × {est['ratio']} ({est['level']} {est['key']}, "
+                               f"{est.get('n')} sales)"}
+    cheapest = pricing.get("raw_active_floor")
+    if cheapest:
+        levels[5] = {"value": round(cheapest * config.CHECK_ASK_DISCOUNT - ship, 2), "n": None,
+                     "detail": f"cheapest identical ${cheapest:.2f} total × {config.CHECK_ASK_DISCOUNT}"}
+    used = [1] if 1 in levels else [k for k in (2, 3, 4) if k in levels]
+    raw = levels[1]["value"] if 1 in levels else _median([levels[k]["value"] for k in used])
+    capped = False
+    if raw is not None and 5 in levels and levels[5]["value"] < raw:
+        raw, capped = levels[5]["value"], True
+    price = _charm(raw) if raw and raw > 0 else None
+    vals = [levels[k]["value"] for k in used]
+    spread = (min(vals), max(vals)) if len(vals) > 1 and min(vals) > 0 \
+        and max(vals) / min(vals) > LADDER_SPREAD else None
+    if 1 in used:
+        basis = "eBay sales of the same item (level 1)"
+    elif used:
+        basis = "median of levels " + ", ".join(str(k) for k in used) + " (no same-item sales)"
+    else:
+        basis = "no level 1-4 evidence"
+    return {"price": price, "basis": basis + (", capped at the asking-price ceiling" if capped else ""),
+            "levels": levels, "used": used, "capped": capped, "range": spread,
+            "sales": len(same), "from_asks": False, "estimated": bool(used) and 1 not in used,
+            "sold_median": _median(same), "disagrees": False, "ask_discount": None}
 
 
 def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
-             text: str = "", quick: bool = False) -> dict:
+             text: str = "", quick: bool = False, history: list | None = None,
+             exclude_item_id: str | None = None) -> dict:
     """Price choice, money and verdict from a pricing result. Shared by
     run_check and the backtest (scripts/backtest_check.py), so the backtest
     scores exactly what /check would say. quick: a quick check that found no
     data at all is NO_DATA instead of SKIP."""
-    pick = choose_price(pricing, exact)
+    pick = choose_price(pricing, exact, ident, history=history, exclude_item_id=exclude_item_id)
     kind, label = label_for(ident, text)
     money = economics(pick["price"], ross_price, label) if pick["price"] and ross_price else None
     cheapest = pricing.get("raw_active_floor")
@@ -291,7 +344,8 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
                          sales=pick["sales"],
                          profit_at_cheapest=at_cheapest["profit"] if at_cheapest else None,
                          low_confidence=pricing.get("claude_confidence") == "low",
-                         from_asks=pick["from_asks"], disagrees=pick["disagrees"])
+                         from_asks=pick["from_asks"], disagrees=pick["disagrees"],
+                         estimated=pick.get("estimated", False))
         if money is None:
             # No price at all is not evidence against the item (Person B,
             # 2026-11-02: in the backtest 14 of 20 such SKIPs were winners).
@@ -571,6 +625,22 @@ def search_links(res: dict) -> dict:
             "for sale": "https://www.ebay.com/sch/i.html?" + urlencode({**base, "_sop": 15})}
 
 
+LEVEL_SHORT = {1: "sold", 2: "similar", 3: "ours", 4: "MSRP×ratio", 5: "ask ≤"}
+
+
+def ladder_line(pick: dict, res: dict) -> str:
+    """Each level found, in order; the ones the price used are marked ✓."""
+    levels, used = pick.get("levels") or {}, set(pick.get("used") or [])
+    parts = [f"L1 sold {pick.get('sales') or 0}" + (f" {_usd(levels[1]['value'])}✓" if 1 in levels else "")]
+    for k in (2, 3, 4):
+        if k in levels:
+            n = f" ({levels[k]['n']})" if levels[k].get("n") and k != 4 else ""
+            parts.append(f"L{k} {LEVEL_SHORT[k]} {_usd(levels[k]['value'])}{n}{'✓' if k in used else ''}")
+    if 5 in levels:
+        parts.append(f"L5 {LEVEL_SHORT[5]}{_usd(levels[5]['value'])}" + (" ✓cap" if pick.get("capped") else ""))
+    return " · ".join(parts)
+
+
 def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", footer: str = "") -> str:
     """At most 5 lines: verdict + why / item / cost · sell · profit /
     evidence / check number, time, mode. The rest: format_details."""
@@ -588,24 +658,21 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
     lines.append(line2)
     ross = req.get("ross_price")
     if money:
-        asks = pick.get("from_asks")
-        approx, tag = ("~", " (asking)") if asks else ("", "")
-        roi = f", ROI {money['roi']:.0%}" if money.get("roi") is not None and not asks else ""
+        asks, est = pick.get("from_asks"), pick.get("estimated")
+        approx, tag = ("~", " (asking)") if asks else ("~", " (est.)") if est else ("", "")
+        rng = pick.get("range")
+        if rng:
+            tag += f", range {_usd(rng[0])}–{_usd(rng[1])}"
+        roi = f", ROI {money['roi']:.0%}" if money.get("roi") is not None and not (asks or est) else ""
         lines.append(f"Ross {_usd(ross)} · sell {approx}{_usd(money['item_price'])}{tag} · "
-                     f"profit {approx}{_usd(money['profit'])}{tag}{roi}")
+                     f"profit {approx}{_usd(money['profit'])}{roi}")
     elif ross is not None:
         lines.append(f"Ross {_usd(ross)} · no price found")
     else:
         lines.append("Add the Ross price as the last number, e.g. /check coach tabby 26 49.99")
     cheapest = f" (cheapest {_usd(res['cheapest_total'])})" if res.get("cheapest_total") else ""
     match = CERTAINTY.get(res.get("confidence"), "-")
-    sim = res.get("similar") or {}
-    similar = ""
-    if req.get("exact", True) and sim.get("n"):
-        rng = (f"{_usd(sim['low'])}–{_usd(sim['high'])}, " if sim["n"] > 1 else "")
-        similar = f" · similar sold {sim['n']} ({rng}median {_usd(sim['median'])})"
-    lines.append(f"Evidence: sold {sales} · for sale {res.get('same_item_active') or 0} identical"
-                 f"{cheapest}{similar} · match {match}")
+    lines.append("Evidence: " + ladder_line(pick, res) + f" · match {match}")
     t = res["timings"].get("total_s", 0)
     mode = ("full" if req.get("full") else "quick") + " · " + ("exact" if req.get("exact", True) else "any")
     lines.append(" · ".join(x for x in (f"#{check_id}" if check_id else "", f"⏱ {t:.0f}s", mode, footer) if x))
@@ -621,6 +688,18 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
         out.append(f"Ross {_usd(ross)}" + (f" · SKU {sku}" if sku else "")
                    + f" → cost {_usd(round(ross * (1 + config.SALES_TAX_RATE), 2))} with "
                      f"{config.SALES_TAX_RATE:.0%} tax")
+    levels = pick.get("levels") or {}
+    if levels or pick.get("used") is not None:
+        out.append("Evidence ladder (item prices, before shipping):")
+        for k in (1, 2, 3, 4, 5):
+            mark = "✓ used" if k in (pick.get("used") or []) else ("cap" if k == 5 and pick.get("capped") else "")
+            if k in levels:
+                out.append(f"  L{k} {LEVEL_NAMES[k]}: {_usd(levels[k]['value'])} ({levels[k]['detail']}) {mark}".rstrip())
+            else:
+                out.append(f"  L{k} {LEVEL_NAMES[k]}: none")
+        if pick.get("range"):
+            out.append(f"  levels differ by more than {LADDER_SPREAD - 1:.0%}: range "
+                       f"{_usd(pick['range'][0])}–{_usd(pick['range'][1])}")
     if money:
         out.append(f"Sell at {_usd(money['item_price'])} + {_usd(money['ship_charged'])} shipping "
                    f"(buyer pays {_usd(money['total'])}), price from {pick['basis']}")

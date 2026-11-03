@@ -13,7 +13,7 @@ from tests import tg_fakes as tg
 
 JUDGED = [{"source": "sold", "verdict": "same_item", "total": t, "title": f"sold {t}", "url": "u"}
           for t in (52.0, 54.0, 56.0)] + \
-         [{"source": "active", "verdict": "same_item", "total": 50.0, "title": "active", "url": "u"}]
+         [{"source": "active", "verdict": "same_item", "total": 80.0, "title": "active", "url": "u"}]
 IDENT = {"brand": "Coach", "product_name": "Tabby 26 shoulder bag", "item_type": "Shoulder Bag", "model": "CH857"}
 
 
@@ -24,7 +24,7 @@ def fake_pricing(calls, empty_quick=False):
             return {"suggested_price": None, "formula_price": None, "raw_active_floor": None,
                     "judged_comps": [], "review_flags": [], "sold_cache_misses": ["q"],
                     "timings": {"comps_s": 1.0, "judge_s": 0.0}}
-        return {"suggested_price": 44.99, "formula_price": 44.99, "raw_active_floor": 50.0,
+        return {"suggested_price": 44.99, "formula_price": 44.99, "raw_active_floor": 80.0,
                 "sold_median": 54.0, "judged_comps": JUDGED, "review_flags": [],
                 "claude_confidence": "high", "same_item_active_count": 1,
                 "sold_cache_misses": [] if kw.get("sold_cache_only") is False else ["q"],
@@ -38,6 +38,8 @@ def env(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(pricing_v2, "get_pricing_v2", fake_pricing(calls))
     monkeypatch.setattr(check, "already_have", lambda *a: [])
+    from pipeline import msrp
+    monkeypatch.setattr(msrp, "load_history", lambda: [])
     monkeypatch.setattr(check, "TIMINGS_FILE", tmp_path / "check_timings.jsonl")
     monkeypatch.setattr(check_cmds, "CHECKS_DIR", tmp_path / "checks")
     monkeypatch.setattr(check_cmds, "ALBUM_WAIT_S", 0.0)
@@ -106,7 +108,7 @@ def test_album_with_a_tag_is_one_saved_check_and_no_item(env, monkeypatch):
     c = db.list_checks(limit=1)[0]
     assert (c["ross_sku"], c["ross_price"], c["verdict"], c["status"]) == ("400289769542", 14.99, "BUY", "checked")
     assert len(c["photos"]) == 2 and c["identification"]["brand"] == "Coach"
-    assert c["comps_summary"]["comps"] and c["suggested_price"] == 44.99 and c["sold_count"] == 3
+    assert c["comps_summary"]["comps"] and c["suggested_price"] == 43.99 and c["sold_count"] == 3
     assert (check_cmds.CHECKS_DIR / str(c["check_id"]) / "2.jpg").exists()
     assert len(db.list_items()) == before                          # not an item
     labels = [d.split(":")[1] for _, d in tg.last_markup_buttons(ctx)]
