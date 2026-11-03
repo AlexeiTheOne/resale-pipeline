@@ -100,8 +100,7 @@ def pricing(**kw):
 @pytest.fixture(autouse=True)
 def no_history(monkeypatch):
     """Our own sales (levels 3-4) come from the DB; tests pass them in explicitly."""
-    from pipeline import msrp
-    monkeypatch.setattr(msrp, "load_history", lambda: [])
+    monkeypatch.setattr(check, "load_our_sales", lambda: [])
 
 
 def test_ladder_level1_same_item_sales_median_and_the_ceiling():
@@ -170,7 +169,7 @@ def test_quick_text_check_passes_quick_options_and_stores_nothing():
     assert res["item_type"] == "bags" and res["label"] == 11.0
     assert res["pick"]["used"] == [1]                 # 2 same-item sales in the fake comps
     text = check.format_reply(res)
-    assert len(text.splitlines()) <= 5 and "quick · exact" in text and "Evidence: L1 sold 2" in text
+    assert len(text.splitlines()) <= 5 and "quick · exact" in text and "Evidence: 2 sold same $42" in text
     details = check.format_details(res)
     assert "Evidence ladder" in details and "break-even" in details
     assert "Quick check: no recent sold data" in details
@@ -251,8 +250,7 @@ MK_SALES = [{"item_id": f"m{i}", "brand": "michael kors", "bucket": "other", "ms
 
 
 def test_headline_is_verdict_and_evidence_and_the_estimate_is_marked(monkeypatch):
-    from pipeline import msrp
-    monkeypatch.setattr(msrp, "load_history", lambda: MK_SALES)
+    monkeypatch.setattr(check, "load_our_sales", lambda: MK_SALES)
     req = {**check.parse_request("/check full 14.99"), "identification": MK_IDENT}
     res = check.run_check(req, pricing_fn=lambda ident, **kw: mkj_pricing(), have_fn=lambda *a: [])
     lines = check.format_reply(res, check_id=12).splitlines()
@@ -262,7 +260,7 @@ def test_headline_is_verdict_and_evidence_and_the_estimate_is_marked(monkeypatch
     # level 3: our two Michael Kors sales ($40, $46); the $160.19 listing is only a ceiling
     assert res["pick"]["used"] == [3] and res["pick"]["price"] == 42.99
     assert lines[2] == "Ross $14.99 · sell ~$42.99 (est.) · profit ~$21.30"
-    assert lines[3] == "Evidence: L1 sold 0 · L3 ours $43.00 (2)✓ · L5 ask ≤$147.11 · match uncertain"
+    assert lines[3] == "Evidence: 0 sold same · our Michael Kors items ~$43 · ask ≤$147 · match uncertain"
     assert lines[4].startswith("#12 · ⏱") and "full · exact" in lines[4]
     assert "no sales found" in res["reasons"] and not any("only 0" in r for r in res["reasons"])
     details = check.format_details(res, check_id=12)
@@ -344,11 +342,30 @@ def test_similar_sales_are_level2_in_exact_and_level1_in_any_mode():
                           pricing_fn=lambda i, **kw: pricing(raw_active_floor=104.05, judged_comps=judged),
                           have_fn=lambda *a: [])
     evidence = check.format_reply(res).splitlines()[3]
-    assert "L1 sold 0" in evidence and "L2 similar $25.12 (3)✓" in evidence and "L5 ask ≤$92.09" in evidence
+    assert evidence.startswith("Evidence: 0 sold same · 3 sold same model $25 · ask ≤$92")
     res_any = check.run_check(check.parse_request("/check any full juicy to go weekender tote 9.99"),
                               pricing_fn=lambda i, **kw: pricing(raw_active_floor=104.05, judged_comps=judged),
                               have_fn=lambda *a: [])
-    assert "L1 sold 3 $25.12✓" in check.format_reply(res_any)
+    assert "Evidence: 3 sold same $25" in check.format_reply(res_any)
+
+
+def test_level3_reports_median_days_to_sell_and_the_example_wording():
+    hist = BAGS + [{"item_id": f"j{i}", "brand": "juicy couture", "bucket": "bag", "msrp": None, "sold": s,
+                    "ratio": None, "days": d} for i, (s, d) in enumerate(((55.0, 9.0), (60.0, 15.0), (58.0, 12.0)))]
+    p = pricing(raw_active_floor=104.05, judged_comps=[{"source": "sold", "verdict": "variant", "total": 30.49},
+                                                       {"source": "active", "verdict": "same_item",
+                                                        "total": 104.05}])
+    pick = check.choose_price(p, exact=True, ident=JUICY, history=hist)
+    assert pick["levels"][3]["value"] == 58.0 and pick["levels"][3]["days"] == 12.0
+    line = check.ladder_line(pick, {})
+    assert line == "0 sold same · 1 sold same model $21 · our Juicy Couture bags ~$58 (12d) · MSRP×47% $51 · ask ≤$92"
+
+
+def test_days_to_sell_from_listing_to_first_sale():
+    assert check._days({"published_at": "2026-08-17T02:31:53+00:00", "first_sold_at": "2026-10-03T05:07:39.000Z"}) \
+        == 47.1
+    assert check._days({"published_at": "2026-10-03T00:00:00+00:00", "sold_at": "2026-10-01T00:00:00Z"}) is None
+    assert check._days({}) is None
 
 
 # --- Person B's approved fixes from the check #2 trace -----------------------------------------

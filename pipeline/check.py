@@ -250,6 +250,31 @@ LADDER_SPREAD = 1.40      # levels further apart than this: show the range
 L1_MIN_SALES = 2
 
 
+def _days(ebay: dict):
+    """Listing to first sale, in days (None when unknown or inconsistent)."""
+    from datetime import datetime as _dt
+    try:
+        a = _dt.fromisoformat(str(ebay.get("published_at")).replace("Z", "+00:00"))
+        b = _dt.fromisoformat(str(ebay.get("first_sold_at") or ebay.get("sold_at")).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    d = (b - a).total_seconds() / 86400
+    return round(d, 1) if d >= 0 else None
+
+
+def load_our_sales() -> list[dict]:
+    """Our sold items for levels 3-4: msrp.sold_history plus days to sell (read only)."""
+    import db
+    from pipeline import msrp
+    rows = db.sold_items_for_calibration()
+    hist = msrp.sold_history([(s["item_id"], s["identification"], s["ebay"], s["receipt"]) for s in rows])
+    days = {s["item_id"]: _days(s["ebay"] if isinstance(s["ebay"], dict) else json.loads(s["ebay"] or "{}"))
+            for s in rows}
+    for h in hist:
+        h["days"] = days.get(h["item_id"])
+    return hist
+
+
 def _median(xs):
     return round(statistics.median(xs), 2) if xs else None
 
@@ -284,21 +309,24 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
                      "detail": f"median of {len(variant)} sale(s) ({_median(variant):.2f} total)"}
     if history is None:
         try:
-            history = msrp.load_history()
+            history = load_our_sales()
         except Exception:
             history = []
     bk, tb = msrp.brand_key(ident.get("brand")), msrp.type_bucket(ident.get("item_type"))
-    ours = [h["sold"] for h in history if bk and h["brand"] == bk and h["bucket"] == tb
+    mine = [h for h in history if bk and h["brand"] == bk and h["bucket"] == tb
             and not (exclude_item_id and h["item_id"].startswith(exclude_item_id))]
-    if ours:
-        levels[3] = {"value": _median(ours), "n": len(ours),
-                     "detail": f"median of {len(ours)} of our {bk} {tb} sale(s)"}
+    if mine:
+        days = [h["days"] for h in mine if h.get("days") is not None]
+        levels[3] = {"value": _median([h["sold"] for h in mine]), "n": len(mine),
+                     "days": _median(days), "brand": ident.get("brand"), "bucket": tb,
+                     "detail": f"median of {len(mine)} of our {bk} {tb} sale(s)"
+                               + (f", median {_median(days):.0f} days to sell" if days else "")}
     try:
         est = msrp.store_estimate(ident, receipt, exclude_item_id=exclude_item_id, history=history)
     except Exception:
         est = {}
     if est.get("estimate") and not est.get("msrp_flags") and est.get("level") in ("brand", "type"):
-        levels[4] = {"value": est["estimate"], "n": est.get("n"),
+        levels[4] = {"value": est["estimate"], "n": est.get("n"), "ratio": est.get("ratio"),
                      "detail": f"MSRP ${est['msrp']:.2f} × {est['ratio']} ({est['level']} {est['key']}, "
                                f"{est.get('n')} sales)"}
     cheapest = pricing.get("raw_active_floor")
@@ -635,16 +663,29 @@ def search_links(res: dict) -> dict:
 LEVEL_SHORT = {1: "sold", 2: "similar", 3: "ours", 4: "MSRP×ratio", 5: "ask ≤"}
 
 
+def _whole(x) -> str:
+    return "-" if x is None else f"${x:,.0f}"
+
+
 def ladder_line(pick: dict, res: dict) -> str:
-    """Each level found, in order; the ones the price used are marked ✓."""
-    levels, used = pick.get("levels") or {}, set(pick.get("used") or [])
-    parts = [f"L1 sold {pick.get('sales') or 0}" + (f" {_usd(levels[1]['value'])}✓" if 1 in levels else "")]
-    for k in (2, 3, 4):
-        if k in levels:
-            n = f" ({levels[k]['n']})" if levels[k].get("n") and k != 4 else ""
-            parts.append(f"L{k} {LEVEL_SHORT[k]} {_usd(levels[k]['value'])}{n}{'✓' if k in used else ''}")
+    """Each level found, in plain words and whole dollars (item prices), e.g.
+    "0 sold same · 1 sold same model $21 · our Juicy Couture bags ~$58 (12d)
+    · MSRP×47% $51 · ask ≤$92"."""
+    levels = pick.get("levels") or {}
+    n1 = pick.get("sales") or 0
+    parts = [f"{n1} sold same" + (f" {_whole(levels[1]['value'])}" if 1 in levels else "")]
+    if 2 in levels:
+        parts.append(f"{levels[2]['n']} sold same model {_whole(levels[2]['value'])}")
+    if 3 in levels:
+        l3 = levels[3]
+        kind = {"bag": "bags", "watch": "watches", "other": "items"}.get(l3.get("bucket"), f"{l3.get('bucket')}s")
+        days = f" ({l3['days']:.0f}d)" if l3.get("days") is not None else ""
+        parts.append(f"our {l3.get('brand') or ''} {kind} ~{_whole(l3['value'])}{days}".replace("  ", " "))
+    if 4 in levels:
+        r = levels[4].get("ratio")
+        parts.append(f"MSRP×{r:.0%} {_whole(levels[4]['value'])}" if r else f"MSRP×ratio {_whole(levels[4]['value'])}")
     if 5 in levels:
-        parts.append(f"L5 {LEVEL_SHORT[5]}{_usd(levels[5]['value'])}" + (" ✓cap" if pick.get("capped") else ""))
+        parts.append(f"ask ≤{_whole(levels[5]['value'])}" + (" (cap)" if pick.get("capped") else ""))
     return " · ".join(parts)
 
 
