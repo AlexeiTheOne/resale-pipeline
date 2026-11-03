@@ -22,6 +22,8 @@ Files it keeps (all under <repo>\logs, which git ignores):
   deploy.lock        pid of the running deploy (stale if that pid is dead)
   deploy-state.json  last alert sent (so a blocked state alerts once) and the
                      last failed sha (skipped until a newer commit, or -Force)
+and, outside the repo, %TEMP%\ebay-deploy-pytest\run-*: pytest's temp files and
+cache, a fresh folder per run (older than a day: deleted when possible).
 
 The bot runs on SQL Server (ResaleDB). Staging tests run on SQL Server too
 (DB_BACKEND=sqlserver, ROSS_REQUIRE_SQLSERVER=1: a missing server fails the
@@ -39,6 +41,8 @@ param(
     [string]$StagingPath = 'C:\Users\boris\Projects\ebay-list-staging',
     # The tests' own Python, outside $StagingPath (git clean wipes that).
     [string]$StagingVenv = 'C:\Users\boris\Projects\ebay-list-staging-venv',
+    # pytest temp + cache, one fresh folder per run (see New-PytestRunDir).
+    [string]$PytestRoot = (Join-Path $env:TEMP 'ebay-deploy-pytest'),
     [string]$RestartScript = 'C:\Users\boris\Projects\restart_ebay_bot.ps1',
     [string]$Branch = 'main',
     [int]$BusyWaitSeconds = 600,
@@ -183,6 +187,19 @@ function Exit-Lock {
     if ($owner -and $owner.Trim() -eq "$PID") { Remove-Item $LockFile -Force -ErrorAction SilentlyContinue }
 }
 
+# A new, empty folder for one pytest run under $PytestRoot. Run folders older
+# than a day are deleted first; any that can't be (made by another login) are
+# left alone, since nothing reuses them.
+function New-PytestRunDir {
+    if (-not (Test-Path $PytestRoot)) { New-Item -ItemType Directory -Path $PytestRoot | Out-Null }
+    Get-ChildItem $PytestRoot -Directory -Filter 'run-*' -ErrorAction SilentlyContinue |
+        Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-1) } |
+        ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    $dir = Join-Path $PytestRoot ('run-{0:yyyyMMdd-HHmmss}-{1}' -f (Get-Date), $PID)
+    New-Item -ItemType Directory -Path $dir | Out-Null
+    return $dir
+}
+
 # ---------------------------------------------------------------- steps
 
 # Tests the commit in the staging worktree. Returns @{Ok; Out}.
@@ -228,8 +245,16 @@ function Test-InStaging([string]$Sha) {
     foreach ($k in $testEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $testEnv[$k], 'Process') }
     $outFile = Join-Path $LogDir 'deploy-pytest.out'
     $errFile = Join-Path $LogDir 'deploy-pytest.err'
+    # pytest's temp files and cache go in a fresh folder per run, outside the
+    # staging copy. Folders pytest makes can be unreadable from another login
+    # of the same user (scheduled task vs a manual run), and a shared
+    # Temp\pytest-of-<user> or staging\.pytest_cache left by one then broke
+    # the other (git clean, and pytest's own cleanup). Same idea as
+    # scripts/precommit_tests.py. Old run folders are removed when possible.
+    $runDir = New-PytestRunDir
     try {
-        $p = Start-Process -FilePath $testPython -ArgumentList '-m', 'pytest', '-q' `
+        $p = Start-Process -FilePath $testPython -ArgumentList '-m', 'pytest', '-q', `
+            "`"--basetemp=$(Join-Path $runDir 'tmp')`"", '-o', "`"cache_dir=$(Join-Path $runDir 'cache')`"" `
             -WorkingDirectory $StagingPath -NoNewWindow -PassThru `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile
         $null = $p.Handle   # keeps ExitCode readable after exit (PS 5.1 quirk)
