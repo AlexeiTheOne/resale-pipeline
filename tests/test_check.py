@@ -15,7 +15,9 @@ def rates(monkeypatch):
                         ("UNDERCUT_V2_PCT", 0.05), ("CHECK_BUY_MIN_PROFIT", 15.0),
                         ("CHECK_BUY_MIN_ROI", 0.75), ("CHECK_MIN_SALES", 3), ("CHECK_MIN_PROFIT", 5.0),
                         ("CHECK_MIN_PROFIT_AT_CHEAPEST", 5.0), ("CHECK_SOLD_CACHE_DAYS", 7.0),
-                        ("CHECK_LABEL_COSTS", "bags=11.00,jewelry=4.50,shoes=12.00,clothing=7.20,other=7.20")):
+                        ("CHECK_LABEL_COSTS",
+                         "bags=11.00,small_bags=5.50,jewelry=4.50,shoes=12.00,clothing=7.20,other=7.20"),
+                        ("CHECK_SMALL_BAG_MAX_IN", 11.0)):
         monkeypatch.setattr(config, name, value)
 
 
@@ -259,7 +261,7 @@ def test_headline_is_verdict_and_evidence_and_the_estimate_is_marked(monkeypatch
     res = check.run_check(req, pricing_fn=lambda ident, **kw: mkj_pricing(), have_fn=lambda *a: [])
     lines = check.format_reply(res, check_id=12).splitlines()
     assert len(lines) == 8
-    assert lines[0] == "🟡 MAYBE: no sales found, 1 uncertain listing"
+    assert lines[0] == "🟡 MAYBE (estimated): no sales found, 1 uncertain listing"
     assert lines[1] == "Michael Kors pave necklace (MKJ3969710)"
     # level 3: our two Michael Kors sales ($40, $46); the $160.19 listing is only a ceiling
     assert res["pick"]["used"] == [3] and res["pick"]["price"] == 42.99
@@ -370,7 +372,8 @@ def test_level3_reports_median_days_to_sell_and_the_example_wording():
     pick = check.choose_price(p, exact=True, ident=JUICY, history=hist)
     assert pick["levels"][3]["value"] == 58.0 and pick["levels"][3]["days"] == 12.0
     line = check.ladder_line(pick, {})
-    assert line == "0 sold same · 1 sold same model $21 · our Juicy Couture bags ~$58 (12d) · MSRP×47% $51 · ask ≤$92"
+    assert line == ("0 sold same · 1 sold same model $21 · our Juicy Couture bags ~$58 (12d) · "
+                    "MSRP×47% $51 (other brands) · ask ≤$92")
 
 
 def test_days_to_sell_from_listing_to_first_sale():
@@ -600,6 +603,68 @@ def test_check3_judge_variant_of_another_style_is_left_out_of_level2():
     assert "1 other style(s) left out" in check.format_details(res)
     any_mode = check.evaluate(p, LUV, 8.99, exact=False, history=BAGS)       # any mode: not level 1 either
     assert any_mode["pick"]["sales"] == 0
+
+
+# --- check #5 (Vans Detached Sling Bag): SKIP needs sales, label by bag size -----------------
+
+VANS = {"brand": "Vans", "item_type": "Sling Bag", "product_name": "Detached Sling Bag", "model": "VN000Q9BFS8",
+        "upc": "197804374267", "retail_price": 45.0, "size": "OS"}
+VANS_ACTIVES = [{"source": "active", "verdict": "same_item", "total": 33.75, "title": "Brand New Vans Detached Sling Bag"},
+                {"source": "active", "verdict": "same_item", "total": 41.14, "title": "Vans Detached Sling Bag New"}]
+
+
+def test_vans_sticker_is_read_without_ai():
+    assert check.read_ross_barcode(str(FIXTURE.with_name("check_ross_tag_vans_sling.jpg"))) == \
+        {"code": "400309056676", "reduced_price": 12.99}
+
+
+def test_an_estimate_with_failing_money_is_borderline_never_skip():
+    v, why = check.verdict(profit=-0.63, roi=-0.05, sales=0, profit_at_cheapest=2.0, estimated=True)
+    assert v == "BORDERLINE" and why[0] == "profit −$0.63 is under $5"
+    v, _ = check.verdict(profit=3.0, roi=0.2, sales=0, profit_at_cheapest=-1.0, estimated=True)
+    assert v == "BORDERLINE"
+    # real sales behind the price: SKIP stays
+    assert check.verdict(profit=-0.63, roi=-0.05, sales=4, profit_at_cheapest=2.0)[0] == "SKIP"
+    assert check.verdict(profit=3.0, roi=0.2, sales=2, profit_at_cheapest=-1.0)[0] == "SKIP"
+
+
+def test_check5_vans_sling_is_borderline_estimated_with_a_small_bag_label(monkeypatch):
+    monkeypatch.setattr(check, "load_our_sales", lambda: BAGS)
+    p = pricing(raw_active_floor=33.75, judged_comps=VANS_ACTIVES)
+    ev = check.evaluate(p, VANS, 12.99, exact=True, history=BAGS)
+    assert ev["pick"]["used"] == [4] and ev["pick"]["price"] == 20.99 and ev["pick"]["levels"][4]["level"] == "type"
+    assert ev["label"] == 5.50 and ev["label_size"] == "small"
+    assert ev["verdict"] == "BORDERLINE" and ev["money"]["profit"] == 4.87
+    res = check.run_check({**check.parse_request("/check full 12.99"), "identification": VANS},
+                          pricing_fn=lambda i, **kw: p, have_fn=lambda *a: [])
+    lines = check.format_reply(res).splitlines()
+    assert lines[0].startswith("🟠 BORDERLINE (estimated): no sales found")
+    assert "MSRP×47% $21 (other brands)" in lines[4]
+    details = check.format_details(res)
+    assert "label $5.50 (bags, small)" in details and "ratio from other brands" in details
+
+
+def test_bag_size_from_dimensions_then_name():
+    assert check.bag_size(VANS) == "small"
+    assert check.bag_size({"item_type": "Weekender Tote Bag"}) == "large"
+    assert check.bag_size({"item_type": "Mini Backpack"}) == "small"            # mini wins
+    assert check.bag_size({"item_type": "Crossbody Tote"}) == "large"
+    assert check.bag_size({"item_type": "Shoulder Bag"}) == "large"             # unknown size: the safe side
+    # the name decides; a 21" sling (check #5's real identification) still ships small
+    assert check.bag_size({**VANS, "specifications": {"Bag Width": "21 inches", "Bag Height": "8.5 inches"}}) \
+        == "small"
+    # a name that says neither: the measured sides
+    assert check.bag_size({"item_type": "Handbag", "specifications": {"Bag Width": "10 in", "Bag Height": "7 in"}}) \
+        == "small"
+    assert check.bag_size({"item_type": "Shoulder Bag", "specifications": {"Bag Width": "14 in"}}) == "large"
+    assert check.bag_size({"item_type": "bag", "specifications": {"Width": "25 cm"}}) == "small"
+    assert check.label_for(VANS) == ("bags", 5.50) and check.label_for(JUICY) == ("bags", 11.0)
+
+
+def test_money_shows_a_real_minus_sign():
+    assert check._usd(-0.63) == "−$0.63" and check._usd(4.87) == "$4.87" and check._usd(None) == "-"
+    assert check._pct(-0.05) == "−5%" and check._pct(0.97) == "97%"
+    assert check._whole(-12.4) == "−$12" and check._whole(-0.2) == "$0" and check._whole(51.2) == "$51"
 
 
 # --- in-stock warning: items AND pieces (production has piece O1W-01) ---------------------------

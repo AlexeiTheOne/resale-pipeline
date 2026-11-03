@@ -202,6 +202,28 @@ charge.
   watches and bags sell at different ratios). That is `pipeline/msrp.py`,
   Person A's file: not changed here.
 
+### Check #5 fixes: SKIP needs sales, label by bag size (Person B, 2026-11-02)
+
+Check #5 (Vans Detached Sling Bag VN000Q9BFS8, Ross $12.99, MSRP $45) said
+❌ SKIP from MSRP × 47% alone, with 0 sales.
+
+- **SKIP only when real sold prices back it:** 2+ same-item sales (level 1).
+  An estimate (levels 2–4) with failing money is 🟠 BORDERLINE, and the
+  headline says "(estimated)" for every estimated verdict, e.g.
+  "🟠 BORDERLINE (estimated): no sales found, 2 listings".
+- **Label by bag size:** `small_bags` in `CHECK_LABEL_COSTS` ($5.50, Ground
+  Advantage) for slings, crossbodies, minis, wallets, wristlets, pouches,
+  belt bags; `bags` ($11) for totes, weekenders, duffels, backpacks and any
+  bag of unknown size. The name decides (a soft sling folds into a poly
+  mailer whatever its length: check #5's sling measures 21"); "mini" beats
+  "backpack". Only a name that says neither ("handbag") goes by the
+  measured sides: none over `CHECK_SMALL_BAG_MAX_IN` (11") = small.
+  Details shows "label $5.50 (bags, small)".
+- **Ratio from other brands:** when the brand has no sales of its own, level
+  4 uses the type ratio (47% from our handbags). The evidence line says
+  "MSRP×47% $21 (other brands)", and Details says so too.
+- **Losses** read "−$0.63", with a real minus sign.
+
 ## 0. Decisions (Person B's review, 2026-11-02). These override the sections below.
 
 | Topic | Decision |

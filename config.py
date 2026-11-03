@@ -352,10 +352,16 @@ CHECK_BO_LIST = float(os.getenv("CHECK_BO_LIST", "1.25"))
 CHECK_BO_ACCEPT = float(os.getenv("CHECK_BO_ACCEPT", "1.05"))
 CHECK_BO_DECLINE = float(os.getenv("CHECK_BO_DECLINE", "0.90"))
 # Shipping label we pay, by item type: "type=dollars,..." Starting estimates;
-# correct them from real label costs. "other" is EBAY_SHIP_COST, the measured
+# correct them from real label costs. small_bags: slings, crossbodies, minis,
+# wallets (Person B, 2026-11-02: ~$5-6 Ground Advantage); bags: totes,
+# weekenders, duffels and any bag of unknown size. "other" is EBAY_SHIP_COST, the measured
 # average.
 CHECK_LABEL_COSTS = os.getenv(
-    "CHECK_LABEL_COSTS", f"bags=11.00,jewelry=4.50,shoes=12.00,clothing=7.20,other={EBAY_SHIP_COST:.2f}")
+    "CHECK_LABEL_COSTS", f"bags=11.00,small_bags=5.50,jewelry=4.50,shoes=12.00,clothing=7.20,"
+                         f"other={EBAY_SHIP_COST:.2f}")
+# A bag counts as small (Ground Advantage, small_bags label) when no side is
+# over this many inches, or by name: sling, crossbody, mini, wallet ...
+CHECK_SMALL_BAG_MAX_IN = float(os.getenv("CHECK_SMALL_BAG_MAX_IN", "11"))
 
 # Smallest NET margin (after eBay fees, ad rate, and shipping) a repricing
 # suggestion may land on — never suggest a cut that sells at a loss.

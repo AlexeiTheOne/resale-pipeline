@@ -136,9 +136,50 @@ def item_type_of(ident: dict, text: str = "") -> str:
     return "other"
 
 
+SMALL_BAG_WORDS = ("sling", "crossbody", "mini", "wallet", "wristlet", "pouch", "belt", "fanny", "waist",
+                   "cardholder", "card", "coin", "clutch", "cosmetic", "makeup", "phone", "lanyard")
+LARGE_BAG_WORDS = ("tote", "weekender", "duffel", "duffle", "luggage", "travel", "backpack", "diaper",
+                   "laptop", "shopper", "carryall", "overnight")
+_DIMENSION_KEYS = ("bag width", "bag height", "bag depth", "width", "height", "depth", "length")
+
+
+def _dimensions(ident: dict) -> list[float]:
+    """The bag's sides in inches, from the identification's specifications."""
+    out = []
+    for k, v in (ident.get("specifications") or {}).items():
+        if str(k).strip().lower() in _DIMENSION_KEYS:
+            m = re.search(r"(\d+(?:\.\d+)?)\s*(in|inch|inches|\"|cm)?", str(v).lower())
+            if m:
+                x = float(m.group(1))
+                out.append(x / 2.54 if m.group(2) == "cm" else x)
+    return out
+
+
+def bag_size(ident: dict, text: str = "") -> str:
+    """"small" or "large" for the shipping label. The name first: a sling,
+    crossbody, mini or wallet is small unless it is also a tote/weekender/
+    backpack ("mini" wins: a mini backpack is small); a tote, weekender or
+    duffel is large. A soft sling folds into a poly mailer whatever its
+    length (check #5: a 21" Vans sling). Only a name that says neither
+    ("handbag", "shoulder bag") goes by the measured sides: none over
+    CHECK_SMALL_BAG_MAX_IN = small. Unknown: large, the safe side for profit."""
+    hay = " ".join(str(ident.get(k) or "") for k in ("item_type", "product_name", "search_query"))
+    words = set(re.findall(r"[a-z]+", f"{hay} {text}".lower()))
+    words |= {w[:-1] for w in words if w.endswith("s")}
+    small, large = words & set(SMALL_BAG_WORDS), words & set(LARGE_BAG_WORDS)
+    if small and (not large or "mini" in small):
+        return "small"
+    if large:
+        return "large"
+    dims = _dimensions(ident)
+    return "small" if dims and max(dims) <= config.CHECK_SMALL_BAG_MAX_IN else "large"
+
+
 def label_for(ident: dict, text: str = "") -> tuple[str, float]:
     kind = item_type_of(ident, text)
     costs = label_costs()
+    if kind == "bags" and bag_size(ident, text) == "small" and "small_bags" in costs:
+        return kind, costs["small_bags"]
     return kind, costs.get(kind, costs["other"])
 
 
@@ -201,8 +242,12 @@ def verdict(*, profit: float | None, roi: float | None, sales: int,
         return "BUY", reasons
     if money_buy:
         return "MAYBE", evidence
+    # SKIP only when real sold prices back it (Person B, 2026-11-02): an
+    # estimate (levels 2-4, asking prices) with failing money is BORDERLINE.
+    backed = sales >= L1_MIN_SALES and not estimated and not from_asks
     if profit_at_cheapest is not None and profit_at_cheapest < 0 and sales < config.CHECK_MIN_SALES:
-        return "SKIP", [f"a loss at the cheapest identical listing (${profit_at_cheapest})"] + evidence
+        why = [f"a loss at the cheapest identical listing ({_usd(profit_at_cheapest)})"] + evidence
+        return ("SKIP", why) if backed else ("BORDERLINE", why)
     if profit >= config.CHECK_MIN_PROFIT:
         why = []
         if profit < config.CHECK_BUY_MIN_PROFIT:
@@ -210,9 +255,10 @@ def verdict(*, profit: float | None, roi: float | None, sales: int,
         if (roi or 0) < config.CHECK_BUY_MIN_ROI:
             why.append(f"ROI under {config.CHECK_BUY_MIN_ROI:.0%}")
         if profit_at_cheapest is not None and profit_at_cheapest < config.CHECK_MIN_PROFIT_AT_CHEAPEST:
-            why.append(f"only ${profit_at_cheapest} at the cheapest identical listing")
+            why.append(f"only {_usd(profit_at_cheapest)} at the cheapest identical listing")
         return "BORDERLINE", why + evidence
-    return "SKIP", [f"profit ${profit} is under ${config.CHECK_MIN_PROFIT:.0f}"] + evidence
+    why = [f"profit {_usd(profit)} is under ${config.CHECK_MIN_PROFIT:.0f}"] + evidence
+    return ("SKIP", why) if backed else ("BORDERLINE", why)
 
 
 # --- the check ------------------------------------------------------------------------
@@ -526,8 +572,12 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
         est = {}
     if est.get("estimate") and not est.get("msrp_flags") and est.get("level") in ("brand", "type"):
         levels[4] = {"value": est["estimate"], "n": est.get("n"), "ratio": est.get("ratio"),
+                     # "type": no sales of this brand, the ratio is other brands' (Person B)
+                     "level": est.get("level"), "key": est.get("key"),
                      "detail": f"MSRP ${est['msrp']:.2f} × {est['ratio']} ({est['level']} {est['key']}, "
-                               f"{est.get('n')} sales)"}
+                               f"{est.get('n')} sales)"
+                               + ("; no sales of this brand yet: ratio from other brands"
+                                  if est.get("level") == "type" else "")}
     cheapest = pricing.get("raw_active_floor")
     if cheapest:
         levels[5] = {"value": round(cheapest * config.CHECK_ASK_DISCOUNT - ship, 2), "n": None,
@@ -594,7 +644,8 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
             # SKIP is only given when real prices back it.
             v, why = NO_DATA, (["the quick check found no recent sales and no identical listing"] if quick
                                else ["no sales and no identical listing found: not enough data for a verdict"])
-    return {"item_type": kind, "label": label, "verdict": v, "reasons": why, "pick": pick,
+    size = bag_size(ident or {}, text) if kind == "bags" else None
+    return {"item_type": kind, "label": label, "label_size": size, "verdict": v, "reasons": why, "pick": pick,
             "money": money, "cheapest_total": cheapest, "at_cheapest": at_cheapest,
             "similar": similar_sold(pricing), "offer": best_offer(pick["price"])}
 
@@ -832,7 +883,10 @@ def photo_roles(paths: list[str], decode=None, vision=None) -> dict:
 # --- reply -------------------------------------------------------------------------------
 
 def _usd(x) -> str:
-    return "-" if x is None else f"${x:,.2f}"
+    """$12.50; a loss with a real minus sign: −$0.63."""
+    if x is None:
+        return "-"
+    return f"−${-x:,.2f}" if x < 0 else f"${x:,.2f}"
 
 
 CERTAINTY = {"high": "certain", "medium": "likely", "low": "uncertain"}
@@ -893,8 +947,17 @@ def search_links(res: dict, labels: bool = False) -> dict:
 LEVEL_SHORT = {1: "sold", 2: "similar", 3: "ours", 4: "MSRP×ratio", 5: "ask ≤"}
 
 
+def _pct(x: float) -> str:
+    """75%; a loss: −5%."""
+    n = round(x * 100)
+    return f"−{-n}%" if n < 0 else f"{n}%"
+
+
 def _whole(x) -> str:
-    return "-" if x is None else f"${x:,.0f}"
+    if x is None:
+        return "-"
+    n = round(x)
+    return f"−${-n:,}" if n < 0 else f"${n:,}"
 
 
 def ladder_line(pick: dict, res: dict) -> str:
@@ -913,7 +976,8 @@ def ladder_line(pick: dict, res: dict) -> str:
         parts.append(f"our {l3.get('brand') or ''} {kind} ~{_whole(l3['value'])}{days}".replace("  ", " "))
     if 4 in levels:
         r = levels[4].get("ratio")
-        parts.append(f"MSRP×{r:.0%} {_whole(levels[4]['value'])}" if r else f"MSRP×ratio {_whole(levels[4]['value'])}")
+        other = " (other brands)" if levels[4].get("level") == "type" else ""
+        parts.append((f"MSRP×{r:.0%} " if r else "MSRP×ratio ") + _whole(levels[4]["value"]) + other)
     if 5 in levels:
         parts.append(f"ask ≤{_whole(levels[5]['value'])}" + (" (cap)" if pick.get("capped") else ""))
     if res.get("demand"):
@@ -936,7 +1000,8 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
         why = "Ross price missing"
     else:
         why = f"{_sales_phrase(sales)}, {_listings_phrase(res)}"
-    lines = [f"{prefix}{ICON[v]} {LABEL.get(v, v)}: {why}"]
+    est = " (estimated)" if pick.get("estimated") and v != NO_DATA else ""
+    lines = [f"{prefix}{ICON[v]} {LABEL.get(v, v)}{est}: {why}"]
     line2 = _item_name(res)
     if res.get("already_have"):
         line2 += " · ⚠️ in stock: " + ", ".join(res["already_have"][:2])
@@ -948,7 +1013,7 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
         rng = pick.get("range")
         if rng:
             tag += f", range {_usd(rng[0])}–{_usd(rng[1])}"
-        roi = f", ROI {money['roi']:.0%}" if money.get("roi") is not None and not (asks or est) else ""
+        roi = f", ROI {_pct(money['roi'])}" if money.get("roi") is not None and not (asks or est) else ""
         lines.append(f"Ross {_usd(ross)} · sell {approx}{_usd(money['item_price'])}{tag} · "
                      f"profit {approx}{_usd(money['profit'])}{roi}")
     elif ross is not None:
@@ -1059,8 +1124,9 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
             out.append(f"  asking prices only: ×{pick['ask_discount']} (our sold/ask gap)"
                        + (f" and −{config.UNDERCUT_V2_PCT:.0%} undercut" if "cheapest" in pick['basis'] else ""))
         out.append(f"Fees + ads {_usd(money['fees'])} ({_fee_rate():.1%} + ${config.EBAY_FIXED_FEE:.2f}) · "
-                   f"label {_usd(money['label'])} ({res.get('item_type')}) · you keep {_usd(money['keep'])}")
-        roi = f"{money['roi']:.0%}" if money.get("roi") is not None else "-"
+                   f"label {_usd(money['label'])} ({res.get('item_type')}"
+                   + (f", {res['label_size']}" if res.get("label_size") else "") + f") · you keep {_usd(money['keep'])}")
+        roi = _pct(money["roi"]) if money.get("roi") is not None else "-"
         out.append(f"Profit {_usd(money['profit'])} · ROI {roi} · break-even {_usd(money['break_even_item'])} "
                    f"+ shipping")
         if res.get("offer"):
