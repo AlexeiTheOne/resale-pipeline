@@ -297,3 +297,31 @@ Two notes:
 The newer version with "Exact matches only" was not found here. In today's
 code the same idea already holds: the pricing formula only counts comps the
 judge calls `same_item`.
+
+## 8. Later: Best Offer set automatically when publishing (Person A's area)
+
+Added by Person B, 2026-11-02. Not built; for Person A to decide.
+
+`/check` now shows Best Offer prices next to the fixed price, from the
+evidence-ladder estimate (branch `check-command`, settings in `config.py`):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `CHECK_BO_LIST` | 1.25 | list price = estimate × 1.25 |
+| `CHECK_BO_ACCEPT` | 1.05 | auto-accept at estimate × 1.05 |
+| `CHECK_BO_DECLINE` | 0.90 | auto-decline below estimate × 0.90 |
+
+All three are rounded to .99. Example: estimate $39.99 → "list $49.99 BO
+(auto-accept $41.99, decline < $35.99) or $39.99 fixed".
+
+**The idea:** when an item is published, turn Best Offer on with these
+thresholds (eBay's `bestOfferTerms`: `autoAcceptPrice`, `autoDeclinePrice`)
+instead of a plain fixed price.
+
+**Questions for Person A:**
+- Which estimate is the base: the `/check` ladder, or the listing price
+  `pricing_v2` sets at intake?
+- How does it fit with repricing and offers to watchers (`pipeline/reprice.py`,
+  `pipeline/offers.py`)? A price cut should move the thresholds too.
+- Judge it by sales outcomes (`scripts/backtest_pricing.py`), as for any
+  pricing change.
