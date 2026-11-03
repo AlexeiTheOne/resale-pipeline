@@ -221,6 +221,72 @@ def _charm(x: float) -> float:
     return round(max(round(x) - 0.01, 0.99), 2)
 
 
+# --- "same model" needs proof (Person B, 2026-11-02) ------------------------------------------
+
+# Words that don't tell one model from another: types, sizes, materials, fillers.
+_GENERIC = _FILLER | {w for ws in LABEL_WORDS.values() for w in ws} | {
+    "to", "by", "w", "womens", "women", "mens", "men", "ladies", "girls", "boys", "kids", "unisex",
+    "large", "extra", "small", "medium", "mini", "xl", "oversized", "big", "canvas", "leather", "faux",
+    "nylon", "denim", "cotton", "suede", "vegan", "bags", "shoes", "set", "style", "collection"}
+OTHER_STYLE = "other_style"     # a judge "variant" with no style code or product name match
+
+
+def model_tokens(ident: dict) -> set:
+    """The product name's distinctive words (not the brand, type or size words):
+    "Juicy To Go Weekender Tote" -> {"go", "weekender"}; "LBAVERY Extra Large
+    Canvas Tote" -> {"lbavery"}."""
+    brand = set(re.findall(r"[a-z0-9]+", str(ident.get("brand") or "").lower()))
+    words = re.findall(r"[a-z0-9]+", str(ident.get("product_name") or "").lower())
+    return {w for w in words if w not in brand and w not in _GENERIC and w.rstrip("s") not in _GENERIC}
+
+
+def _codes(ident: dict) -> list[str]:
+    """The style code, and its base without a colour suffix (11JCDA0JC-JTL -> 11JCDA0JC)."""
+    out = []
+    for raw in (ident.get("model"), ident.get("style_code")):
+        code = _norm_code(raw)
+        if len(code) >= 5 and _looks_like_code(code):
+            out.append(code)
+            base = _norm_code(re.split(r"[-/ ]", str(raw).strip())[0])
+            if len(base) >= 5 and _looks_like_code(base) and base not in out:
+                out.append(base)
+    return out
+
+
+def same_model(comp: dict, ident: dict) -> bool:
+    """Is a sold comp the same model in another colour or size? Only when its
+    title carries our style code, or every distinctive word of our product
+    name (a title cut short may end in the start of the last one: "Weeken").
+    A different style of the same brand (the cat-face faux-fur tote vs the
+    LBAVERY canvas tote) never counts, whatever the judge said."""
+    title = str(comp.get("title") or "").lower()
+    flat = _norm_code(title)
+    if any(c in flat for c in _codes(ident)):
+        return True
+    need = model_tokens(ident)
+    if not need:
+        return False
+    words = re.findall(r"[a-z0-9]+", title)
+    cut = title.rstrip().endswith(("...", "…")) or len(title) >= 75      # eBay titles stop at 80
+    tail = words[-1] if words and cut else None
+
+    def has(w):
+        return w in words or (tail is not None and len(tail) >= 4 and w.startswith(tail))
+    return all(has(w) for w in need)
+
+
+def tighten_same_model(pricing: dict, ident: dict) -> dict:
+    """The judge's "variant" verdicts that fail same_model become OTHER_STYLE:
+    out of level 2 (and of level 1 in any mode), still listed in Details.
+    Idempotent; the pricing dict itself is not changed."""
+    judged = pricing.get("judged_comps") or []
+    if not any(c.get("verdict") == "variant" for c in judged):
+        return pricing
+    out = [{**c, "verdict": OTHER_STYLE, "judge_verdict": "variant"}
+           if c.get("verdict") == "variant" and not same_model(c, ident) else c for c in judged]
+    return {**pricing, "judged_comps": out}
+
+
 def best_offer(price: float | None) -> dict | None:
     """Best Offer from the fixed-price estimate (all .99): list x CHECK_BO_LIST,
     auto-accept x CHECK_BO_ACCEPT, auto-decline under x CHECK_BO_DECLINE."""
@@ -506,6 +572,7 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
     run_check and the backtest (scripts/backtest_check.py), so the backtest
     scores exactly what /check would say. quick: a quick check that found no
     data at all is NO_DATA instead of SKIP."""
+    pricing = tighten_same_model(pricing, ident or {})
     pick = choose_price(pricing, exact, ident, history=history, exclude_item_id=exclude_item_id,
                         details=details)
     kind, label = label_for(ident, text)
@@ -621,6 +688,8 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
     for k, v in (pricing.get("timings") or {}).items():
         if k != "total_s":
             timings[k] = v
+    raw_verdicts = Counter(c.get("verdict") or "unjudged" for c in pricing.get("judged_comps") or [])
+    pricing = tighten_same_model(pricing, ident)
     details = {}
     if full:           # listing age, units sold, category of the cheapest identical listings
         t = time.perf_counter()
@@ -647,7 +716,9 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
             "reference": pricing.get("reference"), "warnings": pricing.get("comp_warning"),
             "judge_model": pricing.get("judge_model"), "escalated": pricing.get("judge_escalated"),
             # how the judge labelled every candidate (logged: quick vs full agreement)
-            "verdicts": dict(Counter(c.get("verdict") or "unjudged" for c in pricing.get("judged_comps") or []))}
+            "verdicts": dict(raw_verdicts),
+            # judge "variant"s that failed the style code / product name test
+            "demoted": sum(c.get("verdict") == OTHER_STYLE for c in pricing.get("judged_comps") or [])}
 
 
 def check_fields(res: dict) -> dict:
@@ -1016,6 +1087,9 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
         out.append("  " + comp_line(c))
     if len(rows) > COMP_LINES:
         out.append(f"  … and {len(rows) - COMP_LINES} more")
+    if res.get("demoted"):
+        out.append(f"  {res['demoted']} other style(s) left out: the judge said same model, but the title has "
+                   f"neither our style code nor our product name")
     if pick.get("dropship_excluded"):
         out.append(f"  {pick['dropship_excluded']} dropship-style sale(s) left out of the price")
     links = search_links(res)

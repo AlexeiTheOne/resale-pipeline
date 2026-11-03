@@ -172,6 +172,36 @@ charge.
   verdict, item, Ross · sell · profit, Best Offer, evidence, best matches,
   searches, check number · time · mode. Details keeps every comp.
 
+### "Same model" needs proof; labels; the brand ratio (Person B, 2026-11-02)
+
+- **Same model (level 2, and level 1 in any mode)** now needs the sold
+  title to carry **our style code** (or its base without a colour suffix:
+  11JCDA0JC-JTL → 11JCDA0JC), **or every distinctive word of our product
+  name** (not brand, type, size or material words: "Juicy To Go Weekender
+  Tote" → "go", "weekender"; "LBAVERY Extra Large Canvas Tote" → "lbavery").
+  A title cut short at 80 characters may end in the start of the last word.
+  Whatever the judge said, a "variant" that fails this becomes
+  `other_style`: left out of the price, counted in Details ("N other
+  style(s) left out"), and in the log next to the judge's own counts. With
+  no style code and no distinctive name there is nothing to prove a match,
+  so no variant counts. Check #3's cat-face faux-fur tote no longer counts
+  for the LBAVERY canvas tote.
+- **Sewn-in labels:** identification (`identify.py` research prompt) now
+  reads size, care and content labels for the style code and the brand's
+  short product name when there is no hang tag, and ignores factory/lot
+  lines. On `test_images/label_ed_hardy_slipper.jpg` (label only, Ed Hardy
+  "EH06521655/EH SLIPPER CUP W"), two live runs gave model EH06521655 both
+  times (before: none), product "Slipper Cup W" once, brand "EH" or none.
+  The label alone doesn't confirm the brand; a photo of the item does.
+  Local OCR can't read this label (tilted, dim), so the model does it.
+- **Brand ratio (level 4) is already brand-first:** `msrp.ratio_for` uses
+  the brand's own median sold/MSRP once it has 3+ sales (any type), else
+  the type bucket (3+ sales), else all sales, which `/check` never uses.
+  Juicy Couture and Luv Betsey have no sales yet, so they get the bag ratio.
+  A later refinement: brand + type when that pair has 3+ sales (a brand's
+  watches and bags sell at different ratios). That is `pipeline/msrp.py`,
+  Person A's file: not changed here.
+
 ## 0. Decisions (Person B's review, 2026-11-02). These override the sections below.
 
 | Topic | Decision |

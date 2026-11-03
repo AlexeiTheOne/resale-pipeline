@@ -134,7 +134,7 @@ def test_check2_ladder_levels_2_and_4_median_with_range():
     p = pricing(raw_active_floor=104.05,
                 judged_comps=[{"source": "sold", "verdict": "variant", "total": 30.49},
                               {"source": "active", "verdict": "same_item", "total": 104.05}])
-    pick = check.choose_price(p, exact=True, ident=JUICY, history=BAGS)
+    pick = check.choose_price(p, exact=True, ident=JUICY, history=BAGS)    # choose_price takes the verdicts as given
     assert pick["levels"][2]["value"] == 20.61 and pick["levels"][4]["value"] == 50.99
     assert 3 not in pick["levels"]                    # we never sold a Juicy Couture bag
     assert pick["used"] == [2, 4] and pick["price"] == 35.99 and pick["range"] == (20.61, 50.99)
@@ -347,7 +347,8 @@ def test_full_check_searches_the_upc_and_similar_items():
 
 
 def test_similar_sales_are_level2_in_exact_and_level1_in_any_mode():
-    judged = [{"source": "sold", "verdict": "variant", "total": t} for t in (30.49, 35.0, 42.0)] + \
+    judged = [{"source": "sold", "verdict": "variant", "total": t, "title": "Juicy To Go Weekender Tote pink"}
+              for t in (30.49, 35.0, 42.0)] + \
              [{"source": "active", "verdict": "same_item", "total": 104.05}]
     res = check.run_check(check.parse_request("/check full juicy to go weekender tote 9.99"),
                           pricing_fn=lambda i, **kw: pricing(raw_active_floor=104.05, judged_comps=judged),
@@ -475,7 +476,8 @@ def test_comp_list_sold_newest_first_then_listings_cheapest_with_flags():
 
 def test_full_check_shows_demand_and_every_comp_quick_looks_nothing_up():
     judged = [{"ebay_id": "a", "source": "sold", "verdict": "variant", "total": 30.49,
-               "date": "2026-09-01T00:00:00Z", "url": "https://www.ebay.com/itm/111111111111"},
+               "date": "2026-09-01T00:00:00Z", "url": "https://www.ebay.com/itm/111111111111",
+               "title": "Juicy Couture Pink Juicy To Go Weekender Tote Bag"},
               DROPSHIP_JUICY]
     asked = []
     run = lambda text: check.run_check(  # noqa: E731
@@ -550,15 +552,16 @@ def test_best_offer_prices_from_the_estimate():
 
 def test_reply_links_best_matches_sold_first_and_always_the_searches():
     req = {**check.parse_request("/check full 8.99"), "identification": LUV}
-    pink = {**CAT_TOTE, "title": "Luv Betsey Pink Canvas Tote", "url": "https://www.ebay.com/itm/222222222222"}
+    pink = {**CAT_TOTE, "title": "Luv Betsey LBAVERY Pink Canvas Tote", "url": "https://www.ebay.com/itm/222222222222"}
     rows = [pink, {"source": "active", "verdict": "same_item", "total": 61.0, "title": "Luv Betsey LBAVERY",
                    "url": "https://www.ebay.com/itm/333333333333?x=1"}, CAT_TOTE]
     res = check.run_check(req, have_fn=lambda *a: [],
                           pricing_fn=lambda i, **kw: pricing(raw_active_floor=61.0, judged_comps=rows))
+    # the cat-face tote (another style) is left out; the identical listing comes next
     assert check.best_links(res) == [("🔗", "Sold $39.66 (pink)", "https://www.ebay.com/itm/222222222222"),
-                                     ("🔗", "Sold $39.66 (same model)", "https://www.ebay.com/itm/377563627161")]
+                                     ("🔗", "For sale $61.00 (same item)", "https://www.ebay.com/itm/333333333333")]
     lines = check.format_reply(res).splitlines()
-    assert lines[5].startswith("🔗 Sold $39.66 (pink) https://www.ebay.com/itm/222222222222 · 🔗 Sold $39.66")
+    assert lines[5].startswith("🔗 Sold $39.66 (pink) https://www.ebay.com/itm/222222222222 · 🔗 For sale $61.00")
     nothing = check.run_check(req, have_fn=lambda *a: [],
                               pricing_fn=lambda i, **kw: pricing(raw_active_floor=None, judged_comps=[]))
     nothing = {**nothing, "pick": {**nothing["pick"], "levels": {}, "used": [], "price": None},
@@ -566,6 +569,37 @@ def test_reply_links_best_matches_sold_first_and_always_the_searches():
     text = check.format_reply(nothing, html=True)
     assert "List " not in text and '🔎 <a href="https://www.ebay.com/sch/i.html?_nkw=Luv+Betsey' in text
     assert "For sale on eBay</a>" in text
+
+
+# --- "same model" needs a style code or product name match (Person B, 2026-11-02) ----------------
+
+def test_a_different_style_of_the_same_brand_is_never_same_model():
+    assert check.model_tokens(LUV) == {"lbavery"}
+    assert not check.same_model(CAT_TOTE, LUV)          # cat-face faux-fur tote vs the LBAVERY canvas tote
+    assert check.same_model({"title": "Luv Betsey LBAVERY Tote Bag Pink Paisley NWT"}, LUV)
+    assert check.same_model({"title": "Betsey Johnson tote lb104065 blue"}, LUV)          # style code
+    pink = {"title": "Juicy Couture Powder Blush Pink Juicy To Go Weekender Tote Bag NWT"}
+    assert check.model_tokens(JUICY) == {"go", "weekender"} and check.same_model(pink, JUICY)
+    cut = {"title": "Juicy Couture Powder Blush Pink Juicy To Go Weeken..."}               # title cut short
+    assert check.same_model(cut, JUICY)
+    assert not check.same_model({"title": "Juicy Couture Velour Weekender Duffel"}, JUICY)  # no "go"
+    assert check.same_model({"title": "Juicy Couture 11JCDA0JC-BLK tote"}, JUICY)          # code base, other colour
+    assert not check.same_model({"title": "Juicy Couture tote"}, {"brand": "Juicy Couture"})  # nothing to match on
+
+
+def test_check3_judge_variant_of_another_style_is_left_out_of_level2():
+    """Check #3's second run: the judge called the cat-face tote a variant."""
+    p = pricing(raw_active_floor=None, judged_comps=[CAT_TOTE])
+    ev = check.evaluate(p, LUV, 8.99, exact=True, history=BAGS)
+    assert 2 not in ev["pick"]["levels"] and ev["pick"]["used"] == [4]
+    assert ev["pick"]["competition_note"] == "no competition, no demand data" and ev["pick"]["price"] == 45.99
+    assert p["judged_comps"][0]["verdict"] == "variant"                      # the input is not changed
+    res = check.run_check({**check.parse_request("/check full 8.99"), "identification": LUV},
+                          pricing_fn=lambda i, **kw: p, have_fn=lambda *a: [])
+    assert res["verdicts"] == {"variant": 1} and res["demoted"] == 1 and res["comp_list"] == []
+    assert "1 other style(s) left out" in check.format_details(res)
+    any_mode = check.evaluate(p, LUV, 8.99, exact=False, history=BAGS)       # any mode: not level 1 either
+    assert any_mode["pick"]["sales"] == 0
 
 
 # --- in-stock warning: items AND pieces (production has piece O1W-01) ---------------------------
