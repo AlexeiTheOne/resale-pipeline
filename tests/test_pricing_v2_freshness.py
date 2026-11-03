@@ -115,3 +115,13 @@ def test_stored_item_pricing_has_no_check_diagnostics(monkeypatch):
     monkeypatch.setattr(v2, "get_pricing_v2", lambda *a, **k: {
         "suggested_price": 10, "timings": {"total_s": 1}, "sold_cache_misses": []})
     assert v2.price_item({"identification": {}, "item_id": "x"}) == {"suggested_price": 10}
+
+
+def test_comps_carry_their_date_id_and_seller_feedback():
+    s = v2.sold_candidate({"itemId": "123456789012", "soldPrice": "30", "shippingPrice": "0",
+                           "shippingType": "free", "title": "x", "endedAt": "2026-10-12T00:00:00Z",
+                           "sellerFeedbackScore": "16206"}, 9.88)
+    assert s["date"] == "2026-10-12T00:00:00Z" and s["seller_feedback"] == 16206
+    a = v2.active_candidate({"price": 94.05, "legacy_item_id": "117471801433", "seller_feedback_score": 16208,
+                             "title": "y"}, 9.88)
+    assert a["ebay_id"] == "117471801433" and a["seller_feedback"] == 16208 and a["date"] is None

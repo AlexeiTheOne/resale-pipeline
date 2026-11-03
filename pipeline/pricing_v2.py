@@ -298,7 +298,7 @@ def sold_candidate(row: dict, our_shipping: float) -> dict | None:
         "shipping": ship_used, "shipping_imputed": imputed, "total": total,
         "condition": row.get("condition") or "", "image": row.get("thumbnailUrl") or "",
         "url": row.get("url") or "", "seller": (row.get("sellerUsername") or "").lower() or None,
-        "date": row.get("endedAt"),
+        "date": row.get("endedAt"), "seller_feedback": _int(row.get("sellerFeedbackScore")),
     }
 
 
@@ -315,7 +315,15 @@ def active_candidate(s: dict, our_shipping: float, source: str = "active") -> di
         "condition": s.get("condition") or "", "image": s.get("image_url") or "",
         "url": s.get("item_web_url") or "",
         "seller": (s.get("seller_username") or "").lower() or None, "date": None,
+        "seller_feedback": _int(s.get("seller_feedback_score")),
     }
+
+
+def _int(v) -> int | None:
+    try:
+        return int(float(v)) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _norm_title(t: str) -> str:
@@ -855,7 +863,8 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
         "formula_price": formula, "store_estimate": store,
         "judged_comps": [{k: c.get(k) for k in ("id", "source", "verdict", "title", "total",
                                                  "item_price", "shipping", "shipping_imputed",
-                                                 "condition", "url", "seller")} for c in cands],
+                                                 "condition", "url", "seller", "date",
+                                                 "ebay_id", "seller_feedback")} for c in cands],
         "candidate_count": len(cands), "dropped": g["dropped"],
         "skipped_queries": g.get("skipped_queries") or [],
         "same_item_sold_count": priced["same_item_sold"],
