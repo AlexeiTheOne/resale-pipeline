@@ -29,6 +29,7 @@ from db import get_item, update_field
 from ebay import guard
 from ebay.auth import get_access_token
 from ebay.taxonomy import InvalidCategoryError, category_aspects, category_name, resolve_valid_category
+from pipeline import specifics as aspect_values
 from pipeline.description_guard import sanitize_description
 from pipeline.gtin import product_gtin
 from pipeline.title import TITLE_MAX_LEN, fit_title
@@ -897,7 +898,9 @@ def _guess_fallback(name: str, item_type_hint: str | None, allowed_values: list[
     if key in GTIN_ASPECT_NAMES:
         return "Does not apply"
     if key == "type" and item_type_hint:
-        return _match_type_hint(item_type_hint, allowed_values) or item_type_hint
+        return (_match_type_hint(item_type_hint, allowed_values)
+                or aspect_values.shoe_type_value(item_type_hint, allowed_values)
+                or item_type_hint)
     if key == "style" and item_type_hint and allowed_values:
         # Only a catalog match: a raw 'Bag' would be a useless buyer filter.
         return _match_type_hint(item_type_hint, allowed_values)
@@ -929,6 +932,24 @@ def _synonym_values(name: str, resolved: dict) -> list | None:
     return None
 
 
+def _shoe_size_from(resolved: dict, identification: dict | None,
+                    allowed_values: list[str]) -> str | None:
+    """A required US Shoe Size from a size we already have under another name:
+    the draft's 'Size' (the prompt asks for it from the tag), or the size the
+    identification read off the tag or sewn-in label. Never a guess: only a
+    value that names one US size matches."""
+    ident = identification or {}
+    spec = ident.get("specifications") or {}
+    candidates = [v for k, v in resolved.items() if "size" in k.strip().lower()]
+    candidates += [ident.get("size")] + [v for k, v in spec.items() if "size" in str(k).lower()]
+    for value in candidates:
+        for v in (value if isinstance(value, list) else [value]):
+            size = aspect_values.shoe_size_value(v, allowed_values)
+            if size:
+                return size
+    return None
+
+
 def _match_allowed(values: list, allowed_values: list[str]) -> str | None:
     """First of our values (or a comma-separated token within one) that matches an
     allowed SELECTION_ONLY value, returned in the catalog's exact casing."""
@@ -940,14 +961,15 @@ def _match_allowed(values: list, allowed_values: list[str]) -> str | None:
     return None
 
 
-def _resolve_required_aspects(category_id: str, aspects: dict, item_type_hint: str | None) -> dict:
+def _resolve_required_aspects(category_id: str, aspects: dict, item_type_hint: str | None,
+                              identification: dict | None = None) -> dict:
     """Fill every category-required aspect with a safe fallback. Raises
     MissingRequiredAspectsError for any we can't confidently fill, instead of
     sending something that's likely to fail validation at publish time."""
     resolved = dict(aspects)
     missing = []
 
-    for spec in category_aspects(category_id):
+    for index, spec in enumerate(category_aspects(category_id)):
         name = spec.get("localizedAspectName")
         if not name:
             continue
@@ -970,17 +992,59 @@ def _resolve_required_aspects(category_id: str, aspects: dict, item_type_hint: s
                 resolved[name] = _normalize_aspect_values(chosen)
                 continue
 
+        if aspect_values.is_shoe_size_aspect(name):
+            size = _shoe_size_from(resolved, identification, allowed_values)
+            if size:
+                resolved[name] = [size]
+                continue
+
         fallback = _guess_fallback(name, item_type_hint, allowed_values)
         if fallback and (mode != "SELECTION_ONLY" or fallback in allowed_values):
             resolved[name] = _normalize_aspect_values(fallback)
             continue
 
-        missing.append({"name": name, "mode": mode, "allowed_values": allowed_values[:15]})
+        # The full list, and the aspect's place in category_aspects(): the bot
+        # offers the values as buttons and finds the tapped one by index.
+        missing.append({"name": name, "mode": mode, "allowed_values": allowed_values,
+                        "index": index})
 
     if missing:
         raise MissingRequiredAspectsError(category_id, missing)
 
     return resolved
+
+
+def missing_required_aspects(item: dict) -> list[dict]:
+    """The category-required specifics create_draft_offer would refuse this
+    item for, as MissingRequiredAspectsError.missing ([] when none). Writes
+    nothing and calls only the (cached) category metadata, so the bot can ask
+    after each value the owner taps whether anything is still missing."""
+    listing = item.get("listing") or {}
+    if not listing.get("category_id"):
+        return []
+    aspects = _build_aspects(listing.get("item_specifics"))
+    try:
+        _resolve_required_aspects(str(listing["category_id"]), aspects,
+                                  (item.get("identification") or {}).get("item_type"),
+                                  item.get("identification"))
+    except MissingRequiredAspectsError as e:
+        return e.missing
+    return []
+
+
+def aspect_choice(category_id: str, index: int, value_index: int) -> tuple[str, str] | None:
+    """(aspect name, value) for a tapped button: the aspect at `index` in the
+    category's metadata and its value at `value_index`. None if either is gone
+    (the cached metadata changed since the buttons were sent)."""
+    specs = category_aspects(str(category_id))
+    if not 0 <= index < len(specs):
+        return None
+    spec = specs[index]
+    values = [v.get("localizedValue") for v in (spec.get("aspectValues") or []) if v.get("localizedValue")]
+    name = spec.get("localizedAspectName")
+    if not name or not 0 <= value_index < len(values):
+        return None
+    return name, values[value_index]
 
 
 def _enforce_single_cardinality(category_id: str, aspects: dict) -> dict:
@@ -1175,7 +1239,8 @@ def create_draft_offer(item_id: str) -> dict:
     # Resolve category-required aspects before doing any side-effecting work
     # (image uploads, API calls) so a missing aspect fails fast and cheap.
     aspects = _build_aspects(listing.get("item_specifics"))
-    aspects = _resolve_required_aspects(category_id, aspects, item_type_hint)
+    aspects = _resolve_required_aspects(category_id, aspects, item_type_hint,
+                                        item.get("identification"))
     aspects = _enforce_single_cardinality(category_id, aspects)
 
     # Reorder so the tag close-up (2nd photo) becomes the last listing image, then

@@ -145,7 +145,7 @@ def _stub_draft(monkeypatch, item):
     created = {}
     monkeypatch.setattr(inv, "get_item", lambda _id: item)
     monkeypatch.setattr(inv, "resolve_valid_category", lambda cid, title: (cid, "Cat"))
-    monkeypatch.setattr(inv, "_resolve_required_aspects", lambda c, a, h: a)
+    monkeypatch.setattr(inv, "_resolve_required_aspects", lambda c, a, h, i=None: a)
     monkeypatch.setattr(inv, "_enforce_single_cardinality", lambda c, a: a)
     monkeypatch.setattr(inv, "listing_photo_order", lambda it: ["a.jpg"])
     monkeypatch.setattr(inv, "_download_brand_image", lambda *a: None)

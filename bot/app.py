@@ -261,6 +261,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("shop", check_cmds.shop_command))
     app.add_handler(CallbackQueryHandler(flow.confirm_callback, pattern=r"^confirm:"))
     app.add_handler(CallbackQueryHandler(flow.review_callback, pattern=r"^review:"))
+    app.add_handler(CallbackQueryHandler(flow.aspect_callback, pattern=r"^asp:"))
     app.add_handler(CallbackQueryHandler(listing_cmds.reprice_callback, pattern=r"^reprice:"))
     app.add_handler(CallbackQueryHandler(inventory_cmds.quick_add_callback, pattern=r"^qa:"))
     app.add_handler(CallbackQueryHandler(inventory_cmds.inv_post_callback, pattern=r"^invpost:"))

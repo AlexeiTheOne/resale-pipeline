@@ -118,6 +118,82 @@ def _aspect_meta(category_aspects: list[dict] | None) -> dict[str, dict]:
     return meta
 
 
+def is_shoe_size_aspect(name: str) -> bool:
+    """'US Shoe Size' and its variants. eBay's shoe categories name the size
+    aspect this way; the draft prompt and our identification call it 'Size'."""
+    return "shoe size" in str(name or "").lower()
+
+
+_SIZE_NUM = r"(\d{1,2}(?:\.[05])?)"
+_OTHER_SIZE_SYSTEM = re.compile(r"\b(uk|eu|eur|euro|cm|mm|jp)\b", re.I)
+_KIDS_SIZE = re.compile(r"\d(?:\.5)?\s*[yck]\b", re.I)  # 5Y, 11C, 3K: kids' sizing
+
+
+def shoe_size_value(text, allowed: list[str] | None = None) -> str | None:
+    """The US shoe size named in `text`, in the catalog's exact form, or None.
+
+    'Men's 10', 'US 10.5', '10 M', '10W', '10 1/2' and '10½' all give a number.
+    Nothing is converted or guessed: a UK/EU size with no US one, a kids' size
+    (5Y, 11C), or two different numbers with nothing saying which is US give
+    None. A US Shoe Size is SELECTION_ONLY, and the catalog's values are plain
+    numbers ('10', '10.5'), so the number is matched against them."""
+    if _is_placeholder(text):
+        return None
+    s = str(text).replace("½", ".5")
+    s = re.sub(r"(\d)\s*-?\s*1/2\b", r"\1.5", s)
+    if _KIDS_SIZE.search(s):
+        return None
+    us = (re.search(r"\bUS\s*(?:men'?s|women'?s|[mw])?\s*" + _SIZE_NUM + r"(?![\d.])", s, re.I)
+          or re.search(r"(?<![\d.])" + _SIZE_NUM + r"\s*(?:\(\s*)?US\b", s, re.I))
+    if us:
+        number = us.group(1)
+    else:
+        if _OTHER_SIZE_SYSTEM.search(s):
+            return None
+        numbers = {float(n) for n in re.findall(r"(?<![\d.])" + _SIZE_NUM + r"(?![\d.])", s)}
+        if len(numbers) != 1:
+            return None
+        number = str(numbers.pop())
+    value = float(number)
+    if not 1 <= value <= 20:
+        return None
+    shown = f"{value:g}"
+    if not allowed:
+        return shown
+    for a in allowed:
+        try:
+            if float(str(a).strip()) == value:
+                return a
+        except ValueError:
+            continue
+    return None
+
+
+_SHOE_WORD = re.compile(r"\b(shoes?|sneakers?|trainers?|cleats?|footwear|runners?)\b", re.I)
+_SHOE_TYPES = [
+    (re.compile(r"\bcleats?\b", re.I), "cleats"),
+    (re.compile(r"\b(sneakers?|trainers)\b", re.I), "sneakers"),
+    (re.compile(r"\b(running|runners?|training|athletic|basketball|tennis|walking|trail|"
+                r"gym|cross[- ]?training|workout|jogging|track|volleyball|pickleball)\b",
+                re.I), "athletic"),
+    (re.compile(r"\b(casual|skate|lifestyle|canvas|slip[- ]on|fashion)\b", re.I), "sneakers"),
+]
+
+
+def shoe_type_value(text, allowed: list[str] | None) -> str | None:
+    """The shoe category's Type (Athletic / Cleats / Sneakers) that `text`
+    names, in the catalog's casing. Only for text that is about shoes ('Running
+    Shoes', 'Sneakers'), so a 'Gym Bag' never becomes Athletic; None when the
+    words don't say which, or the catalog lacks that value."""
+    if _is_placeholder(text) or not allowed or not _SHOE_WORD.search(str(text)):
+        return None
+    canonical = {a.lower(): a for a in allowed}
+    for pattern, want in _SHOE_TYPES:
+        if pattern.search(str(text)):
+            return canonical.get(want)
+    return None
+
+
 def _split(value) -> list[str]:
     values = value if isinstance(value, list) else [value]
     out = []
@@ -145,6 +221,15 @@ def _shape_value(name: str, value: str, meta: dict | None) -> str | None:
     """One value made filter-shaped, or None to drop it. Never truncated."""
     value = re.sub(r"\s+", " ", value).strip()
     allowed = (meta or {}).get("allowed") or []
+    if is_shoe_size_aspect(name):
+        # "Men's 10" holds no allowed value as a phrase (sizes are 1-4
+        # characters, below _allowed_in's 3-character floor for "10"), so the
+        # size used to be dropped and the draft failed on a missing size.
+        return shoe_size_value(value, allowed)
+    if name == "type" and allowed:
+        shoe = shoe_type_value(value, allowed)
+        if shoe:
+            return shoe
     is_filter = name in _FILTER_ASPECTS
     if is_filter:  # "Natural (Beige/Cream)" -> "Natural"
         value = re.sub(r"\s*\([^)]*\)", "", value).strip() or value

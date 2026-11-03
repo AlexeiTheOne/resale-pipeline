@@ -440,6 +440,111 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.application.create_task(_retry_then_release())
 
 
+# More values than this and an aspect gets no buttons: it is typed instead.
+ASPECT_BUTTONS_MAX = 60
+
+
+def _aspects_markup(item_id: str, category_id: str, missing: list[dict]) -> InlineKeyboardMarkup | None:
+    """One button per allowed value of each missing aspect. The data carries
+    the aspect's and value's index in the category metadata (callback data is
+    capped at 64 bytes, so a value like 'Satchel/Top Handle Bag' can't ride)."""
+    rows = []
+    for m in missing:
+        values = m.get("allowed_values") or []
+        if not values or len(values) > ASPECT_BUTTONS_MAX or "index" not in m:
+            continue
+        longest = max(len(v) for v in values)
+        per_row = 6 if longest <= 4 else 4 if longest <= 9 else 2
+        buttons = [InlineKeyboardButton(v, callback_data=f"asp:{item_id}:{category_id}:{m['index']}:{i}")
+                   for i, v in enumerate(values)]
+        rows += [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _ask_missing_aspects(item_id: str, category_id: str, missing: list[dict], message) -> None:
+    """Ask for the required specifics eBay wants and the item didn't show.
+    The message is a reply target, so answering it with a typed correction
+    lands on this item."""
+    lines = [f"⚠️ {item_id[:8]}: eBay category {category_id} needs these item specifics, "
+             "and I couldn't read them off the item:"]
+    for m in missing:
+        values = m.get("allowed_values") or []
+        if not values:
+            hint = " (type it)"
+        elif len(values) > ASPECT_BUTTONS_MAX:
+            hint = f" (type it; e.g. {', '.join(values[:5])}, ...)"
+        elif len(values) <= 15:
+            hint = f" ({', '.join(values)})"
+        else:
+            hint = ""
+        lines.append(f"  • {m['name']}{hint}")
+    example = missing[0]["name"]
+    lines.append(f"\nTap a value below, or reply to this message with a correction such as "
+                 f"'{example} ...'. Once all are filled, I create the draft.")
+    sent = await util._safe_reply(message, "\n".join(lines),
+                                  reply_markup=_aspects_markup(item_id, category_id, missing))
+    util._remember_target(sent, item_id)
+
+
+async def aspect_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A tapped value for a missing required specific: set it on the draft;
+    when nothing required is still missing, create the eBay draft."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, item_id, category_id, index, value_index = query.data.split(":")
+        index, value_index = int(index), int(value_index)
+    except ValueError:
+        return
+
+    item = db.get_item(item_id)
+    if item is None:
+        await query.edit_message_text("This item no longer exists.")
+        return
+    if item["status"] != "review":
+        await util._safe_reply(query.message, f"{item_id[:8]} is '{item['status']}' — nothing to fill.")
+        return
+    # The same claim as Approve/Reject: two quick taps must not both create
+    # the eBay draft.
+    if not util._claim("review", item_id):
+        await util._safe_reply(query.message, f"⏳ Already handling {item_id[:8]}.")
+        return
+    try:
+        listing = dict(item.get("listing") or {})
+        choice = None
+        if str(listing.get("category_id")) == category_id:
+            choice = await asyncio.to_thread(inventory.aspect_choice, category_id, index, value_index)
+        if choice is None:
+            await util._safe_reply(query.message, f"That button is out of date for {item_id[:8]}. "
+                                   "Reply to it with a correction instead.")
+            return
+        name, value = choice
+        specifics = dict(listing.get("item_specifics") or {})
+        specifics[name] = value
+        listing["item_specifics"] = specifics
+        db.update_field(item_id, "listing", listing)
+        item["listing"] = listing
+
+        remaining = await asyncio.to_thread(inventory.missing_required_aspects, item)
+        if remaining:
+            await util._safe_reply(query.message, f"✓ {name}: {value}. Still needed: "
+                                   + ", ".join(m["name"] for m in remaining) + ".")
+            return  # the buttons stay, for the rest
+
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        user_id = query.from_user.id
+        if state.review.get(user_id) == item_id:
+            state.review.pop(user_id, None)
+        state.last_item[user_id] = item_id
+        await util._safe_reply(query.message, f"✓ {name}: {value}.")
+        await _approve_item(item_id, query.message, context)
+    finally:
+        util._release("review", item_id)
+
+
 async def _approve_item(item_id: str, message, context) -> None:
     """Mark an item approved and push it to eBay as a draft offer. Shared by the
     typed 'approve' and the per-draft Approve button. Reports progress/errors to
@@ -450,15 +555,10 @@ async def _approve_item(item_id: str, message, context) -> None:
     try:
         ebay_result = await asyncio.to_thread(inventory.create_draft_offer, item_id)
     except inventory.MissingRequiredAspectsError as e:
-        lines = [
-            f"⚠️ Can't create the draft yet — eBay category {e.category_id} requires these "
-            "item specifics and I couldn't safely infer a value:"
-        ]
-        for m in e.missing:
-            opts = f" (allowed: {', '.join(m['allowed_values'])})" if m["allowed_values"] else ""
-            lines.append(f"  • {m['name']}{opts}")
-        lines.append("The item is saved as 'approved' — fix the listing and retry manually.")
-        await util._safe_reply(message, "\n".join(lines))
+        # Back to review, like a too-long title: a typed correction only
+        # applies under review, and 'approved' left no way to fix it here.
+        db.update_status(item_id, "review")
+        await _ask_missing_aspects(item_id, e.category_id, e.missing, message)
         return
     except inventory.TitleTooLongError as e:
         # Back to review, not left at 'approved': a title is fixed with a typed

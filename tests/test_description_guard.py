@@ -94,7 +94,7 @@ def test_publish_renders_the_guarded_text(monkeypatch):
     seen = {}
     monkeypatch.setattr(inv, "get_item", lambda _id: item)
     monkeypatch.setattr(inv, "resolve_valid_category", lambda cid, t: (cid, None))
-    monkeypatch.setattr(inv, "_resolve_required_aspects", lambda c, a, h: a)
+    monkeypatch.setattr(inv, "_resolve_required_aspects", lambda c, a, h, i=None: a)
     monkeypatch.setattr(inv, "_enforce_single_cardinality", lambda c, a: a)
     monkeypatch.setattr(inv, "listing_photo_order", lambda it: [])
     monkeypatch.setattr(inv, "_download_brand_image", lambda u, i: None)

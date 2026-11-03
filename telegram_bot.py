@@ -79,7 +79,7 @@ from bot.flow import (  # noqa: E402,F401  (re-export)
     _identify_gate_reason, _price_gate_reason, advance, _advance_one, _gate_is_busy,
     _enqueue_gate, _activate_next_gate, _show_identify_gate, _show_price_gate,
     confirm_callback, _approve_item, review_callback, _activate_item, _promote_item,
-    _retry_item,
+    _retry_item, aspect_callback,
 )
 from bot.text_router import (  # noqa: E402,F401  (re-export)
     _PRICE_CORRECTION, _price_from_correction, _apply_manual_price, _charm_price,

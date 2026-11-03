@@ -11,7 +11,7 @@ from llm import LazyClient, generate_with_retry, response_text
 from pipeline.category import choose_category, department_of
 from pipeline.description_guard import sanitize_description
 from pipeline.gtin import product_gtin
-from pipeline.specifics import clean_specifics
+from pipeline.specifics import clean_specifics, is_shoe_size_aspect
 from pipeline.title import (TITLE_MAX_LEN, TITLE_RULES, enforce_band_for_device,
                             ensure_title_fits, fit_title)
 
@@ -266,6 +266,16 @@ def _aspect_hint_block(category: dict | None) -> str | None:
             level = "OPTIONAL"
 
         values = [v.get("localizedValue") for v in (spec.get("aspectValues") or []) if v.get("localizedValue")]
+        if is_shoe_size_aspect(name):
+            # Named apart: the schema above says "Size", and this category
+            # files the size under its own name. The value list is capped
+            # below, so it would hide sizes past the first 20.
+            lines.append(
+                f"- {name} [{level}] (the US size as a number only, e.g. 10 or 10.5, "
+                "read from the size tag or the sewn-in label inside the shoe; put it under "
+                f"\"{name}\", not \"Size\"; leave it out if no label shows it, and never "
+                "convert a UK/EU size)")
+            continue
         if values:
             shown = ", ".join(values[:ASPECT_HINT_VALUE_CAP])
             if len(values) > ASPECT_HINT_VALUE_CAP:

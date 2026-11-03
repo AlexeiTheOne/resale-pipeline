@@ -32,6 +32,7 @@ EXPECTED_COMMANDS = {
 EXPECTED_CALLBACKS = {
     r"^confirm:": "confirm_callback",
     r"^review:": "review_callback",
+    r"^asp:": "aspect_callback",
     r"^reprice:": "reprice_callback",
     r"^qa:": "quick_add_callback",
     r"^invpost:": "inv_post_callback",
