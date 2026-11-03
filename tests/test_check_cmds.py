@@ -9,7 +9,7 @@ import config
 import db
 from bot import check_cmds, state
 from pipeline import check, pricing_v2
-from tests import tg_fakes as tg
+import tg_fakes as tg
 
 JUDGED = [{"source": "sold", "verdict": "same_item", "total": t, "title": f"sold {t}", "url": "u"}
           for t in (52.0, 54.0, 56.0)] + \
