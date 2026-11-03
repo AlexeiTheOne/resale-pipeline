@@ -9,7 +9,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ALLOWED = {"config.py", "scripts/notify.py"}
-SKIP_DIRS = {"tests", "venv", ".venv", "node_modules", "web", ".git"}
+# legacy/: old standalone tools kept unchanged for reference, never imported
+SKIP_DIRS = {"tests", "venv", ".venv", "node_modules", "web", ".git", "legacy"}
 
 
 def test_only_config_loads_dotenv():
