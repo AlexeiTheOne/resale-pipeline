@@ -250,9 +250,26 @@ def _headers() -> dict:
     }
 
 
+_GET_RETRY_WAITS = (2, 5)  # seconds before the 2nd and 3rd try
+
+
 def _request(method: str, path: str, **kwargs):
     guard.require_rest_write(method, path)
-    r = httpx.request(method, f"{EBAY_API_BASE}{path}", headers=_headers(), timeout=30, **kwargs)
+    # GETs change nothing, so a dropped connection or an eBay 5xx is retried.
+    # Writes are not: a POST that timed out may have gone through.
+    waits = _GET_RETRY_WAITS if method.upper() == "GET" else ()
+    for attempt in range(len(waits) + 1):
+        try:
+            r = httpx.request(method, f"{EBAY_API_BASE}{path}", headers=_headers(), timeout=30, **kwargs)
+        except httpx.TransportError:
+            if attempt == len(waits):
+                raise
+            time.sleep(waits[attempt])
+            continue
+        if r.status_code >= 500 and attempt < len(waits):
+            time.sleep(waits[attempt])
+            continue
+        break
     if r.status_code >= 400:
         raise RuntimeError(f"eBay API {method} {path} failed [{r.status_code}]: {r.text}")
     return r

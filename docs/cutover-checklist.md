@@ -143,7 +143,11 @@ Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) 
 - ✅ ODBC Driver 18 is installed (this PC is the production PC).
 - ✅ `pyodbc` and `tzdata` are pinned in `requirements.txt`. Installed into
   production's venv by hand on 2026-11-02, **before** the merge's deploy (see
-  the merge item below).
+  the merge item below): the tests then ran in the live venv before the
+  install, so the merge (9428e3a) would have failed on the missing pyodbc.
+  Since fix/update-field-revert, deploy.ps1 runs the tests in their own venv
+  (`ebay-list-staging-venv`) with the new commit's requirements, and installs
+  into the live venv only after the tests pass.
 - 💤 **Mixed-mode auth + `resale_reader` login (Q7).** Skipped at cutover,
   to be done after it (Person B, 2026-11-02); see section 4. This needs a SQL
   Server service restart, which also drops both bots' connections. As admin:
@@ -213,8 +217,8 @@ Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) 
     them).
   - Delete `resale-dev\data\rehearsal\*`.
   - Done for rehearsals 1 and 2 on 2026-11-02; repeat after any new one.
-- 💤 **Person A:** install SQL Server Express on their machine (Q12) and
-  confirm the Person A answers (Q8–Q14) that Person B relayed.
+- ✅ **Person A:** SQL Server is on their laptop (Q12; the suite ran on it 2026-11-02) and
+  Q8–Q14 are confirmed as proposed.
 
 ---
 

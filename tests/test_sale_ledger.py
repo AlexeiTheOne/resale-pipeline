@@ -208,4 +208,4 @@ def test_projection_uses_the_real_ad_fee():
             "ebay": {"quantity": 0, **orders.sale_db_fields(rec)}}
     p = profit.project(item)
     assert p["actual"] and p["ad_fee"] == 2.77
-    assert abs(p["net"] - (rec["net_proceeds"] - 10.0)) < CENT, p
+    assert abs(p["net"] - (rec["net_proceeds"] - 10.70)) < CENT, p   # $10 + 7% tax

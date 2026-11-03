@@ -3,6 +3,7 @@ the brand warning after identification, and the /report sheet.
 
 No eBay or Telegram calls; the DB is pointed at a temp file before import.
 """
+import pytest
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -97,8 +98,8 @@ def test_numbers():
     eh = _by(board, "brands", "Ed Hardy")
     assert (eh["live"], eh["bought"], eh["sold"]) == (20, 24, 4)
     assert abs(eh["sell_through"] - 4 / 24) < 1e-9
-    assert eh["tied_up"] == 200.0                 # 20 live × $10
-    assert eh["profit"] == 4 * (40.0 - 10.0)
+    assert eh["tied_up"] == pytest.approx(214.0)  # 20 live, $10 + 7% tax × $10
+    assert eh["profit"] == pytest.approx(4 * (40.0 - 10.70))   # cost $10 + 7% tax
     assert eh["median_days"] == 30.0              # listed 90d ago, sold 60d ago
     assert abs(eh["per100"] - 100 * 4 / (20 * 90 + 4 * 30)) < 1e-9
 
@@ -107,7 +108,7 @@ def test_per_order_list_and_missing_data():
     a = _item("Coach", "wallet", status="sold", qty=0, sold_days=20, units=3, net=90.0,
               shape="orders")
     f = sb.item_facts(a, NOW)
-    assert f["sold"] == 3 and f["days_to_sell"] == 70.0 and f["profit"] == 90.0 - 30.0
+    assert f["sold"] == 3 and f["days_to_sell"] == 70.0 and f["profit"] == pytest.approx(90.0 - 32.1)
     # ebay/orders.py's per-order shape: a "sales" list with units / net / sold_at
     b = {"status": "sold", "created_at": _iso(30), "receipt": {"reduced_price": 5},
          "identification": {"brand": "Coach"},
@@ -116,10 +117,10 @@ def test_per_order_list_and_missing_data():
                   "sales": [{"units": 1, "net": 30, "sold_at": _iso(20)},
                             {"units": 1, "net": 40, "sold_at": _iso(5)}]}}
     f = sb.item_facts(b, NOW)
-    assert f["sold"] == 2 and f["profit"] == 60 and f["days_to_sell"] == 10.0
+    assert f["sold"] == 2 and f["profit"] == pytest.approx(70 - 2 * 5.35) and f["days_to_sell"] == 10.0
     del b["ebay"]["sales"]
     f = sb.item_facts(b, NOW)
-    assert f["sold"] == 2 and f["profit"] == 60 and f["days_to_sell"] == 10.0
+    assert f["sold"] == 2 and f["profit"] == pytest.approx(70 - 2 * 5.35) and f["days_to_sell"] == 10.0
     bare = {"status": "sold", "created_at": _iso(5), "ebay": {}, "identification": None}
     f = sb.item_facts(bare, NOW)
     assert f["sold"] == 1 and f["profit"] is None and f["brand"] == "Unknown"

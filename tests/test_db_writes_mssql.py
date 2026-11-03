@@ -1,5 +1,6 @@
 """db.py writes on SQL Server: merges, races, retries, consistency.
 Runs against this run's ResaleDB_Test_* database (see conftest.py)."""
+import contextvars
 import threading
 
 import pyodbc
@@ -14,7 +15,7 @@ import sqlserver
 @pytest.fixture
 def ms(mssql, monkeypatch):
     monkeypatch.setattr(config, "DB_BACKEND", "sqlserver")
-    db_mssql._seen.clear()
+    db_mssql._forget()
     return mssql
 
 
@@ -29,11 +30,12 @@ def _published(**ebay):
 
 def test_two_writers_on_different_keys_both_survive(ms):
     item = _published()
-    first, second = db.get_item(item), db.get_item(item)   # both read before either writes
-    a = dict(first["ebay"], quantity=3)
-    b = dict(second["ebay"], sku="s-2")                     # still holds quantity=1
-    db.update_field(item, "ebay", a)
-    db.update_field(item, "ebay", b)
+    # Two handlers (each update runs in its own task, so its own context).
+    first, second = contextvars.copy_context(), contextvars.copy_context()
+    a = first.run(lambda: dict(db.get_item(item)["ebay"], quantity=3))
+    b = second.run(lambda: dict(db.get_item(item)["ebay"], sku="s-2"))  # read quantity=1
+    first.run(db.update_field, item, "ebay", a)
+    second.run(db.update_field, item, "ebay", b)
     ebay = db.get_item(item)["ebay"]
     assert ebay["quantity"] == 3 and ebay["sku"] == "s-2"  # set by the second writer
 
@@ -41,7 +43,7 @@ def test_two_writers_on_different_keys_both_survive(ms):
 def test_two_threads_on_different_keys_both_survive(ms):
     for round_ in range(5):
         item = _published()
-        db_mssql._seen.clear()
+        db_mssql._forget()
         barrier = threading.Barrier(2)
         errors = []
 
@@ -86,6 +88,32 @@ def test_writes_without_a_fresh_read_still_apply(ms):
     db.update_field(item, "ebay", e)
     ebay = db.get_item(item)["ebay"]
     assert (ebay["quantity"], ebay["sku"]) == (2, "s-9")
+
+
+# A value set back to one it held recently must be written (an undo, a restock).
+
+def test_a_value_set_back_after_a_fresh_read_is_written(ms):
+    item = _published(price=40.0)
+    db.update_field(item, "ebay", dict(db.get_item(item)["ebay"], price=35.0))
+    db.update_field(item, "ebay", dict(db.get_item(item)["ebay"], price=40.0))
+    assert db.get_item(item)["ebay"]["price"] == 40.0
+
+
+def test_a_value_set_back_without_a_re_read_is_written(ms):
+    item = _published()
+    e = dict(db.get_item(item)["ebay"], quantity=0)
+    db.update_field(item, "ebay", e)
+    e["quantity"] = 1                                      # restock, same flow
+    db.update_field(item, "ebay", e)
+    assert db.get_item(item)["ebay"]["quantity"] == 1
+
+
+def test_a_value_set_back_in_separate_tasks_is_written(ms):
+    item = _published(price=40.0)
+    for price in (35.0, 40.0):                             # two handlers, one after the other
+        contextvars.copy_context().run(
+            lambda p=price: db.update_field(item, "ebay", dict(db.get_item(item)["ebay"], price=p)))
+    assert db.get_item(item)["ebay"]["price"] == 40.0
 
 
 def test_a_write_drops_the_stale_json_copy(ms, mssql):
@@ -264,3 +292,27 @@ def test_consistency_check_finds_a_column_that_disagrees(ms, mssql):
     mssql.commit()
     report = db_mssql.consistency_report()
     assert len(report) == 1 and "retail_price" in report[0]
+
+
+def test_two_asyncio_tasks_on_different_keys_both_survive(ms):
+    # The bot runs each Telegram update and job as its own asyncio task.
+    import asyncio
+    item = _published()
+
+    async def handler(key, value, read_done, go):
+        read = db.get_item(item)["ebay"]
+        read_done.set()
+        await go.wait()
+        db.update_field(item, "ebay", dict(read, **{key: value}))
+
+    async def main():
+        r1, r2, go = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        t1 = asyncio.create_task(handler("quantity", 4, r1, go))
+        t2 = asyncio.create_task(handler("sku", "s-7", r2, go))
+        await r1.wait(); await r2.wait()                  # both read before either writes
+        go.set()
+        await asyncio.gather(t1, t2)
+
+    asyncio.run(main())
+    ebay = db.get_item(item)["ebay"]
+    assert (ebay["quantity"], ebay["sku"]) == (4, "s-7")

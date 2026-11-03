@@ -13,6 +13,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 import config
+import profit
 import db
 import identify
 import ross_tag
@@ -190,7 +191,7 @@ def _stock_line(item: dict, detail: bool = False) -> str:
     qp = stock.get("quick_price") or {}
     name = " ".join(str(x) for x in (ident.get("brand"), ident.get("product_name")
                                     or ident.get("item_type")) if x)[:55]
-    cost = (item.get("receipt") or {}).get("reduced_price")
+    cost = profit.paid_with_tax(item)
     bits = [f"${qp.get('price')}" if qp.get("price") else "no price"]
     if cost:
         bits.append(f"cost ${cost}")
@@ -227,7 +228,7 @@ async def stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     items.sort(key=lambda it: (rank.get(verdict_of(it) or "ok", 1), -price_of(it)))
     total = sum(price_of(i) for i in items)
-    cost = sum((i.get("receipt") or {}).get("reduced_price") or 0 for i in items)
+    cost = sum(profit.paid_with_tax(i) or 0 for i in items)
     lines = [f"📦 Not posted: {len(items)} item(s), worth ~${total:,.0f} (cost ${cost:,.0f})",
              "List from the top: best sellers first.", ""]
     for it in items:

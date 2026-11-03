@@ -21,7 +21,7 @@ the stored sale_price and shipping_collected.
 """
 from config import (
     ASSUMED_COST_RATIO, EBAY_AD_FEE_PCT, EBAY_FIXED_FEE, EBAY_FVF_PCT,
-    EBAY_SHIP_CHARGED, EBAY_SHIP_COST,
+    EBAY_SHIP_CHARGED, EBAY_SHIP_COST, SALES_TAX_RATE,
 )
 
 
@@ -34,17 +34,28 @@ def _listed_qty(item: dict) -> int:
     return q if q > 0 else 1
 
 
+def paid_with_tax(item: dict) -> float | None:
+    """What one unit cost at Ross including sales tax: the receipt's
+    reduced_price (the shelf price) x (1 + SALES_TAX_RATE), or None if unknown.
+    Every money figure (profit, floors, reports) uses this, not the shelf price."""
+    paid = (item.get("receipt") or {}).get("reduced_price")
+    if paid is None:
+        return None
+    return round(float(paid) * (1 + SALES_TAX_RATE), 2)
+
+
 def unit_cost(item: dict) -> tuple[float | None, bool]:
     """(what one unit cost you, whether that's an estimate).
 
-    The receipt's reduced_price when it was captured. Without one the cost is
+    The receipt's reduced_price plus the sales tax paid on it at Ross
+    (SALES_TAX_RATE, 7%: it is part of what the item cost). Without one the cost is
     NOT zero — costing a receipt-less item at zero reports its whole sale price
     as profit — so it falls back to a share of the list price (see
     ASSUMED_COST_RATIO), flagged as an estimate so no caller can present a guess
     as a measurement."""
-    paid = (item.get("receipt") or {}).get("reduced_price")
+    paid = paid_with_tax(item)
     if paid is not None:
-        return round(float(paid), 2), False
+        return paid, False
     price = (item.get("listing") or {}).get("price")
     if price is None:
         return None, True
@@ -110,7 +121,7 @@ def breakeven_price(item: dict, min_margin: float = 0.0) -> float | None:
 
     Note FVF applies to the shipping you charge as well as the item, which is why
     shipping doesn't cancel out even when charged == cost."""
-    paid = (item.get("receipt") or {}).get("reduced_price")
+    paid = paid_with_tax(item)
     if paid is None:
         return None
     # The EFFECTIVE ad cost, not the rate set on the listing: eBay billed 5.0% of

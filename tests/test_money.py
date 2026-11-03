@@ -98,14 +98,14 @@ def test_report_and_profit_agree_on_the_same_sale():
 
     revenue = unit * qty
     ad_fee = EBAY_AD_FEE_PCT * revenue
-    cost = 12.00 * qty
+    cost = 12.84 * qty          # $12.00 at Ross + 7% sales tax
     report_net = (revenue + e["shipping_collected"] - e["ebay_fees"]
                   - ad_fee - e["shipping_label_cost"] - cost)
 
     p = profit.project(item)
     assert abs(report_net - p["net"]) < CENT, (report_net, p["net"])
-    assert abs(p["net"] - 35.83) < CENT, p["net"]  # at the 4.6% ad rate
-    assert p["cost"] == 24.00, "two units sold means two units of Ross cost"
+    assert abs(p["net"] - 34.15) < CENT, p["net"]  # at the 4.6% ad rate
+    assert p["cost"] == 25.68, "two units sold means two units of Ross cost"
     assert p["actual"] is True
 
 

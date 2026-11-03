@@ -3,8 +3,7 @@
 Status: **approved with changes, nothing built yet.** Branch `sqlserver-migration`.
 Draft 2026-11-02; revised 2026-11-02 after review.
 Readers: Person A (bot, pricing, listings) and Person B (databases, receipts, buying).
-Sign-off: Person B approved the design and answered their questions. Person A's
-answers were relayed by Person B and still need Person A's own confirmation.
+Sign-off: both people approved the design (Person A confirmed 2026-11-02).
 Section 8 lists every decision.
 
 Numbers below come from the **dev copy** of `ross.db` (162 items) and from
@@ -268,8 +267,8 @@ Index: `(ross_code)`. The effective cost comes from `v_item_cost` (section 1D).
   | `unit_cost_with_tax` | `ROUND(unit_cost * (1 + tax_rate), 2)`, NULL when unit_cost is NULL |
 
   NULL means "no cost known". profit.py's list-price estimate stays in Python,
-  flagged as an estimate, as today. Which cost profit reports use (with or
-  without tax) is Person A's call once Q17 is answered. Line prices on Ross
+  flagged as an estimate, as today. Profit reports use the cost with tax
+  (Q17, profit.paid_with_tax). Line prices on Ross
   receipts are before tax, so both sources compare like for like.
 - `v_items`: a flat row per item (identification + pricing + listing + eBay +
   sales totals + cost + piece counts) for reports, the `prod-logs` skill and the
@@ -750,7 +749,7 @@ names directly.
 |---|---|
 | `get_item(id)` → dict with 11 nested groups | Joins the 1:1 tables and loads the child tables, then **builds the same nested dict** (`dbmap.join_item`). Columns go back to their old keys, child rows become lists, the sale totals inside `ebay` are rebuilt from the `sales` rows with ebay/orders.py's own maths, and the leftover is applied last. Paths are resolved as today. Built in step 2a: identical to SQLite on all 162 dev items. |
 | `list_items(status)` | Same output. Uses a few set-based queries (one per table for all ids) rather than one per item. |
-| `update_field(id, field, data)` | **Merges, then writes only what changed**, in one transaction that first takes `UPDLOCK` on the item row. Merge: `data` is compared with the version this caller read (db.py remembers the recent versions it handed out per item and group, and takes the one closest to `data`); only the keys the caller changed are applied onto the current row. Comparing with the current row alone would not be enough: a second writer's dict still holds the first writer's old value and would write it back. Then the item is split again (`dbmap.split_item`) and only changed columns and changed child lists are written, each column together with its JSON copy. Two writers changing different keys of one group both survive; on the same key, the last writer wins. Built in step 2b. |
+| `update_field(id, field, data)` | **Merges, then writes only what changed**, in one transaction that first takes `UPDLOCK` on the item row. Merge: `data` is compared with the version this caller last read or wrote (remembered per asyncio task / thread in a context variable; none remembered means `data` replaces the group, as on SQLite); only the keys the caller changed are applied onto the current row. (Changed 2026-11-02: first built as "the recently handed-out version closest to `data`", which lost undos: setting a value back to a recent one looked like no change.) Comparing with the current row alone would not be enough: a second writer's dict still holds the first writer's old value and would write it back. Then the item is split again (`dbmap.split_item`) and only changed columns and changed child lists are written, each column together with its JSON copy. Two writers changing different keys of one group both survive; on the same key, the last writer wins. Built in step 2b. |
 | `update_field(id, "pricing", data)` | Writes `item_pricing` as above. When `data` carries comps (a real pricing run), it **inserts a new `pricing_runs` row** with those comps and moves `latest_run_id`. When it doesn't (a manual price, a flag change), it touches `item_pricing` only. `get_item` builds `sold_comps` etc. from the latest run, so `/comps` shows the latest run. |
 | `update_status`, `create_item`, `delete_item` | Same. `delete_item` cascades to child tables; a deleted item's pieces are unlinked (FK SET NULL); its `listing_stats` stay (history, no FK). **It is blocked for sold items (decided, Q8):** it raises a clear `ValueError` before the delete, and the `sales` FK backs that up. |
 | `record_listing_stats`, `record_job_run`, `record_feedback_failure`, taxonomy and token upserts (`ON CONFLICT … DO UPDATE`) | `UPDATE …; IF @@ROWCOUNT = 0 INSERT …` inside `SERIALIZABLE`/`UPDLOCK`. Not `MERGE`, which has known concurrency bugs. |
@@ -968,7 +967,7 @@ from a fresh backup made with `python backup.py --db-only`.
 ## 8. Decisions and open questions
 
 Review: 2026-11-02. Person B answered their questions directly. Person A's
-answers were relayed by Person B; **Person A to confirm** (marked ⧗).
+answers were relayed by Person B and confirmed by Person A on 2026-11-02 (✓).
 
 ### Changes made after review
 
@@ -997,13 +996,13 @@ answers were relayed by Person B; **Person A to confirm** (marked ⧗).
 | Q5 | Decimal-loss fixes | Auto-fix only when the raw text or the subtotal agrees; the rest by hand | Person B |
 | Q6 | Unique ReceiptNumber | Yes; the receipt bot catches the duplicate error and replies "already saved" | Person B |
 | Q7 | Read-only access | Mixed-mode auth plus a read-only SQL login (`resale_reader`) | Person B |
-| Q8 | Deleting a sold item | Blocked | Person A ⧗ |
-| Q9 | Case-insensitive collation | OK | Person A ⧗ |
-| Q10 | `condition` spelling | Normalise | Person A ⧗ |
-| Q11 | Pricing history | Keep every run (change 6) | Person A ⧗ |
-| Q12 | Tests on Person A's machine | Person A installs SQL Server Express | Person A ⧗ |
-| Q13 | SQL outside `db.py` | Move it into `db.py` in this branch | Person A ⧗ |
-| Q14 | Targeted writers (phase 2) | After cutover | Person A ⧗ |
+| Q8 | Deleting a sold item | Blocked | Person A ✓ (2026-11-02) |
+| Q9 | Case-insensitive collation | OK | Person A ✓ (2026-11-02) |
+| Q10 | `condition` spelling | Normalise | Person A ✓ (2026-11-02) |
+| Q11 | Pricing history | Keep every run (change 6) | Person A ✓ (2026-11-02) |
+| Q12 | Tests on Person A's machine | Person A installs SQL Server Express | Person A ✓ (2026-11-02) |
+| Q13 | SQL outside `db.py` | Move it into `db.py` in this branch | Person A ✓ (2026-11-02) |
+| Q14 | Targeted writers (phase 2) | After cutover | Person A ✓ (2026-11-02) |
 | Q15 | Backups | Agreed, with change 4 | Both |
 | Q16 | Location code format | `^[A-Z0-9]+(-[A-Z0-9]+)*$` for now (`LOCATION_CODE_PATTERN`) | Person B |
 
@@ -1024,4 +1023,4 @@ answers were relayed by Person B; **Person A to confirm** (marked ⧗).
     6.3%.
   - 7% = Florida 6% + Miami-Dade 1% surtax. **`SALES_TAX_RATE = 0.07`** (in
     config.py); it slightly overstates cost for exempt items.
-  - Person A decides which cost (with or without tax) profit reports use.
+  - Profit reports use the cost WITH tax (decided by Person A, 2026-11-02: it is paid).
