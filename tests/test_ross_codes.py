@@ -59,6 +59,24 @@ def test_intake_reads_a_tag_that_decodes_only_rotated(monkeypatch):
     assert check.read_ross_barcode(str(ROTATED)) == {"code": "400252597608", "reduced_price": 9.99}
 
 
+from pipeline import inventory as _inventory  # noqa: E402
+
+# The real read_tag, taken at collection: tests/test_inventory.py replaces
+# inventory.read_tag with fakes while it runs (and doesn't put it back).
+_REAL_READ_TAG = _inventory.read_tag
+
+
+@pytest.mark.skipif(ross_tag._zbar_decode is None, reason="pyzbar not installed")
+def test_inv_piece_reads_a_rotated_tag(monkeypatch):
+    """/inv (pipeline/inventory.read_tag) uses the same rotation-aware reader."""
+    import llm
+    monkeypatch.setattr(llm, "generate_with_retry", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("no AI")))
+    info = _REAL_READ_TAG(str(ROTATED))
+    assert (info["ross_code"], info["ross_price"], info["ross_barcode"]) == \
+        ("400252597608", 9.99, "400252597608000999")
+    assert "ross_code_main" not in info
+
+
 def test_decode_barcodes_needs_a_first_barcode(monkeypatch):
     monkeypatch.setattr(ross_tag, "decode_barcode", lambda p: None)
     assert ross_tag.decode_barcodes("nothing.jpg") == []

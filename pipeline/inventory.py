@@ -109,9 +109,10 @@ def read_tag(photo: str | list[str]) -> dict:
             info["upc"] = upcs[0]
             break
     info["upc"] = product_gtin(info.get("upc"))
-    # Every Ross barcode in every photo: the REDUCED sticker (what we paid) is
-    # the code kept; a main tag with another code is kept as ross_code_main.
-    codes = ross_tag.split_codes([b for p in photos for b in ross_tag.decode_barcodes(p) if len(b) >= 18])
+    # Every Ross barcode in every photo, rotation-aware like intake and /check
+    # (a tag at a slant decodes only turned): the REDUCED sticker (what we
+    # paid) is the code kept; a main tag with another code is ross_code_main.
+    codes = ross_tag.split_codes([b for p in photos for b in ross_tag.read_barcodes(p) if len(b) >= 18])
     if codes["code"]:
         info["ross_barcode"] = codes["barcode"]   # the whole barcode, kept for the record
         info["ross_code"] = codes["code"]
