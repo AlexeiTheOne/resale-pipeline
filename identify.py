@@ -14,7 +14,7 @@ from google.genai import errors, types
 
 from llm import LazyClient, error_code, generate_with_retry, response_text
 from config import GEMINI_MODEL, GEMINI_FAST_MODEL, GEMINI_RESEARCH_THINKING_LEVEL
-from pipeline.gtin import product_gtin
+from pipeline.gtin import digits_of, is_store_code, product_gtin
 from ross_tag import read_product_upcs, ocr_text
 
 client = LazyClient()
@@ -118,7 +118,9 @@ RESEARCH_PROMPT = (
     "   - UPC / barcode number (the long digit string, e.g. '1 98928 67569 8'). "
     "The Ross price tag's 12-digit item code starting 400 is the STORE's code, "
     "not the product's UPC: never report or search it as one.\n"
-    "   - style / SKU number (e.g. 'XW08963')\n"
+    "   - style / SKU number (e.g. 'XW08963'), the FULL code exactly as printed, "
+    "print/colour suffix included: 'EHH108-26-WIP', not just 'EHH108' (the suffix "
+    "says which print it is)\n"
     "   - color code (often a 3-digit suffix after the style number, e.g. '971' = a "
     "specific color combo)\n"
     "   - size, material, and any printed retail/original price.\n"
@@ -186,7 +188,8 @@ FORMAT_INSTRUCTIONS = (
     "{\n"
     '  "brand": "brand name or null",\n'
     '  "item_type": "e.g. handbag, sneakers, blanket, blouse",\n'
-    '  "model": "style/SKU number (from a hang tag or a sewn-in label) if known or null",\n'
+    '  "model": "style/SKU number (from a hang tag or a sewn-in label) if known or null; the FULL '
+    'code with its print/colour suffix, e.g. EHH108-26-WIP, never shortened to EHH108",\n'
     '  "upc": "manufacturer UPC/EAN from the product label (digits only) or null; '
     'never the Ross price-tag code starting 400",\n'
     '  "product_name": "the real product-line / marketing name buyers search for, '
@@ -265,6 +268,19 @@ def _extract_style_codes(text: str) -> list[str]:
         if tok not in seen:
             seen.append(tok)
     return seen[:5]
+
+
+def full_style_code(model, ocr_codes) -> str | None:
+    """The full style code: `model`, or a longer OCR'd tag code that starts with
+    it ('EHH108' + OCR 'EHH108-26-WIP' -> 'EHH108-26-WIP'). None when `model`
+    isn't a style code (no digits + letters)."""
+    m = str(model or "").strip()
+    norm = re.sub(r"\W", "", m).upper()
+    if len(norm) < 5 or not (re.search(r"\d", norm) and re.search(r"[A-Z]", norm)):
+        return None
+    longer = [c for c in ocr_codes or () if re.sub(r"\W", "", c).upper().startswith(norm)
+              and len(re.sub(r"\W", "", c)) > len(norm)]
+    return max(longer, key=len) if longer else m
 
 
 def _tag_signals(scan_paths: list[str], fallback_ocr_path: str | None) -> tuple[list[str], list[str]]:
@@ -432,9 +448,18 @@ def identify_item(image_paths: list[str], scan_paths: list[str] | None = None) -
     elif result.get("upc") and not product_gtin(result["upc"]):
         # A model-read "UPC" that is really the Ross tag's 400xxxxxxxxx item code
         # (8c4260b4, fe5be314) or a misread with a bad check digit. Downstream it
-        # becomes the listing's UPC and a pricing GTIN search, so drop it.
+        # becomes the listing's UPC and a pricing GTIN search, so drop it. A Ross
+        # code (some brand tags carry it as their barcode: Ed Hardy) is kept as
+        # ross_code: "already have" matches on it.
+        if is_store_code(result["upc"]) and len(digits_of(result["upc"])) == 12:
+            result["ross_code"] = digits_of(result["upc"])
         print(f"Dropping model-read UPC {result['upc']!r}: not a manufacturer UPC/EAN")
         result["upc"] = None
+    full = full_style_code(result.get("model"), style_codes)
+    if full:
+        # The full style code (print/colour suffix included), also from the
+        # tag OCR when the model shortened it: EHH108 -> EHH108-26-WIP.
+        result["model"] = result["style_code"] = full
     # Whether that UPC came off a barcode or out of the model's eyes. The two are
     # not remotely the same evidence: a decoded barcode is ground truth, while a
     # model-read one is the least reliable field on this whole object (long digit
