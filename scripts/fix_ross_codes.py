@@ -141,13 +141,92 @@ def apply(con, rows, backup: str) -> int:
     return len(done)
 
 
+# --prices (approved by Person B, 2026-11-05, after the code fix): the 4 typed
+# prices, a cent off the tag, set to the price in the tag's barcode.
+# item_id prefix: (stored price now, barcode price)
+PRICE_FIXES = {
+    "0d49692b": (10.00, 9.99),
+    "55f92238": (10.00, 9.99),
+    "7ad33913": (10.00, 9.99),
+    "c47e6fb7": (13.00, 12.99),
+}
+
+
+def price_plan(con, read=None, photos_root=PHOTOS_ROOT) -> list[dict]:
+    import ross_tag
+    read = read or ross_tag.read_barcodes
+    out = []
+    for short, (old, expected) in PRICE_FIXES.items():
+        rows = con.execute("SELECT item_id, ross_code, ross_price, tag_photo_path FROM dbo.item_tags "
+                           "WHERE item_id LIKE ?", short + "%").fetchall()
+        p = {"short": short, "old": old, "expected": expected, "ok": False}
+        if len(rows) != 1:
+            out.append({**p, "why": f"{len(rows)} rows"})
+            continue
+        r = rows[0]
+        got = ross_tag.split_codes(read(str(photos_root / r.tag_photo_path))) if r.tag_photo_path else {}
+        p.update(item_id=r.item_id, code=r.ross_code, now=float(r.ross_price) if r.ross_price is not None else None,
+                 decoded_code=got.get("code"), decoded=got.get("reduced_price"), photo=r.tag_photo_path)
+        if p["now"] != old:
+            p["why"] = f"stored price is {p['now']}, not {old}"
+        elif got.get("code") != r.ross_code or got.get("reduced_price") != expected:
+            p["why"] = f"the photo reads {got.get('code')} ${got.get('reduced_price')}, expected {r.ross_code} ${expected}"
+        else:
+            p["ok"] = True
+        out.append(p)
+    return out
+
+
+def apply_prices(con, rows, backup: str) -> int:
+    cur = con.cursor()
+    try:
+        for p in rows:
+            cur.execute("UPDATE dbo.item_tags SET ross_price = ? WHERE item_id = ? AND ross_price = ?",
+                        p["decoded"], p["item_id"], p["old"])
+            if cur.rowcount != 1:
+                raise RuntimeError(f"{p['item_id']}: {cur.rowcount} rows updated, expected 1")
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    with LOG.open("a", encoding="utf-8") as fh:
+        for p in rows:
+            fh.write(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "database": DATABASE,
+                                 "table": "item_tags", "item_id": p["item_id"], "column": "ross_price",
+                                 "old": p["old"], "new": p["decoded"], "photo": p["photo"],
+                                 "reason": "typed price, a cent off the tag barcode",
+                                 "approved_by": "Person B", "backup": backup}) + "\n")
+    return len(rows)
+
+
+def prices(con, do_apply: bool) -> int:
+    rows = price_plan(con)
+    print(f"{DATABASE} prices: {sum(p['ok'] for p in rows)} of {len(PRICE_FIXES)} ready")
+    for p in rows:
+        print(f"  {p['short']}: ${p.get('now')} -> ${p.get('decoded')} (code {p.get('code')})"
+              + ("" if p["ok"] else f"  SKIP: {p['why']}"))
+    if not do_apply:
+        print("Dry run: nothing written. Run with --prices --apply to back up and fix.")
+        return 0
+    if not all(p["ok"] for p in rows):
+        print("Not applying: every item must be ready.")
+        return 1
+    backup = sqlserver.backup_database(DATABASE, label="before-ross-price-fix")
+    print(f"Backup: {backup}")
+    print(f"Fixed {apply_prices(con, rows, backup)}; logged to {LOG}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--apply", action="store_true", help="back up, then write (default: dry run)")
     ap.add_argument("--json-fix", action="store_true", help="only the JSON-copy follow-up for applied rows")
+    ap.add_argument("--prices", action="store_true", help="the 4 typed prices (dry run unless --apply)")
     args = ap.parse_args(argv)
     con = sqlserver.connect(DATABASE)
     try:
+        if args.prices:
+            return prices(con, args.apply)
         if args.json_fix:
             print(f"JSON copies fixed: {json_fix(con)}; logged to {LOG}")
             return 0

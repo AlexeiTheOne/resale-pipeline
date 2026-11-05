@@ -43,6 +43,22 @@ def test_extract_receipt_keeps_both_codes(monkeypatch, tmp_path):
     assert "main_code" not in ross_tag.extract_receipt(str(tmp_path / "tag.jpg"))
 
 
+ROTATED = __import__("pathlib").Path(__file__).parent.parent / "test_images" / "intake_tag_rotated_15deg.jpg"
+
+
+@pytest.mark.skipif(ross_tag._zbar_decode is None, reason="pyzbar not installed")
+def test_intake_reads_a_tag_that_decodes_only_rotated(monkeypatch):
+    """Item 0d49692b (2026-11-05 fix): its tag decodes only at 15 degrees, so
+    intake stored placeholder 000000000111 and a typed $10.00."""
+    assert ross_tag.decode_barcode(str(ROTATED)) is None                 # the straight read fails
+    assert ross_tag.read_barcodes(str(ROTATED)) == ["400252597608000999"]
+    monkeypatch.setattr(ross_tag, "ocr_text", lambda p: "")              # the barcode alone must do it
+    monkeypatch.setattr(ross_tag, "TAG_VISION_FALLBACK", False)
+    r = ross_tag.extract_receipt(str(ROTATED))
+    assert (r["code"], r["reduced_price"], r["source"]) == ("400252597608", 9.99, "barcode")
+    assert check.read_ross_barcode(str(ROTATED)) == {"code": "400252597608", "reduced_price": 9.99}
+
+
 def test_decode_barcodes_needs_a_first_barcode(monkeypatch):
     monkeypatch.setattr(ross_tag, "decode_barcode", lambda p: None)
     assert ross_tag.decode_barcodes("nothing.jpg") == []

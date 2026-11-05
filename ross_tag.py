@@ -196,6 +196,44 @@ def decode_barcodes(image_path: str) -> list[str]:
     return found
 
 
+# Angles to try when the photo doesn't decode straight, most likely first: a
+# tag photographed sideways (90/270), upside down, or a sticker stuck on at a
+# slant. Real cases: check #2's REDUCED sticker read only at 30-45 degrees;
+# 6 intake tags (2026-11-05) only at 15, -15, 30 or 90 degrees.
+BARCODE_ANGLES = (0, 90, 270, 180, 30, -30, 45, -45, 15, -15, 60, -60)
+BARCODE_BUDGET_S = 6.0
+
+
+def read_barcodes(image_path: str, budget_s: float = BARCODE_BUDGET_S) -> list[str]:
+    """Every Ross barcode in the photo, rotation-aware: decode_barcodes first
+    (straight), then the photo rotated through BARCODE_ANGLES, then at double
+    size, until `budget_s` runs out; at the first angle that reads, every
+    barcode there. [] when nothing decodes. Local, no AI."""
+    found = decode_barcodes(image_path)
+    if found or _zbar_decode is None or Image is None:
+        return found
+    import time
+    try:
+        img = ImageOps.grayscale(ImageOps.exif_transpose(Image.open(image_path)))
+    except Exception:
+        return []
+    deadline = time.perf_counter() + budget_s
+    for scale in (1, 2):
+        base = img if scale == 1 else img.resize((img.size[0] * 2, img.size[1] * 2))
+        for angle in BARCODE_ANGLES:
+            if time.perf_counter() > deadline:
+                return []
+            try:
+                res = _zbar_decode(base.rotate(angle, expand=True, fillcolor=255), symbols=_TAG_ZBAR_SYMBOLS)
+            except Exception:
+                continue
+            ds = [d for d in dict.fromkeys(re.sub(r"\D", "", r.data.decode("utf-8", "ignore")) for r in res)
+                  if len(d) >= 12]
+            if ds:
+                return ds
+    return []
+
+
 def split_codes(barcodes) -> dict:
     """The main tag and the REDUCED sticker from a tag's barcodes.
 
@@ -509,8 +547,10 @@ def extract_receipt(image_path: str) -> dict:
     barcode, with OCR fallback) and the original price (from OCR). Never raises:
     returns a dict with an "error" note if nothing could be read, so a bad tag
     read can't abort the listing pipeline."""
-    # Every barcode: with a REDUCED sticker on the tag there can be two codes.
-    bars = decode_barcodes(image_path)
+    # Every barcode, rotation-aware (a tag shot at a slant decodes only turned:
+    # 6 items got placeholder or misread codes without this, 2026-11-05). With
+    # a REDUCED sticker on the tag there can be two codes.
+    bars = read_barcodes(image_path)
     codes = split_codes(bars)
     barcode = codes["barcode"] or (bars[0] if bars else None)
     bc = parse_barcode(barcode)

@@ -799,10 +799,7 @@ def check_fields(res: dict) -> dict:
                               "warnings": (res.get("warnings") or "")[:500] or None}}
 
 
-# Barcode angles to try, most likely first: a tag photographed sideways (90/270),
-# upside down, or a markdown sticker stuck on at a slant. Check #2's REDUCED
-# sticker read only at 30-45 degrees.
-BARCODE_ANGLES = (0, 90, 270, 180, 30, -30, 45, -45, 15, -15, 60, -60)
+# The rotation-aware reader lives in ross_tag (intake uses it too).
 BARCODE_BUDGET_S = 6.0
 
 
@@ -822,41 +819,13 @@ def read_ross_barcode(path: str, budget_s: float = BARCODE_BUDGET_S) -> dict:
     the first angle that reads), then at double size, until the time budget
     runs out. Local, no AI."""
     import ross_tag
-    found_all = ross_tag.decode_barcodes(path)
-    digits = None
-    if found_all:
-        got = ross_tag.split_codes(found_all)
-        if got.get("code"):
-            return _barcode_result(got)
-        digits = found_all[0]
-    if not digits:
-        try:
-            from PIL import Image, ImageOps
-            img = ImageOps.grayscale(ImageOps.exif_transpose(Image.open(path)))
-        except Exception:
-            return {}
-        deadline = time.perf_counter() + budget_s
-        for scale in (1, 2):
-            base = img if scale == 1 else img.resize((img.size[0] * 2, img.size[1] * 2))
-            for angle in BARCODE_ANGLES:
-                if time.perf_counter() > deadline:
-                    break
-                try:
-                    found = ross_tag._zbar_decode(base.rotate(angle, expand=True, fillcolor=255),
-                                                  symbols=ross_tag._TAG_ZBAR_SYMBOLS)
-                except Exception:
-                    continue
-                ds = [re.sub(r"\D", "", r.data.decode("utf-8", "ignore")) for r in found]
-                ds = [d for d in dict.fromkeys(ds) if len(d) >= 12]
-                if ds:
-                    got = ross_tag.split_codes(ds)
-                    if got.get("code"):
-                        return _barcode_result(got)
-                    digits = ds[0]
-                    break
-            if digits:
-                break
-    parsed = ross_tag.parse_barcode(digits) if digits else {}
+    found = ross_tag.read_barcodes(path, budget_s)      # the same reader as intake
+    if not found:
+        return {}
+    got = ross_tag.split_codes(found)
+    if got.get("code"):
+        return _barcode_result(got)
+    parsed = ross_tag.parse_barcode(found[0])
     return parsed if parsed.get("code") else {}
 
 
