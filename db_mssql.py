@@ -537,6 +537,25 @@ def list_checks(*, user_id=None, status=None, sku=None, since=None, limit: int =
     return [_check_decode(r) for r in _query(sql, *args)]
 
 
+def receipt_lines_for_skus(skus) -> list[dict]:
+    skus = list(skus)[:500]
+    if not skus:
+        return []
+    marks = ", ".join("?" * len(skus))
+    rows = _query(f"""
+        SELECT ri.ItemID AS line_id, ri.SKU AS sku, ri.Description AS description, ri.Price AS price,
+               r.ReceiptDate AS receipt_date, r.ReceiptNumber AS receipt_number, r.StoreCity AS store_city
+        FROM dbo.ReceiptItems ri JOIN dbo.Receipts r ON r.ReceiptID = ri.ReceiptID
+        WHERE ri.SKU IN ({marks})
+        ORDER BY r.ReceiptDate DESC, ri.ItemID DESC""", *skus)
+    for r in rows:
+        if r["price"] is not None:
+            r["price"] = float(r["price"])
+        if r["receipt_date"] is not None and hasattr(r["receipt_date"], "isoformat"):
+            r["receipt_date"] = r["receipt_date"].isoformat()[:10]
+    return rows
+
+
 def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> None:
     _write(_upsert, "job_runs", {"job": job}, {"last_run_at": _ts(_now()), "status": status, "detail": detail})
 

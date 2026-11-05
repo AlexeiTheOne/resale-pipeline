@@ -80,7 +80,7 @@ def read_tag(photo: str | list[str]) -> dict:
     from config import GEMINI_FAST_MODEL
     from identify import client
     from llm import generate_with_retry, response_text
-    from ross_tag import decode_barcode, read_product_upcs
+    from ross_tag import read_product_upcs
 
     photos = [photo] if isinstance(photo, (str, Path)) else list(photo)
     info: dict = {}
@@ -109,13 +109,19 @@ def read_tag(photo: str | list[str]) -> dict:
             info["upc"] = upcs[0]
             break
     info["upc"] = product_gtin(info.get("upc"))
-    ross = next((r for r in map(decode_barcode, photos) if r and len(r) >= 18), None)
-    if ross:
-        info["ross_barcode"] = ross   # the whole barcode, kept for the record
-        info["ross_code"] = ross[:12]
-        price = int(ross[-6:]) / 100
-        if price > 0:
-            info["ross_price"] = price
+    # Every Ross barcode in every photo, rotation-aware like intake and /check
+    # (a tag at a slant decodes only turned): the REDUCED sticker (what we
+    # paid) is the code kept; a main tag with another code is ross_code_main.
+    codes = ross_tag.split_codes([b for p in photos for b in ross_tag.read_barcodes(p) if len(b) >= 18])
+    if codes["code"]:
+        info["ross_barcode"] = codes["barcode"]   # the whole barcode, kept for the record
+        info["ross_code"] = codes["code"]
+        if codes["reduced_price"]:
+            info["ross_price"] = codes["reduced_price"]
+        if codes["main_code"]:
+            info["ross_code_main"] = codes["main_code"]
+        if codes["main_price"] and info.get("ross_original_price") is None:
+            info["ross_original_price"] = codes["main_price"]
     return info
 
 
@@ -233,7 +239,7 @@ def process_piece(code: str, ask=None) -> dict:
             db.update_field(item_id, "receipt", {
                 "reduced_price": info.get("ross_price"), "code": info.get("ross_code"),
                 "original_price": info.get("ross_original_price"), "source": "inventory",
-                "peeled": False})
+                "peeled": False, **({"main_code": info["ross_code_main"]} if info.get("ross_code_main") else {})})
         value, basis = rough_value(info, None, items)
         not_postable = post_check(info, photos)
         db.update_field(item_id, "stock", {

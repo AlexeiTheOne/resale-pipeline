@@ -146,7 +146,8 @@ async def _close_batch(user_id: int, wait: float) -> None:
     paths = await asyncio.to_thread(_save_photos, check_id, photos)
     roles = await asyncio.to_thread(check.photo_roles, paths)
     await asyncio.to_thread(db.update_check, check_id, photos=[config.stored_path(p) for p in paths],
-                            ross_sku=roles["sku"], ross_price=roles["price"])
+                            ross_sku=roles["sku"], ross_sku_main=roles.get("sku_main"),
+                            ross_price=roles["price"])
     note = f" (only the first {MAX_PHOTOS} photos are used; {extra} ignored)" if extra > 0 else ""
     if roles.get("price_source") == "vision":
         note += " (Ross price read from the tag by AI: check it)"
@@ -156,8 +157,8 @@ async def _close_batch(user_id: int, wait: float) -> None:
     if roles["price"] is None:
         await _ask_price(user_id, message, check_id, roles, note)
         return
-    req = {"description": "", "ross_price": roles["price"], "ross_sku": roles["sku"], "exact": True,
-           "full": False}
+    req = {"description": "", "ross_price": roles["price"], "ross_sku": roles["sku"],
+           "ross_sku_main": roles.get("sku_main"), "exact": True, "full": False}
     await _run(user_id, message, req, _pricing_photo(roles), check_id=check_id, roles=roles,
                note=note, guard=False)
 
@@ -197,8 +198,8 @@ async def _price_given(user_id: int, message, check_id: int, price: float) -> No
         except Exception:
             traceback.print_exc()
     await asyncio.to_thread(db.update_check, check_id, ross_price=price)
-    req = {"description": "", "ross_price": price, "ross_sku": w["roles"].get("sku"), "exact": True,
-           "full": False}
+    req = {"description": "", "ross_price": price, "ross_sku": w["roles"].get("sku"),
+           "ross_sku_main": w["roles"].get("sku_main"), "exact": True, "full": False}
     if ident:
         req["identification"] = ident
     await _run(user_id, w["message"], req, _pricing_photo(w["roles"]), check_id=check_id, roles=w["roles"],
@@ -272,17 +273,18 @@ async def _run(user_id: int, message, req: dict, photo: str | None, *, check_id:
         check_id = await asyncio.to_thread(db.add_check, user_id=user_id, ross_price=req.get("ross_price"),
                                            mode="full" if req.get("full") else "quick",
                                            exact=bool(req.get("exact", True)))
+    req = {**req, "check_id": check_id}     # "already have" leaves this check itself out
     if guard:
         state.check_running.add(user_id)
     try:
-        how = "full check, about a minute" if req.get("full") else "quick check, about 20 s"
+        how ="full check, about a minute" if req.get("full") else "quick check, about 20 s"
         sent = await util._safe_reply(message, f"{shop}🔎 Check #{check_id}: checking… ({how}){note}")
         identify_fn = None
         if photo and not req.get("identification"):
             identify_fn = (lambda _p: _identify_roles(roles)) if roles else _identify_one
         try:
             res = await asyncio.to_thread(check.run_check, req, photo_path=photo, identify_fn=identify_fn)
-            if res["verdict"] == check.NO_DATA and not req.get("full"):
+            if res["verdict"] == check.NO_DATA and not req.get("full") and not res.get("no_search"):
                 # Nothing at all in the quick check: straight on to the full
                 # check; the pair counts as one (Person B, 2026-11-02).
                 _log(res, user_id, counted=False)
@@ -357,8 +359,9 @@ async def photo_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if req["ross_price"] is None:
         req["ross_price"] = roles["price"]
     await asyncio.to_thread(db.update_check, check_id, photos=[config.stored_path(p) for p in paths],
-                            ross_sku=roles["sku"], ross_price=req["ross_price"])
-    req["ross_sku"] = roles["sku"]
+                            ross_sku=roles["sku"], ross_sku_main=roles.get("sku_main"),
+                            ross_price=req["ross_price"])
+    req["ross_sku"], req["ross_sku_main"] = roles["sku"], roles.get("sku_main")
     await _run(user_id, message, req, paths[0], check_id=check_id, roles=roles)
 
 

@@ -295,6 +295,8 @@ SALE_TOTAL_KEYS = tuple(k for k in orders.SALE_DB_FIELDS if k != "sales")
 
 TAG = {  # items.receipt: the Ross price tag read at intake
     "code": ("ross_code", CODE12), "code_generated": ("code_generated", BIT),
+    # the main tag's code when the REDUCED sticker (code) has another one
+    "main_code": ("ross_code_main", CODE12),
     "barcode": ("ross_barcode", S(18, False)), "reduced_price": ("ross_price", DEC(10, 2)),
     "original_price": ("ross_original_price", DEC(10, 2)), "peeled": ("peeled", BIT),
     "source": ("tag_source", S(10, False)), "ocr_variant": ("ocr_variant", S(20, False)),
@@ -328,6 +330,7 @@ PIECE_INFO = {
     "color": ("color", S(200)), "product_name": ("product_name", S(300)),
     "upc": ("upc", S(14, False)), "style_code": ("style_code", S(60, False)),
     "msrp": ("msrp", DEC(10, 2)), "ross_code": ("ross_code", CODE12),
+    "ross_code_main": ("ross_code_main", CODE12),
     "ross_barcode": ("ross_barcode", S(18, False)), "ross_price": ("ross_price", DEC(10, 2)),
     "ross_original_price": ("ross_original_price", DEC(10, 2)), "notes": ("notes", S(500)),
 }

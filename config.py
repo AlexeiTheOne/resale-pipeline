@@ -362,6 +362,13 @@ CHECK_LABEL_COSTS = os.getenv(
 # A bag counts as small (Ground Advantage, small_bags label) when no side is
 # over this many inches, or by name: sling, crossbody, mini, wallet ...
 CHECK_SMALL_BAG_MAX_IN = float(os.getenv("CHECK_SMALL_BAG_MAX_IN", "11"))
+# "Do I already have this?" at the top of every /check reply (pipeline/owned.py).
+# The AI title match runs only when no UPC, style code or Ross code matched and
+# there are things of the same brand to compare; 0 turns it off. Model: empty
+# = CLAUDE_CHEAP_MODEL. CHECK_OWNED_SHOW: hits listed in the reply (all in Details).
+CHECK_OWNED_AI = os.getenv("CHECK_OWNED_AI", "1") == "1"
+CHECK_OWNED_AI_MODEL = os.getenv("CHECK_OWNED_AI_MODEL", "")
+CHECK_OWNED_SHOW = int(os.getenv("CHECK_OWNED_SHOW", "3"))
 
 # Smallest NET margin (after eBay fees, ad rate, and shipping) a repricing
 # suggestion may land on — never suggest a cut that sells at a loss.

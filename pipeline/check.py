@@ -103,6 +103,35 @@ def build_identification(text: str) -> dict:
     return ident
 
 
+# A Ross tag code (12 digits, 4...) or its 18-digit barcode: Ross's own number,
+# which no eBay listing carries. Never searched for.
+_ROSS_IN_TEXT = re.compile(r"(?<!\d)4\d{11}(?:\d{6})?(?!\d)")
+
+
+def without_ross_codes(ident: dict) -> dict:
+    """The identification with Ross codes taken out of everything eBay is
+    searched with (search query, product name, UPC)."""
+    from pipeline import gtin
+    out = dict(ident)
+    for k in ("search_query", "product_name"):
+        if isinstance(out.get(k), str):
+            v = re.sub(r"\s+", " ", _ROSS_IN_TEXT.sub(" ", out[k])).strip()
+            if v:
+                out[k] = v
+            else:
+                out.pop(k)
+    if out.get("upc") and gtin.is_store_code(out["upc"]):
+        out.pop("upc")
+    return out
+
+
+def searchable(ident: dict) -> bool:
+    """Is there anything to search eBay with (after without_ross_codes)?"""
+    from pipeline import gtin
+    return bool(ident.get("brand") or ident.get("product_name") or ident.get("search_query")
+                or ident.get("model") or ident.get("style_code") or gtin.product_gtin(ident.get("upc")))
+
+
 # --- label cost by item type (design §4) ----------------------------------------
 
 LABEL_WORDS = {
@@ -655,54 +684,11 @@ def _norm_code(v) -> str:
     return re.sub(r"\W", "", str(v or "")).lower()
 
 
-def stock_keys(*, upc=None, model=None, brand=None, sku=None) -> set:
-    """What makes two things the same product for the in-stock warning: the
-    UPC, a style/model code (it looks like one: digits and letters), brand +
-    model, or the Ross SKU (Ross reuses SKUs now and then, so that one says
-    "similar", see stages.same_item_keys)."""
-    from pipeline import gtin as gtin_mod
-    keys = set()
-    gtin = gtin_mod.product_gtin(upc)
-    if gtin:
-        keys.add(("UPC", gtin))
-    code = _norm_code(model)
-    if len(code) >= 5 and _looks_like_code(code):
-        keys.add(("code", code))
-    b = _norm_code(brand)
-    if b and len(code) >= 4:
-        keys.add(("model", f"{b}:{code}"))
-    if sku and len(str(sku)) == 12:
-        keys.add(("Ross SKU", str(sku)))
-    return keys
-
-
-def already_have(ident: dict, sku: str | None = None) -> list[str]:
-    """Items and pieces (home inventory) that look like the same product: an
-    in-stock warning before buying another (read only)."""
-    import db
-    mine = stock_keys(upc=ident.get("upc"), model=ident.get("model") or ident.get("style_code"),
-                      brand=ident.get("brand"), sku=sku)
-    if not mine:
-        return []
-    out = []
-    for p in db.list_pieces():
-        if p.get("status") in ("sold", "donated"):
-            continue
-        info = p.get("info") or {}
-        theirs = stock_keys(upc=info.get("upc"), model=info.get("style_code") or info.get("model"),
-                            brand=info.get("brand"), sku=info.get("ross_code"))
-        if mine & theirs:
-            what = " ".join(str(info[k]) for k in ("brand", "item_type") if info.get(k))
-            out.append(f"piece {p['code']}" + (f" ({what}, {p.get('status')})" if what else ""))
-    for it in db.list_items():
-        if it.get("status") in ("rejected", "failed"):
-            continue
-        i = it.get("identification") or {}
-        theirs = stock_keys(upc=i.get("upc"), model=i.get("model") or i.get("style_code"),
-                            brand=i.get("brand"), sku=(it.get("receipt") or {}).get("code"))
-        if mine & theirs:
-            out.append(f"item {it['item_id'][:8]} ({it.get('status')})")
-    return out
+def already_have(ident: dict, sku: str | None = None, exclude_check_id: int | None = None) -> dict:
+    """Do I already have this? Items, pieces, receipt lines and earlier checks
+    (pipeline/owned.py). Read only; never raises."""
+    from pipeline import owned
+    return owned.lookup(ident, sku, exclude_check_id)
 
 
 def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, identify_fn=None,
@@ -729,14 +715,34 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
     else:
         ident = build_identification(text)
     full = bool(req.get("full"))
-    pricing = pricing_fn(
-        ident, photo_paths=[photo_path] if photo_path else None, item_id=None,
-        stage="check_judge" if full else "check_quick_judge", escalate=full,
-        sold_cache_only=not full, sold_max_age_s=config.CHECK_SOLD_CACHE_DAYS * 86400,
-        active_max_age_s=0, extra_sold_queries=similar_queries(ident) if full else None,
-        # A UPC or style code already pins the item; image search on a dark
-        # photo only adds noise (check #2: 16 Hugo Boss bags).
-        image_search=not (pricing_v2.upc_of(ident) or pricing_v2.style_code(ident)))
+    # Do I already have this? First: a match lends its identification to the search.
+    from pipeline import owned
+    typed_ross = owned.ross_code(ident.get("upc"))
+    skus = [s for s in (req.get("ross_sku"), req.get("ross_sku_main"), typed_ross) if s]
+    try:
+        have = have_fn(ident, skus, req.get("check_id"))
+    except Exception as e:       # advisory only
+        have = {"hits": [], "ai": None, "error": f"{type(e).__name__}: {str(e)[:120]}"}
+    if not isinstance(have, dict):   # a fake that returns a list: not looked up, no top line
+        have = None
+    borrowed = None
+    if not req.get("identification"):      # a follow-up's identification is already the final one
+        ident, borrowed = owned.borrow_identification(ident, owned.donor(have))
+    ident = without_ross_codes(ident)
+    no_search = not searchable(ident)
+    if no_search:
+        # Only a Ross code that isn't ours: it means nothing to eBay, so no search.
+        pricing = {"judged_comps": [], "timings": {},
+                   "comp_warning": "only a Ross code, which eBay doesn't know: no search"}
+    else:
+        pricing = pricing_fn(
+            ident, photo_paths=[photo_path] if photo_path else None, item_id=None,
+            stage="check_judge" if full else "check_quick_judge", escalate=full,
+            sold_cache_only=not full, sold_max_age_s=config.CHECK_SOLD_CACHE_DAYS * 86400,
+            active_max_age_s=0, extra_sold_queries=similar_queries(ident) if full else None,
+            # A UPC or style code already pins the item; image search on a dark
+            # photo only adds noise (check #2: 16 Hugo Boss bags).
+            image_search=not (pricing_v2.upc_of(ident) or pricing_v2.style_code(ident)))
     for k, v in (pricing.get("timings") or {}).items():
         if k != "total_s":
             timings[k] = v
@@ -750,13 +756,11 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
     ev = evaluate(pricing, ident, req.get("ross_price"), bool(req.get("exact", True)), text,
                   quick=not full, details=details)
     comps = comp_list(pricing, ev["item_type"], bool(req.get("exact", True)), details)
-    try:
-        have = have_fn(ident, req.get("ross_sku"))
-    except Exception:            # advisory only
-        have = []
     timings["total_s"] = round(time.perf_counter() - t0, 2)
     return {"request": dict(req), "photo": bool(photo_path), "identification": ident,
-            **ev, "already_have": have, "timings": timings,
+            **ev, "already_have": have, "borrowed": borrowed, "no_search": no_search,
+            "typed_ross": typed_ross if typed_ross and not req.get("ross_sku") else None,
+            "timings": timings,
             "confidence": pricing.get("claude_confidence"),
             "sold_cache_misses": pricing.get("sold_cache_misses") or [],
             # every comp used (Details); the first 5 are saved with the check
@@ -773,10 +777,16 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
             "demoted": sum(c.get("verdict") == OTHER_STYLE for c in pricing.get("judged_comps") or [])}
 
 
+def owned_saved(have) -> list:
+    from pipeline import owned
+    return owned.saved(have) if isinstance(have, dict) else []
+
+
 def check_fields(res: dict) -> dict:
     """A result as checks-table columns (db.update_check)."""
     money, pick, req = res.get("money") or {}, res["pick"], res["request"]
-    return {"identification": res["identification"], "mode": "full" if req.get("full") else "quick",
+    typed = {"ross_sku": res["typed_ross"]} if res.get("typed_ross") else {}   # /check 400301430764 15.99
+    return {**typed, "identification": res["identification"], "mode": "full" if req.get("full") else "quick",
             "exact": bool(req.get("exact", True)), "verdict": res["verdict"],
             "suggested_price": pick.get("price"), "profit": money.get("profit"), "roi": money.get("roi"),
             "break_even": money.get("break_even_item"), "cheapest_identical": res.get("cheapest_total"),
@@ -785,50 +795,37 @@ def check_fields(res: dict) -> dict:
                               "sold_median": pick.get("sold_median"), "item_type": res.get("item_type"),
                               "label": res.get("label"), "reasons": res.get("reasons"),
                               "comps": res.get("comps") or [],
+                              "owned": owned_saved(res.get("already_have")),
                               "warnings": (res.get("warnings") or "")[:500] or None}}
 
 
-# Barcode angles to try, most likely first: a tag photographed sideways (90/270),
-# upside down, or a markdown sticker stuck on at a slant. Check #2's REDUCED
-# sticker read only at 30-45 degrees.
-BARCODE_ANGLES = (0, 90, 270, 180, 30, -30, 45, -45, 15, -15, 60, -60)
+# The rotation-aware reader lives in ross_tag (intake uses it too).
 BARCODE_BUDGET_S = 6.0
 
 
+def _barcode_result(got: dict) -> dict:
+    """code + reduced_price, and main_code only when the tag has a second code."""
+    out = {"code": got["code"], "reduced_price": got["reduced_price"]}
+    if got.get("main_code"):
+        out["main_code"] = got["main_code"]
+    return out
+
+
 def read_ross_barcode(path: str, budget_s: float = BARCODE_BUDGET_S) -> dict:
-    """{"code", "reduced_price"} from a Ross barcode anywhere in the photo, or
-    {}. Plain decode first (ross_tag.decode_barcode), then rotations of the
-    whole photo, then at double size, until the time budget runs out. Local,
-    no AI."""
+    """{"code", "reduced_price", "main_code"} from the Ross barcodes anywhere in
+    the photo, or {}. The REDUCED sticker (lowest price) is the code; a main
+    tag with another code is main_code (ross_tag.split_codes). Plain decode
+    first (every barcode), then rotations of the whole photo (every barcode at
+    the first angle that reads), then at double size, until the time budget
+    runs out. Local, no AI."""
     import ross_tag
-    digits = ross_tag.decode_barcode(path)
-    if not digits:
-        try:
-            from PIL import Image, ImageOps
-            img = ImageOps.grayscale(ImageOps.exif_transpose(Image.open(path)))
-        except Exception:
-            return {}
-        deadline = time.perf_counter() + budget_s
-        for scale in (1, 2):
-            base = img if scale == 1 else img.resize((img.size[0] * 2, img.size[1] * 2))
-            for angle in BARCODE_ANGLES:
-                if time.perf_counter() > deadline:
-                    break
-                try:
-                    found = ross_tag._zbar_decode(base.rotate(angle, expand=True, fillcolor=255),
-                                                  symbols=ross_tag._TAG_ZBAR_SYMBOLS)
-                except Exception:
-                    continue
-                for res in found:
-                    d = re.sub(r"\D", "", res.data.decode("utf-8", "ignore"))
-                    if len(d) >= 12:
-                        digits = d
-                        break
-                if digits:
-                    break
-            if digits:
-                break
-    parsed = ross_tag.parse_barcode(digits) if digits else {}
+    found = ross_tag.read_barcodes(path, budget_s)      # the same reader as intake
+    if not found:
+        return {}
+    got = ross_tag.split_codes(found)
+    if got.get("code"):
+        return _barcode_result(got)
+    parsed = ross_tag.parse_barcode(found[0])
     return parsed if parsed.get("code") else {}
 
 
@@ -850,7 +847,7 @@ def photo_roles(paths: list[str], decode=None, vision=None) -> dict:
     photo); all photos are scanned for UPC/style codes."""
     decode = decode or read_ross_barcode
     vision = vision or read_ross_vision
-    tag, sku, price, source = None, None, None, None
+    tag, sku, price, source, main = None, None, None, None, None
     for p in paths:
         try:
             parsed = decode(p) or {}
@@ -859,7 +856,17 @@ def photo_roles(paths: list[str], decode=None, vision=None) -> dict:
         code = parsed.get("code")
         if code and len(str(code)) == 12:
             tag, sku, price, source = p, str(code), parsed.get("reduced_price"), "barcode"
+            main = parsed.get("main_code")
             break
+    if tag and not main:
+        # The main tag and the REDUCED sticker photographed apart: a quick plain
+        # decode of the other photos (no rotations) for a second code.
+        import ross_tag
+        bars = [b for p in paths if p != tag for b in ross_tag.decode_barcodes(p) if len(b) == 18]
+        if bars:
+            both = ross_tag.split_codes(bars + ([f"{sku}{round(price * 100):06d}"] if price else [sku]))
+            if both.get("code") and both.get("main_code"):
+                sku, price, main = both["code"], both["reduced_price"], both["main_code"]
     if price is None:
         def tagness(p):
             try:
@@ -877,8 +884,8 @@ def photo_roles(paths: list[str], decode=None, vision=None) -> dict:
                 sku = sku or got.get("code")
                 break
     others = [p for p in paths if p != tag]
-    return {"tag": tag, "sku": sku, "price": price, "price_source": source,
-            "identify": others or ([tag] if tag else []), "scan": list(paths)}
+    return {"tag": tag, "sku": sku, "sku_main": main if main != sku else None, "price": price,
+            "price_source": source, "identify": others or ([tag] if tag else []), "scan": list(paths)}
 
 
 # --- reply -------------------------------------------------------------------------------
@@ -911,8 +918,10 @@ def _listings_phrase(res: dict) -> str:
 
 def _item_name(res: dict) -> str:
     ident, req = res["identification"], res["request"]
-    name = " ".join(str(ident.get(k)) for k in ("brand", "product_name") if ident.get(k)) \
-        or req.get("description") or "item"
+    desc = req.get("description") or ""
+    if desc and not _ROSS_IN_TEXT.sub("", desc).strip(" -"):
+        desc = f"Ross code {desc.strip()}"       # only a code was typed: say so, it isn't a name
+    name = " ".join(str(ident.get(k)) for k in ("brand", "product_name") if ident.get(k)) or desc or "item"
     model = ident.get("model")
     if model and _norm_code(model) not in _norm_code(name):    # no duplicated model number
         name += f" ({model})"
@@ -935,6 +944,7 @@ def search_links(res: dict, labels: bool = False) -> dict:
     q = " ".join(str(ident.get(k)) for k in ("brand", "product_name") if ident.get(k)) \
         or ident.get("model") or ident.get("style_code") or ident.get("search_query") \
         or res["request"].get("description")
+    q = re.sub(r"\s+", " ", _ROSS_IN_TEXT.sub(" ", q or "")).strip()     # never search a Ross code
     if not q:
         return {}
     base = {"_nkw": q, "LH_ItemCondition": "1000|1500", "LH_PrefLoc": 1}
@@ -1002,11 +1012,14 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
     else:
         why = f"{_sales_phrase(sales)}, {_listings_phrase(res)}"
     est = " (estimated)" if pick.get("estimated") and v != NO_DATA else ""
-    lines = [f"{prefix}{ICON[v]} {LABEL.get(v, v)}{est}: {why}"]
-    line2 = _item_name(res)
-    if res.get("already_have"):
-        line2 += " · ⚠️ in stock: " + ", ".join(res["already_have"][:2])
-    lines.append(line2)
+    from pipeline import owned
+    have = res.get("already_have") if isinstance(res.get("already_have"), dict) else None
+    # "Do I already have this?" first (already HTML-escaped when html)
+    top = owned.reply_lines(have, html=html)
+    if top and prefix:
+        top[0] = prefix + top[0]
+        prefix = ""
+    lines = [f"{prefix}{ICON[v]} {LABEL.get(v, v)}{est}: {why}", _item_name(res)]
     ross = req.get("ross_price")
     if money:
         asks, est = pick.get("from_asks"), pick.get("estimated")
@@ -1021,6 +1034,8 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
         lines.append(f"Ross {_usd(ross)} · no price found")
     else:
         lines.append("Add the Ross price as the last number, e.g. /check coach tabby 26 49.99")
+    if res.get("no_search"):
+        lines.append("Only a Ross code, not one of ours: send a photo or describe the item to search eBay")
     offer = res.get("offer")
     if money and offer:
         lines.append(offer_line(offer))
@@ -1031,10 +1046,11 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
     last = " · ".join(x for x in (f"#{check_id}" if check_id else "", f"⏱ {t:.0f}s", mode, footer) if x)
     links = [best_links(res), [("🔎", k, u) for k, u in search_links(res, labels=True).items()]]
     if not html:
-        return "\n".join(lines + [" · ".join(f"{i} {k} {u}" for i, k, u in row) for row in links if row] + [last])
+        return "\n".join(top + lines + [" · ".join(f"{i} {k} {u}" for i, k, u in row) for row in links if row]
+                         + [last])
     from html import escape
     linked = [" · ".join(f'{i} <a href="{escape(u)}">{escape(k)}</a>' for i, k, u in row) for row in links if row]
-    return "\n".join([escape(x) for x in lines] + linked + [escape(last)])
+    return "\n".join(top + [escape(x) for x in lines] + linked + [escape(last)])
 
 
 def offer_line(offer: dict) -> str:
@@ -1102,8 +1118,20 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
     req, money, pick = res["request"], res["money"], res["pick"]
     ross = req.get("ross_price")
     out = [f"Details{f' for check #{check_id}' if check_id else ''}: {_item_name(res)}"]
+    if isinstance(res.get("already_have"), dict):
+        from pipeline import owned
+        out += owned.details_lines(res["already_have"])
+    b = res.get("borrowed")
+    if b:
+        ref = {"item": f"item {str(b['id'])[:8]}", "piece": f"piece {b['id']}", "check": f"check #{b['id']}"}
+        out.append(f"Searched as our {ref.get(b['source'], b['source'])} ({b['match']} match): "
+                   f"{b.get('query') or '-'}")
+    if res.get("no_search"):
+        out.append("No eBay search: only a Ross code, and it isn't one of ours. Ross codes are never searched.")
     if ross is not None:
+        main = req.get("ross_sku_main")
         out.append(f"Ross {_usd(ross)}" + (f" · SKU {sku}" if sku else "")
+                   + (f" (main tag {main})" if main and main != sku else "")
                    + f" → cost {_usd(round(ross * (1 + config.SALES_TAX_RATE), 2))} with "
                      f"{config.SALES_TAX_RATE:.0%} tax")
     levels = pick.get("levels") or {}

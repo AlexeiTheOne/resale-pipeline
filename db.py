@@ -299,7 +299,7 @@ def latest_stats(item_id: str) -> dict | None:
 # same dict: JSON columns decoded, money as float, exact as bool, times as UTC
 # ISO strings.
 
-CHECK_FIELDS = ("user_id", "ross_sku", "ross_price", "photos", "identification", "mode", "exact",
+CHECK_FIELDS = ("user_id", "ross_sku", "ross_sku_main", "ross_price", "photos", "identification", "mode", "exact",
                 "verdict", "suggested_price", "profit", "roi", "break_even", "cheapest_identical",
                 "sold_count", "comps_summary", "status", "status_at", "receipt_item_id", "item_id")
 CHECK_JSON = ("photos", "identification", "comps_summary")
@@ -387,6 +387,19 @@ def list_checks(*, user_id: int | None = None, status: str | None = None, sku: s
         con.row_factory = sqlite3.Row
         rows = con.execute(sql, (*args, int(limit))).fetchall()
     return [_check_row(dict(r)) for r in rows]
+
+
+def receipt_lines_for_skus(skus) -> list[dict]:
+    """Ross receipt lines (what we bought) with one of these 12-digit SKUs,
+    newest first: line_id, sku, description, price, receipt_date (date),
+    receipt_number, store_city. Read only. Receipts are only on SQL Server
+    (ResaleDB.Receipts/ReceiptItems); on SQLite there are none: []."""
+    skus = sorted({str(s) for s in skus or () if s})
+    if not skus:
+        return []
+    if _on_sqlserver():
+        return _sqlserver().receipt_lines_for_skus(skus)
+    return []
 
 
 
