@@ -272,10 +272,11 @@ async def _run(user_id: int, message, req: dict, photo: str | None, *, check_id:
         check_id = await asyncio.to_thread(db.add_check, user_id=user_id, ross_price=req.get("ross_price"),
                                            mode="full" if req.get("full") else "quick",
                                            exact=bool(req.get("exact", True)))
+    req = {**req, "check_id": check_id}     # "already have" leaves this check itself out
     if guard:
         state.check_running.add(user_id)
     try:
-        how = "full check, about a minute" if req.get("full") else "quick check, about 20 s"
+        how ="full check, about a minute" if req.get("full") else "quick check, about 20 s"
         sent = await util._safe_reply(message, f"{shop}🔎 Check #{check_id}: checking… ({how}){note}")
         identify_fn = None
         if photo and not req.get("identification"):

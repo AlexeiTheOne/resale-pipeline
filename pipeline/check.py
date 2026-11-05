@@ -655,54 +655,11 @@ def _norm_code(v) -> str:
     return re.sub(r"\W", "", str(v or "")).lower()
 
 
-def stock_keys(*, upc=None, model=None, brand=None, sku=None) -> set:
-    """What makes two things the same product for the in-stock warning: the
-    UPC, a style/model code (it looks like one: digits and letters), brand +
-    model, or the Ross SKU (Ross reuses SKUs now and then, so that one says
-    "similar", see stages.same_item_keys)."""
-    from pipeline import gtin as gtin_mod
-    keys = set()
-    gtin = gtin_mod.product_gtin(upc)
-    if gtin:
-        keys.add(("UPC", gtin))
-    code = _norm_code(model)
-    if len(code) >= 5 and _looks_like_code(code):
-        keys.add(("code", code))
-    b = _norm_code(brand)
-    if b and len(code) >= 4:
-        keys.add(("model", f"{b}:{code}"))
-    if sku and len(str(sku)) == 12:
-        keys.add(("Ross SKU", str(sku)))
-    return keys
-
-
-def already_have(ident: dict, sku: str | None = None) -> list[str]:
-    """Items and pieces (home inventory) that look like the same product: an
-    in-stock warning before buying another (read only)."""
-    import db
-    mine = stock_keys(upc=ident.get("upc"), model=ident.get("model") or ident.get("style_code"),
-                      brand=ident.get("brand"), sku=sku)
-    if not mine:
-        return []
-    out = []
-    for p in db.list_pieces():
-        if p.get("status") in ("sold", "donated"):
-            continue
-        info = p.get("info") or {}
-        theirs = stock_keys(upc=info.get("upc"), model=info.get("style_code") or info.get("model"),
-                            brand=info.get("brand"), sku=info.get("ross_code"))
-        if mine & theirs:
-            what = " ".join(str(info[k]) for k in ("brand", "item_type") if info.get(k))
-            out.append(f"piece {p['code']}" + (f" ({what}, {p.get('status')})" if what else ""))
-    for it in db.list_items():
-        if it.get("status") in ("rejected", "failed"):
-            continue
-        i = it.get("identification") or {}
-        theirs = stock_keys(upc=i.get("upc"), model=i.get("model") or i.get("style_code"),
-                            brand=i.get("brand"), sku=(it.get("receipt") or {}).get("code"))
-        if mine & theirs:
-            out.append(f"item {it['item_id'][:8]} ({it.get('status')})")
-    return out
+def already_have(ident: dict, sku: str | None = None, exclude_check_id: int | None = None) -> dict:
+    """Do I already have this? Items, pieces, receipt lines and earlier checks
+    (pipeline/owned.py). Read only; never raises."""
+    from pipeline import owned
+    return owned.lookup(ident, sku, exclude_check_id)
 
 
 def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, identify_fn=None,
@@ -751,9 +708,11 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
                   quick=not full, details=details)
     comps = comp_list(pricing, ev["item_type"], bool(req.get("exact", True)), details)
     try:
-        have = have_fn(ident, req.get("ross_sku"))
-    except Exception:            # advisory only
-        have = []
+        have = have_fn(ident, req.get("ross_sku"), req.get("check_id"))
+    except Exception as e:       # advisory only
+        have = {"hits": [], "ai": None, "error": f"{type(e).__name__}: {str(e)[:120]}"}
+    if not isinstance(have, dict):   # a fake that returns a list: not looked up, no top line
+        have = None
     timings["total_s"] = round(time.perf_counter() - t0, 2)
     return {"request": dict(req), "photo": bool(photo_path), "identification": ident,
             **ev, "already_have": have, "timings": timings,
@@ -773,6 +732,11 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
             "demoted": sum(c.get("verdict") == OTHER_STYLE for c in pricing.get("judged_comps") or [])}
 
 
+def owned_saved(have) -> list:
+    from pipeline import owned
+    return owned.saved(have) if isinstance(have, dict) else []
+
+
 def check_fields(res: dict) -> dict:
     """A result as checks-table columns (db.update_check)."""
     money, pick, req = res.get("money") or {}, res["pick"], res["request"]
@@ -785,6 +749,7 @@ def check_fields(res: dict) -> dict:
                               "sold_median": pick.get("sold_median"), "item_type": res.get("item_type"),
                               "label": res.get("label"), "reasons": res.get("reasons"),
                               "comps": res.get("comps") or [],
+                              "owned": owned_saved(res.get("already_have")),
                               "warnings": (res.get("warnings") or "")[:500] or None}}
 
 
@@ -1002,11 +967,14 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
     else:
         why = f"{_sales_phrase(sales)}, {_listings_phrase(res)}"
     est = " (estimated)" if pick.get("estimated") and v != NO_DATA else ""
-    lines = [f"{prefix}{ICON[v]} {LABEL.get(v, v)}{est}: {why}"]
-    line2 = _item_name(res)
-    if res.get("already_have"):
-        line2 += " · ⚠️ in stock: " + ", ".join(res["already_have"][:2])
-    lines.append(line2)
+    from pipeline import owned
+    have = res.get("already_have") if isinstance(res.get("already_have"), dict) else None
+    # "Do I already have this?" first (already HTML-escaped when html)
+    top = owned.reply_lines(have, html=html)
+    if top and prefix:
+        top[0] = prefix + top[0]
+        prefix = ""
+    lines = [f"{prefix}{ICON[v]} {LABEL.get(v, v)}{est}: {why}", _item_name(res)]
     ross = req.get("ross_price")
     if money:
         asks, est = pick.get("from_asks"), pick.get("estimated")
@@ -1031,10 +999,11 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
     last = " · ".join(x for x in (f"#{check_id}" if check_id else "", f"⏱ {t:.0f}s", mode, footer) if x)
     links = [best_links(res), [("🔎", k, u) for k, u in search_links(res, labels=True).items()]]
     if not html:
-        return "\n".join(lines + [" · ".join(f"{i} {k} {u}" for i, k, u in row) for row in links if row] + [last])
+        return "\n".join(top + lines + [" · ".join(f"{i} {k} {u}" for i, k, u in row) for row in links if row]
+                         + [last])
     from html import escape
     linked = [" · ".join(f'{i} <a href="{escape(u)}">{escape(k)}</a>' for i, k, u in row) for row in links if row]
-    return "\n".join([escape(x) for x in lines] + linked + [escape(last)])
+    return "\n".join(top + [escape(x) for x in lines] + linked + [escape(last)])
 
 
 def offer_line(offer: dict) -> str:
@@ -1102,6 +1071,9 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
     req, money, pick = res["request"], res["money"], res["pick"]
     ross = req.get("ross_price")
     out = [f"Details{f' for check #{check_id}' if check_id else ''}: {_item_name(res)}"]
+    if isinstance(res.get("already_have"), dict):
+        from pipeline import owned
+        out += owned.details_lines(res["already_have"])
     if ross is not None:
         out.append(f"Ross {_usd(ross)}" + (f" · SKU {sku}" if sku else "")
                    + f" → cost {_usd(round(ross * (1 + config.SALES_TAX_RATE), 2))} with "

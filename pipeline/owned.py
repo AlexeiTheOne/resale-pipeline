@@ -1,0 +1,436 @@
+"""Do I already have this? The first line of every /check reply.
+
+Looks for the checked product in everything we have or had: items (every
+status), pieces (home inventory), Ross receipt lines and earlier checks.
+Keys, strongest first:
+  1. brand UPC: a real GTIN, never a Ross store code
+  2. style code + colour; the same style in another colour is listed as such
+  3. Ross code: the 12-digit SKU on the tag (Ross reuses SKUs now and then)
+  4. AI title match, only when 1-3 found nothing and we have things of the
+     same brand: the cheap Claude model compares names (config.CHECK_OWNED_AI)
+
+Each hit: status, price, days listed or sold date, what we paid, profit if
+sold, box code if at home, eBay link. Read only; lookup() never raises: a
+failure comes back as {"error": ...} and the reply says it couldn't check.
+"""
+import re
+import traceback
+from datetime import datetime, timezone
+
+import config
+from pipeline import check, gtin
+
+# match labels, strongest first (also the sort order)
+UPC, STYLE, ROSS, STYLE_OTHER_COLOUR, AI_SAME, AI_MODEL = (
+    "UPC", "style code + colour", "Ross code", "same style, other colour", "AI: same item", "AI: same model")
+STRENGTH = {m: i for i, m in enumerate((UPC, STYLE, ROSS, STYLE_OTHER_COLOUR, AI_SAME, AI_MODEL))}
+AI_CANDIDATES = 8
+AI_STAGE = "check_owned"
+_HOME = ("home",)                 # piece statuses that mean "in a box at home"
+_SOURCE_ORDER = {"item": 0, "piece": 0, "receipt": 1, "check": 2}
+
+
+# --- keys --------------------------------------------------------------------------------
+
+def ross_code(value) -> str | None:
+    """The 12-digit Ross SKU in `value` (a tag SKU, or the 18-digit tag barcode
+    that starts with it); None for anything else, including generated
+    placeholder codes (000000000006)."""
+    d = gtin.digits_of(value)
+    if len(d) == 18 and d.startswith("400"):
+        d = d[:12]
+    return d if len(d) == 12 and d.startswith("4") else None
+
+
+def upc_key(value) -> str | None:
+    """A manufacturer UPC/EAN as 14 digits (012345678905 == 0012345678905)."""
+    d = gtin.product_gtin(value)
+    return d.zfill(14) if d else None
+
+
+def keys(ident: dict | None, sku=None) -> dict:
+    """What a product is known by: UPC, style codes (with and without a colour
+    suffix), colour, Ross code. A Ross code stored as the "UPC" counts as the
+    Ross code."""
+    ident = ident or {}
+    return {"upc": upc_key(ident.get("upc")),
+            "codes": set(check._codes(ident)),
+            "colour": str(ident.get("color") or "").strip(),
+            "ross": ross_code(sku) or ross_code(ident.get("upc"))}
+
+
+def _colour_words(colour: str) -> set:
+    words = set(re.findall(r"[a-z]+", colour.lower()))
+    return (words & set(check.COLOURS)) or (words - {"multi", "and", "with", "color", "colour"})
+
+
+def same_colour(a: str, b: str) -> bool:
+    """True when either colour is unknown, or they share a colour word
+    ("Black Multi (leopard)" and "Black")."""
+    wa, wb = _colour_words(a or ""), _colour_words(b or "")
+    return not wa or not wb or bool(wa & wb)
+
+
+def match(mine: dict, theirs: dict) -> str | None:
+    """The strongest key two products share, or None."""
+    if mine["upc"] and mine["upc"] == theirs["upc"]:
+        return UPC
+    style = bool(mine["codes"] & theirs["codes"])
+    if style and same_colour(mine["colour"], theirs["colour"]):
+        return STYLE
+    if mine["ross"] and mine["ross"] == theirs["ross"]:
+        return ROSS
+    return STYLE_OTHER_COLOUR if style else None
+
+
+# --- what we have ---------------------------------------------------------------------------
+
+def _num(v):
+    try:
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _when(v):
+    if not v:
+        return None
+    try:
+        t = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def _days_since(v, now: datetime) -> int | None:
+    t = _when(v)
+    return max(0, (now - t).days) if t else None
+
+
+def _name(ident: dict, title=None) -> str:
+    return (title or " ".join(str(ident.get(k)) for k in ("brand", "product_name", "model") if ident.get(k))
+            or "?")[:60]
+
+
+def _item_hit(it: dict, pieces: list, now: datetime) -> dict:
+    ident, ebay = it.get("identification") or {}, it.get("ebay") or {}
+    listing, receipt = it.get("listing") or {}, it.get("receipt") or {}
+    paid = _num(receipt.get("reduced_price")) or _num(receipt.get("original_price"))
+    if paid is None:
+        paid = next((_num(p.get("cost")) for p in pieces if _num(p.get("cost"))), None)
+    sold = it.get("status") == "sold"
+    hit = {"source": "item", "id": it["item_id"], "status": it.get("status"), "name": _name(ident, listing.get("title")),
+           "paid": paid, "url": None, "box": None, "price": None, "listed_days": None, "sold_at": None,
+           "profit": None}
+    if ebay.get("view_item_url") or ebay.get("listing_id"):
+        hit["url"] = check.short_url(ebay.get("view_item_url")) or f"https://www.ebay.com/itm/{ebay['listing_id']}"
+    if sold:
+        hit["sold_at"] = (ebay.get("sold_at") or ebay.get("first_sold_at") or "")[:10] or None
+        hit["price"] = _num(ebay.get("sale_price")) or _num(listing.get("price"))
+        net, units = _num(ebay.get("net_proceeds")), _num(ebay.get("units_sold")) or 1
+        if net is not None and paid is not None:
+            hit["profit"] = round(net / units - paid * (1 + config.SALES_TAX_RATE), 2)
+    else:
+        hit["price"] = _num(listing.get("price")) or _num((it.get("stock") or {}).get("quick_price"))
+        if ebay.get("published_at") and it.get("status") == "published":
+            hit["listed_days"] = _days_since(ebay["published_at"], now)
+    home = [p["code"] for p in pieces if p.get("status") in _HOME]
+    if home:
+        hit["box"] = ", ".join(home)
+    elif it.get("status") == "stocked" and (it.get("stock") or {}).get("location"):
+        hit["box"] = it["stock"]["location"]
+    return hit
+
+
+def _piece_hit(p: dict) -> dict:
+    info = p.get("info") or {}
+    return {"source": "piece", "id": p["code"], "status": p.get("status"), "name": _name(info),
+            "paid": _num(p.get("cost")) or _num(info.get("ross_price")), "price": _num(p.get("value")),
+            "box": p["code"] if p.get("status") in _HOME else None, "url": None, "listed_days": None,
+            "sold_at": (p.get("sold_at") or "")[:10] or None, "profit": None}
+
+
+def _check_hit(c: dict) -> dict:
+    return {"source": "check", "id": c["check_id"], "status": c.get("status"), "verdict": c.get("verdict"),
+            "name": _name(c.get("identification") or {}), "date": str(c.get("created_at") or "")[:10] or None,
+            "price": _num(c.get("suggested_price")), "paid": _num(c.get("ross_price")), "url": None, "box": None,
+            "listed_days": None, "sold_at": None, "profit": None}
+
+
+def _receipt_hit(r: dict) -> dict:
+    return {"source": "receipt", "id": r.get("line_id"), "status": "bought", "name": (r.get("description") or "?")[:60],
+            "date": r.get("receipt_date"), "city": r.get("store_city"), "paid": _num(r.get("price")),
+            "price": None, "url": None, "box": None, "listed_days": None, "sold_at": None, "profit": None}
+
+
+def _things(exclude_check_id=None) -> list[tuple[dict, dict, dict]]:
+    """(keys, ident-like dict for the AI, hit) for every item, unlinked piece
+    and earlier check. A piece that belongs to an item is that item (its box)."""
+    import db
+    now = datetime.now(timezone.utc)
+    pieces = db.list_pieces()
+    by_item = {}
+    for p in pieces:
+        if p.get("item_id"):
+            by_item.setdefault(p["item_id"], []).append(p)
+    out = []
+    for it in db.list_items():
+        ident = it.get("identification") or {}
+        mine = by_item.get(it["item_id"], [])
+        sku = (it.get("receipt") or {}).get("code") or next(
+            ((p.get("info") or {}).get("ross_code") for p in mine if (p.get("info") or {}).get("ross_code")), None)
+        k = keys(ident, sku)
+        for p in mine:      # the piece may know the UPC/style code the item lacks
+            pk = keys({**(p.get("info") or {}), "model": (p.get("info") or {}).get("style_code")})
+            k["upc"] = k["upc"] or pk["upc"]
+            k["codes"] |= pk["codes"]
+        out.append((k, {**ident, "title": (it.get("listing") or {}).get("title")}, _item_hit(it, mine, now)))
+    for p in pieces:
+        if p.get("item_id"):
+            continue
+        info = p.get("info") or {}
+        ident = {**info, "model": info.get("style_code") or info.get("model")}
+        out.append((keys(ident, info.get("ross_code")), ident, _piece_hit(p)))
+    for c in db.list_checks(limit=1000):
+        if exclude_check_id is not None and c["check_id"] == exclude_check_id:
+            continue
+        ident = c.get("identification") or {}
+        out.append((keys(ident, c.get("ross_sku")), ident, _check_hit(c)))
+    return out
+
+
+# --- AI fallback ------------------------------------------------------------------------------
+
+_AI_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["matches"],
+              "properties": {"matches": {"type": "array", "items": {
+                  "type": "object", "additionalProperties": False, "required": ["n", "same"],
+                  "properties": {"n": {"type": "integer"},
+                                 "same": {"type": "string", "enum": ["same_item", "same_model", "no"]}}}}}}
+
+
+def _describe(ident: dict) -> str:
+    parts = [str(ident.get(k)) for k in ("brand", "product_name", "model", "style_code", "item_type", "color", "size")
+             if ident.get(k)]
+    if ident.get("title"):
+        parts.append(f"title: {ident['title']}")
+    return " | ".join(parts)[:300]
+
+
+def _words(ident: dict) -> set:
+    text = " ".join(str(ident.get(k) or "") for k in ("product_name", "model", "style_code", "title", "item_type"))
+    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 2 and w not in check._GENERIC}
+
+
+def ai_candidates(ident: dict, things: list) -> list:
+    """Things of the same brand, the most shared name words first (at most
+    AI_CANDIDATES); none when the brand is unknown."""
+    from pipeline import scoreboard
+    brand = scoreboard.normalize_brand(ident.get("brand"))
+    if brand == "Unknown":
+        return []
+    mine = _words(ident)
+    same = [t for t in things if scoreboard.normalize_brand(t[1].get("brand")) == brand]
+    same.sort(key=lambda t: -len(mine & _words(t[1])))
+    return same[:AI_CANDIDATES]
+
+
+def ai_match(ident: dict, candidates: list, ask=None) -> list[tuple[int, str]]:
+    """[(index into candidates, AI_SAME | AI_MODEL)] from one cheap Claude call."""
+    import claude_llm
+    ask = ask or claude_llm.ask
+    lines = "\n".join(f"{n}. {_describe(t[1])}" for n, t in enumerate(candidates, 1))
+    prompt = ("A reseller is about to buy this product:\n"
+              f"{_describe(ident)}\n\n"
+              "Which of these things we already have or had are the same product? "
+              "same_item = same product and colour; same_model = same model or style in another "
+              "colour or size; no = a different product (another model of the same brand is 'no').\n"
+              f"{lines}\n\nAnswer for every number.")
+    out = ask(AI_STAGE, prompt, model=config.CHECK_OWNED_AI_MODEL or config.CLAUDE_CHEAP_MODEL,
+              max_tokens=1500, output_schema=_AI_SCHEMA)
+    found = []
+    for m in (out or {}).get("matches") or []:
+        n, same = m.get("n"), m.get("same")
+        if isinstance(n, int) and 1 <= n <= len(candidates) and same in ("same_item", "same_model"):
+            found.append((n - 1, AI_SAME if same == "same_item" else AI_MODEL))
+    return found
+
+
+# --- lookup -----------------------------------------------------------------------------------
+
+def lookup(ident: dict, sku=None, exclude_check_id=None, *, things_fn=None, receipts_fn=None,
+           ai_fn=None) -> dict:
+    """{"hits": [...strongest and most useful first], "ai": None | {"candidates": n},
+    "error": None | text}. Never raises."""
+    import db
+    try:
+        mine = keys(ident, sku)
+        things = (things_fn or _things)(exclude_check_id)
+        hits = []
+        for k, _, hit in things:
+            m = match(mine, k)
+            if m:
+                hits.append({**hit, "match": m})
+        # receipt lines: one per purchase; lines already entered as an item or
+        # piece with that Ross code are that item
+        if mine["ross"]:
+            lines = (receipts_fn or db.receipt_lines_for_skus)([mine["ross"]])
+            entered = sum(1 for k, _, h in things if h["source"] in ("item", "piece") and k["ross"] == mine["ross"])
+            for r in lines[entered:]:
+                hits.append({**_receipt_hit(r), "match": ROSS})
+        ai = None
+        if not hits and config.CHECK_OWNED_AI:
+            cands = ai_candidates(ident, things)
+            if cands:
+                ai = {"candidates": len(cands)}
+                for i, m in (ai_fn or ai_match)(ident, cands):
+                    hits.append({**cands[i][2], "match": m})
+        hits.sort(key=lambda h: str(h.get("date") or ""), reverse=True)      # newest first, then
+        hits.sort(key=lambda h: (_SOURCE_ORDER[h["source"]], STRENGTH[h["match"]], h.get("status") == "sold"))
+        return {"hits": hits, "ai": ai, "error": None}
+    except Exception as e:  # advisory: never stops a check
+        traceback.print_exc()
+        return {"hits": [], "ai": None, "error": f"{type(e).__name__}: {str(e)[:120]}"}
+
+
+# --- reply lines ------------------------------------------------------------------------------
+
+def _date(v) -> str:
+    t = _when(v)
+    return f"{t:%b} {t.day}" + (f" {t.year}" if t.year != datetime.now(timezone.utc).year else "") if t else str(v)
+
+
+def hit_text(h: dict) -> str:
+    """One hit in words, without its link: "Listed $69.99, 136 days · paid $14.99 · UPC"."""
+    usd = check._usd
+    src, status = h["source"], h.get("status")
+    if src == "check":
+        what = f"Checked #{h['id']} {_date(h['date'])}: {check.LABEL.get(h.get('verdict'), h.get('verdict') or '?')}"
+        if h.get("price"):
+            what += f", sell {usd(h['price'])}"
+        if status in ("bought", "skipped"):
+            what += f" ({status})"
+        bits = [what]
+    elif src == "receipt":
+        bits = [f"Bought {_date(h['date'])}" + (f" ({h['city'].title()})" if h.get("city") else "")]
+    elif status == "sold":
+        bits = ["Sold" + (f" {_date(h['sold_at'])}" if h.get("sold_at") else "")
+                + (f" for {usd(h['price'])}" if h.get("price") else "")]
+    elif status == "published":
+        bits = ["Listed" + (f" {usd(h['price'])}" if h.get("price") else "")
+                + (f", {h['listed_days']} days" if h.get("listed_days") is not None else "")]
+    elif h.get("box"):
+        bits = [f"At home, box {h['box']}" + (f" (~{usd(h['price'])})" if h.get("price") else "")]
+    else:
+        bits = [f"{'Piece' if src == 'piece' else 'Item'} ({status})"
+                + (f" {usd(h['price'])}" if h.get("price") else "")]
+    if h.get("box") and not bits[0].startswith("At home"):
+        bits.append(f"box {h['box']}")
+    if h.get("paid") is not None and src != "check":
+        bits.append(f"paid {usd(h['paid'])}")
+    elif h.get("paid") is not None:
+        bits.append(f"Ross {usd(h['paid'])}")
+    if h.get("profit") is not None:
+        bits.append(f"profit {usd(h['profit'])}")
+    label = h["match"]
+    if label not in (UPC, STYLE, ROSS):         # weaker matches name what matched
+        label += f": {h['name'][:40]}"
+    bits.append(label)
+    return " · ".join(bits)
+
+
+def _summary(hits: list) -> str:
+    n = {"listed": 0, "home": 0, "sold": 0, "other": 0, "receipt": 0, "check": 0}
+    for h in hits:
+        if h["source"] in ("receipt", "check"):
+            n[h["source"]] += 1
+        elif h.get("status") == "sold":
+            n["sold"] += 1
+        elif h.get("status") == "published":
+            n["listed"] += 1
+        elif h.get("box"):
+            n["home"] += 1
+        else:
+            n["other"] += 1
+    words = [f"{n['listed']} listed", f"{n['home']} at home", f"{n['sold']} sold", f"{n['other']} in progress",
+             f"{n['receipt']} on receipts", f"{n['check']} checked before"]
+    return ", ".join(w for w in words if not w.startswith("0 "))
+
+
+def reply_lines(owned: dict | None, *, html: bool = False, limit: int | None = None) -> list[str]:
+    """The top of the reply: "✅ New", or "🔁 Already have: 1 listed, 1 sold"
+    and up to `limit` hits with their eBay links."""
+    from html import escape
+    if not owned:
+        return []
+    if owned.get("error"):
+        return ["⚠️ Couldn't check what we already have"]
+    hits = owned.get("hits") or []
+    if not hits:
+        return ["✅ New"]
+    limit = config.CHECK_OWNED_SHOW if limit is None else limit
+    weak = all(h["match"] in (STYLE_OTHER_COLOUR, AI_MODEL) for h in hits)
+    lines = [f"{'🔁 Similar' if weak else '🔁 Already have'}: {_summary(hits)}"]
+    shown = _grouped(hits)
+    for h in shown[:limit]:
+        text = _receipts_text(h["lines"]) if h["source"] == "receipts" else hit_text(h)
+        if html:
+            text = escape(text) + (f' · <a href="{escape(h["url"])}">eBay</a>' if h.get("url") else "")
+        elif h.get("url"):
+            text += f" · {h['url']}"
+        lines.append(f"• {text}")
+    if len(shown) > limit:
+        lines.append(f"• … {len(shown) - limit} more in Details")
+    return lines
+
+
+def _grouped(hits: list) -> list:
+    """The receipt lines as one entry (where the first one was): a SKU bought
+    ten times is one line in the reply, not ten."""
+    out, lines = [], [h for h in hits if h["source"] == "receipt"]
+    for h in hits:
+        if h["source"] != "receipt":
+            out.append(h)
+        elif h is lines[0]:
+            out.append({"source": "receipts", "lines": lines, "url": None})
+    return out
+
+
+def _receipts_text(lines: list) -> str:
+    """"Bought 3× (Aug 11 – Sep 19), $4.99–$15.99, last Hialeah · Ross code"."""
+    usd = check._usd
+    if len(lines) == 1:
+        return hit_text(lines[0])
+    dates = sorted(str(h["date"]) for h in lines if h.get("date"))
+    paid = sorted(h["paid"] for h in lines if h.get("paid") is not None)
+    bits = [f"Bought {len(lines)}×" + (f" ({_date(dates[0])} – {_date(dates[-1])})" if len(dates) > 1 else "")]
+    if paid:
+        bits.append(f"paid {usd(paid[0])}" if paid[0] == paid[-1] else f"paid {usd(paid[0])}–{usd(paid[-1])}")
+    if lines[0].get("city"):
+        bits.append(f"last {lines[0]['city'].title()}")
+    bits.append(ROSS)
+    return " · ".join(bits)
+
+
+def details_lines(owned: dict | None) -> list[str]:
+    """Every hit, for the Details button."""
+    if not owned:
+        return []
+    if owned.get("error"):
+        return [f"Already have: couldn't check ({owned['error']})"]
+    hits = owned.get("hits") or []
+    ai = owned.get("ai")
+    note = f" (AI title match over {ai['candidates']} same-brand thing(s))" if ai else ""
+    if not hits:
+        return [f"Already have: nothing in items, pieces, receipts or earlier checks{note}"]
+    out = [f"Already have ({len(hits)}){note}:"]
+    for h in hits:
+        ref = {"item": f"item {str(h['id'])[:8]}", "piece": f"piece {h['id']}", "check": f"check #{h['id']}",
+               "receipt": f"receipt line {h['id']}"}[h["source"]]
+        out.append(f"  {ref} · {hit_text(h)}" + (f" · {h['url']}" if h.get("url") else ""))
+    return out
+
+
+def saved(owned: dict | None) -> list[dict]:
+    """A compact copy for the checks table (comps_summary.owned)."""
+    return [{"source": h["source"], "id": h["id"], "match": h["match"], "status": h.get("status")}
+            for h in (owned or {}).get("hits") or []][:10]

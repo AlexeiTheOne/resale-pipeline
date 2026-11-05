@@ -17,7 +17,8 @@ def rates(monkeypatch):
                         ("CHECK_MIN_PROFIT_AT_CHEAPEST", 5.0), ("CHECK_SOLD_CACHE_DAYS", 7.0),
                         ("CHECK_LABEL_COSTS",
                          "bags=11.00,small_bags=5.50,jewelry=4.50,shoes=12.00,clothing=7.20,other=7.20"),
-                        ("CHECK_SMALL_BAG_MAX_IN", 11.0)):
+                        ("CHECK_SMALL_BAG_MAX_IN", 11.0), ("CHECK_OWNED_AI", False),
+                        ("CHECK_OWNED_SHOW", 3)):
         monkeypatch.setattr(config, name, value)
 
 
@@ -191,10 +192,10 @@ def test_full_any_check_can_say_buy():
             {"source": "active", "verdict": "same_item", "total": 80.0}])
 
     res = check.run_check(check.parse_request("/check any full Coach Tabby 26 CH857 14.99"),
-                          pricing_fn=fake_pricing, have_fn=lambda *a: ["item 3f2a1b2c (published)"])
+                          pricing_fn=fake_pricing, have_fn=lambda *a: {"hits": [], "ai": None, "error": None})
     assert seen["sold_cache_only"] is False and seen["escalate"] is True and seen["stage"] == "check_judge"
     assert res["verdict"] == "BUY", res["reasons"]
-    assert "⚠️ in stock: item 3f2a1b2c" in check.format_reply(res)
+    assert check.format_reply(res).splitlines()[0] == "✅ New"
 
 
 def test_missing_ross_price_is_a_skip_with_a_hint():
@@ -684,6 +685,15 @@ def test_money_shows_a_real_minus_sign():
 
 # --- in-stock warning: items AND pieces (production has piece O1W-01) ---------------------------
 
+@pytest.fixture
+def fresh_db(monkeypatch, tmp_path):
+    """Its own SQLite file (on SQL Server conftest empties the database)."""
+    import db
+    if config.DB_BACKEND != "sqlserver":
+        monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "check.db"))
+        db.create_tables()
+
+
 def _mk_piece():
     import db
     code = db.add_piece("O1W")
@@ -692,22 +702,28 @@ def _mk_piece():
     return code
 
 
-def test_in_stock_warning_finds_a_piece_by_style_code_upc_or_ross_sku():
+def test_in_stock_warning_finds_a_piece_by_style_code_upc_or_ross_sku(fresh_db):
     code = _mk_piece()
-    by_code = check.already_have(check.build_identification("Michael Kors pave necklace MKJ3969710"))
-    assert by_code and by_code[0].startswith(f"piece {code}") and "Michael Kors necklace" in by_code[0]
-    assert check.already_have({"upc": "796483413276"})
-    assert check.already_have({}, "400289769542")                      # the Ross tag's SKU
-    assert check.already_have({"brand": "Coach", "model": "CH857"}) == []
+
+    def hits(*a):
+        return [(h["source"], h["id"], h["match"]) for h in check.already_have(*a)["hits"]]
+
+    assert hits(check.build_identification("Michael Kors pave necklace MKJ3969710")) == \
+        [("piece", code, "style code + colour")]
+    assert hits({"upc": "796483413276"}) == [("piece", code, "UPC")]
+    assert hits({}, "400289769542") == [("piece", code, "Ross code")]       # the Ross tag's SKU
+    assert hits({"brand": "Coach", "model": "CH857"}) == []
 
 
-def test_in_stock_warning_finds_an_item_and_shows_in_the_reply():
+def test_in_stock_warning_finds_an_item_and_shows_at_the_top_of_the_reply(fresh_db):
     import db
     item = db.create_item([])
     db.update_field(item, "identification", {"brand": "Michael Kors", "model": "MKJ3969710"})
     res = check.run_check(check.parse_request("/check Michael Kors pave necklace MKJ3969710 14.99"),
                           pricing_fn=lambda ident, **kw: mkj_pricing())
-    assert f"item {item[:8]}" in check.format_reply(res).splitlines()[1]
+    top = check.format_reply(res).splitlines()
+    assert top[0].startswith("🔁 Already have: 1 in progress") and "style code + colour" in top[1]
+    assert f"item {item[:8]}" in check.format_details(res)
 
 
 # --- timings log and daily cap -------------------------------------------------------------

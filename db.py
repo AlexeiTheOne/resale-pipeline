@@ -389,6 +389,19 @@ def list_checks(*, user_id: int | None = None, status: str | None = None, sku: s
     return [_check_row(dict(r)) for r in rows]
 
 
+def receipt_lines_for_skus(skus) -> list[dict]:
+    """Ross receipt lines (what we bought) with one of these 12-digit SKUs,
+    newest first: line_id, sku, description, price, receipt_date (date),
+    receipt_number, store_city. Read only. Receipts are only on SQL Server
+    (ResaleDB.Receipts/ReceiptItems); on SQLite there are none: []."""
+    skus = sorted({str(s) for s in skus or () if s})
+    if not skus:
+        return []
+    if _on_sqlserver():
+        return _sqlserver().receipt_lines_for_skus(skus)
+    return []
+
+
 
 def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> None:
     """Stamp a scheduled job as having just completed. Called after the work,

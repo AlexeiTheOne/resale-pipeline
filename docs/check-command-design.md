@@ -227,6 +227,49 @@ Check #5 (Vans Detached Sling Bag VN000Q9BFS8, Ross $12.99, MSRP $45) said
   "MSRP×47% $21 (other brands)", and Details says so too.
 - **Losses** read "−$0.63", with a real minus sign.
 
+### "Do I already have this?" (Person B, 2026-11-05)
+
+The first line of every reply, before the verdict: `pipeline/owned.py`
+(replaces the old "⚠️ in stock" note on line 2).
+
+- **Searched:** items (every status), pieces, Ross receipt lines
+  (`db.receipt_lines_for_skus`, SQL Server only) and earlier checks (not
+  this one).
+- **Keys, strongest first:**
+  1. brand UPC: a valid GTIN, never a Ross store code;
+  2. style code + colour: "Multi" or no colour counts as unknown, which
+     matches any colour. The same style in another colour is listed as
+     "same style, other colour";
+  3. Ross code, the 12-digit tag SKU. A Ross code stored in the UPC field
+     counts as the Ross code.
+- **AI fallback:** a title match runs only when no key matched and we have
+  things of the same brand (at most 8, by shared name words). It is one
+  `CLAUDE_CHEAP_MODEL` call, stage `check_owned`. `CHECK_OWNED_AI=0` turns it
+  off.
+- **Each hit shows:**
+  - status and price;
+  - days listed, or the sold date;
+  - what we paid (the Ross price, else the piece cost);
+  - profit if sold: net per unit − paid × (1 + tax);
+  - the box code if at home;
+  - the eBay link.
+- **Receipt lines:**
+  - Lines already entered as an item or piece with that Ross code are that
+    item.
+  - The remaining lines show as one reply line: "Bought 10× (Aug 11 –
+    Sep 14) · paid $0.99–$15.99".
+- **The reply shows** "✅ New" when there are no hits. Otherwise
+  "🔁 Already have: 1 listed, 1 sold, 2 on receipts", then up to
+  `CHECK_OWNED_SHOW` (3) hits. Details lists every hit.
+- **Coverage (production copy of 2026-11-05, 167 items):**
+  - UPC: 138 items;
+  - style code: 106 items (stored in `model`; the `style_code` column is
+    empty);
+  - Ross code: 117 items;
+  - at least one key: 162. Only 5 rely on the AI match.
+  - 2,726 receipt lines (2,275 SKUs). Only 58 SKUs are also an item's
+    Ross code.
+
 ## 0. Decisions (Person B's review, 2026-11-02). These override the sections below.
 
 | Topic | Decision |
