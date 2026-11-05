@@ -722,7 +722,7 @@ def test_in_stock_warning_finds_an_item_and_shows_at_the_top_of_the_reply(fresh_
     res = check.run_check(check.parse_request("/check Michael Kors pave necklace MKJ3969710 14.99"),
                           pricing_fn=lambda ident, **kw: mkj_pricing())
     top = check.format_reply(res).splitlines()
-    assert top[0].startswith("🔁 Already have: 1 in progress") and "style code + colour" in top[1]
+    assert top[0] == "🔁 Already have: Michael Kors — 1 in progress" and "style code + colour" in top[1]
     assert f"item {item[:8]}" in check.format_details(res)
 
 

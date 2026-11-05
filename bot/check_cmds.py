@@ -284,7 +284,7 @@ async def _run(user_id: int, message, req: dict, photo: str | None, *, check_id:
             identify_fn = (lambda _p: _identify_roles(roles)) if roles else _identify_one
         try:
             res = await asyncio.to_thread(check.run_check, req, photo_path=photo, identify_fn=identify_fn)
-            if res["verdict"] == check.NO_DATA and not req.get("full"):
+            if res["verdict"] == check.NO_DATA and not req.get("full") and not res.get("no_search"):
                 # Nothing at all in the quick check: straight on to the full
                 # check; the pair counts as one (Person B, 2026-11-02).
                 _log(res, user_id, counted=False)

@@ -268,6 +268,27 @@ The first line of every reply, before the verdict: `pipeline/owned.py`
     item.
   - The remaining lines show as one reply line: "Bought 10× (Aug 11 –
     Sep 14) · paid $0.99–$15.99".
+- **Runs before the eBay search (2026-11-05, check `/check 400301430764 15.99`):**
+  - A UPC, style code or Ross code match on an item, piece or earlier
+    check lends that identification to the search.
+  - With nothing of its own (a typed code, no brand), the check takes it
+    whole and searches the listing title. A photo's identification only
+    has its gaps filled.
+  - Ross codes are taken out of every search query, product name, UPC and
+    the 🔎 links. When nothing searchable is left, there is no eBay search
+    and no automatic full check, and the reply says to send a photo.
+  - Details says "Searched as our item …".
+- **First line:** what the matched thing is, e.g. `Ed Hardy "Love Kills
+  Slowly" … Weekender Duffel Bag · bag: weekender duffel · pink
+  multicolor`. With only receipt hits, it's the receipt description.
+- **Listed and sold hits** link with "🔗 <listing title>".
+- **Receipts are counted per receipt:**
+  - A receipt that lists one code at several prices is "misread" and is
+    left out of the price range.
+  - Measured on 213 receipts: 57 times one code at several prices (37 on
+    adjacent lines), and only 63 of 177 subtotals add up.
+  - No Ross code covers clearly different products: 302 codes on 2+
+    lines, 0 with different descriptions.
 - **The reply shows** "✅ New" when there are no hits. Otherwise
   "🔁 Already have: 1 listed, 1 sold, 2 on receipts", then up to
   `CHECK_OWNED_SHOW` (3) hits. Details lists every hit.

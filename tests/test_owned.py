@@ -115,7 +115,7 @@ def test_earlier_checks_but_not_this_one():
         owned.hit_text(h)
 
 
-def test_receipt_lines_not_yet_entered():
+def test_receipt_lines_all_shown_even_with_an_item():
     lines = [{"line_id": 7, "sku": ROSS, "description": "JUICY TOTE", "price": 12.99,
               "receipt_date": "2026-10-30", "store_city": "HOLLYWOOD"},
              {"line_id": 3, "sku": ROSS, "description": "JUICY TOTE", "price": 12.99,
@@ -124,10 +124,10 @@ def test_receipt_lines_not_yet_entered():
     res = owned.lookup({}, ROSS, receipts_fn=lambda skus: asked.append(skus) or lines)
     assert asked == [[ROSS]] and [h["id"] for h in res["hits"]] == [7, 3]
     assert owned.hit_text(res["hits"][0]).startswith("Bought Oct 30 (Hollywood) · paid $12.99")
-    # one of the two purchases is already an item: only the other line shows
+    # receipts misread lines too often to count units by them: every line stays
     _item("published", {"brand": "Juicy Couture"}, receipt={"code": ROSS})
     res = owned.lookup({}, ROSS, receipts_fn=lambda skus: lines)
-    assert [h["source"] for h in res["hits"]] == ["item", "receipt"] and res["hits"][1]["id"] == 3
+    assert [h["source"] for h in res["hits"]] == ["item", "receipt", "receipt"]
 
 
 def test_ai_fallback_only_without_a_key_match():
@@ -188,22 +188,35 @@ def test_reply_lines_new_and_hits():
                  url=None), _hit(source="piece", id="O1W-01", status="home", box="O1W-01", url=None)]
     text = owned.reply_lines({"hits": hits})
     assert text[0] == "🔁 Already have: 1 listed, 1 at home, 1 sold, 1 checked before"
-    assert text[1] == "• Listed $59.99, 12 days · paid $9.99 · UPC · https://www.ebay.com/itm/117000000002"
+    assert text[1] == ("• Listed $59.99, 12 days · paid $9.99 · UPC · 🔗 Juicy <Weekender> "
+                       "https://www.ebay.com/itm/117000000002")
     assert len(text) == 5 and text[-1] == "• … 1 more in Details"
     html = owned.reply_lines({"hits": [_hit(match=owned.STYLE_OTHER_COLOUR)]}, html=True)
     assert html[0].startswith("🔁 Similar: 1 listed")
     assert "Juicy &lt;Weekender&gt;" in html[1] and html[1].endswith(
-        '<a href="https://www.ebay.com/itm/117000000002">eBay</a>')
+        '🔗 <a href="https://www.ebay.com/itm/117000000002">Juicy &lt;Weekender&gt;</a>')
 
 
-def test_receipt_lines_are_one_reply_line():
-    lines = [_hit(source="receipt", id=n, status="bought", date=d, city=c, paid=p, url=None, match=owned.ROSS)
-             for n, d, c, p in ((3, "2026-09-19", "HIALEAH", 7.99), (2, "2026-09-14", "CORAL GABLES", 4.99),
-                                (1, "2026-08-11", "MIAMI", 15.99))]
+def _line(n, receipt, date, paid, desc="EH Pink aop fish f"):
+    return _hit(source="receipt", id=n, status="bought", receipt=receipt, date=date, city="HIALEAH", paid=paid,
+                description=desc, name=desc, url=None, match=owned.ROSS)
+
+
+def test_receipt_lines_are_one_reply_line_per_product():
+    # check #4's Ross code: a receipt listing it at two prices is a misread
+    lines = [_line(5, "R3", "2026-09-19", 7.99), _line(4, "R2", "2026-09-14", 7.99),
+             _line(3, "R2", "2026-09-14", 4.99), _line(2, "R1", "2026-08-11", 15.99),
+             _line(1, "R1", "2026-08-11", 0.99)]
+    s = owned.receipts_summary(lines)
+    assert (s["receipts"], s["lines"], s["misread"], s["low"], s["high"]) == (3, 5, 2, 7.99, 7.99)
     text = owned.reply_lines({"hits": [_hit()] + lines})
-    assert text[0] == "🔁 Already have: 1 listed, 3 on receipts" and len(text) == 3
-    assert text[2].startswith("• Bought 3× (Aug 11") and "paid $4.99–$15.99 · last Hialeah · Ross code" in text[2]
-    assert len(owned.details_lines({"hits": [_hit()] + lines})) == 5
+    assert text[0] == '🔁 Already have: "EH Pink aop fish f" (receipt) — 1 listed, 3 receipts' and len(text) == 3
+    assert text[2] == ('• Bought on 3 receipts (Aug 11 – Sep 19) · "EH Pink aop fish f" · paid $7.99 · '
+                       "2 receipts misread (one code, several prices) · Ross code")
+    assert len(owned.details_lines({"hits": [_hit()] + lines})) == 7
+    # two at one price on one receipt: bought 2, not a misread
+    assert owned.receipts_summary([_line(2, "R1", "2026-08-11", 9.99), _line(1, "R1", "2026-08-11", 9.99)])[
+        "misread"] == 0
 
 
 def test_details_lists_every_hit():
@@ -230,3 +243,73 @@ def test_receipt_lines_on_sqlserver(mssql, monkeypatch):
     [line] = db.receipt_lines_for_skus([ROSS])
     assert (line["sku"], line["description"], line["price"], line["receipt_date"], line["store_city"],
             line["receipt_number"]) == (ROSS, "JUICY TOTE", 12.99, "2026-10-30", "HOLLYWOOD", "1234-5")
+
+
+# --- what it is, and lending it to the search ---------------------------------------------------
+
+ED_HARDY = {"brand": "Ed Hardy", "product_name": '"Love Kills Slowly" Tattoo Print Weekender Duffel Bag',
+            "item_type": "Weekender Duffel Bag", "color": "Pink Multicolor", "model": "EHH230-26-PNA",
+            "upc": "796483413276"}
+
+
+def test_what_it_is():
+    assert owned.what_it_is(ED_HARDY) == ('Ed Hardy "Love Kills Slowly" Tattoo Print Weekender Duffel Bag · '
+                                          "bag: weekender duffel · pink multicolor")
+    assert owned.what_it_is({"brand": "Vans", "product_name": "Old Skool", "item_type": "Sneakers"}) == \
+        "Vans Old Skool · shoes: sneakers"
+    assert owned.what_it_is({"brand": "Michael Kors", "item_type": "necklace"}) == "Michael Kors · accessory: necklace"
+
+
+def test_first_line_says_what_the_matched_item_is():
+    hits = [_hit(ident={**ED_HARDY, "title": "Ed Hardy Love Kills Slowly Weekender"}, match=owned.ROSS),
+            _line(1, "R1", "2026-08-11", 15.99)]
+    head = owned.reply_lines({"hits": hits})[0]
+    assert head == ('🔁 Already have: Ed Hardy "Love Kills Slowly" Tattoo Print Weekender Duffel Bag · '
+                    "bag: weekender duffel · pink multicolor — 1 listed, 1 receipt")
+    # only receipts: their description
+    assert owned.reply_lines({"hits": [_line(1, "R1", "2026-08-11", 1.49, "4PK LUBA LIME MARG")]})[0] == \
+        '🔁 Already have: "4PK LUBA LIME MARG" (receipt) — 1 receipt'
+
+
+def test_borrow_for_a_typed_code_takes_our_item():
+    hit = {"source": "item", "id": "da8b1b25", "match": owned.ROSS,
+           "ident": {**ED_HARDY, "title": "Ed Hardy Love Kills Slowly Weekender Duffel Bag Pink"}}
+    typed = {"product_name": ROSS, "search_query": ROSS, "upc": ROSS}
+    got, info = owned.borrow_identification(typed, hit)
+    assert got["search_query"] == "Ed Hardy Love Kills Slowly Weekender Duffel Bag Pink"
+    assert (got["brand"], got["model"], got["upc"]) == ("Ed Hardy", "EHH230-26-PNA", "796483413276")
+    assert info == {"source": "item", "id": "da8b1b25", "match": owned.ROSS, "query": got["search_query"]}
+    # a photo's own identification is kept; only the gaps are filled
+    photo = {"brand": "Ed Hardy", "product_name": "Tattoo duffel", "search_query": "ed hardy duffel"}
+    got, _ = owned.borrow_identification(photo, hit)
+    assert (got["product_name"], got["search_query"], got["model"]) == ("Tattoo duffel", "ed hardy duffel",
+                                                                        "EHH230-26-PNA")
+    assert owned.borrow_identification(typed, None) == (typed, None)
+    assert owned.donor({"hits": [{**hit, "match": owned.AI_SAME}]}) is None      # weak matches lend nothing
+
+
+def test_run_check_searches_our_item_never_the_ross_code():
+    from pipeline import check
+    _item("published", ED_HARDY, listing={"title": "Ed Hardy Love Kills Slowly Weekender Duffel Bag Pink"},
+          receipt={"code": ROSS, "reduced_price": 15.99})
+    seen = []
+    res = check.run_check(check.parse_request(f"/check {ROSS} 15.99"),
+                          pricing_fn=lambda ident, **kw: seen.append(ident) or {"judged_comps": [], "timings": {}})
+    [ident] = seen
+    assert ident["search_query"] == "Ed Hardy Love Kills Slowly Weekender Duffel Bag Pink"
+    assert not any(ROSS in str(v) for v in ident.values())
+    assert res["borrowed"]["match"] == owned.ROSS and res["typed_ross"] == ROSS
+    assert check.check_fields(res)["ross_sku"] == ROSS
+    reply = check.format_reply(res)
+    assert reply.splitlines()[0].startswith('🔁 Already have: Ed Hardy "Love Kills Slowly"')
+    assert ROSS not in reply.split("🔎", 1)[1]                        # the eBay search links
+    assert "Searched as our item" in check.format_details(res)
+
+
+def test_an_unknown_ross_code_is_not_searched():
+    from pipeline import check
+    res = check.run_check(check.parse_request("/check 400999999990 9.99"),
+                          pricing_fn=lambda ident, **kw: (_ for _ in ()).throw(AssertionError("searched")))
+    assert res["no_search"] and res["verdict"] == check.NO_DATA
+    reply = check.format_reply(res)
+    assert "Only a Ross code" in reply and "Ross code 400999999990" in reply and "🔎" not in reply

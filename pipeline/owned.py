@@ -163,6 +163,7 @@ def _check_hit(c: dict) -> dict:
 
 def _receipt_hit(r: dict) -> dict:
     return {"source": "receipt", "id": r.get("line_id"), "status": "bought", "name": (r.get("description") or "?")[:60],
+            "description": (r.get("description") or "").strip(), "receipt": r.get("receipt_number"),
             "date": r.get("receipt_date"), "city": r.get("store_city"), "paid": _num(r.get("price")),
             "price": None, "url": None, "box": None, "listed_days": None, "sold_at": None, "profit": None}
 
@@ -271,16 +272,14 @@ def lookup(ident: dict, sku=None, exclude_check_id=None, *, things_fn=None, rece
         mine = keys(ident, sku)
         things = (things_fn or _things)(exclude_check_id)
         hits = []
-        for k, _, hit in things:
+        for k, theirs, hit in things:
             m = match(mine, k)
             if m:
-                hits.append({**hit, "match": m})
-        # receipt lines: one per purchase; lines already entered as an item or
-        # piece with that Ross code are that item
+                hits.append({**hit, "match": m, "ident": theirs})
+        # receipt lines (every one: receipts misread lines too often to count
+        # units by them; the reply shows them per receipt, see receipts_summary)
         if mine["ross"]:
-            lines = (receipts_fn or db.receipt_lines_for_skus)(sorted(mine["ross"]))
-            entered = sum(1 for k, _, h in things if h["source"] in ("item", "piece") and k["ross"] & mine["ross"])
-            for r in lines[entered:]:
+            for r in (receipts_fn or db.receipt_lines_for_skus)(sorted(mine["ross"])):
                 hits.append({**_receipt_hit(r), "match": ROSS})
         ai = None
         if not hits and config.CHECK_OWNED_AI:
@@ -288,7 +287,7 @@ def lookup(ident: dict, sku=None, exclude_check_id=None, *, things_fn=None, rece
             if cands:
                 ai = {"candidates": len(cands)}
                 for i, m in (ai_fn or ai_match)(ident, cands):
-                    hits.append({**cands[i][2], "match": m})
+                    hits.append({**cands[i][2], "match": m, "ident": cands[i][1]})
         hits.sort(key=lambda h: str(h.get("date") or ""), reverse=True)      # newest first, then
         hits.sort(key=lambda h: (_SOURCE_ORDER[h["source"]], STRENGTH[h["match"]], h.get("status") == "sold"))
         return {"hits": hits, "ai": ai, "error": None}
@@ -345,9 +344,12 @@ def hit_text(h: dict) -> str:
 
 def _summary(hits: list) -> str:
     n = {"listed": 0, "home": 0, "sold": 0, "other": 0, "receipt": 0, "check": 0}
+    n["receipt"] = len({_receipt_key(h) for h in hits if h["source"] == "receipt"})
     for h in hits:
-        if h["source"] in ("receipt", "check"):
-            n[h["source"]] += 1
+        if h["source"] == "receipt":
+            continue
+        if h["source"] == "check":
+            n["check"] += 1
         elif h.get("status") == "sold":
             n["sold"] += 1
         elif h.get("status") == "published":
@@ -357,8 +359,71 @@ def _summary(hits: list) -> str:
         else:
             n["other"] += 1
     words = [f"{n['listed']} listed", f"{n['home']} at home", f"{n['sold']} sold", f"{n['other']} in progress",
-             f"{n['receipt']} on receipts", f"{n['check']} checked before"]
+             f"{n['receipt']} receipt{'' if n['receipt'] == 1 else 's'}", f"{n['check']} checked before"]
     return ", ".join(w for w in words if not w.startswith("0 "))
+
+
+# --- what it is, and lending it to the search ---------------------------------------------------
+
+STRONG = (UPC, STYLE, ROSS)
+_CATEGORY = {"bags": "bag", "shoes": "shoes", "clothing": "clothing", "jewelry": "accessory"}
+_LEND = ("brand", "product_name", "model", "style_code", "upc", "color", "item_type", "size", "material",
+         "department", "gender", "retail_price")
+
+
+def donor(owned: dict | None) -> dict | None:
+    """The best hit whose identification the check can use: an item, piece or
+    earlier check matched by UPC, style code + colour or Ross code, with a
+    brand or a product name."""
+    for h in (owned or {}).get("hits") or []:
+        ident = h.get("ident") or {}
+        if h["match"] in STRONG and h["source"] in ("item", "piece", "check") and \
+                (ident.get("brand") or ident.get("product_name")):
+            return h
+    return None
+
+
+def what_it_is(ident: dict) -> str:
+    """'Ed Hardy "Love Kills Slowly" Weekender Duffel Bag · bag: weekender duffel · pink multicolor'."""
+    brand = str(ident.get("brand") or "").strip()
+    name = str(ident.get("product_name") or ident.get("title") or "").strip()
+    full = name if brand and brand.lower() in name.lower() else " ".join(x for x in (brand, name) if x)
+    sub = str(ident.get("item_type") or "").strip().lower()
+    cat = _CATEGORY.get(check.item_type_of(ident))
+    if cat:
+        rest = " ".join(w for w in sub.split() if w.rstrip("s") not in (cat, "bag", "shoe", "handbag"))
+        kind = f"{cat}: {rest}" if rest else cat
+    else:
+        kind = sub
+    colour = str(ident.get("color") or "").strip().lower()
+    return " · ".join(x for x in (full[:80], kind, colour) if x)
+
+
+def borrow_identification(ident: dict, hit: dict | None) -> tuple[dict, dict | None]:
+    """(identification for the eBay search, where it came from). A code that
+    matched one of ours says what the thing is: with nothing of its own (a
+    typed code, no brand) the check takes our item's identification and
+    searches its listing title; with its own (a photo) it only fills gaps."""
+    if not hit:
+        return ident, None
+    theirs = {k: v for k, v in (hit.get("ident") or {}).items() if v not in (None, "", [], {})}
+    title = theirs.get("title") or theirs.get("search_query")
+    if not ident.get("brand"):
+        out = {k: theirs[k] for k in _LEND if k in theirs}
+        out["search_query"] = title or " ".join(str(theirs[k]) for k in ("brand", "product_name") if k in theirs)
+    else:
+        out = dict(ident)
+        for k in _LEND:
+            if not out.get(k) and k in theirs:
+                out[k] = theirs[k]
+        if out.get("upc") and gtin.is_store_code(out["upc"]) and theirs.get("upc"):
+            out["upc"] = theirs["upc"]
+        if not check.without_ross_codes(out).get("search_query") and title:
+            out["search_query"] = title
+    if out.get("upc") and not gtin.product_gtin(out["upc"]):
+        out.pop("upc")
+    return out, {"source": hit["source"], "id": hit["id"], "match": hit["match"],
+                 "query": out.get("search_query")}
 
 
 def reply_lines(owned: dict | None, *, html: bool = False, limit: int | None = None) -> list[str]:
@@ -374,18 +439,31 @@ def reply_lines(owned: dict | None, *, html: bool = False, limit: int | None = N
         return ["✅ New"]
     limit = config.CHECK_OWNED_SHOW if limit is None else limit
     weak = all(h["match"] in (STYLE_OTHER_COLOUR, AI_MODEL) for h in hits)
-    lines = [f"{'🔁 Similar' if weak else '🔁 Already have'}: {_summary(hits)}"]
+    best = donor(owned)
+    what = what_it_is(best["ident"]) if best else next(
+        (f'"{h["description"]}" (receipt)' for h in hits if h["source"] == "receipt" and h.get("description")), "")
+    head = f"{'🔁 Similar' if weak else '🔁 Already have'}: " + (f"{what} — " if what else "") + _summary(hits)
+    lines = [escape(head) if html else head]
     shown = _grouped(hits)
     for h in shown[:limit]:
         text = _receipts_text(h["lines"]) if h["source"] == "receipts" else hit_text(h)
+        label = _short(h.get("name") or "eBay", 45)
         if html:
-            text = escape(text) + (f' · <a href="{escape(h["url"])}">eBay</a>' if h.get("url") else "")
+            text = escape(text) + (f' · 🔗 <a href="{escape(h["url"])}">{escape(label)}</a>' if h.get("url") else "")
         elif h.get("url"):
-            text += f" · {h['url']}"
+            text += f" · 🔗 {label} {h['url']}"
         lines.append(f"• {text}")
     if len(shown) > limit:
         lines.append(f"• … {len(shown) - limit} more in Details")
     return lines
+
+
+def _short(text: str, n: int) -> str:
+    """At most n characters, cut at a word: 'Ed Hardy Love Kills Slowly Weekender…'."""
+    text = str(text).strip()
+    if len(text) <= n:
+        return text
+    return text[:n].rsplit(" ", 1)[0].rstrip(" ,-·") + "…"
 
 
 def _grouped(hits: list) -> list:
@@ -400,18 +478,52 @@ def _grouped(hits: list) -> list:
     return out
 
 
-def _receipts_text(lines: list) -> str:
-    """"Bought 3× (Aug 11 – Sep 19), $4.99–$15.99, last Hialeah · Ross code"."""
-    usd = check._usd
-    if len(lines) == 1:
-        return hit_text(lines[0])
+def _receipt_key(h: dict):
+    return h.get("receipt") or (h.get("date"), h.get("city"))
+
+
+def receipts_summary(lines: list) -> dict:
+    """Receipt lines of one product, per receipt. The receipt reader often
+    splits one purchase over adjacent lines at different prices (57 times in
+    213 receipts, 2026-11-05: $0.99 next to $15.99), so a receipt that lists
+    the code at several prices is "misread" and its prices are left out of
+    the range. Repeated lines at one price stay (2 bought)."""
+    by = {}
+    for h in lines:
+        by.setdefault(_receipt_key(h), []).append(h)
+    clean, odd = [], 0
+    for ls in by.values():
+        prices = {h["paid"] for h in ls if h.get("paid") is not None}
+        if len(prices) > 1:
+            odd += 1
+        else:
+            clean += list(prices)
+    descs = [h["description"] for h in lines if len(h.get("description") or "") > 3]
     dates = sorted(str(h["date"]) for h in lines if h.get("date"))
-    paid = sorted(h["paid"] for h in lines if h.get("paid") is not None)
-    bits = [f"Bought {len(lines)}×" + (f" ({_date(dates[0])} – {_date(dates[-1])})" if len(dates) > 1 else "")]
-    if paid:
-        bits.append(f"paid {usd(paid[0])}" if paid[0] == paid[-1] else f"paid {usd(paid[0])}–{usd(paid[-1])}")
-    if lines[0].get("city"):
-        bits.append(f"last {lines[0]['city'].title()}")
+    return {"receipts": len(by), "lines": len(lines), "misread": odd,
+            "low": min(clean) if clean else None, "high": max(clean) if clean else None,
+            "description": max(set(descs), key=descs.count) if descs else None,
+            "first": dates[0] if dates else None, "last": dates[-1] if dates else None,
+            "city": next((h["city"] for h in lines if h.get("city")), None)}
+
+
+def _receipts_text(lines: list) -> str:
+    """'Bought on 7 receipts (Aug 11 – Sep 19) · "EH Pink aop fish f" · paid $7.99–$14.99 ·
+    3 receipts misread · Ross code'."""
+    usd = check._usd
+    s = receipts_summary(lines)
+    if s["lines"] == 1:
+        return hit_text(lines[0]).replace(" · Ross code", "") + \
+            (f' · "{s["description"]}"' if s["description"] else "") + " · Ross code"
+    span = f" ({_date(s['first'])} – {_date(s['last'])})" if s["first"] and s["first"] != s["last"] else \
+        (f" ({_date(s['first'])})" if s["first"] else "")
+    bits = [f"Bought on {s['receipts']} receipt{'' if s['receipts'] == 1 else 's'}{span}"]
+    if s["description"]:
+        bits.append(f'"{s["description"]}"')
+    if s["low"] is not None:
+        bits.append(f"paid {usd(s['low'])}" if s["low"] == s["high"] else f"paid {usd(s['low'])}–{usd(s['high'])}")
+    if s["misread"]:
+        bits.append(f"{s['misread']} receipt{'' if s['misread'] == 1 else 's'} misread (one code, several prices)")
     bits.append(ROSS)
     return " · ".join(bits)
 
@@ -431,7 +543,8 @@ def details_lines(owned: dict | None) -> list[str]:
     for h in hits:
         ref = {"item": f"item {str(h['id'])[:8]}", "piece": f"piece {h['id']}", "check": f"check #{h['id']}",
                "receipt": f"receipt line {h['id']}"}[h["source"]]
-        out.append(f"  {ref} · {hit_text(h)}" + (f" · {h['url']}" if h.get("url") else ""))
+        desc = f' "{h["description"]}" (receipt {h.get("receipt") or "?"})' if h["source"] == "receipt" else ""
+        out.append(f"  {ref}{desc} · {hit_text(h)}" + (f" · {h['url']}" if h.get("url") else ""))
     return out
 
 

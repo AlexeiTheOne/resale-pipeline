@@ -103,6 +103,35 @@ def build_identification(text: str) -> dict:
     return ident
 
 
+# A Ross tag code (12 digits, 4...) or its 18-digit barcode: Ross's own number,
+# which no eBay listing carries. Never searched for.
+_ROSS_IN_TEXT = re.compile(r"(?<!\d)4\d{11}(?:\d{6})?(?!\d)")
+
+
+def without_ross_codes(ident: dict) -> dict:
+    """The identification with Ross codes taken out of everything eBay is
+    searched with (search query, product name, UPC)."""
+    from pipeline import gtin
+    out = dict(ident)
+    for k in ("search_query", "product_name"):
+        if isinstance(out.get(k), str):
+            v = re.sub(r"\s+", " ", _ROSS_IN_TEXT.sub(" ", out[k])).strip()
+            if v:
+                out[k] = v
+            else:
+                out.pop(k)
+    if out.get("upc") and gtin.is_store_code(out["upc"]):
+        out.pop("upc")
+    return out
+
+
+def searchable(ident: dict) -> bool:
+    """Is there anything to search eBay with (after without_ross_codes)?"""
+    from pipeline import gtin
+    return bool(ident.get("brand") or ident.get("product_name") or ident.get("search_query")
+                or ident.get("model") or ident.get("style_code") or gtin.product_gtin(ident.get("upc")))
+
+
 # --- label cost by item type (design §4) ----------------------------------------
 
 LABEL_WORDS = {
@@ -686,14 +715,34 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
     else:
         ident = build_identification(text)
     full = bool(req.get("full"))
-    pricing = pricing_fn(
-        ident, photo_paths=[photo_path] if photo_path else None, item_id=None,
-        stage="check_judge" if full else "check_quick_judge", escalate=full,
-        sold_cache_only=not full, sold_max_age_s=config.CHECK_SOLD_CACHE_DAYS * 86400,
-        active_max_age_s=0, extra_sold_queries=similar_queries(ident) if full else None,
-        # A UPC or style code already pins the item; image search on a dark
-        # photo only adds noise (check #2: 16 Hugo Boss bags).
-        image_search=not (pricing_v2.upc_of(ident) or pricing_v2.style_code(ident)))
+    # Do I already have this? First: a match lends its identification to the search.
+    from pipeline import owned
+    typed_ross = owned.ross_code(ident.get("upc"))
+    skus = [s for s in (req.get("ross_sku"), req.get("ross_sku_main"), typed_ross) if s]
+    try:
+        have = have_fn(ident, skus, req.get("check_id"))
+    except Exception as e:       # advisory only
+        have = {"hits": [], "ai": None, "error": f"{type(e).__name__}: {str(e)[:120]}"}
+    if not isinstance(have, dict):   # a fake that returns a list: not looked up, no top line
+        have = None
+    borrowed = None
+    if not req.get("identification"):      # a follow-up's identification is already the final one
+        ident, borrowed = owned.borrow_identification(ident, owned.donor(have))
+    ident = without_ross_codes(ident)
+    no_search = not searchable(ident)
+    if no_search:
+        # Only a Ross code that isn't ours: it means nothing to eBay, so no search.
+        pricing = {"judged_comps": [], "timings": {},
+                   "comp_warning": "only a Ross code, which eBay doesn't know: no search"}
+    else:
+        pricing = pricing_fn(
+            ident, photo_paths=[photo_path] if photo_path else None, item_id=None,
+            stage="check_judge" if full else "check_quick_judge", escalate=full,
+            sold_cache_only=not full, sold_max_age_s=config.CHECK_SOLD_CACHE_DAYS * 86400,
+            active_max_age_s=0, extra_sold_queries=similar_queries(ident) if full else None,
+            # A UPC or style code already pins the item; image search on a dark
+            # photo only adds noise (check #2: 16 Hugo Boss bags).
+            image_search=not (pricing_v2.upc_of(ident) or pricing_v2.style_code(ident)))
     for k, v in (pricing.get("timings") or {}).items():
         if k != "total_s":
             timings[k] = v
@@ -707,16 +756,11 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
     ev = evaluate(pricing, ident, req.get("ross_price"), bool(req.get("exact", True)), text,
                   quick=not full, details=details)
     comps = comp_list(pricing, ev["item_type"], bool(req.get("exact", True)), details)
-    try:
-        skus = [s for s in (req.get("ross_sku"), req.get("ross_sku_main")) if s]
-        have = have_fn(ident, skus, req.get("check_id"))
-    except Exception as e:       # advisory only
-        have = {"hits": [], "ai": None, "error": f"{type(e).__name__}: {str(e)[:120]}"}
-    if not isinstance(have, dict):   # a fake that returns a list: not looked up, no top line
-        have = None
     timings["total_s"] = round(time.perf_counter() - t0, 2)
     return {"request": dict(req), "photo": bool(photo_path), "identification": ident,
-            **ev, "already_have": have, "timings": timings,
+            **ev, "already_have": have, "borrowed": borrowed, "no_search": no_search,
+            "typed_ross": typed_ross if typed_ross and not req.get("ross_sku") else None,
+            "timings": timings,
             "confidence": pricing.get("claude_confidence"),
             "sold_cache_misses": pricing.get("sold_cache_misses") or [],
             # every comp used (Details); the first 5 are saved with the check
@@ -741,7 +785,8 @@ def owned_saved(have) -> list:
 def check_fields(res: dict) -> dict:
     """A result as checks-table columns (db.update_check)."""
     money, pick, req = res.get("money") or {}, res["pick"], res["request"]
-    return {"identification": res["identification"], "mode": "full" if req.get("full") else "quick",
+    typed = {"ross_sku": res["typed_ross"]} if res.get("typed_ross") else {}   # /check 400301430764 15.99
+    return {**typed, "identification": res["identification"], "mode": "full" if req.get("full") else "quick",
             "exact": bool(req.get("exact", True)), "verdict": res["verdict"],
             "suggested_price": pick.get("price"), "profit": money.get("profit"), "roi": money.get("roi"),
             "break_even": money.get("break_even_item"), "cheapest_identical": res.get("cheapest_total"),
@@ -904,8 +949,10 @@ def _listings_phrase(res: dict) -> str:
 
 def _item_name(res: dict) -> str:
     ident, req = res["identification"], res["request"]
-    name = " ".join(str(ident.get(k)) for k in ("brand", "product_name") if ident.get(k)) \
-        or req.get("description") or "item"
+    desc = req.get("description") or ""
+    if desc and not _ROSS_IN_TEXT.sub("", desc).strip(" -"):
+        desc = f"Ross code {desc.strip()}"       # only a code was typed: say so, it isn't a name
+    name = " ".join(str(ident.get(k)) for k in ("brand", "product_name") if ident.get(k)) or desc or "item"
     model = ident.get("model")
     if model and _norm_code(model) not in _norm_code(name):    # no duplicated model number
         name += f" ({model})"
@@ -928,6 +975,7 @@ def search_links(res: dict, labels: bool = False) -> dict:
     q = " ".join(str(ident.get(k)) for k in ("brand", "product_name") if ident.get(k)) \
         or ident.get("model") or ident.get("style_code") or ident.get("search_query") \
         or res["request"].get("description")
+    q = re.sub(r"\s+", " ", _ROSS_IN_TEXT.sub(" ", q or "")).strip()     # never search a Ross code
     if not q:
         return {}
     base = {"_nkw": q, "LH_ItemCondition": "1000|1500", "LH_PrefLoc": 1}
@@ -1017,6 +1065,8 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
         lines.append(f"Ross {_usd(ross)} · no price found")
     else:
         lines.append("Add the Ross price as the last number, e.g. /check coach tabby 26 49.99")
+    if res.get("no_search"):
+        lines.append("Only a Ross code, not one of ours: send a photo or describe the item to search eBay")
     offer = res.get("offer")
     if money and offer:
         lines.append(offer_line(offer))
@@ -1102,6 +1152,13 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
     if isinstance(res.get("already_have"), dict):
         from pipeline import owned
         out += owned.details_lines(res["already_have"])
+    b = res.get("borrowed")
+    if b:
+        ref = {"item": f"item {str(b['id'])[:8]}", "piece": f"piece {b['id']}", "check": f"check #{b['id']}"}
+        out.append(f"Searched as our {ref.get(b['source'], b['source'])} ({b['match']} match): "
+                   f"{b.get('query') or '-'}")
+    if res.get("no_search"):
+        out.append("No eBay search: only a Ross code, and it isn't one of ours. Ross codes are never searched.")
     if ross is not None:
         main = req.get("ross_sku_main")
         out.append(f"Ross {_usd(ross)}" + (f" · SKU {sku}" if sku else "")
