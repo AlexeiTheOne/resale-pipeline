@@ -241,7 +241,17 @@ The first line of every reply, before the verdict: `pipeline/owned.py`
      matches any colour. The same style in another colour is listed as
      "same style, other colour";
   3. Ross code, the 12-digit tag SKU. A Ross code stored in the UPC field
-     counts as the Ross code.
+     counts as the Ross code. Either code matches: the REDUCED sticker's
+     (`ross_code`, what we paid) or the main tag's when it differs
+     (`ross_code_main`; checks `ross_sku_main`). Every barcode on the tag is
+     read, and the lowest price is the sticker (`ross_tag.split_codes`).
+     Measured 2026-11-05:
+     - 0 of 157 stored tag photos and 7 check photos decoded two different
+       codes.
+     - Reduced items are on receipts as often as full-price ones (13 of 17
+       vs 44 of 94), so the stored code is the one the register prints.
+     - Of 2,616 receipt lines with no item, 1 more would match. That one is
+       a misread code (490… for 400298209190), not a second code.
 - **AI fallback:** a title match runs only when no key matched and we have
   things of the same brand (at most 8, by shared name words). It is one
   `CLAUDE_CHEAP_MODEL` call, stage `check_owned`. `CHECK_OWNED_AI=0` turns it

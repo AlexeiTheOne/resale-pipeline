@@ -170,6 +170,58 @@ def decode_barcode(image_path: str) -> str | None:
     return None
 
 
+def decode_barcodes(image_path: str) -> list[str]:
+    """Every distinct Ross CODE128 barcode in the photo (digits, 12+ long), in
+    decode order: a tag with a REDUCED sticker can show two (see split_codes).
+    decode_barcode first (no barcode: nothing more to try); with one, every
+    rendering is searched for a second."""
+    first = decode_barcode(image_path)
+    if not first:
+        return []
+    if _zbar_decode is None or Image is None:
+        return [first]
+    try:
+        img = ImageOps.exif_transpose(Image.open(image_path))
+    except Exception:
+        return [first]
+    found = [first]
+    for im in (img, ImageOps.grayscale(img), img.resize((img.size[0] * 2, img.size[1] * 2))):
+        try:
+            for res in _zbar_decode(im, symbols=_TAG_ZBAR_SYMBOLS):
+                digits = re.sub(r"\D", "", res.data.decode("utf-8", "ignore"))
+                if len(digits) >= 12 and digits not in found:
+                    found.append(digits)
+        except Exception:
+            continue
+    return found
+
+
+def split_codes(barcodes) -> dict:
+    """The main tag and the REDUCED sticker from a tag's barcodes.
+
+    Each Ross barcode is <12-digit code><price in cents>. The sticker is what
+    we paid: the lowest price. "code"/"reduced_price"/"barcode" are that one
+    (as parse_barcode); "main_code" is the main tag's code when it differs
+    (the highest-priced barcode), "main_price" that barcode's price (the
+    price before the markdown). Ross codes only (400...)."""
+    parsed = []
+    for digits in barcodes or ():
+        d = re.sub(r"\D", "", str(digits))
+        p = parse_barcode(d)
+        if p.get("code") and p["code"].startswith("4"):
+            parsed.append((p["code"], p.get("reduced_price"), d))
+    if not parsed:
+        return {"code": None, "reduced_price": None, "barcode": None, "main_code": None, "main_price": None}
+    priced = [x for x in parsed if x[1]]
+    paid = min(priced, key=lambda x: x[1]) if priced else parsed[0]
+    others = [x for x in parsed if x[0] != paid[0]]
+    main = max(others, key=lambda x: x[1] or 0) if others else None
+    top = max((x[1] for x in priced), default=None)
+    return {"code": paid[0], "reduced_price": paid[1], "barcode": paid[2],
+            "main_code": main[0] if main else None,
+            "main_price": top if top and paid[1] and top > paid[1] else None}
+
+
 # Symbologies that carry a globally-unique product UPC/EAN (so they identify the
 # product). A Ross tag's CODE128 is the store's own 18-digit price code — not the
 # product — so it's deliberately excluded here.
@@ -457,7 +509,10 @@ def extract_receipt(image_path: str) -> dict:
     barcode, with OCR fallback) and the original price (from OCR). Never raises:
     returns a dict with an "error" note if nothing could be read, so a bad tag
     read can't abort the listing pipeline."""
-    barcode = decode_barcode(image_path)
+    # Every barcode: with a REDUCED sticker on the tag there can be two codes.
+    bars = decode_barcodes(image_path)
+    codes = split_codes(bars)
+    barcode = codes["barcode"] or (bars[0] if bars else None)
     bc = parse_barcode(barcode)
 
     ocr = {"original_price": None, "reduced_price": None, "code": None}
@@ -497,6 +552,8 @@ def extract_receipt(image_path: str) -> dict:
     code = bc["code"] or ocr["code"]
     reduced_price = bc["reduced_price"] if bc["reduced_price"] is not None else ocr["reduced_price"]
     original_price = ocr["original_price"]
+    if original_price is None and codes["main_price"]:
+        original_price = codes["main_price"]   # the main tag's barcode: the price before REDUCED
 
     # Last resort: the paid price is the one field the item's whole profit
     # calculation rests on, so if neither the barcode nor OCR produced it, ask the
@@ -530,6 +587,8 @@ def extract_receipt(image_path: str) -> dict:
         "ocr_variant": ocr_variant,
         "photo": str(image_path),
     }
+    if codes["main_code"] and codes["main_code"] != code:
+        result["main_code"] = codes["main_code"]   # the main tag's code, when the sticker's differs
     if code is None and reduced_price is None:
         result["error"] = ocr_error or "no barcode decoded and no price/code found in OCR text"
     return result

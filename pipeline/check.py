@@ -708,7 +708,8 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
                   quick=not full, details=details)
     comps = comp_list(pricing, ev["item_type"], bool(req.get("exact", True)), details)
     try:
-        have = have_fn(ident, req.get("ross_sku"), req.get("check_id"))
+        skus = [s for s in (req.get("ross_sku"), req.get("ross_sku_main")) if s]
+        have = have_fn(ident, skus, req.get("check_id"))
     except Exception as e:       # advisory only
         have = {"hits": [], "ai": None, "error": f"{type(e).__name__}: {str(e)[:120]}"}
     if not isinstance(have, dict):   # a fake that returns a list: not looked up, no top line
@@ -760,13 +761,29 @@ BARCODE_ANGLES = (0, 90, 270, 180, 30, -30, 45, -45, 15, -15, 60, -60)
 BARCODE_BUDGET_S = 6.0
 
 
+def _barcode_result(got: dict) -> dict:
+    """code + reduced_price, and main_code only when the tag has a second code."""
+    out = {"code": got["code"], "reduced_price": got["reduced_price"]}
+    if got.get("main_code"):
+        out["main_code"] = got["main_code"]
+    return out
+
+
 def read_ross_barcode(path: str, budget_s: float = BARCODE_BUDGET_S) -> dict:
-    """{"code", "reduced_price"} from a Ross barcode anywhere in the photo, or
-    {}. Plain decode first (ross_tag.decode_barcode), then rotations of the
-    whole photo, then at double size, until the time budget runs out. Local,
-    no AI."""
+    """{"code", "reduced_price", "main_code"} from the Ross barcodes anywhere in
+    the photo, or {}. The REDUCED sticker (lowest price) is the code; a main
+    tag with another code is main_code (ross_tag.split_codes). Plain decode
+    first (every barcode), then rotations of the whole photo (every barcode at
+    the first angle that reads), then at double size, until the time budget
+    runs out. Local, no AI."""
     import ross_tag
-    digits = ross_tag.decode_barcode(path)
+    found_all = ross_tag.decode_barcodes(path)
+    digits = None
+    if found_all:
+        got = ross_tag.split_codes(found_all)
+        if got.get("code"):
+            return _barcode_result(got)
+        digits = found_all[0]
     if not digits:
         try:
             from PIL import Image, ImageOps
@@ -784,12 +801,13 @@ def read_ross_barcode(path: str, budget_s: float = BARCODE_BUDGET_S) -> dict:
                                                   symbols=ross_tag._TAG_ZBAR_SYMBOLS)
                 except Exception:
                     continue
-                for res in found:
-                    d = re.sub(r"\D", "", res.data.decode("utf-8", "ignore"))
-                    if len(d) >= 12:
-                        digits = d
-                        break
-                if digits:
+                ds = [re.sub(r"\D", "", r.data.decode("utf-8", "ignore")) for r in found]
+                ds = [d for d in dict.fromkeys(ds) if len(d) >= 12]
+                if ds:
+                    got = ross_tag.split_codes(ds)
+                    if got.get("code"):
+                        return _barcode_result(got)
+                    digits = ds[0]
                     break
             if digits:
                 break
@@ -815,7 +833,7 @@ def photo_roles(paths: list[str], decode=None, vision=None) -> dict:
     photo); all photos are scanned for UPC/style codes."""
     decode = decode or read_ross_barcode
     vision = vision or read_ross_vision
-    tag, sku, price, source = None, None, None, None
+    tag, sku, price, source, main = None, None, None, None, None
     for p in paths:
         try:
             parsed = decode(p) or {}
@@ -824,7 +842,17 @@ def photo_roles(paths: list[str], decode=None, vision=None) -> dict:
         code = parsed.get("code")
         if code and len(str(code)) == 12:
             tag, sku, price, source = p, str(code), parsed.get("reduced_price"), "barcode"
+            main = parsed.get("main_code")
             break
+    if tag and not main:
+        # The main tag and the REDUCED sticker photographed apart: a quick plain
+        # decode of the other photos (no rotations) for a second code.
+        import ross_tag
+        bars = [b for p in paths if p != tag for b in ross_tag.decode_barcodes(p) if len(b) == 18]
+        if bars:
+            both = ross_tag.split_codes(bars + ([f"{sku}{round(price * 100):06d}"] if price else [sku]))
+            if both.get("code") and both.get("main_code"):
+                sku, price, main = both["code"], both["reduced_price"], both["main_code"]
     if price is None:
         def tagness(p):
             try:
@@ -842,8 +870,8 @@ def photo_roles(paths: list[str], decode=None, vision=None) -> dict:
                 sku = sku or got.get("code")
                 break
     others = [p for p in paths if p != tag]
-    return {"tag": tag, "sku": sku, "price": price, "price_source": source,
-            "identify": others or ([tag] if tag else []), "scan": list(paths)}
+    return {"tag": tag, "sku": sku, "sku_main": main if main != sku else None, "price": price,
+            "price_source": source, "identify": others or ([tag] if tag else []), "scan": list(paths)}
 
 
 # --- reply -------------------------------------------------------------------------------
@@ -1075,7 +1103,9 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
         from pipeline import owned
         out += owned.details_lines(res["already_have"])
     if ross is not None:
+        main = req.get("ross_sku_main")
         out.append(f"Ross {_usd(ross)}" + (f" · SKU {sku}" if sku else "")
+                   + (f" (main tag {main})" if main and main != sku else "")
                    + f" → cost {_usd(round(ross * (1 + config.SALES_TAX_RATE), 2))} with "
                      f"{config.SALES_TAX_RATE:.0%} tax")
     levels = pick.get("levels") or {}

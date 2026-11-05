@@ -5,7 +5,8 @@ status), pieces (home inventory), Ross receipt lines and earlier checks.
 Keys, strongest first:
   1. brand UPC: a real GTIN, never a Ross store code
   2. style code + colour; the same style in another colour is listed as such
-  3. Ross code: the 12-digit SKU on the tag (Ross reuses SKUs now and then)
+  3. Ross code: the 12-digit SKU on the tag, either the REDUCED sticker's or
+     the main tag's when they differ (Ross reuses SKUs now and then)
   4. AI title match, only when 1-3 found nothing and we have things of the
      same brand: the cheap Claude model compares names (config.CHECK_OWNED_AI)
 
@@ -50,13 +51,16 @@ def upc_key(value) -> str | None:
 
 def keys(ident: dict | None, sku=None) -> dict:
     """What a product is known by: UPC, style codes (with and without a colour
-    suffix), colour, Ross code. A Ross code stored as the "UPC" counts as the
+    suffix), colour, Ross codes. `sku`: one code or several (the REDUCED
+    sticker's and the main tag's). A Ross code stored as the "UPC" counts as a
     Ross code."""
     ident = ident or {}
+    skus = sku if isinstance(sku, (list, tuple, set)) else [sku]
+    ross = {c for c in map(ross_code, [*skus, ident.get("upc")]) if c}
     return {"upc": upc_key(ident.get("upc")),
             "codes": set(check._codes(ident)),
             "colour": str(ident.get("color") or "").strip(),
-            "ross": ross_code(sku) or ross_code(ident.get("upc"))}
+            "ross": ross}
 
 
 def _colour_words(colour: str) -> set:
@@ -78,7 +82,7 @@ def match(mine: dict, theirs: dict) -> str | None:
     style = bool(mine["codes"] & theirs["codes"])
     if style and same_colour(mine["colour"], theirs["colour"]):
         return STYLE
-    if mine["ross"] and mine["ross"] == theirs["ross"]:
+    if mine["ross"] & theirs["ross"]:
         return ROSS
     return STYLE_OTHER_COLOUR if style else None
 
@@ -177,25 +181,26 @@ def _things(exclude_check_id=None) -> list[tuple[dict, dict, dict]]:
     for it in db.list_items():
         ident = it.get("identification") or {}
         mine = by_item.get(it["item_id"], [])
-        sku = (it.get("receipt") or {}).get("code") or next(
-            ((p.get("info") or {}).get("ross_code") for p in mine if (p.get("info") or {}).get("ross_code")), None)
-        k = keys(ident, sku)
-        for p in mine:      # the piece may know the UPC/style code the item lacks
-            pk = keys({**(p.get("info") or {}), "model": (p.get("info") or {}).get("style_code")})
+        receipt = it.get("receipt") or {}
+        k = keys(ident, [receipt.get("code"), receipt.get("main_code")])
+        for p in mine:      # the piece may know the UPC/style code/Ross codes the item lacks
+            info = p.get("info") or {}
+            pk = keys({**info, "model": info.get("style_code")}, [info.get("ross_code"), info.get("ross_code_main")])
             k["upc"] = k["upc"] or pk["upc"]
             k["codes"] |= pk["codes"]
+            k["ross"] |= pk["ross"]
         out.append((k, {**ident, "title": (it.get("listing") or {}).get("title")}, _item_hit(it, mine, now)))
     for p in pieces:
         if p.get("item_id"):
             continue
         info = p.get("info") or {}
         ident = {**info, "model": info.get("style_code") or info.get("model")}
-        out.append((keys(ident, info.get("ross_code")), ident, _piece_hit(p)))
+        out.append((keys(ident, [info.get("ross_code"), info.get("ross_code_main")]), ident, _piece_hit(p)))
     for c in db.list_checks(limit=1000):
         if exclude_check_id is not None and c["check_id"] == exclude_check_id:
             continue
         ident = c.get("identification") or {}
-        out.append((keys(ident, c.get("ross_sku")), ident, _check_hit(c)))
+        out.append((keys(ident, [c.get("ross_sku"), c.get("ross_sku_main")]), ident, _check_hit(c)))
     return out
 
 
@@ -273,8 +278,8 @@ def lookup(ident: dict, sku=None, exclude_check_id=None, *, things_fn=None, rece
         # receipt lines: one per purchase; lines already entered as an item or
         # piece with that Ross code are that item
         if mine["ross"]:
-            lines = (receipts_fn or db.receipt_lines_for_skus)([mine["ross"]])
-            entered = sum(1 for k, _, h in things if h["source"] in ("item", "piece") and k["ross"] == mine["ross"])
+            lines = (receipts_fn or db.receipt_lines_for_skus)(sorted(mine["ross"]))
+            entered = sum(1 for k, _, h in things if h["source"] in ("item", "piece") and k["ross"] & mine["ross"])
             for r in lines[entered:]:
                 hits.append({**_receipt_hit(r), "match": ROSS})
         ai = None

@@ -299,7 +299,7 @@ def latest_stats(item_id: str) -> dict | None:
 # same dict: JSON columns decoded, money as float, exact as bool, times as UTC
 # ISO strings.
 
-CHECK_FIELDS = ("user_id", "ross_sku", "ross_price", "photos", "identification", "mode", "exact",
+CHECK_FIELDS = ("user_id", "ross_sku", "ross_sku_main", "ross_price", "photos", "identification", "mode", "exact",
                 "verdict", "suggested_price", "profit", "roi", "break_even", "cheapest_identical",
                 "sold_count", "comps_summary", "status", "status_at", "receipt_item_id", "item_id")
 CHECK_JSON = ("photos", "identification", "comps_summary")

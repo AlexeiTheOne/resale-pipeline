@@ -49,7 +49,7 @@ def test_keys_ross_code_and_upc():
     assert owned.upc_key("796483413276") == owned.upc_key("0796483413276")
     assert owned.upc_key(ROSS) is None                            # a Ross code is never a UPC
     k = owned.keys({"upc": ROSS})                                 # stored in the UPC field by mistake
-    assert k["upc"] is None and k["ross"] == ROSS
+    assert k["upc"] is None and k["ross"] == {ROSS}
 
 
 @pytest.mark.parametrize("a,b,same", [("Black", "black multi (leopard)", True), ("Black", "Pink", False),

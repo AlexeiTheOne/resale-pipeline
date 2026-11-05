@@ -257,10 +257,18 @@ def _checks_table(con: sqlite3.Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_checks_created ON checks (created_at)")
 
 
+def _checks_sku_main(con: sqlite3.Connection) -> None:
+    """The main tag's Ross code when the REDUCED sticker's (ross_sku) differs.
+    Items and pieces keep theirs in their JSON (receipt.main_code,
+    info.ross_code_main)."""
+    con.execute("ALTER TABLE checks ADD COLUMN ross_sku_main TEXT")
+
+
 # (version, name, function). Append only.
 MIGRATIONS = [
     (1, "baseline", _baseline),
     (2, "checks_table", _checks_table),
+    (3, "checks_sku_main", _checks_sku_main),
 ]
 
 
@@ -1065,11 +1073,25 @@ def _mssql_checks_table(cur) -> None:
     cur.execute("CREATE INDEX IX_checks_created_at ON dbo.checks (created_at)")
 
 
+def _mssql_ross_code_main(cur) -> None:
+    """A Ross tag can carry two codes: the main tag's and a REDUCED sticker's
+    (what we paid; ross_code / ross_sku stay that one). The main tag's, when
+    it differs, so receipts and "already have" match on either. Nullable, no
+    backfill: existing rows read one code."""
+    for table in ("item_tags", "pieces"):
+        cur.execute(f"ALTER TABLE dbo.{table} ADD ross_code_main CHAR(12) NULL "
+                    f"CONSTRAINT CK_{table}_ross_code_main CHECK "
+                    "(LEN(ross_code_main) = 12 AND ross_code_main NOT LIKE '%[^0-9]%')")
+        cur.execute(f"CREATE INDEX IX_{table}_ross_code_main ON dbo.{table} (ross_code_main)")
+    cur.execute("ALTER TABLE dbo.checks ADD ross_sku_main VARCHAR(20) NULL")
+
+
 # (version, name, function). Append only.
 MSSQL_MIGRATIONS = [
     (1, "resaledb_baseline", _mssql_baseline),
     (2, "receipt_unique_indexes", _mssql_receipt_unique),
     (3, "checks_table", _mssql_checks_table),
+    (4, "ross_code_main", _mssql_ross_code_main),
 ]
 # The production migration copies the receipts into a database at this
 # version: the unique indexes (step 2) come after the receipt cleanup.

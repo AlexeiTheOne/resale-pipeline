@@ -146,7 +146,8 @@ async def _close_batch(user_id: int, wait: float) -> None:
     paths = await asyncio.to_thread(_save_photos, check_id, photos)
     roles = await asyncio.to_thread(check.photo_roles, paths)
     await asyncio.to_thread(db.update_check, check_id, photos=[config.stored_path(p) for p in paths],
-                            ross_sku=roles["sku"], ross_price=roles["price"])
+                            ross_sku=roles["sku"], ross_sku_main=roles.get("sku_main"),
+                            ross_price=roles["price"])
     note = f" (only the first {MAX_PHOTOS} photos are used; {extra} ignored)" if extra > 0 else ""
     if roles.get("price_source") == "vision":
         note += " (Ross price read from the tag by AI: check it)"
@@ -156,8 +157,8 @@ async def _close_batch(user_id: int, wait: float) -> None:
     if roles["price"] is None:
         await _ask_price(user_id, message, check_id, roles, note)
         return
-    req = {"description": "", "ross_price": roles["price"], "ross_sku": roles["sku"], "exact": True,
-           "full": False}
+    req = {"description": "", "ross_price": roles["price"], "ross_sku": roles["sku"],
+           "ross_sku_main": roles.get("sku_main"), "exact": True, "full": False}
     await _run(user_id, message, req, _pricing_photo(roles), check_id=check_id, roles=roles,
                note=note, guard=False)
 
@@ -197,8 +198,8 @@ async def _price_given(user_id: int, message, check_id: int, price: float) -> No
         except Exception:
             traceback.print_exc()
     await asyncio.to_thread(db.update_check, check_id, ross_price=price)
-    req = {"description": "", "ross_price": price, "ross_sku": w["roles"].get("sku"), "exact": True,
-           "full": False}
+    req = {"description": "", "ross_price": price, "ross_sku": w["roles"].get("sku"),
+           "ross_sku_main": w["roles"].get("sku_main"), "exact": True, "full": False}
     if ident:
         req["identification"] = ident
     await _run(user_id, w["message"], req, _pricing_photo(w["roles"]), check_id=check_id, roles=w["roles"],
@@ -358,8 +359,9 @@ async def photo_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if req["ross_price"] is None:
         req["ross_price"] = roles["price"]
     await asyncio.to_thread(db.update_check, check_id, photos=[config.stored_path(p) for p in paths],
-                            ross_sku=roles["sku"], ross_price=req["ross_price"])
-    req["ross_sku"] = roles["sku"]
+                            ross_sku=roles["sku"], ross_sku_main=roles.get("sku_main"),
+                            ross_price=req["ross_price"])
+    req["ross_sku"], req["ross_sku_main"] = roles["sku"], roles.get("sku_main")
     await _run(user_id, message, req, paths[0], check_id=check_id, roles=roles)
 
 
