@@ -289,6 +289,30 @@ The first line of every reply, before the verdict: `pipeline/owned.py`
     adjacent lines), and only 63 of 177 subtotals add up.
   - No Ross code covers clearly different products: 302 codes on 2+
     lines, 0 with different descriptions.
+- **Same item vs same model (Person B, 2026-11-05, check #5).** Ed Hardy
+  EHH108-26-WIP (Wilma print, Ross 400298771833) had matched other EHH108
+  prints (Tillie) on the base code as "style code + colour".
+  - **The same item** is a matching UPC, Ross code or FULL style code, the
+    print/colour suffix included (EHH108-26-WIP).
+  - A code with no suffix (LB102100) also needs the colour to agree. If we
+    hold that base with a suffix elsewhere (EHH108 → EHH108-26-TLP), a bare
+    EHH108 is only the model.
+  - **The same model** (base code only) shows as one line of its own: "Same
+    model EHH108, other prints/colours: 2 listed, 1 sold". It doesn't count
+    as "already have" and lends nothing to pricing.
+  - **Colours:** "Multi" doesn't match a named print ("Wilma Print"), and a
+    named print must appear on both sides. "Tattoo print" names none.
+  - **A brand tag's barcode that is a Ross code** (Ed Hardy tags carry one)
+    is a Ross code. `identify` keeps it as `ross_code`, not as the UPC, and
+    matching uses it.
+  - **Intake stores the full style code:** the prompt asks for it, and a
+    longer OCR'd tag code wins over a shortened one. `item_identification.style_code`
+    was empty on every item.
+  - **Production, 164 items:** 62 full codes (base + suffix), 45 one-part
+    codes, 57 none. In the 13 brands whose codes carry suffixes, 7 items
+    store a base only (4 of them Ed Hardy).
+  - **Brand concentration:** "Ed Hardy: 40 listed, 12 sold" after the
+    hits, or "✅ New · Ed Hardy: 40 listed".
 - **The reply shows** "✅ New" when there are no hits. Otherwise
   "🔁 Already have: 1 listed, 1 sold, 2 on receipts", then up to
   `CHECK_OWNED_SHOW` (3) hits. Details lists every hit.

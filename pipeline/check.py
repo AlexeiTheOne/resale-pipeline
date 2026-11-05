@@ -717,7 +717,8 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
     full = bool(req.get("full"))
     # Do I already have this? First: a match lends its identification to the search.
     from pipeline import owned
-    typed_ross = owned.ross_code(ident.get("upc"))
+    # a Ross code typed, or read off a brand tag (identify keeps it as ross_code, not a UPC)
+    typed_ross = owned.ross_code(ident.get("upc")) or owned.ross_code(ident.get("ross_code"))
     skus = [s for s in (req.get("ross_sku"), req.get("ross_sku_main"), typed_ross) if s]
     try:
         have = have_fn(ident, skus, req.get("check_id"))
