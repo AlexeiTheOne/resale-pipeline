@@ -10,8 +10,14 @@ those stored with the base only. Each full code was read from the item's photos
 style_code_reread); EHH203-42-003 also by OCR. e5756e70 EHH108-26-TLP agrees
 with c57cb4cc, the same Tillie print with the same Ross code.
 
-Not here: 41d6e5f5 (11JCD9NJC: no code readable on its photos) and 3347c963
-(EH-H02-26-DHO reads as EHH403-26-DHO: a misread, not a base-only code).
+3347c963 (added later, approved by Person B, 2026-11-05) is a misread rather
+than a base-only code: stored EH-H02-26-DHO, the hang tag reads EHH403-26-DHO.
+
+Not here: 41d6e5f5 (11JCD9NJC: no code readable on its photos) and 575134c7
+(Ralph Lauren Home, left as is by Person B).
+
+An item whose model is already the new code is reported as done and skipped,
+so a rerun applies only what is still pending.
 
 Per item, in item_identification only: model and style_code -> the full code,
 only where model is still the old value; one transaction. Each change is
@@ -36,6 +42,7 @@ FIXES = {
     "8b5ddc05": ("EHH203", "EHH203-42-003", "vision + OCR, hang tag"),
     "f027cb9c": ("XW09620", "XW09620 970 0IC", "vision, hang tag"),
     "f0665406": ("XW08963", "XW08963 971 0GG", "vision, hang tag"),
+    "3347c963": ("EH-H02-26-DHO", "EHH403-26-DHO", "vision, hang tag; stored code was a misread"),
 }
 
 
@@ -45,13 +52,16 @@ def plan(con) -> list[dict]:
         rows = con.execute("SELECT i.item_id, i.model, i.style_code, i.brand, it.status FROM dbo.item_identification i "
                            "JOIN dbo.items it ON it.item_id = i.item_id WHERE i.item_id LIKE ?",
                            short + "%").fetchall()
-        p = {"short": short, "old": old, "new": new, "how": how, "ok": False}
+        p = {"short": short, "old": old, "new": new, "how": how, "ok": False, "done": False}
         if len(rows) != 1:
             out.append({**p, "why": f"{len(rows)} rows"})
             continue
         r = rows[0]
         p.update(item_id=r.item_id, now=r.model, style_code=r.style_code, brand=r.brand, status=r.status)
-        if r.model != old:
+        if r.model == new:
+            p["done"] = True
+            p["why"] = "already fixed"
+        elif r.model != old:
             p["why"] = f"model is {r.model!r}, not {old!r} (changed since?)"
         else:
             p["ok"] = True
@@ -89,7 +99,8 @@ def main(argv=None) -> int:
     con = sqlserver.connect(DATABASE)
     try:
         rows = plan(con)
-        print(f"{DATABASE}: {sum(p['ok'] for p in rows)} of {len(FIXES)} ready")
+        print(f"{DATABASE}: {sum(p['ok'] for p in rows)} ready, {sum(p['done'] for p in rows)} already fixed, "
+              f"of {len(FIXES)}")
         for p in rows:
             print(f"  {p['short']} {p.get('brand', '')} ({p.get('status', '?')}): model {p.get('now')!r} -> "
                   f"{p['new']!r} (style_code {p.get('style_code')!r} -> {p['new']!r}) · {p['how']}"
@@ -97,9 +108,13 @@ def main(argv=None) -> int:
         if not args.apply:
             print("Dry run: nothing written. Run with --apply to back up and fix.")
             return 0
-        if not all(p["ok"] for p in rows):
-            print("Not applying: every item must be ready.")
+        if not all(p["ok"] or p["done"] for p in rows):
+            print("Not applying: every item must be ready or already fixed.")
             return 1
+        rows = [p for p in rows if p["ok"]]
+        if not rows:
+            print("Nothing to fix.")
+            return 0
         backup = sqlserver.backup_database(DATABASE, label="before-style-code-fix")
         print(f"Backup: {backup}")
         print(f"Fixed {apply(con, rows, backup)}; logged to {LOG}")
