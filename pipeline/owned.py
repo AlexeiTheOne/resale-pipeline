@@ -57,6 +57,11 @@ def upc_key(value) -> str | None:
     return d.zfill(14) if d else None
 
 
+def _base_like(code: str) -> bool:
+    """Enough for a base style code: 5+ characters, letters and digits."""
+    return len(code) >= 5 and bool(re.search(r"\d", code)) and bool(re.search(r"[a-z]", code))
+
+
 def style_codes(ident: dict) -> tuple[set, set, set]:
     """(full codes, base codes, full codes that carry a suffix), normalised:
     'EHH108-26-WIP' -> full {'ehh10826wip'}, base {'ehh108'}, suffixed
@@ -67,8 +72,14 @@ def style_codes(ident: dict) -> tuple[set, set, set]:
         if len(code) < 5 or not check._looks_like_code(code):
             continue
         full.add(code)
-        b = check._norm_code(re.split(r"[-/ ]", str(raw).strip())[0])
-        if len(b) >= 5 and check._looks_like_code(b) and b != code:
+        # the base: the first part, or as many leading parts as make a code
+        # ("EH-H02-26-DHO" -> EHH02; "EHH108-26-WIP" -> EHH108)
+        b = ""
+        for part in re.split(r"[-/ ]+", str(raw).strip()):
+            b += check._norm_code(part)
+            if _base_like(b):
+                break
+        if _base_like(b) and b != code:
             base.add(b)
             suffixed.add(code)
         else:

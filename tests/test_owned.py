@@ -324,6 +324,9 @@ WILMA = {"brand": "Ed Hardy", "product_name": "Wilma Print Tattoo Skull Shoulder
 def test_style_codes_full_base_and_suffix():
     assert owned.style_codes({"model": "EHH108-26-WIP"}) == ({"ehh10826wip"}, {"ehh108"}, {"ehh10826wip"})
     assert owned.style_codes({"model": "LB102100"}) == ({"lb102100"}, {"lb102100"}, set())
+    # a first part too short to be a base (3347c963)
+    assert owned.style_codes({"model": "EH-H02-26-DHO"}) == ({"ehh0226dho"}, {"ehh02"}, {"ehh0226dho"})
+    assert owned.style_codes({"model": "XW09620 970 0IC"}) == ({"xw096209700ic"}, {"xw09620"}, {"xw096209700ic"})
 
 
 @pytest.mark.parametrize("theirs,expected", [
