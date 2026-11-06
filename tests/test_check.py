@@ -11,6 +11,7 @@ from pipeline import check
 def rates(monkeypatch):
     """The design's numbers, pinned so a config change doesn't move the tests."""
     for name, value in (("EBAY_FVF_PCT", 0.155), ("EBAY_AD_FEE_PCT", 0.046), ("EBAY_FIXED_FEE", 0.40),
+                        ("CHECK_FEE_PCT", 0.247),
                         ("EBAY_SHIP_CHARGED", 9.88), ("EBAY_SHIP_COST", 7.20), ("SALES_TAX_RATE", 0.07),
                         ("UNDERCUT_V2_PCT", 0.05), ("CHECK_BUY_MIN_PROFIT", 15.0),
                         ("CHECK_BUY_MIN_ROI", 0.75), ("CHECK_MIN_SALES", 3), ("CHECK_MIN_PROFIT", 5.0),
@@ -56,12 +57,22 @@ def test_label_by_item_type(text, kind, label):
 
 def test_worked_example_from_the_design():
     m = check.economics(39.99, 14.99, 7.20)
+    # fees: 24.7% of what the buyer pays, ads and fixed fee included (Person B, 2026-11-06)
     assert (m["total"], m["fees"], m["keep"], m["cost"], m["profit"], m["roi"]) == \
-        (49.87, 10.42, 32.25, 16.04, 16.21, 1.01)
-    assert (m["break_even_total"], m["break_even_item"]) == (29.59, 19.71)
-    assert check.at_total(44.50, 14.99, 7.20)["profit"] == 11.92
+        (49.87, 12.32, 30.35, 16.04, 14.31, 0.89)
+    assert (m["break_even_total"], m["break_even_item"]) == (30.86, 20.98)
+    assert check.at_total(44.50, 14.99, 7.20)["profit"] == 10.27
     # at break-even the profit is zero
     assert abs(check.economics(m["break_even_item"], 14.99, 7.20)["profit"]) <= 0.01
+
+
+def test_max_buy_is_the_ross_price_for_15_profit():
+    mb = check.max_buy(39.99, 7.20)
+    assert mb == 14.34 and 15.0 <= check.economics(39.99, mb, 7.20)["profit"] < 15.02
+    assert check.max_buy(None, 7.20) is None and check.max_buy(12.99, 11.0) < 0
+    assert check.max_buy_line({"max_buy": None, "pick": {"price": None}}) == "Max buy: - (no sell price found)"
+    assert check.max_buy_line({"max_buy": -3.0, "pick": {"price": 12.99}}).startswith("Max buy: none")
+    assert check.max_buy_line({"max_buy": 14.34, "pick": {"price": 39.99}}) == "Max buy: $14.34 ($15 profit at $39.99)"
 
 
 # --- verdict ------------------------------------------------------------------------
@@ -114,8 +125,9 @@ def test_ladder_level1_same_item_sales_median_and_the_ceiling():
     assert e["used"] == [1] and e["sales"] == 2 and e["levels"][1]["value"] == 42.12 and e["price"] == 41.99
     a = check.choose_price(p, exact=False)           # any: variants count as level 1
     assert a["sales"] == 3 and a["levels"][1]["value"] == 40.12 and a["price"] == 39.99
-    capped = check.choose_price(pricing(), exact=True)  # cheapest identical 44.50 x 0.98 - 9.88 = 33.73
-    assert capped["capped"] and capped["price"] == 33.99
+    # an unsold ask (44.50 x 0.98 - 9.88 = 33.73) doesn't lower a price eBay sales back (Person B, 2026-11-06)
+    sold = check.choose_price(pricing(), exact=True)
+    assert not sold["capped"] and sold["price"] == 41.99 and sold["levels"][5]["value"] == 33.73
 
 
 def test_asking_prices_are_never_the_price():
@@ -140,8 +152,67 @@ def test_check2_ladder_levels_2_and_4_median_with_range():
     pick = check.choose_price(p, exact=True, ident=JUICY, history=BAGS)    # choose_price takes the verdicts as given
     assert pick["levels"][2]["value"] == 20.61 and pick["levels"][4]["value"] == 50.99
     assert 3 not in pick["levels"]                    # we never sold a Juicy Couture bag
-    assert pick["used"] == [2, 4] and pick["price"] == 35.99 and pick["range"] == (20.61, 50.99)
+    # real sales win (Person B, 2026-11-06): the sale, not MSRP x ratio (shown, not used)
+    assert pick["used"] == [2] and pick["price"] == 20.99 and pick["range"] is None
     assert pick["levels"][5]["value"] == 92.09 and not pick["capped"] and pick["estimated"]
+
+
+VON_DUTCH = {"brand": "Von Dutch", "item_type": "Bowling Bag", "model": "VDBB-1036PRP", "upc": "196644080567",
+             "product_name": "Purple & White Cow Print Vegan Pony Hair Bowling Bag",
+             "color": "Purple / Light Purple / White", "retail_price": 169.0}
+VD_SOLD = [  # check #10's live sold searches, 2026-11-06 (totals with shipping)
+    {"source": "sold", "verdict": "same_item", "total": 63.03,
+     "title": "VON DUTCH~ Purple & White Cow Print Vegan Pony Hair Bag + Strap NWT"},
+    {"source": "sold", "verdict": "variant", "total": 53.23,
+     "title": "Von Dutch Brown & White Cow Print Vegan Pony Hair Bowling Bag"},
+    {"source": "sold", "verdict": "variant", "total": 49.88,
+     "title": "Von Dutch Women's Green & White Cow Print Vegan Pony Hair Bowling Bag NWT"},
+    {"source": "sold", "verdict": "variant", "total": 57.72, "title": "Von Dutch Blue Cow Print Mini Bowling Bag Y2K Handbag NWT"},
+    {"source": "sold", "verdict": "variant", "total": 50.0,
+     "title": "Von Dutch Lime Green Faux Fur Mini Bowling Bag Flying Eyeball NWT Y2K Style"},
+    {"source": "active", "verdict": "same_item", "total": 72.2,
+     "title": "Von Dutch Purple Cow Print Vegan Pony Hair Bowling Bag W/Crossbody Strap NEW"},
+]
+
+
+def test_check10_fewer_words_query_and_other_colours_are_the_same_model():
+    assert check.fewer_words_query(VON_DUTCH) == "Von Dutch cow print bowling bag"
+    assert ("fewer", "Von Dutch cow print bowling bag") in check.similar_queries(VON_DUTCH)
+    assert check.model_tokens(VON_DUTCH) == {"cow", "print", "bowling"}     # no colour or material words
+    assert check.same_model(VD_SOLD[1], VON_DUTCH) and check.same_model(VD_SOLD[3], VON_DUTCH)
+    assert not check.same_model(VD_SOLD[4], VON_DUTCH)                      # the eyeball bag: another style
+    assert check.fewer_words_query({"brand": "Coach"}) is None
+
+
+def test_check10_real_sales_win_over_msrp_of_other_brands_and_unsold_asks():
+    """Check #10: one sale of the same purple bag and three other colours; MSRP
+    $169 x other brands' ratio said $61, capped by the $72.20 ask."""
+    p = pricing(raw_active_floor=72.2, judged_comps=VD_SOLD, same_item_active_count=1)
+    ev = check.evaluate(p, VON_DUTCH, 24.99, exact=True, history=BAGS)
+    pick = ev["pick"]
+    # the eyeball bag is demoted; level 2 = the purple sale + 3 colours: median (53.23+57.72)/2 = 55.475
+    assert pick["levels"][2]["n"] == 4 and pick["levels"][2]["same_item"] == 1
+    assert pick["used"] == [2] and pick["price"] == 45.99 and not pick["capped"]
+    assert 4 in pick["levels"] and 4 not in pick["used"]                   # shown, not used
+    assert ev["max_buy"] == check.max_buy(45.99, ev["label"]) == 15.01
+    res = check.run_check({**check.parse_request("/check full 24.99"), "identification": VON_DUTCH},
+                          pricing_fn=lambda i, **kw: p, have_fn=lambda *a: [])
+    text = check.format_reply(res)
+    assert "1 sold same · 4 sold same model (incl. 1 same) $46" in text and "Max buy: ~$" in text
+
+
+def test_a_quick_check_with_no_sold_search_cached_says_so():
+    p = pricing(judged_comps=VD_SOLD[5:], raw_active_floor=72.2, rungs_tried=["a", "b"],
+                sold_cache_misses=["a", "b"])
+    res = check.run_check({**check.parse_request("/check 24.99"), "identification": VON_DUTCH},
+                          pricing_fn=lambda i, **kw: p, have_fn=lambda *a: [])
+    assert res["sold_searched"] is False and "Evidence: sold not searched" in check.format_reply(res)
+    some = check.run_check({**check.parse_request("/check 24.99"), "identification": VON_DUTCH},
+                           pricing_fn=lambda i, **kw: {**p, "sold_cache_misses": ["a"]}, have_fn=lambda *a: [])
+    assert some["sold_searched"] is True
+    full = check.run_check({**check.parse_request("/check full 24.99"), "identification": VON_DUTCH},
+                           pricing_fn=lambda i, **kw: p, have_fn=lambda *a: [])
+    assert full["sold_searched"] is True
 
 
 def test_level3_our_own_sales_same_brand_and_type_with_leave_one_out():
@@ -261,21 +332,22 @@ def test_headline_is_verdict_and_evidence_and_the_estimate_is_marked(monkeypatch
     req = {**check.parse_request("/check full 14.99"), "identification": MK_IDENT}
     res = check.run_check(req, pricing_fn=lambda ident, **kw: mkj_pricing(), have_fn=lambda *a: [])
     lines = check.format_reply(res, check_id=12).splitlines()
-    assert len(lines) == 8
+    assert len(lines) == 9
     assert lines[0] == "🟡 MAYBE (estimated): no sales found, 1 uncertain listing"
     assert lines[1] == "Michael Kors pave necklace (MKJ3969710)"
     # level 3: our two Michael Kors sales ($40, $46); the $160.19 listing is only a ceiling
     assert res["pick"]["used"] == [3] and res["pick"]["price"] == 42.99
-    assert lines[2] == "Ross $14.99 · sell ~$42.99 (est.) · profit ~$21.30"
-    assert lines[3] == "List $53.99 BO (auto-accept $44.99, decline < $38.99) or $42.99 fixed"
-    assert lines[4] == "Evidence: 0 sold same · our Michael Kors items ~$43 · ask ≤$147 · match uncertain"
-    assert lines[5] == "🔗 For sale $160.19 (same item) https://ebay.com/itm/1"
-    assert lines[6].startswith("🔎 Sold on eBay https://www.ebay.com/sch/") and "LH_Sold=1" in lines[6]
-    assert " · 🔎 For sale on eBay https://" in lines[6]
-    assert lines[7].startswith("#12 · ⏱") and "full · exact" in lines[7]
+    assert lines[2] == "Ross $14.99 · sell ~$42.99 (est.) · profit ~$19.27"
+    assert lines[3] == "Max buy: ~$18.98 ($15 profit at ~$42.99)"
+    assert lines[4] == "List $53.99 BO (auto-accept $44.99, decline < $38.99) or $42.99 fixed"
+    assert lines[5] == "Evidence: 0 sold same · our Michael Kors items ~$43 · ask ≤$147 · match uncertain"
+    assert lines[6] == "🔗 For sale $160.19 (same item) https://ebay.com/itm/1"
+    assert lines[7].startswith("🔎 Sold on eBay https://www.ebay.com/sch/") and "LH_Sold=1" in lines[7]
+    assert " · 🔎 For sale on eBay https://" in lines[7]
+    assert lines[8].startswith("#12 · ⏱") and "full · exact" in lines[8]
     html = check.format_reply(res, check_id=12, html=True).splitlines()
-    assert html[5] == '🔗 <a href="https://ebay.com/itm/1">For sale $160.19 (same item)</a>'
-    assert html[6].startswith('🔎 <a href="https://www.ebay.com/sch/i.html?_nkw=Michael') and "&amp;LH_Sold=1" in html[6]
+    assert html[6] == '🔗 <a href="https://ebay.com/itm/1">For sale $160.19 (same item)</a>'
+    assert html[7].startswith('🔎 <a href="https://www.ebay.com/sch/i.html?_nkw=Michael') and "&amp;LH_Sold=1" in html[7]
     assert "no sales found" in res["reasons"] and not any("only 0" in r for r in res["reasons"])
     details = check.format_details(res, check_id=12)
     assert "L3 our own sales, same brand + type: $43.00" in details and "L1 eBay sold, same item: none" in details
@@ -338,7 +410,7 @@ def test_vision_reads_the_price_only_when_no_barcode_reads(tmp_path):
 def test_full_check_searches_the_upc_and_similar_items():
     ident = {"brand": "Juicy Couture", "item_type": "Weekender Tote Bag", "upc": "885919782199",
              "model": "11JCDA0JC-JTL", "product_name": "Juicy To Go Weekender Tote"}
-    assert check.similar_queries(ident) == [("upc", "885919782199"),
+    assert check.similar_queries(ident) == [("upc", "885919782199"), ("fewer", "Juicy Couture go weekender bag"),
                                             ("similar", "Juicy Couture Weekender Tote Bag")]
     seen = []
     req = {**check.parse_request("/check full 9.99"), "identification": ident}
@@ -356,7 +428,7 @@ def test_similar_sales_are_level2_in_exact_and_level1_in_any_mode():
     res = check.run_check(check.parse_request("/check full juicy to go weekender tote 9.99"),
                           pricing_fn=lambda i, **kw: pricing(raw_active_floor=104.05, judged_comps=judged),
                           have_fn=lambda *a: [])
-    evidence = check.format_reply(res).splitlines()[4]
+    evidence = check.format_reply(res).splitlines()[5]
     assert evidence.startswith("Evidence: 0 sold same · 3 sold same model $25 · ask ≤$92")
     res_any = check.run_check(check.parse_request("/check any full juicy to go weekender tote 9.99"),
                               pricing_fn=lambda i, **kw: pricing(raw_active_floor=104.05, judged_comps=judged),
@@ -491,7 +563,7 @@ def test_full_check_shows_demand_and_every_comp_quick_looks_nothing_up():
     assert asked == [] and quick["demand"] is None
     res = run("/check full juicy to go weekender tote bag 9.99")
     assert asked == ["117471801433"] and res["demand"].startswith("1 for sale ")
-    assert res["demand"] in check.format_reply(res).splitlines()[4]
+    assert res["demand"] in check.format_reply(res).splitlines()[5]
     details = check.format_details(res)
     assert "Comps used" in details and "sold $30.49 · 2026-09-01 · same model" in details
     assert "⚠️ dropship?" in details and "https://www.ebay.com/itm/111111111111" in details
@@ -518,7 +590,8 @@ def test_no_competition_with_demand_prices_at_the_upper_end():
     pick = check.choose_price(p, exact=True, ident=LUV, history=BAGS)
     assert pick["levels"][2]["value"] == 29.78 and pick["levels"][4]["value"] == 45.99
     assert pick["competition_note"] == "no competition, unique" and pick["upper_end"]
-    assert pick["price"] == 45.99 and pick["basis"].startswith("upper end of levels 2, 4")
+    # the sale wins over MSRP x ratio (Person B, 2026-11-06): upper end of level 2 alone
+    assert pick["price"] == 29.99 and pick["basis"].startswith("upper end of levels 2") and pick["used"] == [2]
 
 
 def test_no_competition_and_no_demand_keeps_the_median():
@@ -532,7 +605,7 @@ def test_a_real_identical_listing_keeps_the_median_and_the_ceiling():
     pick = check.choose_price(pricing(raw_active_floor=52.0, judged_comps=[CAT_TOTE, rival]), exact=True,
                               ident=LUV, history=BAGS)
     assert pick["competitors"] == 1 and pick["competition_note"] is None
-    assert pick["price"] == 37.99 and not pick["capped"]          # median of 29.78 and 45.99, under 52x0.98-9.88
+    assert pick["price"] == 29.99 and not pick["capped"]          # the 29.78 sale; MSRP x ratio not used
 
 
 def test_dropship_listings_are_not_competition_but_stay_the_ceiling():
@@ -542,9 +615,12 @@ def test_dropship_listings_are_not_competition_but_stay_the_ceiling():
     p = pricing(raw_active_floor=104.05, judged_comps=[pink, DROPSHIP_JUICY])
     pick = check.choose_price(p, exact=True, ident=JUICY, history=BAGS, details=DROPSHIP_DETAILS)
     assert pick["competitors"] == 0 and pick["competition_note"] == "no competition, unique"
-    assert pick["price"] == 50.99 and pick["levels"][5]["value"] == 92.09 and not pick["capped"]
+    assert pick["price"] == 20.99 and pick["levels"][5]["value"] == 92.09 and not pick["capped"]
     low_cap = pricing(raw_active_floor=50.0, judged_comps=[pink, {**DROPSHIP_JUICY, "total": 50.0}])
-    assert check.choose_price(low_cap, exact=True, ident=JUICY, history=BAGS, details=DROPSHIP_DETAILS)["capped"]
+    # a sale backs the price, so even a low ask doesn't cap it (Person B, 2026-11-06)
+    assert not check.choose_price(low_cap, exact=True, ident=JUICY, history=BAGS, details=DROPSHIP_DETAILS)["capped"]
+    no_sale = pricing(raw_active_floor=50.0, judged_comps=[{**DROPSHIP_JUICY, "total": 50.0}])
+    assert check.choose_price(no_sale, exact=True, ident=JUICY, history=BAGS, details=DROPSHIP_DETAILS)["capped"]
 
 
 def test_best_offer_prices_from_the_estimate():
@@ -565,7 +641,7 @@ def test_reply_links_best_matches_sold_first_and_always_the_searches():
     assert check.best_links(res) == [("🔗", "Sold $39.66 (pink)", "https://www.ebay.com/itm/222222222222"),
                                      ("🔗", "For sale $61.00 (same item)", "https://www.ebay.com/itm/333333333333")]
     lines = check.format_reply(res).splitlines()
-    assert lines[5].startswith("🔗 Sold $39.66 (pink) https://www.ebay.com/itm/222222222222 · 🔗 For sale $61.00")
+    assert lines[6].startswith("🔗 Sold $39.66 (pink) https://www.ebay.com/itm/222222222222 · 🔗 For sale $61.00")
     nothing = check.run_check(req, have_fn=lambda *a: [],
                               pricing_fn=lambda i, **kw: pricing(raw_active_floor=None, judged_comps=[]))
     nothing = {**nothing, "pick": {**nothing["pick"], "levels": {}, "used": [], "price": None},
@@ -638,12 +714,12 @@ def test_check5_vans_sling_is_borderline_estimated_with_a_small_bag_label(monkey
     ev = check.evaluate(p, VANS, 12.99, exact=True, history=BAGS)
     assert ev["pick"]["used"] == [4] and ev["pick"]["price"] == 20.99 and ev["pick"]["levels"][4]["level"] == "type"
     assert ev["label"] == 5.50 and ev["label_size"] == "small"
-    assert ev["verdict"] == "BORDERLINE" and ev["money"]["profit"] == 4.87
+    assert ev["verdict"] == "BORDERLINE" and ev["money"]["profit"] == 3.85
     res = check.run_check({**check.parse_request("/check full 12.99"), "identification": VANS},
                           pricing_fn=lambda i, **kw: p, have_fn=lambda *a: [])
     lines = check.format_reply(res).splitlines()
     assert lines[0].startswith("🟠 BORDERLINE (estimated): no sales found")
-    assert "MSRP×47% $21 (other brands)" in lines[4]
+    assert "MSRP×47% $21 (other brands)" in lines[5]
     details = check.format_details(res)
     assert "label $5.50 (bags, small)" in details and "ratio from other brands" in details
 

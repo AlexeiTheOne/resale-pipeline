@@ -334,6 +334,12 @@ CHECK_MIN_PROFIT_AT_CHEAPEST = float(os.getenv("CHECK_MIN_PROFIT_AT_CHEAPEST", "
 # items: sold price / asking price, mean 0.98 (84% sold at the full ask).
 # Revisit with pilot outcomes from the checks table.
 CHECK_ASK_DISCOUNT = float(os.getenv("CHECK_ASK_DISCOUNT", "0.98"))
+# /check's eBay fees, as a share of what the buyer pays (item + shipping):
+# 24.7%, measured on a real order (Person B, 2026-11-06). It replaces
+# EBAY_FVF_PCT + EBAY_AD_FEE_PCT + EBAY_FIXED_FEE in /check only; the
+# repricing floor and the profit report keep those. The label is still
+# subtracted on its own (CHECK_LABEL_COSTS).
+CHECK_FEE_PCT = float(os.getenv("CHECK_FEE_PCT", "0.247"))
 # Checks per day (US Eastern), and when to warn.
 CHECK_DAILY_MAX = int(os.getenv("CHECK_DAILY_MAX", "50"))
 CHECK_DAILY_WARN = int(os.getenv("CHECK_DAILY_WARN", "40"))

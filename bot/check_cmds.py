@@ -284,14 +284,19 @@ async def _run(user_id: int, message, req: dict, photo: str | None, *, check_id:
             identify_fn = (lambda _p: _identify_roles(roles)) if roles else _identify_one
         try:
             res = await asyncio.to_thread(check.run_check, req, photo_path=photo, identify_fn=identify_fn)
-            if res["verdict"] == check.NO_DATA and not req.get("full") and not res.get("no_search"):
-                # Nothing at all in the quick check: straight on to the full
-                # check; the pair counts as one (Person B, 2026-11-02).
+            no_sales = res.get("sold_searched") is False
+            if (res["verdict"] == check.NO_DATA or no_sales) and not req.get("full") \
+                    and not res.get("no_search"):
+                # Nothing at all in the quick check, or no sales looked at (none
+                # of its sold searches cached, check #10): straight on to the full
+                # check; the pair counts as one (Person B, 2026-11-02 / 2026-11-06).
                 _log(res, user_id, counted=False)
                 if sent:
+                    why = ("NO DATA in the quick check" if res["verdict"] == check.NO_DATA
+                           else "no eBay sales cached for this item yet")
                     try:
-                        await sent.edit_text(f"{shop}❓ Check #{check_id}: NO DATA in the quick check.\n"
-                                             "Checking more sources… (full check, about a minute)")
+                        await sent.edit_text(f"{shop}❓ Check #{check_id}: {why}.\n"
+                                             "Searching eBay sales… (full check, about a minute)")
                     except Exception:
                         traceback.print_exc()
                 req = {**req, "full": True, "auto_full": True, "identification": res["identification"]}

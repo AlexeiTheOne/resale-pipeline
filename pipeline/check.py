@@ -10,7 +10,8 @@ pilot, and the daily-cap count).
 Modes (Person B, 2026-11-02):
   quick (default)  live active comps + sold comps ONLY from a cache under
                    CHECK_SOLD_CACHE_DAYS old (no Apify call), judge without
-                   escalation. Aim: ~20 s.
+                   escalation. Aim: ~20 s. None of its sold searches
+                   cached -> the bot goes on to the full check (check #10).
   full             the full pricing run: live sold queries, escalation on;
                    cached sold rows still only if under CHECK_SOLD_CACHE_DAYS.
   exact (default)  price, sales and "cheapest identical" from the judge's
@@ -19,6 +20,7 @@ Modes (Person B, 2026-11-02):
   any              Claude's suggested price, sales = same_item + variant.
 """
 import json
+import math
 import re
 import statistics
 import time
@@ -215,12 +217,14 @@ def label_for(ident: dict, text: str = "") -> tuple[str, float]:
 # --- money (design §4; all rates from config) -------------------------------------
 
 def _fee_rate() -> float:
-    return config.EBAY_FVF_PCT + config.EBAY_AD_FEE_PCT
+    """eBay's cut of what the buyer pays (item + shipping): CHECK_FEE_PCT, all
+    fees and ads in one rate, measured on a real order (Person B, 2026-11-06)."""
+    return config.CHECK_FEE_PCT
 
 
 def at_total(total: float, ross_price: float, label: float) -> dict:
     """What one unit nets when the buyer pays `total` (item + shipping)."""
-    fees = total * _fee_rate() + config.EBAY_FIXED_FEE
+    fees = total * _fee_rate()
     keep = total - fees - label
     cost = ross_price * (1 + config.SALES_TAX_RATE)
     profit = keep - cost
@@ -236,10 +240,23 @@ def economics(item_price: float, ross_price: float, label: float,
     ship = config.EBAY_SHIP_CHARGED if ship_charged is None else ship_charged
     out = at_total(item_price + ship, ross_price, label)
     cost = ross_price * (1 + config.SALES_TAX_RATE)
-    be_total = (cost + label + config.EBAY_FIXED_FEE) / (1 - _fee_rate())
+    be_total = (cost + label) / (1 - _fee_rate())
     out.update(item_price=round(item_price, 2), ship_charged=round(ship, 2),
                break_even_total=round(be_total, 2), break_even_item=round(be_total - ship, 2))
     return out
+
+
+def max_buy(item_price: float | None, label: float, ship_charged: float | None = None,
+            profit: float | None = None) -> float | None:
+    """The highest Ross tag price (before tax) that still leaves `profit`
+    (CHECK_BUY_MIN_PROFIT, $15) when it sells at item_price. Negative: even a
+    free item doesn't make it. None without a price."""
+    if not item_price:
+        return None
+    profit = config.CHECK_BUY_MIN_PROFIT if profit is None else profit
+    keep = at_total(item_price + (config.EBAY_SHIP_CHARGED if ship_charged is None else ship_charged),
+                    0.0, label)["keep"]
+    return math.floor((keep - profit) / (1 + config.SALES_TAX_RATE) * 100) / 100
 
 
 # --- verdict (design §5) ------------------------------------------------------------
@@ -304,16 +321,55 @@ _GENERIC = _FILLER | {w for ws in LABEL_WORDS.values() for w in ws} | {
     "to", "by", "w", "womens", "women", "mens", "men", "ladies", "girls", "boys", "kids", "unisex",
     "large", "extra", "small", "medium", "mini", "xl", "oversized", "big", "canvas", "leather", "faux",
     "nylon", "denim", "cotton", "suede", "vegan", "bags", "shoes", "set", "style", "collection"}
+# Materials and finishes: the same model comes in them too ("Vegan Pony Hair").
+_MATERIALS = {"pony", "hair", "fur", "sherpa", "plush", "fuzzy", "velvet", "satin", "patent", "pu",
+              "polyester", "straw", "woven", "quilted", "metallic", "glitter", "sequin", "genuine",
+              "pebbled", "saffiano", "vinyl", "mesh", "corduroy", "teddy", "shearling", "fleece"}
+# Colour words that name a pattern: a different pattern is a different model.
+_PATTERNS = {"denim", "leopard", "paisley", "floral", "plaid"}
 OTHER_STYLE = "other_style"     # a judge "variant" with no style code or product name match
 
 
-def model_tokens(ident: dict) -> set:
-    """The product name's distinctive words (not the brand, type or size words):
-    "Juicy To Go Weekender Tote" -> {"go", "weekender"}; "LBAVERY Extra Large
-    Canvas Tote" -> {"lbavery"}."""
+def _model_words(ident: dict) -> list[str]:
+    """The product name's distinctive words, in order: not the brand, type,
+    size, colour or material words. The same model comes in other colours and
+    materials (check #10: "Purple & White Cow Print Vegan Pony Hair Bowling
+    Bag" -> cow, print, bowling, so the brown one is the same model)."""
     brand = set(re.findall(r"[a-z0-9]+", str(ident.get("brand") or "").lower()))
     words = re.findall(r"[a-z0-9]+", str(ident.get("product_name") or "").lower())
-    return {w for w in words if w not in brand and w not in _GENERIC and w.rstrip("s") not in _GENERIC}
+    skip = _GENERIC | _MATERIALS | (set(COLOURS) - _PATTERNS)
+    out = []
+    for w in words:
+        if w not in brand and w not in skip and w.rstrip("s") not in skip and w not in out:
+            out.append(w)
+    return out
+
+
+def model_tokens(ident: dict) -> set:
+    """The product name's distinctive words (not the brand, type, size,
+    colour or material words): "Juicy To Go Weekender Tote" -> {"go",
+    "weekender"}; "LBAVERY Extra Large Canvas Tote" -> {"lbavery"}."""
+    return set(_model_words(ident))
+
+
+FEWER_WORDS_MAX = 4
+
+
+def fewer_words_query(ident: dict) -> str | None:
+    """eBay's "results matching fewer words" (check #10: the long queries found
+    no sales, "Von Dutch cow print bowling bag" found the same bag in four
+    colours): the brand, up to FEWER_WORDS_MAX distinctive words of the
+    product name (no colour, material or size) and the item type's last word."""
+    brand = str(ident.get("brand") or "").strip()
+    words = _model_words(ident)[:FEWER_WORDS_MAX]
+    if not brand or not words:
+        return None
+    kind = re.findall(r"[a-z]+", str(ident.get("item_type") or "").lower())
+    name = re.findall(r"[a-z]+", str(ident.get("product_name") or "").lower())
+    noun = kind[-1] if kind else (name[-1] if name else "")
+    if noun and noun not in words:
+        words.append(noun)
+    return f"{brand} {' '.join(words)}"
 
 
 def _codes(ident: dict) -> list[str]:
@@ -373,12 +429,16 @@ def best_offer(price: float | None) -> dict | None:
 
 
 def similar_queries(ident: dict) -> list[tuple[str, str]]:
-    """Extra sold searches for a full check: the brand's UPC, then similar
-    items (brand + item type, e.g. "Juicy Couture Weekender Tote Bag")."""
+    """Extra sold searches for a full check: the brand's UPC, the name in
+    fewer words (fewer_words_query), then similar items (brand + item type,
+    e.g. "Juicy Couture Weekender Tote Bag")."""
     out = []
     upc = re.sub(r"\D", "", str(ident.get("upc") or ""))
     if len(upc) in (12, 13, 14):
         out.append(("upc", upc))
+    fewer = fewer_words_query(ident)
+    if fewer:
+        out.append(("fewer", fewer))
     brand, kind = (str(ident.get(k) or "").strip() for k in ("brand", "item_type"))
     if brand and kind:
         out.append(("similar", f"{brand} {kind}"))
@@ -551,13 +611,16 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
     """The evidence ladder (Person B, 2026-11-02). Every level is an ITEM price
     (eBay totals minus the shipping we charge):
       1 eBay sold, same item: 2+ sales -> their median, done.
-      2 eBay sold, same model other colour/size (the judge's variants), 1+.
+      2 eBay sold, same model other colour/size (the judge's variants), 1+,
+        plus a single same-item sale.
       3 our own sales, same brand + type (median sold price).
       4 MSRP x brand ratio (our sold/MSRP; type bucket when the brand has
         too few sales; never the all-sales fallback).
       5 eBay asking prices x CHECK_ASK_DISCOUNT: a ceiling, never the price.
-    No level 1: the median of levels 2-4. Capped at level 5 (so never above
-    the cheapest identical listing). Any mode counts variants as level 1.
+    Real sales win (Person B, 2026-11-06): no level 1 -> the median of levels
+    2 and 3; no eBay sales either -> levels 3 and 4. Only a price without
+    eBay sales is capped at level 5 (never above the cheapest identical
+    listing). Any mode counts variants as level 1.
     Competition (Person B, 2026-11-02): no identical listing for sale
     (dropship-style ones don't count) and demand shown by level 2 or 3 ->
     the upper end of levels 2-4 ("no competition, unique"); no demand
@@ -579,9 +642,14 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
     if len(same) >= L1_MIN_SALES:
         levels[1] = {"value": round(_median(same) - ship, 2), "n": len(same),
                      "detail": f"median of {len(same)} sales ({_median(same):.2f} total)"}
-    if variant:
-        levels[2] = {"value": round(_median(variant) - ship, 2), "n": len(variant),
-                     "detail": f"median of {len(variant)} sale(s) ({_median(variant):.2f} total)"}
+    # A single same-item sale is too few for level 1, but it is a real sale:
+    # it joins the same-model sales in level 2 (check #10, Person B 2026-11-06).
+    lone = same if len(same) < L1_MIN_SALES else []
+    l2 = sorted(variant + lone)
+    if l2:
+        levels[2] = {"value": round(_median(l2) - ship, 2), "n": len(l2), "same_item": len(lone),
+                     "detail": f"median of {len(l2)} sale(s) ({_median(l2):.2f} total)"
+                               + (f", {len(lone)} of them the same item" if lone else "")}
     if history is None:
         try:
             history = load_our_sales()
@@ -612,7 +680,16 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
     if cheapest:
         levels[5] = {"value": round(cheapest * config.CHECK_ASK_DISCOUNT - ship, 2), "n": None,
                      "detail": f"cheapest identical ${cheapest:.2f} total × {config.CHECK_ASK_DISCOUNT}"}
-    used = [1] if 1 in levels else [k for k in (2, 3, 4) if k in levels]
+    # Real sales win (Person B, 2026-11-06): eBay sales of the same item
+    # (level 1), else of the same model (level 2) with our own sales (level 3).
+    # MSRP x ratio (level 4) is only used when there are no sales at all.
+    if 1 in levels:
+        used = [1]
+    elif 2 in levels:
+        used = [k for k in (2, 3) if k in levels]
+    else:
+        used = [k for k in (3, 4) if k in levels]
+    sold_backed = 1 in used or 2 in used
     raw = levels[1]["value"] if 1 in levels else _median([levels[k]["value"] for k in used])
     competitors = [c for c in all_judged if c.get("source") != "sold" and c.get("verdict") == "same_item"
                    and c.get("total") and not is_dropship(with_details(c, details), kind)]
@@ -625,7 +702,9 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
         else:
             note = "no competition, no demand data"
     capped = False
-    if raw is not None and 5 in levels and levels[5]["value"] < raw:
+    # Asking prices are a ceiling only for estimates: when eBay sales back the
+    # price, an unsold ask doesn't lower it (Person B, 2026-11-06).
+    if raw is not None and 5 in levels and levels[5]["value"] < raw and not sold_backed:
         raw, capped = levels[5]["value"], True
     price = _charm(raw) if raw and raw > 0 else None
     vals = [levels[k]["value"] for k in used]
@@ -677,7 +756,8 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
     size = bag_size(ident or {}, text) if kind == "bags" else None
     return {"item_type": kind, "label": label, "label_size": size, "verdict": v, "reasons": why, "pick": pick,
             "money": money, "cheapest_total": cheapest, "at_cheapest": at_cheapest,
-            "similar": similar_sold(pricing), "offer": best_offer(pick["price"])}
+            "similar": similar_sold(pricing), "offer": best_offer(pick["price"]),
+            "max_buy": max_buy(pick["price"], label)}
 
 
 def _norm_code(v) -> str:
@@ -764,6 +844,11 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
             "timings": timings,
             "confidence": pricing.get("claude_confidence"),
             "sold_cache_misses": pricing.get("sold_cache_misses") or [],
+            # False: a quick check found none of its sold searches cached, so it
+            # looked at no sales at all (check #10); the bot goes on to the full check
+            "sold_searched": not (not full and not no_search and pricing.get("rungs_tried")
+                                  and len(pricing.get("sold_cache_misses") or [])
+                                  >= len(pricing.get("rungs_tried") or [])),
             # every comp used (Details); the first 5 are saved with the check
             "comp_list": comps, "demand": demand_summary(comps),
             "comps": [{"source": c["status"], **{k: c.get(k) for k in ("verdict", "title", "total", "url",
@@ -795,6 +880,7 @@ def check_fields(res: dict) -> dict:
             "comps_summary": {"basis": pick.get("basis"), "sales": pick.get("sales"),
                               "sold_median": pick.get("sold_median"), "item_type": res.get("item_type"),
                               "label": res.get("label"), "reasons": res.get("reasons"),
+                              "max_buy": res.get("max_buy"),
                               "comps": res.get("comps") or [],
                               "owned": owned_saved(res.get("already_have")),
                               "warnings": (res.get("warnings") or "")[:500] or None}}
@@ -978,9 +1064,14 @@ def ladder_line(pick: dict, res: dict) -> str:
     · MSRP×47% $51 · ask ≤$92"."""
     levels = pick.get("levels") or {}
     n1 = pick.get("sales") or 0
-    parts = [f"{n1} sold same" + (f" {_whole(levels[1]['value'])}" if 1 in levels else "")]
+    if res.get("sold_searched") is False:
+        # a quick check with nothing cached looked at no sales: never "0 sold"
+        parts = ["sold not searched"]
+    else:
+        parts = [f"{n1} sold same" + (f" {_whole(levels[1]['value'])}" if 1 in levels else "")]
     if 2 in levels:
-        parts.append(f"{levels[2]['n']} sold same model {_whole(levels[2]['value'])}")
+        incl = f" (incl. {levels[2]['same_item']} same)" if levels[2].get("same_item") else ""
+        parts.append(f"{levels[2]['n']} sold same model{incl} {_whole(levels[2]['value'])}")
     if 3 in levels:
         l3 = levels[3]
         kind = {"bag": "bags", "watch": "watches", "other": "items"}.get(l3.get("bucket"), f"{l3.get('bucket')}s")
@@ -1035,6 +1126,7 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
         lines.append(f"Ross {_usd(ross)} · no price found")
     else:
         lines.append("Add the Ross price as the last number, e.g. /check coach tabby 26 49.99")
+    lines.append(max_buy_line(res))
     if res.get("no_search"):
         lines.append("Only a Ross code, not one of ours: send a photo or describe the item to search eBay")
     offer = res.get("offer")
@@ -1052,6 +1144,18 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
     from html import escape
     linked = [" · ".join(f'{i} <a href="{escape(u)}">{escape(k)}</a>' for i, k, u in row) for row in links if row]
     return "\n".join(top + [escape(x) for x in lines] + linked + [escape(last)])
+
+
+def max_buy_line(res: dict) -> str:
+    """"Max buy: $21.40 ($15 profit at $49.99)", on every reply."""
+    mb, price = res.get("max_buy"), (res.get("pick") or {}).get("price")
+    need = f"${config.CHECK_BUY_MIN_PROFIT:.0f} profit"
+    if mb is None or not price:
+        return "Max buy: - (no sell price found)"
+    if mb <= 0:
+        return f"Max buy: none (no {need} even at $0 when it sells at {_usd(price)})"
+    est = "~" if (res.get("pick") or {}).get("estimated") else ""
+    return f"Max buy: {est}{_usd(mb)} ({need} at {est}{_usd(price)})"
 
 
 def offer_line(offer: dict) -> str:
@@ -1153,7 +1257,7 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
         if pick.get("ask_discount"):
             out.append(f"  asking prices only: ×{pick['ask_discount']} (our sold/ask gap)"
                        + (f" and −{config.UNDERCUT_V2_PCT:.0%} undercut" if "cheapest" in pick['basis'] else ""))
-        out.append(f"Fees + ads {_usd(money['fees'])} ({_fee_rate():.1%} + ${config.EBAY_FIXED_FEE:.2f}) · "
+        out.append(f"Fees + ads {_usd(money['fees'])} ({_fee_rate():.1%} of what the buyer pays) · "
                    f"label {_usd(money['label'])} ({res.get('item_type')}"
                    + (f", {res['label_size']}" if res.get("label_size") else "") + f") · you keep {_usd(money['keep'])}")
         roi = _pct(money["roi"]) if money.get("roi") is not None else "-"
@@ -1163,6 +1267,7 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
             o = res["offer"]
             out.append(offer_line(o) + f" (×{config.CHECK_BO_LIST} / ×{config.CHECK_BO_ACCEPT} / "
                                        f"×{config.CHECK_BO_DECLINE} of the estimate)")
+    out.append(max_buy_line(res))
     if pick.get("competition_note"):
         out.append(f"Competition: {pick.get('competitors', 0)} identical listing(s) besides dropship-style ones"
                    f" → {pick['competition_note']}" + (", priced at the upper end" if pick.get("upper_end") else ""))

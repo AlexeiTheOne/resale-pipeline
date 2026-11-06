@@ -227,6 +227,50 @@ Check #5 (Vans Detached Sling Bag VN000Q9BFS8, Ross $12.99, MSRP $45) said
   "MSRP×47% $21 (other brands)", and Details says so too.
 - **Losses** read "−$0.63", with a real minus sign.
 
+### Check #10 fixes: real sold comps, fees, Max buy (Person B, 2026-11-06)
+
+Check #10 was a Von Dutch VDBB-1036PRP purple cow print bowling bag. The bot
+said "0 sold same", priced it from MSRP × other brands' ratio ($60.99), and
+capped that at the asking prices. eBay's own Sold link showed the bag sold
+in four colours in 30 days, the purple one included.
+
+- **Why no sales:** it was a quick check, and quick checks read only cached
+  sold searches. None of its 5 searches was cached, so it looked at no
+  sales at all. Live, the two long queries ("… crossbody NWT", the full
+  product name) find nothing anyway. Only the style code (1 sale) and
+  fewer words find them.
+- **A quick check with no sold search cached** now goes straight on to the
+  full check, as NO DATA does. The message says "no eBay sales cached for
+  this item yet". The pair counts as one check. When a quick reply does
+  have no sales looked at, the evidence says "sold not searched", never
+  "0 sold same".
+- **Fewer words** (`fewer_words_query`): the full check also searches the
+  brand + up to 4 distinctive words of the product name (no colour,
+  material or size) + the item type's noun, like eBay's "results matching
+  fewer words": "Von Dutch cow print bowling bag".
+- **Same model** ignores colour and material words in the product name
+  ("Purple & White … Vegan Pony Hair") but keeps pattern words (leopard,
+  plaid, …). So the brown cow print is the same model, and the "flying
+  eyeball" bowling bag still isn't.
+- **Real sales win the ladder:** level 1 if there is one. Else level 2 (+
+  level 3, our own sales). MSRP × ratio (level 4) is used only when there are
+  no sales, and is otherwise shown but not used. **Asking prices cap only a
+  price without eBay sales**: an unsold ask doesn't lower a price that sales
+  back. A **single same-item sale** (too few for level 1) joins level 2.
+- **Fees:** `CHECK_FEE_PCT` = **24.7% of what the buyer pays** (item +
+  shipping), measured on a real order. It covers all fees and ads, with no
+  separate $0.40. The label is still subtracted on its own. It's /check
+  only: the repricing floor and the profit report keep `EBAY_FVF_PCT` +
+  `EBAY_AD_FEE_PCT` + `EBAY_FIXED_FEE` (Person A's).
+- **Max buy** on every reply, and in Details: the highest Ross tag price
+  (before tax) that leaves $15 profit (`CHECK_BUY_MIN_PROFIT`) at the sell
+  price. "~" when the price is an estimate. "none" when even $0 doesn't
+  make it.
+
+Replayed (dev, full): **BORDERLINE, sell ~$45.99** from 7 sales (1 the
+same purple bag, 6 other colours), profit ~$9.83 at $24.99, **Max buy
+~$20.15**. It was MAYBE at $60.99.
+
 ### "Do I already have this?" (Person B, 2026-11-05)
 
 The first line of every reply, before the verdict: `pipeline/owned.py`
@@ -459,16 +503,18 @@ v2 terms: the judge decides what is identical, not keyword rules.
 P   = suggested item price (default mode) or formula price (exact)
 S   = shipping we charge                      EBAY_SHIP_CHARGED   9.88
 T   = P + S                                   (what the buyer pays)
-fees= T × (EBAY_FVF_PCT + EBAY_AD_FEE_PCT) + EBAY_FIXED_FEE  = T × 0.201 + 0.40
+fees= T × CHECK_FEE_PCT  = T × 0.247   (2026-11-06; was T × 0.201 + 0.40, see "Check #10 fixes")
 L   = shipping label we pay                   EBAY_SHIP_COST      7.20  (or "ship 12" in the message)
 C   = Ross price × (1 + SALES_TAX_RATE)       ×1.07
 profit = T − fees − L − C          ROI = profit / C
-break-even total  T_be = (C + L + 0.40) / (1 − 0.201)     → break-even item price = T_be − S
+break-even total  T_be = (C + L) / (1 − 0.247)     → break-even item price = T_be − S
 profit_at_cheapest = same formula at T = raw_active_floor (cheapest identical total)
+max buy = (T − fees − L − 15) / 1.07          (the Ross price for $15 profit)
 ```
 
-Worked example: Ross $14.99, P = $39.99 → T = $49.87, fees $10.42, label $7.20,
-C = $16.04 → **profit $16.21, ROI 101%**, break-even T = $29.59 (item $19.71).
+Worked example (24.7%): Ross $14.99, P = $39.99 → T = $49.87, fees $12.32,
+label $7.20, C = $16.04 → **profit $14.31, ROI 89%**, break-even T = $30.86
+(item $20.98), max buy $14.34.
 
 `EBAY_FVF_PCT` 15.5% is already the effective rate measured on our orders
 (it includes eBay's fee on the sales tax the buyer pays). `EBAY_AD_FEE_PCT`
