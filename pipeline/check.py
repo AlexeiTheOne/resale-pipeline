@@ -34,6 +34,7 @@ import config
 EASTERN = ZoneInfo("America/New_York")
 TIMINGS_FILE = Path(config.LOG_DIR) / "check_timings.jsonl"
 VERDICTS = ("BUY", "MAYBE", "BORDERLINE", "SKIP")
+STEP_DOWN = dict(zip(VERDICTS, VERDICTS[1:]))     # high supply: one step lower
 # No price at all (no sales, no identical listing): not a judgement on the
 # item. After a quick check the bot goes straight on to a full check; a full
 # check with no price stays NO_DATA (Person B, 2026-11-02). SKIP only when
@@ -569,6 +570,204 @@ def demand_summary(comps: list[dict], now: datetime | None = None) -> str | None
     return f"{len(rows)} for sale {span}, {sold} sold"
 
 
+# --- saturation: sales vs listings for sale (Person B, 2026-11-06) --------------------------
+
+_SIZE_WORDS = {"mini"}
+
+
+def _colour_words(text: str) -> list[str]:
+    """Colour words in order (not pattern words: those name a model)."""
+    plain = set(COLOURS) - _PATTERNS
+    out = []
+    for w in re.findall(r"[a-z]+", str(text or "").lower()):
+        w = "grey" if w == "gray" else w
+        if w in plain and w not in out:
+            out.append(w)
+    return out
+
+
+def same_item_title(comp: dict, ident: dict) -> bool:
+    """A listing of the same item in our colour: the same model (same_model)
+    with our full style code, or with our main colour and no colour we don't
+    have ("Purple Cow Print ... Bowling Bag" for the purple & white bag; the
+    brown one is the same model, not the same item). A mini is not the same
+    item as a bag that isn't one."""
+    if not same_model(comp, ident):
+        return False
+    title = str(comp.get("title") or "").lower()
+    words = set(re.findall(r"[a-z]+", title))
+    name = " ".join(str(ident.get(k) or "") for k in ("product_name", "size")).lower()
+    if any(w in words and w not in name for w in _SIZE_WORDS):
+        return False
+    codes = _codes(ident)
+    if codes and codes[0] in _norm_code(title):
+        return True
+    ours = _colour_words(ident.get("product_name")) or _colour_words(ident.get("color"))
+    if not ours:
+        return False
+    ours_all = set(ours) | set(_colour_words(ident.get("color")))
+    theirs = _colour_words(title)
+    return ours[0] in theirs and set(theirs) <= ours_all
+
+
+def _supply_part(sold: int, active: int, capped: bool, active_capped: bool) -> dict:
+    months = round(active / sold, 1) if sold else None
+    high = not capped and active > 0 and (
+        (months is not None and months > config.CHECK_SUPPLY_HIGH_MONTHS)
+        or (not sold and active >= config.CHECK_SUPPLY_MIN_ACTIVE))
+    return {"sold": sold, "active": active, "months": months, "high": high,
+            "sold_capped": capped, "active_capped": active_capped}
+
+
+def count_supply(sold_rows: list[dict], active_rows: list[dict], ident: dict, judged: list | None = None,
+                 *, now: datetime | None = None, full_sold: list | None = None,
+                 full_active: list | None = None) -> dict:
+    """Sales in the last CHECK_SUPPLY_DAYS and listings for sale now, of the
+    same item and of the same model (all colours; the same item included).
+    Rows are pricing candidates (pricing_v2.sold_candidate / active_candidate),
+    own listings already left out. A row counts by its title (same_model,
+    same_item_title) or by the judge's verdict on it (judged, by ebay_id).
+    full_sold / full_active: the rows of searches that came back as a full
+    page (sold: all inside the window). When most of such a page is the
+    item or model counted, there are more of them than the page shows: the
+    count is a floor ("7+") and a sales floor is never called high supply.
+    A full page of mostly other styles ("Von Dutch Bowling Bag") is not."""
+    verdicts = {c.get("ebay_id"): c.get("verdict") for c in judged or [] if c.get("ebay_id")}
+    today = (now or datetime.now(EASTERN)).date()
+
+    def recent(c):
+        try:
+            d = datetime.fromisoformat(str(c.get("date"))[:10]).date()
+        except (TypeError, ValueError):
+            return False
+        return (today - d).days <= config.CHECK_SUPPLY_DAYS
+
+    brand = re.sub(r"[^a-z0-9]", "", str(ident.get("brand") or "").lower())
+
+    def kind(c):
+        v = verdicts.get(c.get("ebay_id"))
+        # by title only when it names our brand ("Lime Green Cow Print ... Bowling Bag" may be anyone's)
+        titled = not brand or brand in re.sub(r"[^a-z0-9]", "", str(c.get("title") or "").lower())
+        if v == "same_item" or (titled and same_item_title(c, ident)):
+            return "item"
+        if v == "variant" or (titled and same_model(c, ident)):
+            return "model"
+        return None
+    from pipeline import pricing_v2
+    sold = [c for c in pricing_v2.dedupe([c for c in sold_rows if c]) if recent(c)]
+    active = pricing_v2.dedupe([c for c in active_rows if c])
+    s_kind, a_kind = [kind(c) for c in sold], [kind(c) for c in active]
+
+    def floor(pages, kinds):
+        for rows in pages or []:
+            rows = [c for c in rows if c]
+            if rows and sum(kind(c) in kinds for c in rows) * 2 > len(rows):
+                return True
+        return False
+    item_k, model_k = ("item",), ("item", "model")
+    item = _supply_part(s_kind.count("item"), a_kind.count("item"),
+                        floor(full_sold, item_k), floor(full_active, item_k))
+    model = _supply_part(sum(k in model_k for k in s_kind), sum(k in model_k for k in a_kind),
+                         floor(full_sold, model_k), floor(full_active, model_k))
+    return {"days": config.CHECK_SUPPLY_DAYS, "item": item, "model": model,
+            "high": item["high"] or model["high"],
+            "high_part": "model" if model["high"] else "item" if item["high"] else None}
+
+
+def supply_lookup(pricing: dict, ident: dict, *, fetch_sold=None, fetch_active=None,
+                  now: datetime | None = None) -> dict | None:
+    """Full check: the saturation counts. Sold rows are re-read from the cache
+    the full check just filled (no new Apify call); listings are the pricing
+    searches plus one free Browse search on the name in fewer words with up to
+    CHECK_SUPPLY_ACTIVE_COUNT rows (the long-name search finds few listings
+    of the other colours). None when nothing could be counted."""
+    from pipeline import pricing_v2
+    fetch_sold = fetch_sold or pricing_v2.fetch_sold
+    fetch_active = fetch_active or pricing_v2.fetch_active
+    ship = config.EBAY_SHIP_CHARGED
+    sold, full_q = [], []
+    window = config.CHECK_SUPPLY_DAYS
+    today = (now or datetime.now(EASTERN)).date()
+    for q in pricing.get("rungs_tried") or []:
+        try:
+            rows = fetch_sold(q, cache_only=True) or []
+        except Exception:
+            rows = []
+        cands = [c for c in (pricing_v2.sold_candidate(r, ship) for r in rows) if c]
+        sold += cands
+        dates = []
+        for c in cands:
+            try:
+                dates.append(datetime.fromisoformat(str(c.get("date"))[:10]).date())
+            except (TypeError, ValueError):
+                pass
+        if len(rows) >= config.PRICING_V2_SOLD_COUNT and dates and (today - min(dates)).days <= window:
+            full_q.append(cands)
+    active, full_a = [], []
+    searches = [(pricing_v2.active_query(ident), None, None)]
+    if pricing_v2.upc_of(ident):
+        searches.append((None, pricing_v2.upc_of(ident), None))
+    fewer = fewer_words_query(ident)
+    if fewer:
+        searches.append((fewer, None, config.CHECK_SUPPLY_ACTIVE_COUNT))
+    for q, gtin, limit in searches:
+        if not (q or gtin):
+            continue
+        try:
+            rows = fetch_active(q, gtin, limit=limit) if limit else fetch_active(q, gtin)
+        except Exception:
+            continue
+        cands = [pricing_v2.active_candidate(r, ship) for r in rows]
+        if limit:                  # the wide search decides alone: a short page of it is all there is
+            full_a = [cands] if len(rows) >= limit else []
+        elif len(rows) >= config.PRICING_V2_ACTIVE_COUNT:
+            full_a.append(cands)
+        active += cands
+    if not sold and not any(active):
+        return None
+    try:
+        own_ids, own_titles = pricing_v2.own_listings()
+    except Exception:
+        own_ids, own_titles = set(), set()
+    kept_s, _ = pricing_v2.filter_candidates(sold, config.OWN_SELLER_USERNAMES, own_ids, own_titles)
+    kept_a, _ = pricing_v2.filter_candidates(active, config.OWN_SELLER_USERNAMES, own_ids, own_titles)
+    return count_supply(kept_s, kept_a, ident, pricing.get("judged_comps"), now=now,
+                        full_sold=full_q, full_active=full_a)
+
+
+def _supply_count(n: int, capped: bool) -> str:
+    return f"{n}+" if capped else str(n)
+
+
+def supply_text(part: dict, days: int) -> str:
+    """"4 sold / 20 active in 30d (~5 months of supply)"."""
+    s = f"{_supply_count(part['sold'], part.get('sold_capped'))} sold / " \
+        f"{_supply_count(part['active'], part.get('active_capped'))} active in {days}d"
+    if part.get("sold_capped"):
+        tail = "fast seller" if part["sold"] else ""
+    elif not part["sold"]:
+        tail = "no sales" if part["active"] else ""
+    elif part["months"] < 1:
+        tail = "under a month of supply"
+    else:
+        tail = f"~{part['months']:.0f} month{'s' if round(part['months']) != 1 else ''} of supply"
+    if part.get("high"):
+        tail = (tail + ", high" if tail else "high")
+    return s + (f" ({tail})" if tail else "")
+
+
+def supply_line(res: dict) -> str | None:
+    """"Supply: same model 4 sold / 20 active in 30d (~5 months of supply,
+    high) · same item 1 sold / 3 active in 30d (~3 months of supply)"."""
+    sup = res.get("supply")
+    if not sup:
+        return None
+    parts = [f"same model {supply_text(sup['model'], sup['days'])}"]
+    if sup["item"]["sold"] or sup["item"]["active"]:
+        parts.append(f"same item {supply_text(sup['item'], sup['days'])}")
+    return ("⚠️ " if sup.get("high") else "") + "Supply: " + " · ".join(parts)
+
+
 LEVEL_NAMES = {1: "eBay sold, same item", 2: "eBay sold, same model other colour/size",
                3: "our own sales, same brand + type", 4: "MSRP × brand ratio",
                5: "eBay asking prices (ceiling only)"}
@@ -607,7 +806,7 @@ def _median(xs):
 
 def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history: list | None = None,
                  receipt: dict | None = None, exclude_item_id: str | None = None,
-                 details: dict | None = None) -> dict:
+                 details: dict | None = None, supply: dict | None = None) -> dict:
     """The evidence ladder (Person B, 2026-11-02). Every level is an ITEM price
     (eBay totals minus the shipping we charge):
       1 eBay sold, same item: 2+ sales -> their median, done.
@@ -624,7 +823,9 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
     Competition (Person B, 2026-11-02): no identical listing for sale
     (dropship-style ones don't count) and demand shown by level 2 or 3 ->
     the upper end of levels 2-4 ("no competition, unique"); no demand
-    either -> the median stays ("no competition, no demand data")."""
+    either -> the median stays ("no competition, no demand data").
+    High supply (supply_lookup, Person B 2026-11-06): a price from eBay
+    sales goes no higher than the lower quartile of those sales."""
     from pipeline import msrp
     ident = ident or {}
     kind = item_type_of(ident)
@@ -701,6 +902,15 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
             raw, upper, note = max(levels[k]["value"] for k in used), True, "no competition, unique"
         else:
             note = "no competition, no demand data"
+    low_end = None
+    if supply and supply.get("high") and sold_backed and raw is not None:
+        real = same if 1 in used else l2
+        q1 = statistics.quantiles(real, n=4, method="inclusive")[0] if len(real) > 1 else real[0]
+        low_end = round(q1 - ship, 2)
+        if low_end < raw:
+            raw, upper = low_end, False
+        else:
+            low_end = None
     capped = False
     # Asking prices are a ceiling only for estimates: when eBay sales back the
     # price, an unsold ask doesn't lower it (Person B, 2026-11-06).
@@ -716,7 +926,10 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
         basis = ("upper end" if upper else "median") + " of levels " + ", ".join(str(k) for k in used)             + " (no same-item sales)"
     else:
         basis = "no level 1-4 evidence"
+    if low_end is not None:
+        basis += ", lowered to the lower quartile of the sales (high supply)"
     return {"price": price, "basis": basis + (", capped at the asking-price ceiling" if capped else ""),
+            "low_end": low_end,
             "levels": levels, "used": used, "capped": capped, "range": spread,
             "sales": len(same), "from_asks": False, "estimated": bool(used) and 1 not in used,
             "sold_median": _median(same), "disagrees": False, "ask_discount": None,
@@ -726,14 +939,16 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
 
 def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
              text: str = "", quick: bool = False, history: list | None = None,
-             exclude_item_id: str | None = None, details: dict | None = None) -> dict:
+             exclude_item_id: str | None = None, details: dict | None = None,
+             supply: dict | None = None) -> dict:
     """Price choice, money and verdict from a pricing result. Shared by
     run_check and the backtest (scripts/backtest_check.py), so the backtest
     scores exactly what /check would say. quick: a quick check that found no
-    data at all is NO_DATA instead of SKIP."""
+    data at all is NO_DATA instead of SKIP. supply (full check,
+    supply_lookup): high supply lowers the verdict one step."""
     pricing = tighten_same_model(pricing, ident or {})
     pick = choose_price(pricing, exact, ident, history=history, exclude_item_id=exclude_item_id,
-                        details=details)
+                        details=details, supply=supply)
     kind, label = label_for(ident, text)
     money = economics(pick["price"], ross_price, label) if pick["price"] and ross_price else None
     cheapest = pricing.get("raw_active_floor")
@@ -753,11 +968,16 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
             # SKIP is only given when real prices back it.
             v, why = NO_DATA, (["the quick check found no recent sales and no identical listing"] if quick
                                else ["no sales and no identical listing found: not enough data for a verdict"])
-    size = bag_size(ident or {}, text) if kind == "bags" else None
+    if supply and supply.get("high") and v in STEP_DOWN:
+        part = supply[supply["high_part"]]
+        what = "same model" if supply["high_part"] == "model" else "same item"
+        v, why = STEP_DOWN[v], [f"high supply: {what} {supply_text(part, supply['days'])}, "
+                                f"one step lower"] + list(why)
+    size =bag_size(ident or {}, text) if kind == "bags" else None
     return {"item_type": kind, "label": label, "label_size": size, "verdict": v, "reasons": why, "pick": pick,
             "money": money, "cheapest_total": cheapest, "at_cheapest": at_cheapest,
             "similar": similar_sold(pricing), "offer": best_offer(pick["price"]),
-            "max_buy": max_buy(pick["price"], label)}
+            "max_buy": max_buy(pick["price"], label), "supply": supply}
 
 
 def _norm_code(v) -> str:
@@ -772,7 +992,7 @@ def already_have(ident: dict, sku: str | None = None, exclude_check_id: int | No
 
 
 def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, identify_fn=None,
-              have_fn=None, details_fn=None) -> dict:
+              have_fn=None, details_fn=None, supply_fn=None) -> dict:
     """Identify (photo or text), price, money, verdict. Returns everything the
     reply and the timings log need. Raises only on programming errors; API
     failures come back as pricing warnings."""
@@ -834,8 +1054,16 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
         t = time.perf_counter()
         details = demand_lookup(pricing, details_fn=details_fn)
         timings["demand_s"] = round(time.perf_counter() - t, 2)
+    supply = None
+    if full and not no_search:     # sold in 30 days vs listings for sale (saturation)
+        t = time.perf_counter()
+        try:
+            supply = (supply_fn or supply_lookup)(pricing, ident)
+        except Exception:          # advisory: a failed count never loses the check
+            supply = None
+        timings["supply_s"] = round(time.perf_counter() - t, 2)
     ev = evaluate(pricing, ident, req.get("ross_price"), bool(req.get("exact", True)), text,
-                  quick=not full, details=details)
+                  quick=not full, details=details, supply=supply)
     comps = comp_list(pricing, ev["item_type"], bool(req.get("exact", True)), details)
     timings["total_s"] = round(time.perf_counter() - t0, 2)
     return {"request": dict(req), "photo": bool(photo_path), "identification": ident,
@@ -880,7 +1108,7 @@ def check_fields(res: dict) -> dict:
             "comps_summary": {"basis": pick.get("basis"), "sales": pick.get("sales"),
                               "sold_median": pick.get("sold_median"), "item_type": res.get("item_type"),
                               "label": res.get("label"), "reasons": res.get("reasons"),
-                              "max_buy": res.get("max_buy"),
+                              "max_buy": res.get("max_buy"), "supply": res.get("supply"),
                               "comps": res.get("comps") or [],
                               "owned": owned_saved(res.get("already_have")),
                               "warnings": (res.get("warnings") or "")[:500] or None}}
@@ -1134,6 +1362,9 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
         lines.append(offer_line(offer))
     match = CERTAINTY.get(res.get("confidence"), "-")
     lines.append("Evidence: " + ladder_line(pick, res) + f" · match {match}")
+    sup = supply_line(res)
+    if sup:
+        lines.append(sup)
     t = res["timings"].get("total_s", 0)
     mode = ("full" if req.get("full") else "quick") + " · " + ("exact" if req.get("exact", True) else "any")
     last = " · ".join(x for x in (f"#{check_id}" if check_id else "", f"⏱ {t:.0f}s", mode, footer) if x)
@@ -1268,6 +1499,14 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
             out.append(offer_line(o) + f" (×{config.CHECK_BO_LIST} / ×{config.CHECK_BO_ACCEPT} / "
                                        f"×{config.CHECK_BO_DECLINE} of the estimate)")
     out.append(max_buy_line(res))
+    sup = supply_line(res)
+    if sup:
+        out.append(sup.replace("⚠️ ", ""))
+        out.append(f"  high supply = over {config.CHECK_SUPPLY_HIGH_MONTHS:g} months of listings at the"
+                   f" {res['supply']['days']}-day sales rate"
+                   + ("; the verdict is one step lower" if res["supply"].get("high") else ""))
+        if pick.get("low_end") is not None:
+            out.append(f"  high supply: priced at the lower quartile of the sales, {_usd(pick['low_end'])}")
     if pick.get("competition_note"):
         out.append(f"Competition: {pick.get('competitors', 0)} identical listing(s) besides dropship-style ones"
                    f" → {pick['competition_note']}" + (", priced at the upper end" if pick.get("upper_end") else ""))

@@ -352,6 +352,16 @@ CHECK_SOLD_CACHE_DAYS = float(os.getenv("CHECK_SOLD_CACHE_DAYS", "7"))
 CHECK_DROPSHIP_FEEDBACK = int(os.getenv("CHECK_DROPSHIP_FEEDBACK", "10000"))
 # Full check: look up this many identical listings (listing age, units sold).
 CHECK_DEMAND_LISTINGS = int(os.getenv("CHECK_DEMAND_LISTINGS", "3"))
+# Saturation (Person B, 2026-11-06), full check: sales in the last
+# CHECK_SUPPLY_DAYS vs listings for sale now, same item and same model. Over
+# CHECK_SUPPLY_HIGH_MONTHS of supply (listings / sales per month), or no
+# sales and at least CHECK_SUPPLY_MIN_ACTIVE listings, is high supply: the
+# verdict drops one step and a price from sales moves to their lower quartile.
+CHECK_SUPPLY_DAYS = int(os.getenv("CHECK_SUPPLY_DAYS", "30"))
+CHECK_SUPPLY_HIGH_MONTHS = float(os.getenv("CHECK_SUPPLY_HIGH_MONTHS", "3"))
+CHECK_SUPPLY_MIN_ACTIVE = int(os.getenv("CHECK_SUPPLY_MIN_ACTIVE", "4"))
+# Listings fetched for the same-model count (eBay Browse allows 200 a page).
+CHECK_SUPPLY_ACTIVE_COUNT = int(os.getenv("CHECK_SUPPLY_ACTIVE_COUNT", "200"))
 # Best Offer from the /check estimate (Person B, 2026-11-02): list at
 # estimate x LIST, auto-accept at x ACCEPT, auto-decline under x DECLINE.
 CHECK_BO_LIST = float(os.getenv("CHECK_BO_LIST", "1.25"))

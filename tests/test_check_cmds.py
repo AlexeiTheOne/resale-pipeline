@@ -41,6 +41,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(check, "load_our_sales", lambda: [])
     from ebay import browse
     monkeypatch.setattr(browse, "listing_details", lambda i: (_ for _ in ()).throw(AssertionError("Browse")))
+    monkeypatch.setattr(browse, "search_active", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Browse")))
     monkeypatch.setattr(check, "TIMINGS_FILE", tmp_path / "check_timings.jsonl")
     monkeypatch.setattr(check_cmds, "CHECKS_DIR", tmp_path / "checks")
     monkeypatch.setattr(check_cmds, "ALBUM_WAIT_S", 0.0)

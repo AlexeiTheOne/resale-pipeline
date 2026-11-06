@@ -176,9 +176,10 @@ def fetch_sold(query: str, count: int | None = None, *, max_age_s: float | None 
 
 
 def fetch_active(query: str | None = None, gtin: str | None = None, *,
-                 max_age_s: float | None = None) -> list[dict]:
+                 max_age_s: float | None = None, limit: int | None = None) -> list[dict]:
+    """limit: /check's supply count asks for more rows than pricing does."""
     from ebay import browse
-    params = {"q": query or "", "gtin": gtin or "", "limit": config.PRICING_V2_ACTIVE_COUNT,
+    params = {"q": query or "", "gtin": gtin or "", "limit": limit or config.PRICING_V2_ACTIVE_COUNT,
               "zip": config.PRICING_V2_SHIP_TO_ZIP, "cond": list(NEW_CONDITION_IDS)}
     return _cached("active", json.dumps(params, sort_keys=True), lambda: browse.search_active(
         query, gtin=gtin, limit=params["limit"], condition_ids=NEW_CONDITION_IDS,

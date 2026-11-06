@@ -117,6 +117,8 @@ def no_history(monkeypatch):
     monkeypatch.setattr(check, "load_our_sales", lambda: [])
     from ebay import browse
     monkeypatch.setattr(browse, "listing_details", lambda i: (_ for _ in ()).throw(AssertionError("Browse")))
+    # the full check's supply count: no eBay search in tests (a failed one is skipped)
+    monkeypatch.setattr(browse, "search_active", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Browse")))
 
 
 def test_ladder_level1_same_item_sales_median_and_the_ceiling():
@@ -199,6 +201,147 @@ def test_check10_real_sales_win_over_msrp_of_other_brands_and_unsold_asks():
                           pricing_fn=lambda i, **kw: p, have_fn=lambda *a: [])
     text = check.format_reply(res)
     assert "1 sold same · 4 sold same model (incl. 1 same) $46" in text and "Max buy: ~$" in text
+
+
+# --- saturation: sold in 30 days vs listings for sale (Person B, 2026-11-06) -----------------
+
+NOW = datetime(2026, 11, 6, 12, tzinfo=check.EASTERN)
+_n = iter(range(100000, 999999))
+
+
+def _sold(title, date, total=50.0):
+    return {"source": "sold", "ebay_id": str(next(_n)), "title": title, "total": total, "item_price": total,
+            "date": date, "condition": "New with tags"}
+
+
+def _active(title, total=80.0):
+    return {"source": "active", "ebay_id": str(next(_n)), "title": title, "total": total, "item_price": total,
+            "condition": "New"}
+
+
+PURPLE = "Von Dutch Purple & White Cow Print Vegan Pony Hair Bowling Bag"
+VD_SOLD_30D = [_sold(PURPLE, "2026-10-20", 63.03),
+               _sold("Von Dutch Brown & White Cow Print Vegan Pony Hair Bowling Bag", "2026-11-04", 53.23),
+               _sold("Von Dutch Women's Green & White Cow Print Vegan Pony Hair Bowling Bag NWT", "2026-11-01", 49.88),
+               _sold("Von Dutch Orange Cow Print Pony Hair Bowling Bag Purse", "2026-10-25", 35.99),
+               _sold("Von Dutch Red Cow Print Bowling Bag", "2026-09-01"),             # outside 30 days
+               _sold("Von Dutch Lime Green Faux Fur Mini Bowling Bag Flying Eyeball", "2026-11-02")]  # other style
+VD_ACTIVE = ([_active(PURPLE + " + Strap NWT", 84.10),
+              _active("Von Dutch Purple Cow Print Vegan Pony Hair Bowling Bag W/Crossbody Strap NEW", 82.70),
+              _active("New Von Dutch Purple White Cow Print Bowling Bag", 85.15),
+              _active("Von Dutch Purple Cow Print Mini Bowling Bag")]                # a mini: same model only
+             + [_active(f"Von Dutch {c} Cow Print Vegan Pony Hair Bowling Bag")
+                for c in ["Brown & White", "Orange", "Red White", "Green", "Pink & White", "Blue", "Lime",
+                          "Black White", "Chocolate Brown White", "Light Blue", "Red", "Orange Mini", "Green White",
+                          "Pink", "Brown", "Tan"]]
+             + [_active("Von Dutch Vegan Pony Hair Orange Cow Print Shoulder Bag"),   # no "bowling": other style
+                _active("Lime Green Cow Print Vegan Pony Hair Bowling Bag")])        # no brand: anyone's
+
+
+def test_check10_supply_same_model_4_sold_20_active_is_5_months_high():
+    sup = check.count_supply(VD_SOLD_30D, VD_ACTIVE, VON_DUTCH, now=NOW)
+    assert (sup["model"]["sold"], sup["model"]["active"], sup["model"]["months"]) == (4, 20, 5.0)
+    assert (sup["item"]["sold"], sup["item"]["active"]) == (1, 3)            # the 3 purple asks, not the mini
+    assert sup["model"]["high"] and not sup["item"]["high"] and sup["high"]   # 3 months is not over 3
+    assert check.supply_text(sup["model"], 30) == "4 sold / 20 active in 30d (~5 months of supply, high)"
+    line = check.supply_line({"supply": sup})
+    assert line == ("⚠️ Supply: same model 4 sold / 20 active in 30d (~5 months of supply, high) · "
+                    "same item 1 sold / 3 active in 30d (~3 months of supply)")
+    # the judge's same_item on a title without "bowling" still counts (the "+ Strap" sale)
+    odd = _sold("VON DUTCH~ Purple & White Cow Print Vegan Pony Hair Bag + Strap NWT", "2026-11-05")
+    two = check.count_supply([odd], [], VON_DUTCH, [{"ebay_id": odd["ebay_id"], "verdict": "same_item"}], now=NOW)
+    assert two["item"]["sold"] == two["model"]["sold"] == 1
+
+
+def test_supply_thresholds_and_no_sales():
+    few = check.count_supply(VD_SOLD_30D[:4], VD_ACTIVE[:6], VON_DUTCH, now=NOW)   # 4 sold / 6 active
+    assert few["model"]["months"] == 1.5 and not few["high"]
+    none = check.count_supply([], VD_ACTIVE[4:8], VON_DUTCH, now=NOW)             # 0 sold / 4 active
+    assert none["model"]["high"] and check.supply_text(none["model"], 30) == "0 sold / 4 active in 30d (no sales, high)"
+    thin = check.count_supply([], VD_ACTIVE[4:6], VON_DUTCH, now=NOW)             # 2 listings: too few to say
+    assert not thin["high"]
+
+
+def test_high_supply_lowers_the_verdict_one_step_and_the_price_to_the_low_end():
+    p = pricing(raw_active_floor=72.2, judged_comps=VD_SOLD, same_item_active_count=1)
+    base = check.evaluate(p, VON_DUTCH, 24.99, exact=True, history=BAGS)
+    sup = check.count_supply(VD_SOLD_30D, VD_ACTIVE, VON_DUTCH, now=NOW)
+    ev = check.evaluate(p, VON_DUTCH, 24.99, exact=True, history=BAGS, supply=sup)
+    # level 2 sales 49.88 53.23 57.72 63.03: lower quartile 52.39 - 9.88 shipping = 42.51 -> $42.99
+    assert base["pick"]["price"] == 45.99 and ev["pick"]["price"] == 42.99 and ev["pick"]["low_end"] == 42.51
+    assert "lower quartile" in ev["pick"]["basis"]
+    assert ev["verdict"] == check.STEP_DOWN[base["verdict"]]
+    assert ev["reasons"][0].startswith("high supply: same model 4 sold / 20 active")
+    # a MAYBE (estimated from same-model sales) becomes BORDERLINE; a BUY a MAYBE
+    cheap = check.evaluate(p, VON_DUTCH, 5.0, exact=True, history=BAGS)
+    assert cheap["verdict"] == "MAYBE"
+    assert check.evaluate(p, VON_DUTCH, 5.0, exact=True, history=BAGS, supply=sup)["verdict"] == "BORDERLINE"
+    assert check.STEP_DOWN == {"BUY": "MAYBE", "MAYBE": "BORDERLINE", "BORDERLINE": "SKIP"}
+    # without sales behind the price, the price stays
+    asks_only = pricing(raw_active_floor=72.2, judged_comps=VD_SOLD[5:])
+    a0 = check.evaluate(asks_only, VON_DUTCH, 24.99, exact=True, history=BAGS)
+    a1 = check.evaluate(asks_only, VON_DUTCH, 24.99, exact=True, history=BAGS, supply=sup)
+    assert a1["pick"]["price"] == a0["pick"]["price"] and a1["pick"]["low_end"] is None
+
+
+def _apify(title, date, price=50.0):
+    return {"itemId": str(next(_n)), "title": title, "endedAt": date, "soldPrice": price,
+            "shippingPrice": 0, "condition": "New with tags"}
+
+
+def _browse(title, price=70.0):
+    return {"legacy_item_id": str(next(_n)), "title": title, "price": price, "shipping_cost": 0, "condition": "New"}
+
+
+def test_supply_lookup_reads_the_sold_cache_and_searches_listings_in_fewer_words(monkeypatch):
+    from pipeline import pricing_v2
+    monkeypatch.setattr(pricing_v2, "own_listings", lambda: (set(), set()))
+    other_styles = [_apify(f"Von Dutch Bowling Bag style {i}", "2026-11-0" + str(1 + i % 5)) for i in range(15)]
+    model_page = [_apify(f"Von Dutch {c} Cow Print Bowling Bag", "2026-11-05")
+                  for c in ["Brown", "Green", "Orange", "Red", "Pink"] * 3]
+    sold = {"code": [_apify(PURPLE, "2026-10-20")], "similar": other_styles, "fewer": model_page[:4]}
+    asked = []
+
+    def fetch_sold(q, cache_only=False):
+        assert cache_only                                     # never a new Apify call
+        return sold[q]
+
+    def fetch_active(q, gtin, limit=None):
+        asked.append((q, gtin, limit))
+        return [_browse(f"Von Dutch Green Cow Print Bowling Bag {i}") for i in range(10)] if limit else []
+    p = {"rungs_tried": ["code", "similar", "fewer"], "judged_comps": []}
+    sup = check.supply_lookup(p, VON_DUTCH, fetch_sold=fetch_sold, fetch_active=fetch_active, now=NOW)
+    assert ("Von Dutch cow print bowling bag", None, 200) in asked and (None, "196644080567", None) in asked
+    # a full page of other styles is not a floor: 5 sold / 10 active = 2 months
+    assert sup["model"]["sold"] == 5 and sup["model"]["active"] == 10 and not sup["model"]["sold_capped"]
+    # a full page of the model in 30 days: 15+ sold, a fast seller, never high supply
+    sold["fewer"] = model_page
+    fast = check.supply_lookup(p, VON_DUTCH, fetch_sold=fetch_sold, fetch_active=fetch_active, now=NOW)
+    assert fast["model"]["sold_capped"] and not fast["high"]
+    assert check.supply_text(fast["model"], 30).startswith("16+ sold / 10 active in 30d (fast seller")
+    # nothing to count: no supply line
+    assert check.supply_lookup({"rungs_tried": []}, VON_DUTCH, fetch_sold=fetch_sold,
+                               fetch_active=lambda *a, **k: [], now=NOW) is None
+
+
+def test_a_full_check_shows_supply_and_a_quick_check_does_not():
+    p = pricing(raw_active_floor=72.2, judged_comps=VD_SOLD, same_item_active_count=1)
+    sup = check.count_supply(VD_SOLD_30D, VD_ACTIVE, VON_DUTCH, now=NOW)
+    full = check.run_check({**check.parse_request("/check full 24.99"), "identification": VON_DUTCH},
+                           pricing_fn=lambda i, **kw: p, have_fn=lambda *a: [], supply_fn=lambda *a: sup)
+    text = check.format_reply(full)
+    assert "⚠️ Supply: same model 4 sold / 20 active in 30d (~5 months of supply, high)" in text
+    assert "high supply = over 3 months" in check.format_details(full)
+    assert check.check_fields(full)["comps_summary"]["supply"]["model"]["active"] == 20
+    quick = check.run_check({**check.parse_request("/check 24.99"), "identification": VON_DUTCH},
+                            pricing_fn=lambda i, **kw: p, have_fn=lambda *a: [],
+                            supply_fn=lambda *a: (_ for _ in ()).throw(AssertionError("quick")))
+    assert quick["supply"] is None and "Supply:" not in check.format_reply(quick)
+    # a failed count never loses the check
+    broken = check.run_check({**check.parse_request("/check full 24.99"), "identification": VON_DUTCH},
+                             pricing_fn=lambda i, **kw: p, have_fn=lambda *a: [],
+                             supply_fn=lambda *a: 1 / 0)
+    assert broken["supply"] is None and broken["verdict"]
 
 
 def test_a_quick_check_with_no_sold_search_cached_says_so():

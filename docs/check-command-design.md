@@ -271,6 +271,56 @@ Replayed (dev, full): **BORDERLINE, sell ~$45.99** from 7 sales (1 the
 same purple bag, 6 other colours), profit ~$9.83 at $24.99, **Max buy
 ~$20.15**. It was MAYBE at $60.99.
 
+### Saturation: sold in 30 days vs listings for sale (Person B, 2026-11-06)
+
+Full check only (`supply_lookup`, `count_supply`). For the **same item** and
+the **same model** (all colours, the same item included):
+
+- **Sold in the last 30 days** (`CHECK_SUPPLY_DAYS`), from the sold searches
+  the full check just made. They are re-read from the cache, so there is
+  no new Apify call.
+- **For sale now**: the pricing searches, plus one free Browse search on the
+  name in fewer words with up to 200 rows (`CHECK_SUPPLY_ACTIVE_COUNT`).
+  The long-name search finds few listings of the other colours.
+- **Which rows count:**
+  - Same model: `same_model`, or the judge said variant / same item.
+  - Same item: the judge said so, or the title is the same model with our
+    full style code, or with our main colour and no colour we don't have.
+    A mini is not the same item as a bag that isn't one.
+  - A match by title alone needs our brand in the title.
+  - Our own listings are left out.
+- **Months of supply** = listings / sales in 30 days.
+- **High supply:**
+  - over `CHECK_SUPPLY_HIGH_MONTHS` (3) months, or no sales and at least
+    `CHECK_SUPPLY_MIN_ACTIVE` (4) listings;
+  - on either line, same item or same model.
+- **What high supply does:**
+  - The verdict drops one step: BUY → MAYBE → BORDERLINE → SKIP. The
+    first reason says why.
+  - A price from eBay sales (levels 1-2) goes no higher than the **lower
+    quartile** of those sales. An estimate without sales keeps its price
+    and only loses the step.
+- **A full page is a floor.** Sometimes a search comes back as a full page
+  (sold: 15 rows, all inside 30 days) and most of its rows are the item or
+  model. Then there are more than the page shows. The count is shown as
+  "15+" ("fast seller"), and a sales floor is never called high supply. A
+  full page of mostly other styles ("Von Dutch Bowling Bag") is not a
+  floor.
+- **Shown** as one line after the evidence, also in Details, and saved in
+  `comps_summary.supply`: "⚠️ Supply: same model 7 sold / 37 active in 30d
+  (~5 months of supply, high) · same item 1 sold / 3 active in 30d (~3
+  months of supply)".
+
+Check #10 replayed (dev, full):
+- same model 7 sold / 37 active, same item 1 sold / 3 active (the three
+  purple asks, $82.70–85.15 with shipping);
+- the price goes from the $45.99 median to the lower quartile, **$41.99**;
+- the verdict goes from BORDERLINE to **SKIP**;
+- profit ~$6.82 at $24.99; Max buy ~$17.34.
+
+There are 37 active, not ~20, because the 200-row search finds more
+colours than eBay's first page shows.
+
 ### "Do I already have this?" (Person B, 2026-11-05)
 
 The first line of every reply, before the verdict: `pipeline/owned.py`
