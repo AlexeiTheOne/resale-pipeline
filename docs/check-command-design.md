@@ -7,6 +7,152 @@ pricing and reviews the PR. Builds on proposal (b) in
 `legacy/comps_app.py` (both on branch `post-cutover-ideas`). Every fact about
 today's code is from `main` at `9428e3a`.
 
+## 0000. Design: cheaper quick check, and every check's evidence saved (Person B, 2026-11-07). Not built yet.
+
+Pricing is Person A's area: Person B asked for this design and tells them.
+Nothing below is code yet.
+
+### Where we are (measured)
+
+| | Quick check today | Full check today |
+|---|---|---|
+| Steps | identify (Gemini + Google Search), cached sold rows only, Browse, Sonnet judge | the same + live Apify sold searches, UPC/fewer-words/brand+type searches, demand, supply |
+| AI | identify $0.012 + judge $0.020 = **$0.03** | identify $0.012 + judge $0.02–0.06 = **$0.03–0.07** |
+| Apify | $0, but a quick check with **nothing cached goes on to the full check** (check #10) | **$0.06–0.12** (5 checks, 2026-11-05/06); the brand + type and fewer-words searches fill their 15 rows ($0.06 each), the specific ones usually find 0–2 |
+| Time | 27–31 s (identify 20–23 s, comps 0.8 s, judge 6–7 s) | +13–20 s after a quick one; 35–65 s from a photo when Apify runs |
+
+- **AI costs** are from `llm_usage` (production, since 2026-10-01).
+- **Apify** is from the sold cache.
+- **Times** are from `logs/check_timings.jsonl`.
+- **Web search measured on Claude:** `value_notes` (Sonnet 5.5, 5 searches) averages $0.12 a call with 31.6k input tokens, so about **$0.024 per search** all-in ($0.01 per search plus the result tokens).
+- **Web search measured on Gemini:** the identify research (Gemini, about 3 Google searches) averages $0.008 a call.
+
+### Part 1: the quick check, modelled on the manual method. No Apify, ever.
+
+**Steps:**
+1. **Identify** (today's step, unchanged).
+2. Then, in parallel:
+   - **(a) Retail prices.** The cheapest new prices now, from Walmart, Target, Amazon, Nordstrom Rack, TJ Maxx/Marshalls, Macy's and the brand's site: store, price, URL, in stock or not. Claude `web_search_20260209` on Sonnet 5.5 (the same call shape as `quick_price.py`):
+     - `max_uses` 2;
+     - `blocked_domains`: eBay, Poshmark, Mercari, Depop, Etsy, Solefeed, because resale isn't retail (the API takes either an allowed or a blocked list, not both);
+     - the answer as a JSON list via structured output.
+   - **(b) eBay listings** for sale, via Browse (free): today's text, GTIN and image searches, plus the 200-row wide search the supply count uses.
+   - **(c) Our own sales**: the brand + type bucket (ladder level 3), from ResaleDB.
+   - **(d) Saved evidence** (Part 2): eBay sales of the same model from the last 7 days, and older ones marked with their age.
+3. **AI summary.** One Sonnet call, today's `check_quick_judge`. It marks each listing and offer as same item / same model / other, and returns:
+   - the cheapest new retail;
+   - the typical eBay ask (the median same-item ask) and the cheapest real one (dropship listings left out, as today);
+   - a one-line saturation hint;
+   - its reasons.
+4. **Price, verdict and max buy stay in code**, using today's ladder. The AI judges matches and never sets the money. Changes:
+   - **Retail as a ceiling:** our price is never above the cheapest new retail delivered price (price + shipping, or free shipping) × 0.9. A buyer won't pay eBay more than Walmart.
+   - **Asks as a price, a new level 4b:** the cheapest real identical ask × a **sold-to-ask ratio** learned from the saved evidence. It's learned per brand + type, else per type, from models that have both sales and asks. Until 20 models have both, the ratio is shown but not used (only check #10 has one so far: 0.64).
+   - **Saturation hint:** same-model listings from the 200-row Browse search. With sold counts from saved evidence it is today's months-of-supply rule. Without them, 20 or more same-model listings, or 3 or more identical ones, count as "crowded": the verdict drops one step and the reply says so.
+   - **At most MAYBE without sales,** as today. A quick MAYBE or BUY that no sale backs says **"est. — run Full before buying"**, with the button.
+   - **No more auto-full.** A quick check with nothing cached answers from retail + asks + our sales and offers the button, instead of going on to the full check (which is where Apify was spent).
+
+**Full check:** today's full check, plus the retail step. Apify only runs here: sold prices.
+
+**Both sides of step (a), and the recommendation.**
+- **Claude web search, as asked.** About $0.05 and 8–15 s per check, run in parallel with Browse. The result is a clean store/price/URL list.
+- **The Gemini identify research already searches Google** (about 3 searches) before the photo is identified. For check #10 it returned the official $169 and the brand's $99 sale price without being asked. Asking that prompt also for "current new prices: store, price, URL" costs about $0.002 and no extra time.
+- **Recommendation:** ask Gemini first, and run the Claude search only when Gemini returns no retail offer with a URL. In check #10's and #2's cases a Claude search found nothing Gemini hadn't (see below). Expected cost: about $0.01–0.02 a check instead of $0.05.
+
+**Cost and speed per check (proposed):**
+
+| | Quick (new) | Full (new) |
+|---|---|---|
+| AI | identify $0.012 + retail $0.002–0.05 + summary $0.02 = **$0.035–0.08** | the same + full judge, about **$0.05–0.10** |
+| Apify | **$0** | $0.06–0.12; **$0–0.02** when the model's sales are saved (Part 2) |
+| Time | **30–35 s**, or 40–45 s with the Claude search (it runs in parallel with Browse) | 35–65 s, as today |
+
+### Part 2: `check_evidence`, facts only
+
+**One row per piece of evidence, saved by every check, intake pricing and reprice.**
+- Skipped checks count too ("including the items I skipped").
+- Facts only: no descriptions, no page text, no photos.
+- The schema change is Person B's area: a new numbered step in `migrations.py`, for SQL Server and SQLite.
+
+| Column | |
+|---|---|
+| `evidence_id` | key |
+| `check_id`, `item_id` | the check, or the stored item (intake/reprice); either may be null |
+| `model_key` | `sold_reuse.model_keys`: `vondutch|words|bowling cow print`, `edhardy|code|ehh108` (one row per key, or a key table) |
+| `source` | `retail`, `ebay_sold`, `ebay_active`, `own_sale` |
+| `store` | Walmart, Target, … / the eBay seller / ours |
+| `title`, `condition` | as shown |
+| `price`, `shipping`, `total` | dollars; total = price + shipping, as the comps use |
+| `url`, `ebay_id` | the link; `ebay_id` dedupes eBay rows |
+| `event_date` | sale date (sold, own sale) or the date first seen (listing, retail offer) |
+| `match` | `same_item`, `same_model`, `other` (after `tighten_same_model`), and who said so (`judge`, `code`, `title`) |
+| `query` | the search it came from |
+| `fetched_at` | when we got it |
+
+Indexes: `(model_key, source, fetched_at)`, `(check_id)`, `(item_id)`.
+Size: about 50 rows a check, so about 5,000 a month.
+
+**As a cache, shared by /check, intake and repricing:**
+- **eBay sold rows:** a full check, intake or reprice first reads the model's sold rows from the last 7 days. Apify runs only for searches with nothing saved for the model. The exact style code and UPC searches always run, because they rarely return rows and cost about $0.
+  - This is the same rule as `pipeline/sold_reuse.py` (commit `7d01a45`, 2026-11-07). That commit keeps a JSON index next to the sold cache; the table replaces it.
+- **Retail offers:** reused for 7 days, which saves the Claude search on a repeat model.
+- **eBay listings:** Browse is free, so it is always searched again. Every search is still saved, so the history shows the asks over time.
+- **Repricing:** writes its rows with `item_id` and reads by `model_key`. It still uses its own cached rows of any age first, as today.
+
+**History and backtests:**
+- Price history per model: sales, asks and retail over time.
+- The sold-to-ask ratio of Part 1.
+- `backtest_check` and `backtest_pricing` replay from the table, so a backtest costs $0 of Apify. Backtests spent about $7.90 of the last two months' $11.50 of Apify free credit.
+
+**Order of work:**
+1. The migration step, plus writing evidence from /check, intake and reprice (write only).
+2. Reading the sold rows from the table (replaces the JSON index).
+3. The new quick check (Part 1).
+4. Backtests read from the table.
+
+### Expected Apify cost at about 100 checks a month
+
+Assumptions:
+- About 85 of 100 checks are a model not seen in the last 7 days.
+- A full check costs $0.08 on average.
+- Intake: about 30 items bought a month, about $0.02 each.
+- Repricing: at most 15 pricing runs a week, mostly cached.
+
+| | Checks | Intake | Repricing | **Month** |
+|---|---|---|---|---|
+| Today (an uncached quick check goes on to full) | 85 × $0.08 = $6.80 | $0.60 | ≤ $1.40 | **≈ $7–9** |
+| New quick check, **no** evidence cache (full on about 30 checks) | 30 × $0.08 = $2.40 | $0.60 | ≤ $1.40 | **≈ $3–4** |
+| New quick check **with** the evidence cache (repeat models and brands, intake after a check) | about $1.50–2 | ≈ $0 | ≤ $1 | **≈ $2–3** |
+
+- The free credit is $10 a month: two accounts at $5 each.
+- One backtest run of today's kind costs about $3.50. With the table it costs $0.
+- The AI cost of the new quick check is about $3.50–8 a month (Anthropic and Gemini, not Apify).
+
+### What the new quick check would have said
+
+**Check #10, Von Dutch VDBB-1036PRP purple cow print bowling bag, Ross $24.99:**
+- **Retail:** nothing new for this colour. The brand's other cow-print colours are $99 (list $169); Solefeed is resale, so it is left out. Gemini's research had already found $169 and $99.
+- **eBay asks:** 3 identical at $72.20, $84.10 and $85.15, and 37 of the same model for sale.
+- **Our sales:** no Von Dutch bags sold.
+- **Result:** with no sales, today's ladder gives MSRP × the bag ratio, capped at the ask: **~$60.99 (est.), profit ~$24.41, Max buy ~$33.78**. That is MAYBE, and the crowded hint drops it to **🟠 BORDERLINE: "est. — run Full before buying"**.
+- **The full check:** SKIP at ~$41.99, from the real sales.
+- **Takeaway:** the quick check overprices this bag by about $19. The crowded hint and the "run Full" line are what keep it from saying buy. With the sold-to-ask ratio (0.64), the quick price would be ~$35.99 (profit $4.29), which is BORDERLINE, and SKIP with the crowded hint. That matches the full check.
+
+**Check #2, Juicy Couture To Go Weekender Tote 11JCDA0JC-JTL (Liquorice Black), Ross $9.99:**
+- **Retail:** nothing current for this tote. Searches for the name, the code and the UPC found no store. Walmart sells other Juicy weekenders at $110. The MSRP is $109.
+- **eBay asks:** the only identical listing is a dropship one ($104.05: copied title, 16k-feedback seller, Diaper Bags category), so there is no real ask.
+- **Our sales:** no Juicy bags.
+- **Result:** MSRP $109 × our bag ratio 0.47 gives **~$50.99 (est.), profit ~$26.91, Max buy ~$21.12**, so **🟡 MAYBE: "est. — run Full before buying"**.
+- **The full check:** its one sale (pink, $30.49 total) gives $20.99: profit $2.76, Max buy below $0, so SKIP.
+- **Takeaway:** the quick check would say buy-ish where the sales say no. Without sales, a quick check can only screen; the "run Full before buying" line is required, not optional.
+
+**Conclusion:**
+- The new quick check is cheap (about $0.04 and no Apify), and it is right about retail and asks.
+- On these two items, without sold prices, it overprices by $19–30. It catches check #10 only through the crowded hint.
+- It has two uses:
+  - a **"no"** screen: a crowded market, retail below our price, or a negative max buy ends the check;
+  - a pointer to the full check for anything it would buy.
+- The saved evidence makes the full check nearly free on repeat models, and teaches the sold-to-ask ratio that makes the quick price usable.
+
 ## 00. v1 change: shopping mode, photos only (Person B, 2026-11-02). This overrides everything below where they differ.
 
 **No typing in the aisle.**
