@@ -664,6 +664,39 @@ row):
 | Judge: Sonnet, +Opus in ~26% | ~$0.04 | ~$0.04 | ~$0.04 |
 | **Total** | **~$0.22** | **~$0.24** | **~$0.04–0.06** |
 
+### Apify use, measured, and the same model's searches reused (Person B, 2026-11-07)
+
+**What it costs.** Apify bills $0.004 per sold row. A search that finds nothing
+costs only the $0.0001 run start.
+- The specific searches (style code, UPC, the long product name) usually find
+  0–2 rows.
+- The broad ones fill their 15 rows: brand + type "Von Dutch handbag" $0.06,
+  fewer words up to $0.06.
+- A full check measured $0.06–0.12 (5 checks, 2026-11-05/06). Intake pricing:
+  $0–0.12, about $0.02 on average.
+- The two months' spend ($11.50 of free credit) was mostly backtests: Person
+  A's pricing backtest on 2026-10-14/17 ($4.34) and `backtest_check --full-check`
+  on 2026-11-02 ($3.53, 357 searches). Day-to-day use was $0.06–0.21 a day.
+
+**Reuse** (`pipeline/sold_reuse.py`, `SOLD_MODEL_REUSE_DAYS` = 7):
+- **The index.** Every sold search is filed under its model:
+  - the brand + the base style code;
+  - the brand + 2 or more distinctive product-name words (`model_tokens`).
+- **What is reused.** A later item of the same model gets the same kind of
+  search (product name, search query, fewer words, brand + type) from the last
+  7 days instead of an Apify call. A later item can be another colour, the
+  intake after a /check, or a reprice.
+- **What still runs.** The exact-item searches (full style code, UPC) always
+  run. They are what tells the colours apart, and they cost almost nothing.
+- **Already shared before.** Searches worded without colour ("Von Dutch cow
+  print bowling bag") were already shared by their exact text.
+- **Who uses it.** /check (quick and full), intake and repricing (`price_item`)
+  share the one sold cache. Repricing still uses its own cached rows of any age
+  first, and reuses only for searches it doesn't have. Backtests
+  (`get_pricing_v2` directly) don't reuse.
+- **Logging.** Every check logs `apify_searches`, `apify_rows` and `apify_usd`
+  in `logs/check_timings.jsonl`.
+
 **Guards.**
 - `CHECK_DAILY_MAX` = 30 checks a day caps the cost at about **$7 a day**.
 - The existing `ApifyBudgetExceeded` and the `ANTHROPIC_MONTHLY_BUDGET` warnings

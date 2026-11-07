@@ -1053,6 +1053,8 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
             stage="check_judge" if full else "check_quick_judge", escalate=full,
             sold_cache_only=not full, sold_max_age_s=config.CHECK_SOLD_CACHE_DAYS * 86400,
             active_max_age_s=0, extra_sold_queries=similar_queries(ident) if full else None,
+            # another colour's, the intake's or a reprice's searches of this model
+            model_reuse_s=config.SOLD_MODEL_REUSE_DAYS * 86400,
             # A UPC or style code already pins the item; image search on a dark
             # photo only adds noise (check #2: 16 Hugo Boss bags).
             image_search=not (pricing_v2.upc_of(ident) or pricing_v2.style_code(ident)))

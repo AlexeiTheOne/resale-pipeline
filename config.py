@@ -345,6 +345,10 @@ CHECK_DAILY_WARN = int(os.getenv("CHECK_DAILY_WARN", "40"))
 # Cached sold rows older than this are not used by /check (pricing for stored
 # items keeps any age until Person A agrees otherwise).
 CHECK_SOLD_CACHE_DAYS = float(os.getenv("CHECK_SOLD_CACHE_DAYS", "7"))
+# /check, intake and repricing reuse the same model's sold searches (another
+# colour, a /check before the intake) up to this old instead of calling Apify
+# (pipeline/sold_reuse.py). 0 = off.
+SOLD_MODEL_REUSE_DAYS = float(os.getenv("SOLD_MODEL_REUSE_DAYS", "7"))
 # Dropship-style listings (copied Amazon titles, huge sellers, wrong
 # category): flagged on 2 signals, kept out of the sold evidence, still a
 # ceiling. A seller at or above this feedback score counts as one signal.
