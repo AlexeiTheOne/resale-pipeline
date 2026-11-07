@@ -257,11 +257,12 @@ in four colours in 30 days, the purple one included.
   no sales, and is otherwise shown but not used. **Asking prices cap only a
   price without eBay sales**: an unsold ask doesn't lower a price that sales
   back. A **single same-item sale** (too few for level 1) joins level 2.
-- **Fees:** `CHECK_FEE_PCT` = **24.7% of what the buyer pays** (item +
-  shipping), measured on a real order. It covers all fees and ads, with no
-  separate $0.40. The label is still subtracted on its own. It's /check
-  only: the repricing floor and the profit report keep `EBAY_FVF_PCT` +
-  `EBAY_AD_FEE_PCT` + `EBAY_FIXED_FEE` (Person A's).
+- **Fees** (corrected 2026-11-07): 15.5% of what the buyer pays + $0.40
+  per order + the listing's ad rate (4%), about 20% in all. See §4. A flat
+  24.7% (`CHECK_FEE_PCT`) was used for one day; it came from one small
+  order with a 6.5% ad rate and has been removed. The label is still
+  subtracted on its own. The repricing floor and the profit report are
+  unchanged (Person A's).
 - **Max buy** on every reply, and in Details: the highest Ross tag price
   (before tax) that leaves $15 profit (`CHECK_BUY_MIN_PROFIT`) at the sell
   price. "~" when the price is an estimate. "none" when even $0 doesn't
@@ -269,7 +270,9 @@ in four colours in 30 days, the purple one included.
 
 Replayed (dev, full): **BORDERLINE, sell ~$45.99** from 7 sales (1 the
 same purple bag, 6 other colours), profit ~$9.83 at $24.99, **Max buy
-~$20.15**. It was MAYBE at $60.99.
+~$20.15** (with the 24.7% fees; with the 2026-11-07 fees: profit ~$12.34,
+Max buy ~$22.50). It was MAYBE at $60.99. The saturation signal below then
+lowers it further.
 
 ### Saturation: sold in 30 days vs listings for sale (Person B, 2026-11-06)
 
@@ -316,7 +319,7 @@ Check #10 replayed (dev, full):
   purple asks, $82.70–85.15 with shipping);
 - the price goes from the $45.99 median to the lower quartile, **$41.99**;
 - the verdict goes from BORDERLINE to **SKIP**;
-- profit ~$6.82 at $24.99; Max buy ~$17.34.
+- profit ~$9.12 at $24.99; Max buy ~$19.49 (2026-11-07 fees).
 
 There are 37 active, not ~20, because the 200-row search finds more
 colours than eBay's first page shows.
@@ -553,22 +556,30 @@ v2 terms: the judge decides what is identical, not keyword rules.
 P   = suggested item price (default mode) or formula price (exact)
 S   = shipping we charge                      EBAY_SHIP_CHARGED   9.88
 T   = P + S                                   (what the buyer pays)
-fees= T × CHECK_FEE_PCT  = T × 0.247   (2026-11-06; was T × 0.201 + 0.40, see "Check #10 fixes")
+a   = the listing's ad rate                   EBAY_DEFAULT_AD_RATE_PCT  4%
+fees= T × (EBAY_FVF_PCT + a) + EBAY_FIXED_FEE = T × (0.155 + 0.04) + 0.40   (2026-11-07)
 L   = shipping label we pay                   EBAY_SHIP_COST      7.20  (or "ship 12" in the message)
 C   = Ross price × (1 + SALES_TAX_RATE)       ×1.07
 profit = T − fees − L − C          ROI = profit / C
-break-even total  T_be = (C + L) / (1 − 0.247)     → break-even item price = T_be − S
+break-even total  T_be = (C + L + 0.40) / (1 − 0.195)     → break-even item price = T_be − S
 profit_at_cheapest = same formula at T = raw_active_floor (cheapest identical total)
 max buy = (T − fees − L − 15) / 1.07          (the Ross price for $15 profit)
 ```
 
-Worked example (24.7%): Ross $14.99, P = $39.99 → T = $49.87, fees $12.32,
-label $7.20, C = $16.04 → **profit $14.31, ROI 89%**, break-even T = $30.86
-(item $20.98), max buy $14.34.
+Worked example: Ross $14.99, P = $39.99 → T = $49.87, fees $10.12,
+label $7.20, C = $16.04 → **profit $16.51, ROI 103%**, break-even T = $29.37
+(item $19.49), max buy $16.40.
 
-`EBAY_FVF_PCT` 15.5% is already the effective rate measured on our orders
-(it includes eBay's fee on the sales tax the buyer pays). `EBAY_AD_FEE_PCT`
-4.6% assumes every listing is promoted at the default rate, as today.
+Fitted on our 85 orders (Person B, 2026-11-07):
+- Fees without ads are 15.5% × (item + shipping) + $0.40 (`EBAY_FVF_PCT`,
+  `EBAY_FIXED_FEE`), off by $0.79 an order on average. The 15.5% is the
+  effective rate: it includes eBay's fee on the sales tax the buyer pays.
+- Ads were charged on 77 of the 85 orders, at a median 4.3% of item +
+  shipping. /check uses the ad rate a new listing gets
+  (`EBAY_DEFAULT_AD_RATE_PCT`, 4%).
+- All-in median: 19.6%.
+
+The flat 24.7% of 2026-11-06 was one small order with a 6.5% ad rate.
 
 **Label cost by item type** (`CHECK_LABEL_COSTS`; these are starting
 estimates, to be corrected from real label costs). The type comes from the

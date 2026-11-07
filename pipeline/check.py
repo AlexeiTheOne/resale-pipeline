@@ -217,15 +217,27 @@ def label_for(ident: dict, text: str = "") -> tuple[str, float]:
 
 # --- money (design §4; all rates from config) -------------------------------------
 
+def _ad_rate() -> float:
+    """The ad rate a new listing gets (EBAY_DEFAULT_AD_RATE_PCT, 4%), as a fraction."""
+    return max(config.EBAY_DEFAULT_AD_RATE_PCT or 0, 0) / 100
+
+
 def _fee_rate() -> float:
-    """eBay's cut of what the buyer pays (item + shipping): CHECK_FEE_PCT, all
-    fees and ads in one rate, measured on a real order (Person B, 2026-11-06)."""
-    return config.CHECK_FEE_PCT
+    """eBay's percentage of what the buyer pays (item + shipping): the final
+    value fee (EBAY_FVF_PCT, 15.5% effective) plus the listing's ad rate.
+    The fixed fee per order (EBAY_FIXED_FEE) comes on top (Person B,
+    2026-11-07; fitted on our 85 orders: fees 15.5% + $0.40, ads ~4%,
+    together 19.6%)."""
+    return config.EBAY_FVF_PCT + _ad_rate()
+
+
+def ebay_fees(total: float) -> float:
+    return total * _fee_rate() + config.EBAY_FIXED_FEE
 
 
 def at_total(total: float, ross_price: float, label: float) -> dict:
     """What one unit nets when the buyer pays `total` (item + shipping)."""
-    fees = total * _fee_rate()
+    fees = ebay_fees(total)
     keep = total - fees - label
     cost = ross_price * (1 + config.SALES_TAX_RATE)
     profit = keep - cost
@@ -241,7 +253,7 @@ def economics(item_price: float, ross_price: float, label: float,
     ship = config.EBAY_SHIP_CHARGED if ship_charged is None else ship_charged
     out = at_total(item_price + ship, ross_price, label)
     cost = ross_price * (1 + config.SALES_TAX_RATE)
-    be_total = (cost + label) / (1 - _fee_rate())
+    be_total = (cost + label + config.EBAY_FIXED_FEE) / (1 - _fee_rate())
     out.update(item_price=round(item_price, 2), ship_charged=round(ship, 2),
                break_even_total=round(be_total, 2), break_even_item=round(be_total - ship, 2))
     return out
@@ -1488,7 +1500,8 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
         if pick.get("ask_discount"):
             out.append(f"  asking prices only: ×{pick['ask_discount']} (our sold/ask gap)"
                        + (f" and −{config.UNDERCUT_V2_PCT:.0%} undercut" if "cheapest" in pick['basis'] else ""))
-        out.append(f"Fees + ads {_usd(money['fees'])} ({_fee_rate():.1%} of what the buyer pays) · "
+        out.append(f"Fees + ads {_usd(money['fees'])} ({config.EBAY_FVF_PCT:.1%} + {_ad_rate():.1%} ad rate of what "
+                   f"the buyer pays + {_usd(config.EBAY_FIXED_FEE)}) · "
                    f"label {_usd(money['label'])} ({res.get('item_type')}"
                    + (f", {res['label_size']}" if res.get("label_size") else "") + f") · you keep {_usd(money['keep'])}")
         roi = _pct(money["roi"]) if money.get("roi") is not None else "-"

@@ -49,8 +49,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(check_cmds, "_identify_one", lambda path: dict(IDENT))
     monkeypatch.setattr(config, "CHECK_DAILY_MAX", 50)
     monkeypatch.setattr(config, "CHECK_DAILY_WARN", 40)
-    # flow tests: a fee rate pinned so the fake sales stay a BUY (the money is tested in test_check)
-    monkeypatch.setattr(config, "CHECK_FEE_PCT", 0.20)
+    # flow tests: fees pinned so the fake sales stay a BUY (the money is tested in test_check)
+    monkeypatch.setattr(config, "EBAY_FVF_PCT", 0.155)
+    monkeypatch.setattr(config, "EBAY_FIXED_FEE", 0.40)
+    monkeypatch.setattr(config, "EBAY_DEFAULT_AD_RATE_PCT", 4.0)
     yield calls
     for s in state.shop_mode.values():
         if s.get("task"):

@@ -11,7 +11,7 @@ from pipeline import check
 def rates(monkeypatch):
     """The design's numbers, pinned so a config change doesn't move the tests."""
     for name, value in (("EBAY_FVF_PCT", 0.155), ("EBAY_AD_FEE_PCT", 0.046), ("EBAY_FIXED_FEE", 0.40),
-                        ("CHECK_FEE_PCT", 0.247),
+                        ("EBAY_DEFAULT_AD_RATE_PCT", 4.0),
                         ("EBAY_SHIP_CHARGED", 9.88), ("EBAY_SHIP_COST", 7.20), ("SALES_TAX_RATE", 0.07),
                         ("UNDERCUT_V2_PCT", 0.05), ("CHECK_BUY_MIN_PROFIT", 15.0),
                         ("CHECK_BUY_MIN_ROI", 0.75), ("CHECK_MIN_SALES", 3), ("CHECK_MIN_PROFIT", 5.0),
@@ -57,18 +57,21 @@ def test_label_by_item_type(text, kind, label):
 
 def test_worked_example_from_the_design():
     m = check.economics(39.99, 14.99, 7.20)
-    # fees: 24.7% of what the buyer pays, ads and fixed fee included (Person B, 2026-11-06)
+    # fees: 15.5% + the 4% ad rate of what the buyer pays + $0.40 (Person B, 2026-11-07)
     assert (m["total"], m["fees"], m["keep"], m["cost"], m["profit"], m["roi"]) == \
-        (49.87, 12.32, 30.35, 16.04, 14.31, 0.89)
-    assert (m["break_even_total"], m["break_even_item"]) == (30.86, 20.98)
-    assert check.at_total(44.50, 14.99, 7.20)["profit"] == 10.27
+        (49.87, 10.12, 32.55, 16.04, 16.51, 1.03)
+    assert (m["break_even_total"], m["break_even_item"]) == (29.37, 19.49)
+    assert check.at_total(44.50, 14.99, 7.20)["profit"] == 12.18
     # at break-even the profit is zero
     assert abs(check.economics(m["break_even_item"], 14.99, 7.20)["profit"]) <= 0.01
+    # the ad rate is the listing's: no ads, no ad fee
+    config.EBAY_DEFAULT_AD_RATE_PCT = 0          # restored by the rates fixture
+    assert check.economics(39.99, 14.99, 7.20)["fees"] == round(49.87 * 0.155 + 0.40, 2)
 
 
 def test_max_buy_is_the_ross_price_for_15_profit():
     mb = check.max_buy(39.99, 7.20)
-    assert mb == 14.34 and 15.0 <= check.economics(39.99, mb, 7.20)["profit"] < 15.02
+    assert mb == 16.40 and 15.0 <= check.economics(39.99, mb, 7.20)["profit"] < 15.02
     assert check.max_buy(None, 7.20) is None and check.max_buy(12.99, 11.0) < 0
     assert check.max_buy_line({"max_buy": None, "pick": {"price": None}}) == "Max buy: - (no sell price found)"
     assert check.max_buy_line({"max_buy": -3.0, "pick": {"price": 12.99}}).startswith("Max buy: none")
@@ -196,7 +199,7 @@ def test_check10_real_sales_win_over_msrp_of_other_brands_and_unsold_asks():
     assert pick["levels"][2]["n"] == 4 and pick["levels"][2]["same_item"] == 1
     assert pick["used"] == [2] and pick["price"] == 45.99 and not pick["capped"]
     assert 4 in pick["levels"] and 4 not in pick["used"]                   # shown, not used
-    assert ev["max_buy"] == check.max_buy(45.99, ev["label"]) == 15.01
+    assert ev["max_buy"] == check.max_buy(45.99, ev["label"]) == 17.36
     res = check.run_check({**check.parse_request("/check full 24.99"), "identification": VON_DUTCH},
                           pricing_fn=lambda i, **kw: p, have_fn=lambda *a: [])
     text = check.format_reply(res)
@@ -480,8 +483,8 @@ def test_headline_is_verdict_and_evidence_and_the_estimate_is_marked(monkeypatch
     assert lines[1] == "Michael Kors pave necklace (MKJ3969710)"
     # level 3: our two Michael Kors sales ($40, $46); the $160.19 listing is only a ceiling
     assert res["pick"]["used"] == [3] and res["pick"]["price"] == 42.99
-    assert lines[2] == "Ross $14.99 · sell ~$42.99 (est.) · profit ~$19.27"
-    assert lines[3] == "Max buy: ~$18.98 ($15 profit at ~$42.99)"
+    assert lines[2] == "Ross $14.99 · sell ~$42.99 (est.) · profit ~$21.62"
+    assert lines[3] == "Max buy: ~$21.17 ($15 profit at ~$42.99)"
     assert lines[4] == "List $53.99 BO (auto-accept $44.99, decline < $38.99) or $42.99 fixed"
     assert lines[5] == "Evidence: 0 sold same · our Michael Kors items ~$43 · ask ≤$147 · match uncertain"
     assert lines[6] == "🔗 For sale $160.19 (same item) https://ebay.com/itm/1"
@@ -857,7 +860,7 @@ def test_check5_vans_sling_is_borderline_estimated_with_a_small_bag_label(monkey
     ev = check.evaluate(p, VANS, 12.99, exact=True, history=BAGS)
     assert ev["pick"]["used"] == [4] and ev["pick"]["price"] == 20.99 and ev["pick"]["levels"][4]["level"] == "type"
     assert ev["label"] == 5.50 and ev["label_size"] == "small"
-    assert ev["verdict"] == "BORDERLINE" and ev["money"]["profit"] == 3.85
+    assert ev["verdict"] == "BORDERLINE" and ev["money"]["profit"] == 5.05
     res = check.run_check({**check.parse_request("/check full 12.99"), "identification": VANS},
                           pricing_fn=lambda i, **kw: p, have_fn=lambda *a: [])
     lines = check.format_reply(res).splitlines()
