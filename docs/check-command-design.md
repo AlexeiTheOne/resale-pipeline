@@ -12,6 +12,12 @@ today's code is from `main` at `9428e3a`.
 Pricing is Person A's area: Person B asked for this design and tells them.
 Nothing below is code yet.
 
+**Decided (Person B, 2026-11-07):**
+- **Retail prices:** Gemini identify research first; Claude web search only as a fallback when Gemini returns no store offer with a URL.
+- **The AI judges matches only.** Price, verdict and max buy stay in code.
+- **The order:** the evidence table and the new quick check are one separate PR, after PR #4 is merged.
+- **No backtests until the evidence table exists.** They spent about $7.90 of the last two months' $11.50 of Apify free credit. With the table they replay for $0.
+
 ### Where we are (measured)
 
 | | Quick check today | Full check today |
