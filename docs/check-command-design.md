@@ -7,6 +7,158 @@ pricing and reviews the PR. Builds on proposal (b) in
 `legacy/comps_app.py` (both on branch `post-cutover-ideas`). Every fact about
 today's code is from `main` at `9428e3a`.
 
+## 0000. Design: cheaper quick check, and every check's evidence saved (Person B, 2026-11-07). Not built yet.
+
+Pricing is Person A's area: Person B asked for this design and tells them.
+Nothing below is code yet.
+
+**Decided (Person B, 2026-11-07):**
+- **Retail prices:** Gemini identify research first; Claude web search only as a fallback when Gemini returns no store offer with a URL.
+- **The AI judges matches only.** Price, verdict and max buy stay in code.
+- **The order:** the evidence table and the new quick check are one separate PR, after PR #4 is merged.
+- **No backtests until the evidence table exists.** They spent about $7.90 of the last two months' $11.50 of Apify free credit. With the table they replay for $0.
+
+### Where we are (measured)
+
+| | Quick check today | Full check today |
+|---|---|---|
+| Steps | identify (Gemini + Google Search), cached sold rows only, Browse, Sonnet judge | the same + live Apify sold searches, UPC/fewer-words/brand+type searches, demand, supply |
+| AI | identify $0.012 + judge $0.020 = **$0.03** | identify $0.012 + judge $0.02–0.06 = **$0.03–0.07** |
+| Apify | $0, but a quick check with **nothing cached goes on to the full check** (check #10) | **$0.06–0.12** (5 checks, 2026-11-05/06); the brand + type and fewer-words searches fill their 15 rows ($0.06 each), the specific ones usually find 0–2 |
+| Time | 27–31 s (identify 20–23 s, comps 0.8 s, judge 6–7 s) | +13–20 s after a quick one; 35–65 s from a photo when Apify runs |
+
+- **AI costs** are from `llm_usage` (production, since 2026-10-01).
+- **Apify** is from the sold cache.
+- **Times** are from `logs/check_timings.jsonl`.
+- **Web search measured on Claude:** `value_notes` (Sonnet 5.5, 5 searches) averages $0.12 a call with 31.6k input tokens, so about **$0.024 per search** all-in ($0.01 per search plus the result tokens).
+- **Web search measured on Gemini:** the identify research (Gemini, about 3 Google searches) averages $0.008 a call.
+
+### Part 1: the quick check, modelled on the manual method. No Apify, ever.
+
+**Steps:**
+1. **Identify** (today's step, unchanged).
+2. Then, in parallel:
+   - **(a) Retail prices.** The cheapest new prices now, from Walmart, Target, Amazon, Nordstrom Rack, TJ Maxx/Marshalls, Macy's and the brand's site: store, price, URL, in stock or not. Claude `web_search_20260209` on Sonnet 5.5 (the same call shape as `quick_price.py`):
+     - `max_uses` 2;
+     - `blocked_domains`: eBay, Poshmark, Mercari, Depop, Etsy, Solefeed, because resale isn't retail (the API takes either an allowed or a blocked list, not both);
+     - the answer as a JSON list via structured output.
+   - **(b) eBay listings** for sale, via Browse (free): today's text, GTIN and image searches, plus the 200-row wide search the supply count uses.
+   - **(c) Our own sales**: the brand + type bucket (ladder level 3), from ResaleDB.
+   - **(d) Saved evidence** (Part 2): eBay sales of the same model from the last 7 days, and older ones marked with their age.
+3. **AI summary.** One Sonnet call, today's `check_quick_judge`. It marks each listing and offer as same item / same model / other, and returns:
+   - the cheapest new retail;
+   - the typical eBay ask (the median same-item ask) and the cheapest real one (dropship listings left out, as today);
+   - a one-line saturation hint;
+   - its reasons.
+4. **Price, verdict and max buy stay in code**, using today's ladder. The AI judges matches and never sets the money. Changes:
+   - **Retail as a ceiling:** our price is never above the cheapest new retail delivered price (price + shipping, or free shipping) × 0.9. A buyer won't pay eBay more than Walmart.
+   - **Asks as a price, a new level 4b:** the cheapest real identical ask × a **sold-to-ask ratio** learned from the saved evidence. It's learned per brand + type, else per type, from models that have both sales and asks. Until 20 models have both, the ratio is shown but not used (only check #10 has one so far: 0.64).
+   - **Saturation hint:** same-model listings from the 200-row Browse search. With sold counts from saved evidence it is today's months-of-supply rule. Without them, 20 or more same-model listings, or 3 or more identical ones, count as "crowded": the verdict drops one step and the reply says so.
+   - **At most MAYBE without sales,** as today. A quick MAYBE or BUY that no sale backs says **"est. — run Full before buying"**, with the button.
+   - **No more auto-full.** A quick check with nothing cached answers from retail + asks + our sales and offers the button, instead of going on to the full check (which is where Apify was spent).
+
+**Full check:** today's full check, plus the retail step. Apify only runs here: sold prices.
+
+**Both sides of step (a), and the recommendation.**
+- **Claude web search, as asked.** About $0.05 and 8–15 s per check, run in parallel with Browse. The result is a clean store/price/URL list.
+- **The Gemini identify research already searches Google** (about 3 searches) before the photo is identified. For check #10 it returned the official $169 and the brand's $99 sale price without being asked. Asking that prompt also for "current new prices: store, price, URL" costs about $0.002 and no extra time.
+- **Recommendation:** ask Gemini first, and run the Claude search only when Gemini returns no retail offer with a URL. In check #10's and #2's cases a Claude search found nothing Gemini hadn't (see below). Expected cost: about $0.01–0.02 a check instead of $0.05.
+
+**Cost and speed per check (proposed):**
+
+| | Quick (new) | Full (new) |
+|---|---|---|
+| AI | identify $0.012 + retail $0.002–0.05 + summary $0.02 = **$0.035–0.08** | the same + full judge, about **$0.05–0.10** |
+| Apify | **$0** | $0.06–0.12; **$0–0.02** when the model's sales are saved (Part 2) |
+| Time | **30–35 s**, or 40–45 s with the Claude search (it runs in parallel with Browse) | 35–65 s, as today |
+
+### Part 2: `check_evidence`, facts only
+
+**One row per piece of evidence, saved by every check, intake pricing and reprice.**
+- Skipped checks count too ("including the items I skipped").
+- Facts only: no descriptions, no page text, no photos.
+- The schema change is Person B's area: a new numbered step in `migrations.py`, for SQL Server and SQLite.
+
+| Column | |
+|---|---|
+| `evidence_id` | key |
+| `check_id`, `item_id` | the check, or the stored item (intake/reprice); either may be null |
+| `model_key` | `sold_reuse.model_keys`: `vondutch|words|bowling cow print`, `edhardy|code|ehh108` (one row per key, or a key table) |
+| `source` | `retail`, `ebay_sold`, `ebay_active`, `own_sale` |
+| `store` | Walmart, Target, … / the eBay seller / ours |
+| `title`, `condition` | as shown |
+| `price`, `shipping`, `total` | dollars; total = price + shipping, as the comps use |
+| `url`, `ebay_id` | the link; `ebay_id` dedupes eBay rows |
+| `event_date` | sale date (sold, own sale) or the date first seen (listing, retail offer) |
+| `match` | `same_item`, `same_model`, `other` (after `tighten_same_model`), and who said so (`judge`, `code`, `title`) |
+| `query` | the search it came from |
+| `fetched_at` | when we got it |
+
+Indexes: `(model_key, source, fetched_at)`, `(check_id)`, `(item_id)`.
+Size: about 50 rows a check, so about 5,000 a month.
+
+**As a cache, shared by /check, intake and repricing:**
+- **eBay sold rows:** a full check, intake or reprice first reads the model's sold rows from the last 7 days. Apify runs only for searches with nothing saved for the model. The exact style code and UPC searches always run, because they rarely return rows and cost about $0.
+  - This is the same rule as `pipeline/sold_reuse.py` (commit `7d01a45`, 2026-11-07). That commit keeps a JSON index next to the sold cache; the table replaces it.
+- **Retail offers:** reused for 7 days, which saves the Claude search on a repeat model.
+- **eBay listings:** Browse is free, so it is always searched again. Every search is still saved, so the history shows the asks over time.
+- **Repricing:** writes its rows with `item_id` and reads by `model_key`. It still uses its own cached rows of any age first, as today.
+
+**History and backtests:**
+- Price history per model: sales, asks and retail over time.
+- The sold-to-ask ratio of Part 1.
+- `backtest_check` and `backtest_pricing` replay from the table, so a backtest costs $0 of Apify. Backtests spent about $7.90 of the last two months' $11.50 of Apify free credit.
+
+**Order of work:**
+1. The migration step, plus writing evidence from /check, intake and reprice (write only).
+2. Reading the sold rows from the table (replaces the JSON index).
+3. The new quick check (Part 1).
+4. Backtests read from the table.
+
+### Expected Apify cost at about 100 checks a month
+
+Assumptions:
+- About 85 of 100 checks are a model not seen in the last 7 days.
+- A full check costs $0.08 on average.
+- Intake: about 30 items bought a month, about $0.02 each.
+- Repricing: at most 15 pricing runs a week, mostly cached.
+
+| | Checks | Intake | Repricing | **Month** |
+|---|---|---|---|---|
+| Today (an uncached quick check goes on to full) | 85 × $0.08 = $6.80 | $0.60 | ≤ $1.40 | **≈ $7–9** |
+| New quick check, **no** evidence cache (full on about 30 checks) | 30 × $0.08 = $2.40 | $0.60 | ≤ $1.40 | **≈ $3–4** |
+| New quick check **with** the evidence cache (repeat models and brands, intake after a check) | about $1.50–2 | ≈ $0 | ≤ $1 | **≈ $2–3** |
+
+- The free credit is $10 a month: two accounts at $5 each.
+- One backtest run of today's kind costs about $3.50. With the table it costs $0.
+- The AI cost of the new quick check is about $3.50–8 a month (Anthropic and Gemini, not Apify).
+
+### What the new quick check would have said
+
+**Check #10, Von Dutch VDBB-1036PRP purple cow print bowling bag, Ross $24.99:**
+- **Retail:** nothing new for this colour. The brand's other cow-print colours are $99 (list $169); Solefeed is resale, so it is left out. Gemini's research had already found $169 and $99.
+- **eBay asks:** 3 identical at $72.20, $84.10 and $85.15, and 37 of the same model for sale.
+- **Our sales:** no Von Dutch bags sold.
+- **Result:** with no sales, today's ladder gives MSRP × the bag ratio, capped at the ask: **~$60.99 (est.), profit ~$24.41, Max buy ~$33.78**. That is MAYBE, and the crowded hint drops it to **🟠 BORDERLINE: "est. — run Full before buying"**.
+- **The full check:** SKIP at ~$41.99, from the real sales.
+- **Takeaway:** the quick check overprices this bag by about $19. The crowded hint and the "run Full" line are what keep it from saying buy. With the sold-to-ask ratio (0.64), the quick price would be ~$35.99 (profit $4.29), which is BORDERLINE, and SKIP with the crowded hint. That matches the full check.
+
+**Check #2, Juicy Couture To Go Weekender Tote 11JCDA0JC-JTL (Liquorice Black), Ross $9.99:**
+- **Retail:** nothing current for this tote. Searches for the name, the code and the UPC found no store. Walmart sells other Juicy weekenders at $110. The MSRP is $109.
+- **eBay asks:** the only identical listing is a dropship one ($104.05: copied title, 16k-feedback seller, Diaper Bags category), so there is no real ask.
+- **Our sales:** no Juicy bags.
+- **Result:** MSRP $109 × our bag ratio 0.47 gives **~$50.99 (est.), profit ~$26.91, Max buy ~$21.12**, so **🟡 MAYBE: "est. — run Full before buying"**.
+- **The full check:** its one sale (pink, $30.49 total) gives $20.99: profit $2.76, Max buy below $0, so SKIP.
+- **Takeaway:** the quick check would say buy-ish where the sales say no. Without sales, a quick check can only screen; the "run Full before buying" line is required, not optional.
+
+**Conclusion:**
+- The new quick check is cheap (about $0.04 and no Apify), and it is right about retail and asks.
+- On these two items, without sold prices, it overprices by $19–30. It catches check #10 only through the crowded hint.
+- It has two uses:
+  - a **"no"** screen: a crowded market, retail below our price, or a negative max buy ends the check;
+  - a pointer to the full check for anything it would buy.
+- The saved evidence makes the full check nearly free on repeat models, and teaches the sold-to-ask ratio that makes the quick price usable.
+
 ## 00. v1 change: shopping mode, photos only (Person B, 2026-11-02). This overrides everything below where they differ.
 
 **No typing in the aisle.**
@@ -227,6 +379,175 @@ Check #5 (Vans Detached Sling Bag VN000Q9BFS8, Ross $12.99, MSRP $45) said
   "MSRP×47% $21 (other brands)", and Details says so too.
 - **Losses** read "−$0.63", with a real minus sign.
 
+### Check #10 fixes: real sold comps, fees, Max buy (Person B, 2026-11-06)
+
+Check #10 was a Von Dutch VDBB-1036PRP purple cow print bowling bag. The bot
+said "0 sold same", priced it from MSRP × other brands' ratio ($60.99), and
+capped that at the asking prices. eBay's own Sold link showed the bag sold
+in four colours in 30 days, the purple one included.
+
+- **Why no sales:** it was a quick check, and quick checks read only cached
+  sold searches. None of its 5 searches was cached, so it looked at no
+  sales at all. Live, the two long queries ("… crossbody NWT", the full
+  product name) find nothing anyway. Only the style code (1 sale) and
+  fewer words find them.
+- **A quick check with no sold search cached** now goes straight on to the
+  full check, as NO DATA does. The message says "no eBay sales cached for
+  this item yet". The pair counts as one check. When a quick reply does
+  have no sales looked at, the evidence says "sold not searched", never
+  "0 sold same".
+- **Fewer words** (`fewer_words_query`): the full check also searches the
+  brand + up to 4 distinctive words of the product name (no colour,
+  material or size) + the item type's noun, like eBay's "results matching
+  fewer words": "Von Dutch cow print bowling bag".
+- **Same model** ignores colour and material words in the product name
+  ("Purple & White … Vegan Pony Hair") but keeps pattern words (leopard,
+  plaid, …). So the brown cow print is the same model, and the "flying
+  eyeball" bowling bag still isn't.
+- **Real sales win the ladder:** level 1 if there is one. Else level 2 (+
+  level 3, our own sales). MSRP × ratio (level 4) is used only when there are
+  no sales, and is otherwise shown but not used. **Asking prices cap only a
+  price without eBay sales**: an unsold ask doesn't lower a price that sales
+  back. A **single same-item sale** (too few for level 1) joins level 2.
+- **Fees** (corrected 2026-11-07): 15.5% of what the buyer pays + $0.40
+  per order + the listing's ad rate (4%), about 20% in all. See §4. A flat
+  24.7% (`CHECK_FEE_PCT`) was used for one day; it came from one small
+  order with a 6.5% ad rate and has been removed. The label is still
+  subtracted on its own. The repricing floor and the profit report are
+  unchanged (Person A's).
+- **Max buy** on every reply, and in Details: the highest Ross tag price
+  (before tax) that leaves $15 profit (`CHECK_BUY_MIN_PROFIT`) at the sell
+  price. "~" when the price is an estimate. "none" when even $0 doesn't
+  make it.
+
+Replayed (dev, full): **BORDERLINE, sell ~$45.99** from 7 sales (1 the
+same purple bag, 6 other colours), profit ~$9.83 at $24.99, **Max buy
+~$20.15** (with the 24.7% fees; with the 2026-11-07 fees: profit ~$12.34,
+Max buy ~$22.50). It was MAYBE at $60.99. The saturation signal below then
+lowers it further.
+
+### Saturation: sold in 30 days vs listings for sale (Person B, 2026-11-06)
+
+Full check only (`supply_lookup`, `count_supply`). For the **same item** and
+the **same model** (all colours, the same item included):
+
+- **Sold in the last 30 days** (`CHECK_SUPPLY_DAYS`), from the sold searches
+  the full check just made. They are re-read from the cache, so there is
+  no new Apify call.
+- **For sale now**: the pricing searches, plus one free Browse search on the
+  name in fewer words with up to 200 rows (`CHECK_SUPPLY_ACTIVE_COUNT`).
+  The long-name search finds few listings of the other colours.
+- **Which rows count:**
+  - Same model: `same_model`, or the judge said variant / same item.
+  - Same item: the judge said so, or the title is the same model with our
+    full style code, or with our main colour and no colour we don't have.
+    A mini is not the same item as a bag that isn't one.
+  - A match by title alone needs our brand in the title.
+  - Our own listings are left out.
+- **Months of supply** = listings / sales in 30 days.
+- **High supply:**
+  - over `CHECK_SUPPLY_HIGH_MONTHS` (3) months, or no sales and at least
+    `CHECK_SUPPLY_MIN_ACTIVE` (4) listings;
+  - on either line, same item or same model.
+- **What high supply does:**
+  - The verdict drops one step: BUY → MAYBE → BORDERLINE → SKIP. The
+    first reason says why.
+  - A price from eBay sales (levels 1-2) goes no higher than the **lower
+    quartile** of those sales. An estimate without sales keeps its price
+    and only loses the step.
+- **A full page is a floor.** Sometimes a search comes back as a full page
+  (sold: 15 rows, all inside 30 days) and most of its rows are the item or
+  model. Then there are more than the page shows. The count is shown as
+  "15+" ("fast seller"), and a sales floor is never called high supply. A
+  full page of mostly other styles ("Von Dutch Bowling Bag") is not a
+  floor.
+- **Shown** as one line after the evidence, also in Details, and saved in
+  `comps_summary.supply`: "⚠️ Supply: same model 7 sold / 37 active in 30d
+  (~5 months of supply, high) · same item 1 sold / 3 active in 30d (~3
+  months of supply)".
+
+Check #10 replayed (dev, full):
+- same model 7 sold / 37 active, same item 1 sold / 3 active (the three
+  purple asks, $82.70–85.15 with shipping);
+- the price goes from the $45.99 median to the lower quartile, **$41.99**;
+- the verdict goes from BORDERLINE to **SKIP**;
+- profit ~$9.12 at $24.99; Max buy ~$19.49 (2026-11-07 fees).
+
+There are 37 active, not ~20, because the 200-row search finds more
+colours than eBay's first page shows.
+
+### Check #17 fixes: failed searches, shoe sizes, wording, box (Person B, 2026-11-07)
+
+Check #17: Nike Air Max Muse FV1920-004, Metallic Oil Green, women's 9,
+Ross $19.99. BORDERLINE was about right: the colourway has ~110 listings at
+$53-80 with shipping. Four fixes:
+
+1. **A failed sold search is not "no sales".** Apify answered 402 (both
+   accounts out of credit) on the style-code search, and the reply said "no
+   sales found".
+   - `pricing_v2.gather_candidates` now records each failed sold search
+     (`sold_failed`: query and reason). The reasons are `out_of_credit` for
+     402, `budget`, `rejected` for 401/403, and `error`. Intake and
+     repricing drop this field, so their stored pricing is unchanged.
+   - The reply starts with "⚠️ Sold data incomplete: Apify out of credit".
+     The evidence line says "0 sold same (searches incomplete)".
+   - Details lists the failed searches. The supply line ends in "sold
+     counts incomplete".
+   - With no price at all, NO DATA says the searches failed.
+   - The high-supply step stays. Listings for sale are counted in full; only
+     sales can be missing.
+2. **Shoes and sized clothing: the same item is the style code (colour code
+   included) plus the size.** The size is read from titles (`shoe_sizes`,
+   `clothing_sizes`, `size_match`).
+   - "Size 9", "WMNS 9", "W9", "US 9" and "EU 40.5" all count. Sizes 30
+     and up are EU. A men's size counts as the women's size minus 1.5.
+     "Air Max 90" is not a size.
+   - `tighten_size`, run in code after the judge:
+     - A judge "same item" whose title states another size becomes "same
+       model". It is still our colour.
+     - A judge "same model" with our full style code and our size becomes
+       "same item".
+     - A title that states no size keeps the judge's verdict.
+     - The identical-listing count and the cheapest identical listing are
+       counted again.
+   - The judge's prompt is not changed (it is shared with intake).
+   - Supply: the "same item" line becomes **same colour** (any size). The
+     high-supply step stays on that line, because saturation of the colour
+     matters. A **size** count is added for display only, and it never
+     lowers the verdict: "size 9: 0 sold / 3 active". It counts titles that
+     state our size, so it is a floor.
+   - Our colour in other sizes for sale still counts as competition. A shoe
+     is never "no competition, unique" when its colour has 41 listings.
+   - A typed `/check ... size 9 ...` sets the size.
+3. **Wording.** With same-model sales the reply says "no same-item sales,
+   18 model sales", not "no sales found". With both kinds of sales it says
+   "1 same-item sale, 18 model sales". When some sold searches failed and
+   nothing was found: "no sales in the sold searches that worked".
+4. **Shoes: with box or not.**
+   - eBay's "Brand New" / "New with box" is counted apart from "New (Other)" /
+     "New without box".
+   - The reply shows both: "📦 Sold: 11 with box ~$81 · 7 no box (New
+     other) ~$86 · has yours the box? Tap below".
+   - There are two buttons, **With box** and **No box**. A tap re-scores
+     the same comps (`check.with_box`) and edits the reply in place: no
+     search and no AI call. Full / Any reruns keep the answer.
+   - Once known, only the sales in our condition set the price, and the
+     cheapest identical listing is the cheapest one in our condition. When
+     there are no sales in our condition, all sales are used, and the reply
+     says so.
+   - The identification's "missing box" guess from the photo is not used.
+     The answer is asked, because a photo can't tell.
+   - Saved in `comps_summary`: `box`, `box_split`, `size` and
+     `sold_incomplete`.
+
+Replayed on check #17's cached rows (offline: Apify's 402 faked for the
+missing search, the judge replaced by title rules, no spend):
+- "⚠️ Sold data incomplete: Apify out of credit";
+- "BORDERLINE (estimated): no same-item sales, 18 model sales";
+- same colour 4 sold / 41 active (~10 months, high), size 9: 0 sold / 3
+  active;
+- ~$65.99, Max buy ~$31.47; with No box, ~$62.99 from the 7 no-box sales.
+
 ### "Do I already have this?" (Person B, 2026-11-05)
 
 The first line of every reply, before the verdict: `pipeline/owned.py`
@@ -289,6 +610,30 @@ The first line of every reply, before the verdict: `pipeline/owned.py`
     adjacent lines), and only 63 of 177 subtotals add up.
   - No Ross code covers clearly different products: 302 codes on 2+
     lines, 0 with different descriptions.
+- **Same item vs same model (Person B, 2026-11-05, check #5).** Ed Hardy
+  EHH108-26-WIP (Wilma print, Ross 400298771833) had matched other EHH108
+  prints (Tillie) on the base code as "style code + colour".
+  - **The same item** is a matching UPC, Ross code or FULL style code, the
+    print/colour suffix included (EHH108-26-WIP).
+  - A code with no suffix (LB102100) also needs the colour to agree. If we
+    hold that base with a suffix elsewhere (EHH108 → EHH108-26-TLP), a bare
+    EHH108 is only the model.
+  - **The same model** (base code only) shows as one line of its own: "Same
+    model EHH108, other prints/colours: 2 listed, 1 sold". It doesn't count
+    as "already have" and lends nothing to pricing.
+  - **Colours:** "Multi" doesn't match a named print ("Wilma Print"), and a
+    named print must appear on both sides. "Tattoo print" names none.
+  - **A brand tag's barcode that is a Ross code** (Ed Hardy tags carry one)
+    is a Ross code. `identify` keeps it as `ross_code`, not as the UPC, and
+    matching uses it.
+  - **Intake stores the full style code:** the prompt asks for it, and a
+    longer OCR'd tag code wins over a shortened one. `item_identification.style_code`
+    was empty on every item.
+  - **Production, 164 items:** 62 full codes (base + suffix), 45 one-part
+    codes, 57 none. In the 13 brands whose codes carry suffixes, 7 items
+    store a base only (4 of them Ed Hardy).
+  - **Brand concentration:** "Ed Hardy: 40 listed, 12 sold" after the
+    hits, or "✅ New · Ed Hardy: 40 listed".
 - **The reply shows** "✅ New" when there are no hits. Otherwise
   "🔁 Already have: 1 listed, 1 sold, 2 on receipts", then up to
   `CHECK_OWNED_SHOW` (3) hits. Details lists every hit.
@@ -435,20 +780,30 @@ v2 terms: the judge decides what is identical, not keyword rules.
 P   = suggested item price (default mode) or formula price (exact)
 S   = shipping we charge                      EBAY_SHIP_CHARGED   9.88
 T   = P + S                                   (what the buyer pays)
-fees= T × (EBAY_FVF_PCT + EBAY_AD_FEE_PCT) + EBAY_FIXED_FEE  = T × 0.201 + 0.40
+a   = the listing's ad rate                   EBAY_DEFAULT_AD_RATE_PCT  4%
+fees= T × (EBAY_FVF_PCT + a) + EBAY_FIXED_FEE = T × (0.155 + 0.04) + 0.40   (2026-11-07)
 L   = shipping label we pay                   EBAY_SHIP_COST      7.20  (or "ship 12" in the message)
 C   = Ross price × (1 + SALES_TAX_RATE)       ×1.07
 profit = T − fees − L − C          ROI = profit / C
-break-even total  T_be = (C + L + 0.40) / (1 − 0.201)     → break-even item price = T_be − S
+break-even total  T_be = (C + L + 0.40) / (1 − 0.195)     → break-even item price = T_be − S
 profit_at_cheapest = same formula at T = raw_active_floor (cheapest identical total)
+max buy = (T − fees − L − 15) / 1.07          (the Ross price for $15 profit)
 ```
 
-Worked example: Ross $14.99, P = $39.99 → T = $49.87, fees $10.42, label $7.20,
-C = $16.04 → **profit $16.21, ROI 101%**, break-even T = $29.59 (item $19.71).
+Worked example: Ross $14.99, P = $39.99 → T = $49.87, fees $10.12,
+label $7.20, C = $16.04 → **profit $16.51, ROI 103%**, break-even T = $29.37
+(item $19.49), max buy $16.40.
 
-`EBAY_FVF_PCT` 15.5% is already the effective rate measured on our orders
-(it includes eBay's fee on the sales tax the buyer pays). `EBAY_AD_FEE_PCT`
-4.6% assumes every listing is promoted at the default rate, as today.
+Fitted on our 85 orders (Person B, 2026-11-07):
+- Fees without ads are 15.5% × (item + shipping) + $0.40 (`EBAY_FVF_PCT`,
+  `EBAY_FIXED_FEE`), off by $0.79 an order on average. The 15.5% is the
+  effective rate: it includes eBay's fee on the sales tax the buyer pays.
+- Ads were charged on 77 of the 85 orders, at a median 4.3% of item +
+  shipping. /check uses the ad rate a new listing gets
+  (`EBAY_DEFAULT_AD_RATE_PCT`, 4%).
+- All-in median: 19.6%.
+
+The flat 24.7% of 2026-11-06 was one small order with a 6.5% ad rate.
 
 **Label cost by item type** (`CHECK_LABEL_COSTS`; these are starting
 estimates, to be corrected from real label costs). The type comes from the
@@ -532,6 +887,39 @@ row):
 | Identify (Gemini) | $0 | ~$0.015 | ~$0.015 |
 | Judge: Sonnet, +Opus in ~26% | ~$0.04 | ~$0.04 | ~$0.04 |
 | **Total** | **~$0.22** | **~$0.24** | **~$0.04–0.06** |
+
+### Apify use, measured, and the same model's searches reused (Person B, 2026-11-07)
+
+**What it costs.** Apify bills $0.004 per sold row. A search that finds nothing
+costs only the $0.0001 run start.
+- The specific searches (style code, UPC, the long product name) usually find
+  0–2 rows.
+- The broad ones fill their 15 rows: brand + type "Von Dutch handbag" $0.06,
+  fewer words up to $0.06.
+- A full check measured $0.06–0.12 (5 checks, 2026-11-05/06). Intake pricing:
+  $0–0.12, about $0.02 on average.
+- The two months' spend ($11.50 of free credit) was mostly backtests: Person
+  A's pricing backtest on 2026-10-14/17 ($4.34) and `backtest_check --full-check`
+  on 2026-11-02 ($3.53, 357 searches). Day-to-day use was $0.06–0.21 a day.
+
+**Reuse** (`pipeline/sold_reuse.py`, `SOLD_MODEL_REUSE_DAYS` = 7):
+- **The index.** Every sold search is filed under its model:
+  - the brand + the base style code;
+  - the brand + 2 or more distinctive product-name words (`model_tokens`).
+- **What is reused.** A later item of the same model gets the same kind of
+  search (product name, search query, fewer words, brand + type) from the last
+  7 days instead of an Apify call. A later item can be another colour, the
+  intake after a /check, or a reprice.
+- **What still runs.** The exact-item searches (full style code, UPC) always
+  run. They are what tells the colours apart, and they cost almost nothing.
+- **Already shared before.** Searches worded without colour ("Von Dutch cow
+  print bowling bag") were already shared by their exact text.
+- **Who uses it.** /check (quick and full), intake and repricing (`price_item`)
+  share the one sold cache. Repricing still uses its own cached rows of any age
+  first, and reuses only for searches it doesn't have. Backtests
+  (`get_pricing_v2` directly) don't reuse.
+- **Logging.** Every check logs `apify_searches`, `apify_rows` and `apify_usd`
+  in `logs/check_timings.jsonl`.
 
 **Guards.**
 - `CHECK_DAILY_MAX` = 30 checks a day caps the cost at about **$7 a day**.

@@ -81,6 +81,21 @@ class ApifyBudgetExceeded(RuntimeError):
     """The next uncached Apify call would push estimated spend past the cap."""
 
 
+def sold_failure_reason(e: Exception) -> str:
+    """Why a sold search failed: "out_of_credit" (Apify's 402, check #17),
+    "budget" (our own cap), "rejected" (401/403) or "error". /check shows it
+    so that a failed search never reads as "no sales"."""
+    if isinstance(e, ApifyBudgetExceeded):
+        return "budget"
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    if status is None:          # comps.call: "Apify rejected both ... (HTTP 402)"
+        m = re.search(r"\bHTTP (\d{3})\b", str(e))
+        status = int(m.group(1)) if m else None
+    if status == 402:
+        return "out_of_credit"
+    return "rejected" if status in (401, 403) else "error"
+
+
 # --- spend accounting (process-wide; the backtest reads and caps it) ---------
 
 _lock = threading.Lock()
@@ -142,6 +157,16 @@ def sold_is_cached(query: str, count: int | None = None) -> bool:
     return _cache_path("sold", _sold_key(query, count or config.PRICING_V2_SOLD_COUNT)).exists()
 
 
+def sold_cache_age(query: str, count: int | None = None) -> float | None:
+    """Seconds since `query`'s sold rows were fetched; None when not cached."""
+    path = _cache_path("sold", _sold_key(query, count or config.PRICING_V2_SOLD_COUNT))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return time.time() - float(data.get("fetched_at") or path.stat().st_mtime)
+    except (OSError, ValueError):
+        return None
+
+
 def fetch_sold(query: str, count: int | None = None, *, max_age_s: float | None = None,
                cache_only: bool = False) -> list[dict] | None:
     """Sold rows for `query`. None only with cache_only and nothing usable cached."""
@@ -176,9 +201,10 @@ def fetch_sold(query: str, count: int | None = None, *, max_age_s: float | None 
 
 
 def fetch_active(query: str | None = None, gtin: str | None = None, *,
-                 max_age_s: float | None = None) -> list[dict]:
+                 max_age_s: float | None = None, limit: int | None = None) -> list[dict]:
+    """limit: /check's supply count asks for more rows than pricing does."""
     from ebay import browse
-    params = {"q": query or "", "gtin": gtin or "", "limit": config.PRICING_V2_ACTIVE_COUNT,
+    params = {"q": query or "", "gtin": gtin or "", "limit": limit or config.PRICING_V2_ACTIVE_COUNT,
               "zip": config.PRICING_V2_SHIP_TO_ZIP, "cond": list(NEW_CONDITION_IDS)}
     return _cached("active", json.dumps(params, sort_keys=True), lambda: browse.search_active(
         query, gtin=gtin, limit=params["limit"], condition_ids=NEW_CONDITION_IDS,
@@ -617,12 +643,15 @@ def gather_candidates(ident: dict, photo_paths=None, *, sold_max_age_s: float | 
                       sold_cache_only: bool = False,
                       active_max_age_s: float | None = None,
                       extra_sold_queries: list | None = None,
-                      image_search: bool = True) -> dict:
+                      image_search: bool = True,
+                      model_reuse_s: float | None = None) -> dict:
     """Fetch (cached) and normalise every candidate. Returns candidates plus
     per-source counts, the queries used and any fetch errors.
     The freshness arguments and extra_sold_queries ([(name, query)], e.g. the
     UPC and a similar-items query) are for /check (pipeline/check.py); intake
-    and repricing leave them at their defaults."""
+    and repricing leave them at their defaults.
+    model_reuse_s: reuse the same model's sold searches up to this old
+    (pipeline/sold_reuse.py); None = off (backtests)."""
     our_ship = config.EBAY_SHIP_CHARGED
     queries = sold_queries(ident)
     seen_q = {q.lower() for _, q in queries}
@@ -641,34 +670,73 @@ def gather_candidates(ident: dict, photo_paths=None, *, sold_max_age_s: float | 
         kept_q = [(n, q) for n, q in queries if n in allowed or sold_is_cached(q)]
         skipped = [q for n, q in queries if (n, q) not in kept_q]
         queries = kept_q
+
+    def usable(q):      # q's own cached rows will do: no Apify call
+        age = sold_cache_age(q)
+        return age is not None and (sold_max_age_s is None or age <= sold_max_age_s)
+
+    # The same model's searches of the last model_reuse_s (pipeline/sold_reuse.py):
+    # an uncached search is replaced by the same kind of search made for another
+    # item of the model, so it costs nothing.
+    own_queries, reused, reused_for = list(queries), [], []
+    if model_reuse_s is not None and queries:
+        from pipeline import sold_reuse
+        by_kind = sold_reuse.fresh(ident, model_reuse_s, exclude=[q for _, q in queries])
+        kept_q = []
+        for n, q in queries:
+            if n in sold_reuse.REUSABLE and by_kind.get(n) and not usable(q):
+                reused_for.append(q)
+                reused += [(f"{n}:model{i}", rq) for i, rq in enumerate(by_kind.pop(n), 1)]
+            else:
+                kept_q.append((n, q))
+        queries = kept_q + reused
     # Only set options are passed, so the default call stays fetch_sold(q) etc.
     sold_kw = {k: v for k, v in (("max_age_s", sold_max_age_s),
                                  ("cache_only", sold_cache_only)) if v not in (None, False)}
     act_kw = {"max_age_s": active_max_age_s} if active_max_age_s is not None else {}
-    jobs = {f"sold:{name}": (fetch_sold, (q,), sold_kw) for name, q in queries}
+    reused_names = {n for n, _ in reused}
+    live = set() if sold_cache_only else {n for n, q in queries
+                                          if n not in reused_names and not usable(q)}
+    jobs = {f"sold:{name}": (fetch_sold, (q,), {"cache_only": True} if name in reused_names else sold_kw)
+            for name, q in queries}
     if aq:
         jobs["active:text"] = (fetch_active, (aq, None), act_kw)
     if gtin:
         jobs["active:gtin"] = (fetch_active, (None, gtin), act_kw)
     if photo and image_search:
         jobs["image"] = (fetch_by_image, (photo,), act_kw)
-    raw, cache_misses = {}, []
+    raw, cache_misses, sold_failed = {}, [], []
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         futs = {pool.submit(fn, *args, **kw): name for name, (fn, args, kw) in jobs.items()}
         for f in concurrent.futures.as_completed(futs):
             name = futs[f]
+            query = dict(queries).get(name.split(":", 1)[-1], name)
             try:
                 raw[name] = f.result()
                 if raw[name] is None:       # cache_only and nothing fresh cached
                     raw[name] = []
-                    cache_misses.append(dict(queries).get(name.split(":", 1)[-1], name))
+                    cache_misses.append(query)
             except ApifyBudgetExceeded as e:
                 errors.append(f"{name}: skipped, {e}")
-                skipped.append(dict(queries).get(name.split(":", 1)[-1], name))
+                skipped.append(query)
+                sold_failed.append({"query": query, "reason": "budget"})
                 raw[name] = []
             except Exception as e:      # one dead source must not lose the others
                 errors.append(f"{name}: {type(e).__name__}: {str(e)[:160]}")
+                if name.startswith("sold:"):
+                    sold_failed.append({"query": query, "reason": sold_failure_reason(e)})
                 raw[name] = []
+    # Apify use of this run: the sold searches that weren't cached (an estimate,
+    # as apify_spend: rows x price per row + a run start each).
+    live_rows = sum(len(raw.get(f"sold:{n}") or []) for n in live)
+    apify = {"searches": len(live), "rows": live_rows,
+             "usd": round(_apify_estimate(live_rows) + (len(live) - 1) * config.APIFY_RUN_START_COST, 4)
+             if live else 0.0}
+    if model_reuse_s is not None:
+        from pipeline import sold_reuse
+        misses = set(cache_misses)
+        sold_reuse.record(ident, [(n, q) for n, q in own_queries
+                                  if f"sold:{n}" in raw and q not in misses])
     sold = [sold_candidate(r, our_ship) for name, _ in queries for r in raw.get(f"sold:{name}", [])]
     active = [active_candidate(r, our_ship) for k in ("active:gtin", "active:text")
               for r in raw.get(k, [])]
@@ -688,7 +756,8 @@ def gather_candidates(ident: dict, photo_paths=None, *, sold_max_age_s: float | 
         c["id"] = f"{p}{counters[p]}"
     return {"candidates": pooled, "dropped": dropped, "errors": errors,
             "queries": [q for _, q in queries], "skipped_queries": skipped,
-            "sold_cache_misses": cache_misses,
+            "sold_cache_misses": cache_misses, "sold_failed": sold_failed,
+            "sold_reused": [q for _, q in reused], "sold_reused_for": reused_for, "apify": apify,
             "active_query": aq, "gtin": gtin,
             "photo": photo, "raw_counts": {k: len(v) for k, v in raw.items()}}
 
@@ -707,12 +776,17 @@ def price_item(item: dict) -> dict:
     """Price a stored item: the one entry point for the intake price stage
     (pipeline/stages.py) and the weekly repricer (pipeline/reprice.py).
     Nothing is stored here."""
+    # The same model's sold searches of the last SOLD_MODEL_REUSE_DAYS (a /check
+    # at Ross, another colour's intake) stand in for uncached ones: one sold
+    # cache shared by /check, intake and repricing (Person B, 2026-11-07).
     res = get_pricing_v2(item.get("identification") or {},
                          photo_paths=item.get("photos") or [],
-                         receipt=item.get("receipt"), item_id=item.get("item_id"))
+                         receipt=item.get("receipt"), item_id=item.get("item_id"),
+                         model_reuse_s=config.SOLD_MODEL_REUSE_DAYS * 86400)
     # Run diagnostics for /check; a stored item's pricing keeps its usual shape.
     res.pop("timings", None)
     res.pop("sold_cache_misses", None)
+    res.pop("sold_failed", None)
     return res
 
 
@@ -722,7 +796,8 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
                    sold_cache_only: bool = False,
                    active_max_age_s: float | None = None,
                    extra_sold_queries: list | None = None,
-                   image_search: bool = True) -> dict:
+                   image_search: bool = True,
+                   model_reuse_s: float | None = None) -> dict:
     """Claude's price is the suggested price. The formula over same_item sold
     comps is a cross-check: only computed with >= PRICE_THIN_MIN_COMPS of them,
     and a gap over FORMULA_DISAGREE_PCT is flagged for review with both numbers.
@@ -744,8 +819,11 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
     t = time.perf_counter()
     g = gather_candidates(ident, photo_paths, sold_max_age_s=sold_max_age_s,
                           sold_cache_only=sold_cache_only, active_max_age_s=active_max_age_s,
-                          extra_sold_queries=extra_sold_queries, image_search=image_search)
-    timings = {"comps_s": round(time.perf_counter() - t, 2)}
+                          extra_sold_queries=extra_sold_queries, image_search=image_search,
+                          model_reuse_s=model_reuse_s)
+    timings = {"comps_s": round(time.perf_counter() - t, 2),
+               "apify_searches": g["apify"]["searches"], "apify_rows": g["apify"]["rows"],
+               "apify_usd": g["apify"]["usd"]}
     cands = g["candidates"]
     warnings, flags = list(g["errors"]), []
     if g["dropped"]["own"]:
@@ -879,5 +957,8 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
         "thumbnails_used": bool(j and j.get("thumbnails_used")),
         "raw_counts": g["raw_counts"],
         "sold_cache_misses": g.get("sold_cache_misses") or [],
+        # sold searches that failed ({"query", "reason"}): /check's "Sold data incomplete"
+        "sold_failed": g.get("sold_failed") or [],
+        "sold_reused": g.get("sold_reused") or [], "sold_reused_for": g.get("sold_reused_for") or [],
         "timings": {**timings, "total_s": round(time.perf_counter() - t_start, 2)},
     }

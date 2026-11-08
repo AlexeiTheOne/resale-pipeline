@@ -334,18 +334,37 @@ CHECK_MIN_PROFIT_AT_CHEAPEST = float(os.getenv("CHECK_MIN_PROFIT_AT_CHEAPEST", "
 # items: sold price / asking price, mean 0.98 (84% sold at the full ask).
 # Revisit with pilot outcomes from the checks table.
 CHECK_ASK_DISCOUNT = float(os.getenv("CHECK_ASK_DISCOUNT", "0.98"))
+# /check's eBay fees (Person B, 2026-11-07): EBAY_FVF_PCT x (item + shipping)
+# + EBAY_FIXED_FEE per order + the listing's ad rate (EBAY_DEFAULT_AD_RATE_PCT)
+# x (item + shipping). Fitted on our 85 orders: fees 15.5% + $0.40, ads ~4%,
+# all-in median 19.6%. (The 24.7% of 2026-11-06 was one small order with a
+# 6.5% ad rate.) The label is subtracted on its own (CHECK_LABEL_COSTS).
 # Checks per day (US Eastern), and when to warn.
 CHECK_DAILY_MAX = int(os.getenv("CHECK_DAILY_MAX", "50"))
 CHECK_DAILY_WARN = int(os.getenv("CHECK_DAILY_WARN", "40"))
 # Cached sold rows older than this are not used by /check (pricing for stored
 # items keeps any age until Person A agrees otherwise).
 CHECK_SOLD_CACHE_DAYS = float(os.getenv("CHECK_SOLD_CACHE_DAYS", "7"))
+# /check, intake and repricing reuse the same model's sold searches (another
+# colour, a /check before the intake) up to this old instead of calling Apify
+# (pipeline/sold_reuse.py). 0 = off.
+SOLD_MODEL_REUSE_DAYS = float(os.getenv("SOLD_MODEL_REUSE_DAYS", "7"))
 # Dropship-style listings (copied Amazon titles, huge sellers, wrong
 # category): flagged on 2 signals, kept out of the sold evidence, still a
 # ceiling. A seller at or above this feedback score counts as one signal.
 CHECK_DROPSHIP_FEEDBACK = int(os.getenv("CHECK_DROPSHIP_FEEDBACK", "10000"))
 # Full check: look up this many identical listings (listing age, units sold).
 CHECK_DEMAND_LISTINGS = int(os.getenv("CHECK_DEMAND_LISTINGS", "3"))
+# Saturation (Person B, 2026-11-06), full check: sales in the last
+# CHECK_SUPPLY_DAYS vs listings for sale now, same item and same model. Over
+# CHECK_SUPPLY_HIGH_MONTHS of supply (listings / sales per month), or no
+# sales and at least CHECK_SUPPLY_MIN_ACTIVE listings, is high supply: the
+# verdict drops one step and a price from sales moves to their lower quartile.
+CHECK_SUPPLY_DAYS = int(os.getenv("CHECK_SUPPLY_DAYS", "30"))
+CHECK_SUPPLY_HIGH_MONTHS = float(os.getenv("CHECK_SUPPLY_HIGH_MONTHS", "3"))
+CHECK_SUPPLY_MIN_ACTIVE = int(os.getenv("CHECK_SUPPLY_MIN_ACTIVE", "4"))
+# Listings fetched for the same-model count (eBay Browse allows 200 a page).
+CHECK_SUPPLY_ACTIVE_COUNT = int(os.getenv("CHECK_SUPPLY_ACTIVE_COUNT", "200"))
 # Best Offer from the /check estimate (Person B, 2026-11-02): list at
 # estimate x LIST, auto-accept at x ACCEPT, auto-decline under x DECLINE.
 CHECK_BO_LIST = float(os.getenv("CHECK_BO_LIST", "1.25"))

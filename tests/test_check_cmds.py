@@ -41,6 +41,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(check, "load_our_sales", lambda: [])
     from ebay import browse
     monkeypatch.setattr(browse, "listing_details", lambda i: (_ for _ in ()).throw(AssertionError("Browse")))
+    monkeypatch.setattr(browse, "search_active", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Browse")))
     monkeypatch.setattr(check, "TIMINGS_FILE", tmp_path / "check_timings.jsonl")
     monkeypatch.setattr(check_cmds, "CHECKS_DIR", tmp_path / "checks")
     monkeypatch.setattr(check_cmds, "ALBUM_WAIT_S", 0.0)
@@ -48,6 +49,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(check_cmds, "_identify_one", lambda path: dict(IDENT))
     monkeypatch.setattr(config, "CHECK_DAILY_MAX", 50)
     monkeypatch.setattr(config, "CHECK_DAILY_WARN", 40)
+    # flow tests: fees pinned so the fake sales stay a BUY (the money is tested in test_check)
+    monkeypatch.setattr(config, "EBAY_FVF_PCT", 0.155)
+    monkeypatch.setattr(config, "EBAY_FIXED_FEE", 0.40)
+    monkeypatch.setattr(config, "EBAY_DEFAULT_AD_RATE_PCT", 4.0)
     yield calls
     for s in state.shop_mode.values():
         if s.get("task"):
@@ -100,7 +105,7 @@ def test_album_with_a_tag_is_one_saved_check_and_no_item(env, monkeypatch):
     b, ctx = tg.make_photo_update(context=ctx, media_group_id="g1")
     tg.run_steps((check_cmds.shop_photo, a), (check_cmds.shop_photo, b), ctx=ctx)
     texts = tg.sent_texts(ctx)
-    assert texts[-1].startswith("🛒 ✅ BUY: 3 sales, 1 listing") and len(texts[-1].splitlines()) <= 8
+    assert texts[-1].startswith("🛒 ✅ BUY: 3 sales, 1 listing") and len(texts[-1].splitlines()) <= 9
     assert '🔎 <a href="https://www.ebay.com/sch/' in texts[-1]          # sent as HTML, links tappable
     details = next(d for _, d in tg.last_markup_buttons(ctx) if d.startswith("chk:details:"))
     upd, ctx = tg.make_callback_update(details, context=ctx)
@@ -180,12 +185,41 @@ def test_quick_no_data_goes_straight_on_to_full_and_counts_once(env, monkeypatch
     p, ctx = tg.make_photo_update(context=ctx)
     tg.run_steps((check_cmds.shop_photo, p), ctx=ctx)
     texts = tg.sent_texts(ctx)
-    assert any("NO DATA in the quick check" in t and "Checking more sources" in t for t in texts)
+    assert any("NO DATA in the quick check" in t and "Searching eBay sales" in t for t in texts)
     assert [c["sold_cache_only"] for c in calls] == [True, False]
     assert calls[1]["ident"] == calls[0]["ident"]
     assert check.checks_today(check.TIMINGS_FILE) == 1
     c = db.list_checks(limit=1)[0]
     assert c["mode"] == "full" and c["verdict"] == "BUY"
+
+
+def test_quick_with_no_sold_search_cached_goes_on_to_full(env, monkeypatch):
+    """Check #10: the quick check had a price (MSRP x ratio, asks) but had
+    looked at no sales at all; it said "0 sold same" while eBay had four."""
+    calls = []
+    real = fake_pricing(calls)
+
+    def get(ident, **kw):
+        out = real(ident, **kw)
+        if kw.get("sold_cache_only"):          # every sold search missed the cache
+            out = {**out, "judged_comps": JUDGED[3:], "rungs_tried": ["a", "b"], "sold_cache_misses": ["a", "b"]}
+        return out
+    monkeypatch.setattr(pricing_v2, "get_pricing_v2", get)
+    # our own Coach bag sales give the quick check a price (level 3), so it isn't NO DATA
+    monkeypatch.setattr(check, "load_our_sales", lambda: [
+        {"item_id": f"c{i}", "brand": "coach", "bucket": "bag", "msrp": None, "sold": 45.0, "ratio": None}
+        for i in range(2)])
+    tag_on(monkeypatch, tag_index=1)
+    ctx = shop_on()
+    p, ctx = tg.make_photo_update(context=ctx)
+    tg.run_steps((check_cmds.shop_photo, p), ctx=ctx)
+    texts = tg.sent_texts(ctx)
+    assert any("no eBay sales cached for this item yet" in t and "Searching eBay sales" in t for t in texts)
+    assert [c["sold_cache_only"] for c in calls] == [True, False]
+    assert check.checks_today(check.TIMINGS_FILE) == 1
+    assert "Max buy: $" in texts[-1]
+    c = db.list_checks(limit=1)[0]
+    assert c["mode"] == "full" and c["verdict"] == "BUY" and c["comps_summary"]["max_buy"] > 0
 
 
 # --- typed /check and a captioned photo (fallbacks) -----------------------------------------
@@ -235,6 +269,52 @@ def test_usage_cap_and_one_at_a_time(env, monkeypatch):
     upd, ctx = tg.make_text_update("/check dkny tote 9.99")
     tg.run(check_cmds.check_command, upd, ctx)
     assert "Still working" in tg.sent_texts(ctx)[-1]
+
+
+SHOE_COMPS = [{"source": "sold", "verdict": "variant", "total": t,
+               "title": f"Nike Air Max Muse FV1920-004 Size 8 {t}",
+               "url": "u", "condition": cond}
+              for t, cond in ((82.0, "Brand New"), (77.0, "Brand New"), (104.0, "Brand New"),
+                              (65.0, "New (Other)"), (79.0, "New (Other)"))]
+
+
+def test_shoes_ask_for_the_box_and_rescore_without_a_new_search(env, monkeypatch):
+    """Check #17: "has yours the box?" as two buttons; the answer re-scores the
+    same comps (no pricing call) and edits the reply."""
+    calls = []
+
+    def get(ident, **kw):
+        calls.append(kw)
+        return {"judged_comps": SHOE_COMPS, "raw_active_floor": None, "claude_confidence": "medium",
+                "same_item_active_count": 0, "sold_cache_misses": [], "rungs_tried": ["q"],
+                "timings": {"comps_s": 1.0, "judge_s": 1.0}}
+    monkeypatch.setattr(pricing_v2, "get_pricing_v2", get)
+    upd, ctx = tg.make_text_update("/check full Nike Air Max Muse FV1920-004 sneakers size 9 19.99")
+    tg.run(check_cmds.check_command, upd, ctx)
+    assert "has yours the box? Tap below" in tg.sent_texts(ctx)[-1]
+    labels = dict(tg.last_markup_buttons(ctx))
+    assert "📦 With box" in labels and "📦 No box" in labels
+    cid = db.list_checks(limit=1)[0]["check_id"]
+    before = db.get_check(cid)["suggested_price"]
+    n = len(calls)
+    upd2, ctx = tg.make_callback_update(labels["📦 No box"], context=ctx)
+    tg.run(check_cmds.check_callback, upd2, ctx)
+    assert len(calls) == n                                     # no new search, no judge call
+    assert "yours: no box" in tg.sent_texts(ctx)[-1]
+    assert "✓ No box" in dict(tg.last_markup_buttons(ctx))
+    c = db.get_check(cid)
+    assert c["comps_summary"]["box"] is False and c["suggested_price"] != before   # no-box sales: 65, 79
+    # Full / Any reruns keep the answer
+    anyb = next(d for _, d in tg.last_markup_buttons(ctx) if d.startswith("chk:any:"))
+    upd3, ctx = tg.make_callback_update(anyb, context=ctx)
+    tg.run(check_cmds.check_callback, upd3, ctx)
+    assert db.get_check(cid)["comps_summary"]["box"] is False
+
+
+def test_bags_get_no_box_buttons(env):
+    upd, ctx = tg.make_text_update("/check Coach Tabby 26 CH857 shoulder bag 14.99")
+    tg.run(check_cmds.check_command, upd, ctx)
+    assert not any("box" in label.lower() for label, _ in tg.last_markup_buttons(ctx))
 
 
 def test_expired_button(env):

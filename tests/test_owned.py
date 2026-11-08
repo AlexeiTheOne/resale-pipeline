@@ -191,9 +191,9 @@ def test_reply_lines_new_and_hits():
     assert text[1] == ("• Listed $59.99, 12 days · paid $9.99 · UPC · 🔗 Juicy <Weekender> "
                        "https://www.ebay.com/itm/117000000002")
     assert len(text) == 5 and text[-1] == "• … 1 more in Details"
-    html = owned.reply_lines({"hits": [_hit(match=owned.STYLE_OTHER_COLOUR)]}, html=True)
-    assert html[0].startswith("🔁 Similar: 1 listed")
-    assert "Juicy &lt;Weekender&gt;" in html[1] and html[1].endswith(
+    html = owned.reply_lines({"hits": [_hit(match=owned.SAME_MODEL, model_code="JC1234")]}, html=True)
+    assert html[0] == "✅ New"
+    assert html[1].startswith("• Same model JC1234, other prints/colours: 1 listed") and html[1].endswith(
         '🔗 <a href="https://www.ebay.com/itm/117000000002">Juicy &lt;Weekender&gt;</a>')
 
 
@@ -313,3 +313,88 @@ def test_an_unknown_ross_code_is_not_searched():
     assert res["no_search"] and res["verdict"] == check.NO_DATA
     reply = check.format_reply(res)
     assert "Only a Ross code" in reply and "Ross code 400999999990" in reply and "🔎" not in reply
+
+
+# --- full vs base style code, colours, brand concentration (check #5, Ed Hardy EHH108) ---------
+
+WILMA = {"brand": "Ed Hardy", "product_name": "Wilma Print Tattoo Skull Shoulder Tote Bag", "model": "EHH108-26-WIP",
+         "color": "Black Multi / Wilma Print", "item_type": "Shoulder Tote Bag"}
+
+
+def test_style_codes_full_base_and_suffix():
+    assert owned.style_codes({"model": "EHH108-26-WIP"}) == ({"ehh10826wip"}, {"ehh108"}, {"ehh10826wip"})
+    assert owned.style_codes({"model": "LB102100"}) == ({"lb102100"}, {"lb102100"}, set())
+    # a first part too short to be a base (3347c963)
+    assert owned.style_codes({"model": "EH-H02-26-DHO"}) == ({"ehh0226dho"}, {"ehh02"}, {"ehh0226dho"})
+    assert owned.style_codes({"model": "XW09620 970 0IC"}) == ({"xw096209700ic"}, {"xw09620"}, {"xw096209700ic"})
+
+
+@pytest.mark.parametrize("theirs,expected", [
+    ({"model": "EHH108-26-WIP", "color": "Pink"}, owned.STYLE_FULL),    # the suffix is the print
+    ({"model": "EHH108-26-TLP"}, owned.SAME_MODEL),                     # Tillie print
+    ({"model": "EHH108", "color": "Black Multi"}, owned.SAME_MODEL),    # base only: never the same item
+    ({"model": "EHH203"}, None),
+])
+def test_full_style_is_the_same_item_base_is_the_same_model(theirs, expected):
+    assert owned.match(owned.keys(WILMA), owned.keys(theirs)) == expected
+
+
+def test_a_code_with_no_suffix_needs_the_colour():
+    lb = {"model": "LB102100", "color": "Cherry Gingham"}
+    assert owned.match(owned.keys(lb), owned.keys({"model": "LB102100", "color": "cherry"})) == owned.STYLE
+    assert owned.match(owned.keys(lb), owned.keys({"model": "LB102100", "color": "Black"})) == owned.SAME_MODEL
+
+
+def test_multi_does_not_match_a_named_print():
+    assert not owned.same_colour("Multi", "Wilma Print")
+    assert not owned.same_colour("Multicolor", "Tillie")
+    assert not owned.same_colour("Black Multi / Wilma Print", "Black background, tattoo print")
+    assert not owned.same_colour("Wilma Print", "Tillie Print")
+    assert owned.same_colour("Black Wilma Print", "wilma print, black")
+    assert owned.same_colour("Black Multi", "Black") and owned.same_colour("Multi", "multicolour")
+
+
+def test_a_base_we_also_hold_with_a_suffix_is_only_the_model():
+    # both stored as plain EHH108, but EHH108-26-TLP shows the brand's codes take suffixes
+    a, b = owned.keys({"model": "EHH108", "color": "Black"}), owned.keys({"model": "EHH108", "color": "Black"})
+    assert owned.match(a, b) == owned.STYLE
+    assert owned.match(a, b, {"ehh108"}) == owned.SAME_MODEL
+
+
+def test_brand_tag_ross_code_is_a_ross_code():
+    k = owned.keys({"ross_code": "400298771833"})
+    assert k["ross"] == {"400298771833"} and k["upc"] is None
+    assert owned.match(owned.keys({}, ["400298771833"]), k) == owned.ROSS
+
+
+def test_check5_wilma_is_new_with_other_prints_on_their_own_line():
+    _item("published", {"brand": "Ed Hardy", "model": "EHH108-26-TLP", "color": "Hot Pink, Black"},
+          listing={"title": "Ed Hardy Zip Tote Tillie Print Large Hot Pink"},
+          ebay={"listing_id": "117000000009", "published_at": _iso(30)})
+    _item("published", {"brand": "Ed Hardy", "model": "EHH108", "color": "Black background with tattoo print"})
+    _item("sold", {"brand": "Ed Hardy", "model": "EHH108-26-BTP", "color": "Black Multi"})
+    _item("published", {"brand": "Ed Hardy", "model": "EHH230-26-PNA"})
+    res = owned.lookup(dict(WILMA), ["400298771833"])
+    assert {h["match"] for h in res["hits"]} == {owned.SAME_MODEL}
+    assert res["brand"] == {"brand": "Ed Hardy", "listed": 3, "home": 0, "sold": 1}
+    lines = owned.reply_lines(res)
+    assert lines[0] == "✅ New"
+    assert lines[1].startswith("• Same model EHH108, other prints/colours: 2 listed, 1 sold · 🔗 Ed Hardy Zip Tote")
+    assert lines[2] == "• Ed Hardy: 3 listed, 1 sold"
+    assert owned.donor(res) is None                                   # another print lends nothing to pricing
+
+
+def test_new_with_brand_on_the_same_line():
+    _item("published", {"brand": "Ed Hardy", "model": "EHH230-26-PNA"})
+    no_ai = lambda ident, cands: []  # noqa: E731
+    assert owned.reply_lines(owned.lookup({"brand": "Ed Hardy", "model": "EHH999-26-ZZZ"}, ai_fn=no_ai)) == \
+        ["✅ New · Ed Hardy: 1 listed"]
+    assert owned.reply_lines(owned.lookup({"brand": "Nobody"})) == ["✅ New · Nobody: none yet"]
+
+
+def test_identify_keeps_the_full_style_code():
+    import identify
+    assert identify.full_style_code("EHH108", ["EHH108-26-WIP", "X1234"]) == "EHH108-26-WIP"
+    assert identify.full_style_code("EHH108-26-WIP", []) == "EHH108-26-WIP"
+    assert identify.full_style_code("LB102100", ["AB12345"]) == "LB102100"
+    assert identify.full_style_code("Krush Weekender", ["EHH108"]) is None

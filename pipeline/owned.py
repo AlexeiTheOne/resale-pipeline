@@ -2,13 +2,17 @@
 
 Looks for the checked product in everything we have or had: items (every
 status), pieces (home inventory), Ross receipt lines and earlier checks.
-Keys, strongest first:
+Keys, strongest first. The same item:
   1. brand UPC: a real GTIN, never a Ross store code
-  2. style code + colour; the same style in another colour is listed as such
-  3. Ross code: the 12-digit SKU on the tag, either the REDUCED sticker's or
-     the main tag's when they differ (Ross reuses SKUs now and then)
-  4. AI title match, only when 1-3 found nothing and we have things of the
-     same brand: the cheap Claude model compares names (config.CHECK_OWNED_AI)
+  2. Ross code: the 12-digit SKU, from the price tag (REDUCED sticker or main
+     tag) or a brand tag that carries it (Ross reuses SKUs now and then)
+  3. the FULL style code, print/colour suffix included (EHH108-26-WIP); a
+     code with no suffix (LB102100) also needs the colour to agree
+The same model in another print or colour (one line of its own):
+  4. the base style code only (EHH108 vs EHH108-26-TLP)
+And when nothing at all matched, an AI title match over our things of the
+same brand: the cheap Claude model compares names (config.CHECK_OWNED_AI).
+The brand's concentration ("Ed Hardy: 44 listed, 12 sold") is shown too.
 
 Each hit: status, price, days listed or sold date, what we paid, profit if
 sold, box code if at home, eBay link. Read only; lookup() never raises: a
@@ -22,9 +26,13 @@ import config
 from pipeline import check, gtin
 
 # match labels, strongest first (also the sort order)
-UPC, STYLE, ROSS, STYLE_OTHER_COLOUR, AI_SAME, AI_MODEL = (
-    "UPC", "style code + colour", "Ross code", "same style, other colour", "AI: same item", "AI: same model")
-STRENGTH = {m: i for i, m in enumerate((UPC, STYLE, ROSS, STYLE_OTHER_COLOUR, AI_SAME, AI_MODEL))}
+UPC, ROSS, STYLE_FULL, STYLE, SAME_MODEL, AI_SAME, AI_MODEL = (
+    "UPC", "Ross code", "full style code", "style code + colour", "same model, other print/colour",
+    "AI: same item", "AI: same model")
+STYLE_OTHER_COLOUR = SAME_MODEL          # the old name
+STRENGTH = {m: i for i, m in enumerate((UPC, ROSS, STYLE_FULL, STYLE, SAME_MODEL, AI_SAME, AI_MODEL))}
+MODEL_ONLY = (SAME_MODEL, AI_MODEL)      # not this item: the same model in another print/colour
+STRONG = (UPC, ROSS, STYLE_FULL, STYLE)  # this very item (and may lend its identification)
 AI_CANDIDATES = 8
 AI_STAGE = "check_owned"
 _HOME = ("home",)                 # piece statuses that mean "in a box at home"
@@ -49,42 +57,101 @@ def upc_key(value) -> str | None:
     return d.zfill(14) if d else None
 
 
+def _base_like(code: str) -> bool:
+    """Enough for a base style code: 5+ characters, letters and digits."""
+    return len(code) >= 5 and bool(re.search(r"\d", code)) and bool(re.search(r"[a-z]", code))
+
+
+def style_codes(ident: dict) -> tuple[set, set, set]:
+    """(full codes, base codes, full codes that carry a suffix), normalised:
+    'EHH108-26-WIP' -> full {'ehh10826wip'}, base {'ehh108'}, suffixed
+    {'ehh10826wip'}; 'LB102100' -> full = base = {'lb102100'}, no suffix."""
+    full, base, suffixed = set(), set(), set()
+    for raw in (ident.get("style_code"), ident.get("model")):
+        code = check._norm_code(raw)
+        if len(code) < 5 or not check._looks_like_code(code):
+            continue
+        full.add(code)
+        # the base: the first part, or as many leading parts as make a code
+        # ("EH-H02-26-DHO" -> EHH02; "EHH108-26-WIP" -> EHH108)
+        b = ""
+        for part in re.split(r"[-/ ]+", str(raw).strip()):
+            b += check._norm_code(part)
+            if _base_like(b):
+                break
+        if _base_like(b) and b != code:
+            base.add(b)
+            suffixed.add(code)
+        else:
+            base.add(code)
+    return full, base, suffixed
+
+
 def keys(ident: dict | None, sku=None) -> dict:
-    """What a product is known by: UPC, style codes (with and without a colour
-    suffix), colour, Ross codes. `sku`: one code or several (the REDUCED
-    sticker's and the main tag's). A Ross code stored as the "UPC" counts as a
-    Ross code."""
+    """What a product is known by: UPC, full and base style codes, colour, Ross
+    codes. `sku`: one code or several (the REDUCED sticker's and the main
+    tag's). A Ross code in the "UPC" (a brand tag's barcode that is Ross's
+    code) or in identification["ross_code"] counts as a Ross code."""
     ident = ident or {}
     skus = sku if isinstance(sku, (list, tuple, set)) else [sku]
-    ross = {c for c in map(ross_code, [*skus, ident.get("upc")]) if c}
-    return {"upc": upc_key(ident.get("upc")),
-            "codes": set(check._codes(ident)),
-            "colour": str(ident.get("color") or "").strip(),
-            "ross": ross}
+    ross = {c for c in map(ross_code, [*skus, ident.get("upc"), ident.get("ross_code")]) if c}
+    full, base, suffixed = style_codes(ident)
+    return {"upc": upc_key(ident.get("upc")), "full": full, "base": base, "suffixed": suffixed,
+            "codes": full | base, "colour": str(ident.get("color") or "").strip(), "ross": ross}
+
+
+_COLOUR_FILLER = {"and", "with", "color", "colour", "print", "pattern", "background", "trim", "accents", "the"}
 
 
 def _colour_words(colour: str) -> set:
-    words = set(re.findall(r"[a-z]+", colour.lower()))
-    return (words & set(check.COLOURS)) or (words - {"multi", "and", "with", "color", "colour"})
+    """Named colours, else the words ("Wilma Print" -> {"wilma"}). Multi /
+    multicolor / multicolour are one word, "multi"."""
+    text = re.sub(r"multi[- ]?colou?r(ed)?", "multi", colour.lower())
+    words = set(re.findall(r"[a-z]+", text))
+    return (words & (set(check.COLOURS) | {"multi"})) or (words - _COLOUR_FILLER)
+
+
+# "... Print" words that name no particular print
+_GENERIC_PRINT = {"tattoo", "all", "over", "allover", "logo", "graphic", "animal", "floral", "the", "a", "with",
+                  "and", "multi", "multicolor", "multicolour", "allover"}
+_PRINT_RE = re.compile(r"([a-z]+)\s+print\b")
+
+
+def print_names(colour: str) -> set:
+    """Named prints in a colour: "Black Multi / Wilma Print" -> {"wilma"};
+    "... tattoo print" names none."""
+    return {w for w in _PRINT_RE.findall((colour or "").lower()) if w not in _GENERIC_PRINT}
 
 
 def same_colour(a: str, b: str) -> bool:
     """True when either colour is unknown, or they share a colour word
-    ("Black Multi (leopard)" and "Black")."""
+    ("Black Multi (leopard)" and "Black"). A named print must be named on the
+    other side too: "Multi" doesn't match "Wilma Print", nor does "Tillie
+    Print"."""
+    pa, pb = print_names(a), print_names(b)
+    if pa or pb:
+        la, lb = (a or "").lower(), (b or "").lower()
+        return (not pa or any(p in lb for p in pa)) and (not pb or any(p in la for p in pb))
     wa, wb = _colour_words(a or ""), _colour_words(b or "")
     return not wa or not wb or bool(wa & wb)
 
 
-def match(mine: dict, theirs: dict) -> str | None:
-    """The strongest key two products share, or None."""
+def match(mine: dict, theirs: dict, suffixed_bases: set | frozenset = frozenset()) -> str | None:
+    """The strongest key two products share, or None. `suffixed_bases`: base
+    codes we also hold WITH a suffix (ehh108, from EHH108-26-TLP): such a
+    code with no suffix is a base only, never the full style."""
     if mine["upc"] and mine["upc"] == theirs["upc"]:
         return UPC
-    style = bool(mine["codes"] & theirs["codes"])
-    if style and same_colour(mine["colour"], theirs["colour"]):
-        return STYLE
     if mine["ross"] & theirs["ross"]:
         return ROSS
-    return STYLE_OTHER_COLOUR if style else None
+    full = mine["full"] & theirs["full"]
+    if full & (mine["suffixed"] | theirs["suffixed"]):
+        return STYLE_FULL                 # the print/colour is in the code
+    if full - set(suffixed_bases) and same_colour(mine["colour"], theirs["colour"]):
+        return STYLE
+    if full or mine["base"] & theirs["base"]:
+        return SAME_MODEL
+    return None
 
 
 # --- what we have ---------------------------------------------------------------------------
@@ -263,6 +330,35 @@ def ai_match(ident: dict, candidates: list, ask=None) -> list[tuple[int, str]]:
 
 # --- lookup -----------------------------------------------------------------------------------
 
+def brand_counts(ident: dict, things: list) -> dict | None:
+    """How much of this brand we hold: {"brand", "listed", "home", "sold"} over
+    items (scoreboard's brand names, so "Luv Betsey" counts as Betsey Johnson
+    only if that's how it normalises). None when the brand is unknown."""
+    from pipeline import scoreboard
+    name = scoreboard.normalize_brand(ident.get("brand"))
+    if name == "Unknown":
+        return None
+    n = {"brand": name, "listed": 0, "home": 0, "sold": 0}
+    for _, theirs, h in things:
+        if h["source"] != "item" or scoreboard.normalize_brand(theirs.get("brand")) != name:
+            continue
+        if h.get("status") == "published":
+            n["listed"] += 1
+        elif h.get("status") == "sold":
+            n["sold"] += 1
+        elif h.get("box"):
+            n["home"] += 1
+    return n
+
+
+def brand_text(b: dict | None) -> str:
+    """'Ed Hardy: 44 listed, 1 at home, 12 sold' ('Ed Hardy: none yet')."""
+    if not b:
+        return ""
+    parts = [f"{b[k]} {w}" for k, w in (("listed", "listed"), ("home", "at home"), ("sold", "sold")) if b[k]]
+    return f"{b['brand']}: {', '.join(parts) or 'none yet'}"
+
+
 def lookup(ident: dict, sku=None, exclude_check_id=None, *, things_fn=None, receipts_fn=None,
            ai_fn=None) -> dict:
     """{"hits": [...strongest and most useful first], "ai": None | {"candidates": n},
@@ -272,10 +368,16 @@ def lookup(ident: dict, sku=None, exclude_check_id=None, *, things_fn=None, rece
         mine = keys(ident, sku)
         things = (things_fn or _things)(exclude_check_id)
         hits = []
+        # base codes some item carries with a suffix: without one, they are a base only
+        suffixed_bases = {b for k, _, _ in things if k["suffixed"] for b in k["base"]}
+        if mine["suffixed"]:
+            suffixed_bases |= mine["base"]
         for k, theirs, hit in things:
-            m = match(mine, k)
+            m = match(mine, k, suffixed_bases)
             if m:
-                hits.append({**hit, "match": m, "ident": theirs})
+                shared = sorted(mine["base"] & k["base"]) or sorted(mine["full"] & k["full"])
+                hits.append({**hit, "match": m, "ident": theirs,
+                             **({"model_code": shared[0].upper()} if m == SAME_MODEL and shared else {})})
         # receipt lines (every one: receipts misread lines too often to count
         # units by them; the reply shows them per receipt, see receipts_summary)
         if mine["ross"]:
@@ -290,7 +392,10 @@ def lookup(ident: dict, sku=None, exclude_check_id=None, *, things_fn=None, rece
                     hits.append({**cands[i][2], "match": m, "ident": cands[i][1]})
         hits.sort(key=lambda h: str(h.get("date") or ""), reverse=True)      # newest first, then
         hits.sort(key=lambda h: (_SOURCE_ORDER[h["source"]], STRENGTH[h["match"]], h.get("status") == "sold"))
-        return {"hits": hits, "ai": ai, "error": None}
+        # the brand: the check's own, else the matched item's (a typed code has none)
+        best = donor({"hits": hits})
+        who = ident if ident.get("brand") or not best else best["ident"]
+        return {"hits": hits, "ai": ai, "error": None, "brand": brand_counts(who, things)}
     except Exception as e:  # advisory: never stops a check
         traceback.print_exc()
         return {"hits": [], "ai": None, "error": f"{type(e).__name__}: {str(e)[:120]}"}
@@ -336,7 +441,7 @@ def hit_text(h: dict) -> str:
     if h.get("profit") is not None:
         bits.append(f"profit {usd(h['profit'])}")
     label = h["match"]
-    if label not in (UPC, STYLE, ROSS):         # weaker matches name what matched
+    if label not in STRONG:                     # weaker matches name what matched
         label += f": {h['name'][:40]}"
     bits.append(label)
     return " · ".join(bits)
@@ -365,7 +470,6 @@ def _summary(hits: list) -> str:
 
 # --- what it is, and lending it to the search ---------------------------------------------------
 
-STRONG = (UPC, STYLE, ROSS)
 _CATEGORY = {"bags": "bag", "shoes": "shoes", "clothing": "clothing", "jewelry": "accessory"}
 _LEND = ("brand", "product_name", "model", "style_code", "upc", "color", "item_type", "size", "material",
          "department", "gender", "retail_price")
@@ -427,35 +531,57 @@ def borrow_identification(ident: dict, hit: dict | None) -> tuple[dict, dict | N
 
 
 def reply_lines(owned: dict | None, *, html: bool = False, limit: int | None = None) -> list[str]:
-    """The top of the reply: "✅ New", or "🔁 Already have: 1 listed, 1 sold"
-    and up to `limit` hits with their eBay links."""
+    """The top of the reply:
+      "🔁 Already have: <what it is> — 1 listed, 1 sold", up to `limit` hits
+      of this item with their links, or "✅ New";
+      then the same model in other prints/colours on one line of its own;
+      then the brand's concentration ("Ed Hardy: 44 listed, 12 sold")."""
     from html import escape
     if not owned:
         return []
     if owned.get("error"):
         return ["⚠️ Couldn't check what we already have"]
     hits = owned.get("hits") or []
-    if not hits:
-        return ["✅ New"]
+    same = [h for h in hits if h["match"] not in MODEL_ONLY]
+    models = [h for h in hits if h["match"] in MODEL_ONLY]
+    brand = brand_text(owned.get("brand"))
+    esc = escape if html else (lambda s: s)
     limit = config.CHECK_OWNED_SHOW if limit is None else limit
-    weak = all(h["match"] in (STYLE_OTHER_COLOUR, AI_MODEL) for h in hits)
-    best = donor(owned)
-    what = what_it_is(best["ident"]) if best else next(
-        (f'"{h["description"]}" (receipt)' for h in hits if h["source"] == "receipt" and h.get("description")), "")
-    head = f"{'🔁 Similar' if weak else '🔁 Already have'}: " + (f"{what} — " if what else "") + _summary(hits)
-    lines = [escape(head) if html else head]
-    shown = _grouped(hits)
-    for h in shown[:limit]:
-        text = _receipts_text(h["lines"]) if h["source"] == "receipts" else hit_text(h)
-        label = _short(h.get("name") or "eBay", 45)
-        if html:
-            text = escape(text) + (f' · 🔗 <a href="{escape(h["url"])}">{escape(label)}</a>' if h.get("url") else "")
-        elif h.get("url"):
-            text += f" · 🔗 {label} {h['url']}"
-        lines.append(f"• {text}")
-    if len(shown) > limit:
-        lines.append(f"• … {len(shown) - limit} more in Details")
+    if not same:
+        lines = [esc("✅ New" + (f" · {brand}" if brand and not models else ""))]
+    else:
+        best = donor(owned)
+        what = what_it_is(best["ident"]) if best else next(
+            (f'"{h["description"]}" (receipt)' for h in same if h["source"] == "receipt" and h.get("description")),
+            "")
+        lines = [esc("🔁 Already have: " + (f"{what} — " if what else "") + _summary(same))]
+        shown = _grouped(same)
+        for h in shown[:limit]:
+            text = _receipts_text(h["lines"]) if h["source"] == "receipts" else hit_text(h)
+            lines.append("• " + _with_link(text, h, html))
+        if len(shown) > limit:
+            lines.append(f"• … {len(shown) - limit} more in Details")
+    if models:
+        lines.append("• " + _with_link(_models_text(models), next((h for h in models if h.get("url")), {}), html))
+    if brand and (same or models):
+        lines.append(esc(f"• {brand}"))
     return lines
+
+
+def _with_link(text: str, h: dict, html: bool) -> str:
+    """The text, then "🔗 <listing title>" linking to the hit's eBay page."""
+    from html import escape
+    label = _short(h.get("name") or "eBay", 45)
+    if html:
+        return escape(text) + (f' · 🔗 <a href="{escape(h["url"])}">{escape(label)}</a>' if h.get("url") else "")
+    return text + (f" · 🔗 {label} {h['url']}" if h.get("url") else "")
+
+
+def _models_text(models: list) -> str:
+    """'Same model EHH108, other prints/colours: 2 listed, 1 sold'."""
+    code = next((h["model_code"] for h in models if h.get("model_code")), None)
+    who = f"Same model {code}" if code else "Same model"
+    return f"{who}, other prints/colours: {_summary(models)}"
 
 
 def _short(text: str, n: int) -> str:
@@ -537,9 +663,11 @@ def details_lines(owned: dict | None) -> list[str]:
     hits = owned.get("hits") or []
     ai = owned.get("ai")
     note = f" (AI title match over {ai['candidates']} same-brand thing(s))" if ai else ""
+    brand = brand_text(owned.get("brand"))
     if not hits:
-        return [f"Already have: nothing in items, pieces, receipts or earlier checks{note}"]
-    out = [f"Already have ({len(hits)}){note}:"]
+        return [f"Already have: nothing in items, pieces, receipts or earlier checks{note}"] + \
+            ([f"  {brand}"] if brand else [])
+    out = [f"Already have ({len(hits)}){note}:" + (f" · {brand}" if brand else "")]
     for h in hits:
         ref = {"item": f"item {str(h['id'])[:8]}", "piece": f"piece {h['id']}", "check": f"check #{h['id']}",
                "receipt": f"receipt line {h['id']}"}[h["source"]]

@@ -134,7 +134,7 @@ class Pipeline:
                 "confidence": self.confidence, "upc": None,
                 "search_query": f"{self.brand} canvas tote"}
 
-    def _price(self, ident, *, photo_paths=None, receipt=None, item_id=None, ask=None):
+    def _price(self, ident, *, photo_paths=None, receipt=None, item_id=None, ask=None, **kw):
         self.seen.append(("price", self._status()))
         self.price_receipt = receipt
         return {"engine": "v2", "suggested_price": 24.99, "machine_price": 24.99,
