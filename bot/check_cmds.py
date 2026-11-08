@@ -232,7 +232,7 @@ def _expire() -> None:
         state.checks.pop(token, None)
 
 
-def _markup(token: str, req: dict, bought: bool = False) -> InlineKeyboardMarkup:
+def _markup(token: str, req: dict, bought: bool = False, shoes: bool = False) -> InlineKeyboardMarkup:
     row = []
     if not req.get("full"):
         row.append(InlineKeyboardButton("🔬 Full check", callback_data=f"chk:full:{token}"))
@@ -240,7 +240,14 @@ def _markup(token: str, req: dict, bought: bool = False) -> InlineKeyboardMarkup
                                     callback_data=f"chk:{'any' if req.get('exact', True) else 'exact'}:{token}"))
     if not bought:
         row.append(InlineKeyboardButton("🛍 Bought", callback_data=f"chk:bought:{token}"))
-    return InlineKeyboardMarkup([row, [InlineKeyboardButton("Details", callback_data=f"chk:details:{token}")]])
+    rows = [row]
+    if shoes:      # "has yours the box?": re-scored from the same comps, no new search
+        box = req.get("box")
+        rows.append([InlineKeyboardButton(("✓ " if box is True else "📦 ") + "With box",
+                                          callback_data=f"chk:box1:{token}"),
+                     InlineKeyboardButton(("✓ " if box is False else "📦 ") + "No box",
+                                          callback_data=f"chk:box0:{token}")])
+    return InlineKeyboardMarkup(rows + [[InlineKeyboardButton("Details", callback_data=f"chk:details:{token}")]])
 
 
 def _identify_one(path: str) -> dict:
@@ -321,11 +328,12 @@ async def _run(user_id: int, message, req: dict, photo: str | None, *, check_id:
         token = secrets.token_hex(4)
         saved = {k: v for k, v in req.items() if k != "auto_full"}
         saved["identification"] = res["identification"]     # buttons don't re-identify
+        shoes = res.get("item_type") == "shoes"
         state.checks[token] = {"req": saved, "photo": photo, "user": user_id, "ts": time.time(),
-                               "check_id": check_id,
+                               "check_id": check_id, "shoes": shoes, "res": res,
                                "details": check.format_details(res, check_id=check_id,
                                                                sku=req.get("ross_sku"))}
-        markup = _markup(token, req)
+        markup = _markup(token, req, shoes=shoes)
         if sent:
             try:
                 await sent.edit_text(util._scrub(html), reply_markup=markup, parse_mode="HTML",
@@ -372,8 +380,38 @@ async def photo_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # --- buttons ---------------------------------------------------------------------------------
 
+async def _box_given(message, token: str, saved: dict, box: bool) -> None:
+    """Shoes: "with box" / "no box" tapped. The check is re-scored from the comps
+    it already has (check.with_box: no search, no AI call), saved, and the
+    reply edited in place."""
+    res = saved.get("res")
+    if not res:
+        await util._safe_reply(message, "That check has expired. Send it again.")
+        return
+    res = await asyncio.to_thread(check.with_box, res, box)
+    saved["res"] = res
+    saved["req"] = {**saved["req"], "box": box}          # Full / Any reruns keep the answer
+    cid = saved["check_id"]
+    saved["details"] = check.format_details(res, check_id=cid, sku=saved["req"].get("ross_sku"))
+    try:
+        await asyncio.to_thread(db.update_check, cid, **check.check_fields(res))
+    except Exception:
+        traceback.print_exc()
+    markup = _markup(token, saved["req"], bought=saved.get("bought", False), shoes=True)
+    html = check.format_reply(res, check_id=cid, html=True)
+    try:
+        await message.edit_text(util._scrub(html), reply_markup=markup, parse_mode="HTML",
+                                disable_web_page_preview=True)
+    except Exception:
+        traceback.print_exc()
+        if not await util._safe_reply(message, html, reply_markup=markup, parse_mode="HTML",
+                                      disable_web_page_preview=True):
+            await util._safe_reply(message, check.format_reply(res, check_id=cid), reply_markup=markup,
+                                   disable_web_page_preview=True)
+
+
 async def check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """chk:full|any|exact|bought:<token>."""
+    """chk:full|any|exact|bought|box1|box0|details:<token>."""
     query = update.callback_query
     await query.answer()
     _expire()
@@ -391,11 +429,16 @@ async def check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     if action == "bought":
         await asyncio.to_thread(db.set_check_status, saved["check_id"], "bought")
+        saved["bought"] = True
         try:
-            await query.message.edit_reply_markup(reply_markup=_markup(token, saved["req"], bought=True))
+            await query.message.edit_reply_markup(reply_markup=_markup(token, saved["req"], bought=True,
+                                                                       shoes=saved.get("shoes", False)))
         except Exception:
             traceback.print_exc()
         await util._safe_reply(query.message, f"🛍 Check #{saved['check_id']} marked bought.")
+        return
+    if action in ("box1", "box0"):
+        await _box_given(query.message, token, saved, action == "box1")
         return
     req = dict(saved["req"])
     if action == "full":

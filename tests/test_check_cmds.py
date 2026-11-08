@@ -271,6 +271,52 @@ def test_usage_cap_and_one_at_a_time(env, monkeypatch):
     assert "Still working" in tg.sent_texts(ctx)[-1]
 
 
+SHOE_COMPS = [{"source": "sold", "verdict": "variant", "total": t,
+               "title": f"Nike Air Max Muse FV1920-004 Size 8 {t}",
+               "url": "u", "condition": cond}
+              for t, cond in ((82.0, "Brand New"), (77.0, "Brand New"), (104.0, "Brand New"),
+                              (65.0, "New (Other)"), (79.0, "New (Other)"))]
+
+
+def test_shoes_ask_for_the_box_and_rescore_without_a_new_search(env, monkeypatch):
+    """Check #17: "has yours the box?" as two buttons; the answer re-scores the
+    same comps (no pricing call) and edits the reply."""
+    calls = []
+
+    def get(ident, **kw):
+        calls.append(kw)
+        return {"judged_comps": SHOE_COMPS, "raw_active_floor": None, "claude_confidence": "medium",
+                "same_item_active_count": 0, "sold_cache_misses": [], "rungs_tried": ["q"],
+                "timings": {"comps_s": 1.0, "judge_s": 1.0}}
+    monkeypatch.setattr(pricing_v2, "get_pricing_v2", get)
+    upd, ctx = tg.make_text_update("/check full Nike Air Max Muse FV1920-004 sneakers size 9 19.99")
+    tg.run(check_cmds.check_command, upd, ctx)
+    assert "has yours the box? Tap below" in tg.sent_texts(ctx)[-1]
+    labels = dict(tg.last_markup_buttons(ctx))
+    assert "📦 With box" in labels and "📦 No box" in labels
+    cid = db.list_checks(limit=1)[0]["check_id"]
+    before = db.get_check(cid)["suggested_price"]
+    n = len(calls)
+    upd2, ctx = tg.make_callback_update(labels["📦 No box"], context=ctx)
+    tg.run(check_cmds.check_callback, upd2, ctx)
+    assert len(calls) == n                                     # no new search, no judge call
+    assert "yours: no box" in tg.sent_texts(ctx)[-1]
+    assert "✓ No box" in dict(tg.last_markup_buttons(ctx))
+    c = db.get_check(cid)
+    assert c["comps_summary"]["box"] is False and c["suggested_price"] != before   # no-box sales: 65, 79
+    # Full / Any reruns keep the answer
+    anyb = next(d for _, d in tg.last_markup_buttons(ctx) if d.startswith("chk:any:"))
+    upd3, ctx = tg.make_callback_update(anyb, context=ctx)
+    tg.run(check_cmds.check_callback, upd3, ctx)
+    assert db.get_check(cid)["comps_summary"]["box"] is False
+
+
+def test_bags_get_no_box_buttons(env):
+    upd, ctx = tg.make_text_update("/check Coach Tabby 26 CH857 shoulder bag 14.99")
+    tg.run(check_cmds.check_command, upd, ctx)
+    assert not any("box" in label.lower() for label, _ in tg.last_markup_buttons(ctx))
+
+
 def test_expired_button(env):
     upd, ctx = tg.make_callback_update("chk:full:deadbeef")
     tg.run(check_cmds.check_callback, upd, ctx)

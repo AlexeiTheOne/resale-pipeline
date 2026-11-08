@@ -103,6 +103,9 @@ def build_identification(text: str) -> dict:
     upc = re.search(r"(?<!\d)(\d{12,13})(?!\d)", text or "")
     if upc:
         ident["upc"] = upc.group(1)
+    size = re.search(r"\b(?:size|sz)\s*(\d{1,2}(?:\.5)?|xxs|xs|s|m|l|xl|xxl|2xl|3xl)\b", text or "", re.I)
+    if size:                      # shoes / clothing: "size 9" is part of the same item (check #17)
+        ident["size"] = size.group(1)
     return ident
 
 
@@ -277,8 +280,11 @@ def max_buy(item_price: float | None, label: float, ship_charged: float | None =
 def verdict(*, profit: float | None, roi: float | None, sales: int,
             profit_at_cheapest: float | None, low_confidence: bool = False,
             from_asks: bool = False, disagrees: bool = False,
-            estimated: bool = False, own_sales: bool = False) -> tuple[str, list[str]]:
-    """BUY / MAYBE / BORDERLINE / SKIP and the reasons, from config thresholds."""
+            estimated: bool = False, own_sales: bool = False, model_sales: int = 0,
+            incomplete: bool = False) -> tuple[str, list[str]]:
+    """BUY / MAYBE / BORDERLINE / SKIP and the reasons, from config thresholds.
+    model_sales: same-model sales (level 2), named when there are no same-item
+    sales; incomplete: some sold searches failed, so "no sales" is not known."""
     if profit is None:
         return "SKIP", ["no price found"]
     reasons = []
@@ -287,7 +293,7 @@ def verdict(*, profit: float | None, roi: float | None, sales: int,
                       or profit_at_cheapest >= config.CHECK_MIN_PROFIT_AT_CHEAPEST))
     evidence = []
     if sales < config.CHECK_MIN_SALES:
-        evidence.append("no sales found" if sales == 0 else
+        evidence.append(sales_phrase(sales, model_sales, incomplete) if sales == 0 else
                         f"only {sales} sale{'s' if sales > 1 else ''} (need {config.CHECK_MIN_SALES})")
     if from_asks:
         evidence.append("priced from asking prices, not sales")
@@ -349,7 +355,9 @@ def _model_words(ident: dict) -> list[str]:
     materials (check #10: "Purple & White Cow Print Vegan Pony Hair Bowling
     Bag" -> cow, print, bowling, so the brown one is the same model)."""
     brand = set(re.findall(r"[a-z0-9]+", str(ident.get("brand") or "").lower()))
-    words = re.findall(r"[a-z0-9]+", str(ident.get("product_name") or "").lower())
+    # "size 9" typed into the name is the size, not the model
+    name = re.sub(r"\b(?:size|sz)\s*[\w.]+", " ", str(ident.get("product_name") or "").lower())
+    words = re.findall(r"[a-z0-9]+", name)
     skip = _GENERIC | _MATERIALS | (set(COLOURS) - _PATTERNS)
     out = []
     for w in words:
@@ -428,8 +436,197 @@ def tighten_same_model(pricing: dict, ident: dict) -> dict:
     if not any(c.get("verdict") == "variant" for c in judged):
         return pricing
     out = [{**c, "verdict": OTHER_STYLE, "judge_verdict": "variant"}
-           if c.get("verdict") == "variant" and not same_model(c, ident) else c for c in judged]
+           if c.get("verdict") == "variant" and not c.get("other_size") and not same_model(c, ident) else c
+           for c in judged]
     return {**pricing, "judged_comps": out}
+
+
+# --- sizes: shoes and sized clothing (Person B, 2026-11-07, check #17) -------------------------
+# The same item is the same style code (colour code included) AND the same size.
+# Sizes are read from titles; a title that states no size proves nothing.
+
+SIZED_KINDS = ("shoes", "clothing")
+_US = ("us", "us_w", "us_m")
+_SIZE_SYS = {"size": "us", "sz": "us", "us": "us", "uk": "uk", "eu": "eu", "eur": "eu",
+             "women's": "us_w", "womens": "us_w", "women": "us_w", "wmns": "us_w", "w": "us_w",
+             "ladies": "us_w", "men's": "us_m", "mens": "us_m", "men": "us_m", "m": "us_m"}
+_SHOE_NUM = re.compile(r"^\d{1,2}(?:\.5)?$")
+_LETTERS = {"xxs": "XXS", "xs": "XS", "s": "S", "small": "S", "m": "M", "medium": "M", "l": "L",
+            "large": "L", "xl": "XL", "xxl": "XXL", "2xl": "XXL", "xxxl": "3XL", "3xl": "3XL"}
+# Letter sizes safe to read anywhere in a title; "small" / "large" / "s" / "m" / "l"
+# only right after "size" or a gender word ("Small Pony" is a logo).
+_LETTERS_ALONE = {"xxs", "xs", "medium", "xl", "xxl", "2xl", "xxxl", "3xl"}
+_CLOTHING_LEAD = {"size", "sz", "mens", "men's", "men", "womens", "women's", "women", "ladies",
+                  "boys", "girls", "juniors", "youth"}
+
+
+def _size_words(text: str) -> list[str]:
+    t = str(text or "").lower().replace("’", "'")
+    t = re.sub(r"\bextra[\s-]?large\b|\bx[\s-]large\b", "xl", t)
+    t = re.sub(r"\bxx[\s-]large\b", "xxl", t)
+    t = re.sub(r"(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])", " ", t)       # us9 / w9 / 9w -> us 9 / w 9 / 9 w
+    t = re.sub(r"\b([23]) xl\b", r"\1xl", t)                         # but 2 xl -> 2xl
+    return re.findall(r"\b[23]xl\b|[a-z']+|\d+(?:\.\d)?", t)
+
+
+def shoe_sizes(text: str) -> set:
+    """{("us_w", 9.0), ("eu", 40.5)} from "Women's Size 9", "WMNS 9",
+    "Size 43" (30+ is EU), "US 9 / UK 6.5 / EUR 40.5". A number counts only
+    right after a size word (size, sz, us, uk, eu, women's, men's, w, m), so
+    "Air Max 90" is no size."""
+    words = _size_words(text)
+    out = set()
+    for i, w in enumerate(words):
+        if not _SHOE_NUM.match(w) or i == 0 or words[i - 1] not in _SIZE_SYS:
+            continue
+        sys_ = _SIZE_SYS[words[i - 1]]
+        # a gender word before "size"/"us": "women's size 9", "mens us 10"
+        if sys_ == "us" and i >= 2 and _SIZE_SYS.get(words[i - 2]) in ("us_w", "us_m"):
+            sys_ = _SIZE_SYS[words[i - 2]]
+        v = float(w)
+        if sys_ in _US and v >= 30:
+            sys_ = "eu"
+        if (sys_ == "eu" and 30 <= v <= 52) or (sys_ != "eu" and 1 <= v <= 18):
+            out.add((sys_, v))
+    return out
+
+
+def clothing_sizes(text: str, *, field: bool = False) -> set:
+    """{("letter", "M")} or {("num", 10.0)}. field: the identification's size
+    field itself, where a bare "M" or "10" is the size."""
+    words = _size_words(text)
+    out = set()
+    for i, w in enumerate(words):
+        lead = i > 0 and words[i - 1] in _CLOTHING_LEAD
+        if w in _LETTERS and (field or lead or w in _LETTERS_ALONE):
+            out.add(("letter", _LETTERS[w]))
+        elif re.fullmatch(r"\d{1,2}", w) and (field or (i > 0 and words[i - 1] in ("size", "sz"))):
+            out.add(("num", float(w)))
+    return out
+
+
+def size_of(ident: dict, kind: str | None = None) -> set:
+    """Our size, from the identification's size field (shoes: a bare "9" is
+    US, women's when the name or size says so)."""
+    kind = kind or item_type_of(ident)
+    raw = str(ident.get("size") or "")
+    if not raw.strip() or kind not in SIZED_KINDS:
+        return set()
+    if kind == "clothing":
+        return clothing_sizes(raw, field=True)
+    got = shoe_sizes(raw)
+    if not got:
+        m = re.search(r"(?<![\d.])(\d{1,2}(?:\.5)?)(?![\d.])", raw)
+        if m and 1 <= float(m.group(1)) <= 18:
+            hay = f"{raw} {ident.get('product_name') or ''} {ident.get('item_type') or ''}".lower()
+            gender = "us_w" if re.search(r"\bwom[ae]n|\bwmns\b|\bladies\b", hay) else \
+                "us_m" if re.search(r"\bm[ae]n'?s?\b", hay) else "us"
+            got = {(gender, float(m.group(1)))}
+    hay = f"{raw} {ident.get('product_name') or ''}".lower()
+    if re.search(r"\bwom[ae]n|\bwmns\b|\bladies\b", hay):        # "US 9" on a women's shoe
+        got = {("us_w", v) if s == "us" else (s, v) for s, v in got}
+    return got
+
+
+def size_label(ident: dict, kind: str | None = None) -> str | None:
+    """"9", "EU 40.5", "M": how the reply names our size."""
+    sizes = sorted(size_of(ident, kind), key=lambda s: (s[0] not in _US + ("letter", "num"), s[0]))
+    if not sizes:
+        return None
+    s, v = sizes[0]
+    num = f"{v:g}" if isinstance(v, float) else str(v)
+    return num if s in _US + ("letter", "num") else f"{s.upper()} {num}"
+
+
+def title_sizes(title: str, kind: str) -> set:
+    return shoe_sizes(title) if kind == "shoes" else clothing_sizes(title) if kind == "clothing" else set()
+
+
+def _size_pair(a: tuple, b: tuple) -> bool | None:
+    """Same size (True), another size (False), or not comparable (None)."""
+    (sa, va), (sb, vb) = a, b
+    if sa == sb or (sa in _US and sb in _US and "us" in (sa, sb)):
+        return va == vb
+    if {sa, sb} == {"us_w", "us_m"}:                 # women's = men's + 1.5
+        w, m = (va, vb) if sa == "us_w" else (vb, va)
+        return w == m + 1.5
+    return None
+
+
+def size_match(theirs: set, ours: set) -> bool | None:
+    """True: the title states our size; False: it states only other sizes;
+    None: it states none we can compare."""
+    seen = [r for r in (_size_pair(t, o) for t in theirs for o in ours) if r is not None]
+    if not seen:
+        return None
+    return any(seen)
+
+
+def colour_code(ident: dict) -> str | None:
+    """The full style code when it carries a colour part (FV1920-004), normalised."""
+    codes = _codes(ident)
+    return codes[0] if len(codes) > 1 else None
+
+
+def tighten_size(pricing: dict, ident: dict, kind: str | None = None) -> dict:
+    """Shoes and sized clothing: a judge same_item whose title states another
+    size becomes a variant (other_size: still our colour, counted at colour
+    level in supply); a judge variant whose title carries our full style code
+    and our size becomes same_item. The identical-listing count and cheapest
+    identical are counted again. Idempotent; pricing itself is not changed."""
+    kind = kind or item_type_of(ident)
+    ours = size_of(ident, kind)
+    if not ours:
+        return pricing
+    full = colour_code(ident)
+    out, changed = [], False
+    for c in pricing.get("judged_comps") or []:
+        m = size_match(title_sizes(c.get("title"), kind), ours)
+        if c.get("verdict") == "same_item" and m is False:
+            c, changed = {**c, "verdict": "variant", "judge_verdict": "same_item", "other_size": True}, True
+        elif c.get("verdict") == "variant" and m and full and full in _norm_code(c.get("title")):
+            c, changed = {**c, "verdict": "same_item", "judge_verdict": "variant"}, True
+        out.append(c)
+    if not changed:
+        return pricing
+    same_act = [c for c in out if c.get("source") != "sold" and c.get("verdict") == "same_item" and c.get("total")]
+    floor = min((c["total"] for c in same_act if not c.get("shipping_imputed")), default=None)
+    return {**pricing, "judged_comps": out, "same_item_active_count": len(same_act), "raw_active_floor": floor}
+
+
+# --- shoes: with box or not (Person B, 2026-11-07, check #17) ---------------------------------
+# eBay's "New with box" / "Brand New" vs "New without box" / "New (Other)":
+# counted apart, and the price uses the sales in our condition once we know it.
+
+def box_of(condition: str | None) -> str | None:
+    c = str(condition or "").strip().lower()
+    if not c:
+        return None
+    if any(w in c for w in ("without box", "no box", "(other)", "new other", "open box", "without tags")):
+        return "no_box"
+    if "with box" in c or c in ("brand new", "new", "new with tags"):
+        return "box"
+    return None
+
+
+def box_split(pricing: dict, kind: str) -> dict | None:
+    """Shoes: sales of the same item and model, and identical listings, by box
+    or not (item prices). None for other items or when no condition is known."""
+    if kind != "shoes":
+        return None
+    ship = config.EBAY_SHIP_CHARGED
+    out = {"sold": {"box": [], "no_box": []}, "active": {"box": [], "no_box": []}}
+    for c in pricing.get("judged_comps") or []:
+        b = box_of(c.get("condition"))
+        if not b or not c.get("total"):
+            continue
+        if c.get("source") == "sold" and c.get("verdict") in ("same_item", "variant") and not is_dropship(c, kind):
+            out["sold"][b].append(round(c["total"] - ship, 2))
+        elif c.get("source") != "sold" and c.get("verdict") == "same_item":
+            out["active"][b].append(round(c["total"] - ship, 2))
+    if not any(out["sold"].values()) and not any(out["active"].values()):
+        return None
+    return out
 
 
 def best_offer(price: float | None) -> dict | None:
@@ -561,8 +758,10 @@ def comp_list(pricing: dict, kind: str, exact: bool, details: dict | None = None
             continue
         m = with_details(c, details)
         row = {k: m.get(k) for k in ("ebay_id", "verdict", "title", "total", "url", "date", "seller",
-                                     "seller_feedback", "category_path", "listed", "units_sold")}
+                                     "seller_feedback", "category_path", "listed", "units_sold",
+                                     "condition", "other_size")}
         row["status"] = src
+        row["box"] = box_of(row.get("condition")) if kind == "shoes" else None
         row["signals"] = dropship_signals(row, kind)
         row["dropship"] = len(row["signals"]) >= 2
         out.append(row)
@@ -643,8 +842,14 @@ def count_supply(sold_rows: list[dict], active_rows: list[dict], ident: dict, ju
     page (sold: all inside the window). When most of such a page is the
     item or model counted, there are more of them than the page shows: the
     count is a floor ("7+") and a sales floor is never called high supply.
-    A full page of mostly other styles ("Von Dutch Bowling Bag") is not."""
-    verdicts = {c.get("ebay_id"): c.get("verdict") for c in judged or [] if c.get("ebay_id")}
+    A full page of mostly other styles ("Von Dutch Bowling Bag") is not.
+    Shoes and sized clothing (check #17): "item" is our colour in any size
+    (item_label "same colour"; the high-supply step stays at this level), and
+    "size" counts the rows of our colour whose title states our size
+    (shown only, never high supply)."""
+    # a same_item judged another size by its title is still our colour (tighten_size)
+    verdicts = {c.get("ebay_id"): "same_item" if c.get("other_size") else c.get("verdict")
+                for c in judged or [] if c.get("ebay_id")}
     today = (now or datetime.now(EASTERN)).date()
 
     def recent(c):
@@ -681,9 +886,21 @@ def count_supply(sold_rows: list[dict], active_rows: list[dict], ident: dict, ju
                         floor(full_sold, item_k), floor(full_active, item_k))
     model = _supply_part(sum(k in model_k for k in s_kind), sum(k in model_k for k in a_kind),
                          floor(full_sold, model_k), floor(full_active, model_k))
-    return {"days": config.CHECK_SUPPLY_DAYS, "item": item, "model": model,
-            "high": item["high"] or model["high"],
-            "high_part": "model" if model["high"] else "item" if item["high"] else None}
+    out = {"days": config.CHECK_SUPPLY_DAYS, "item": item, "model": model,
+           "high": item["high"] or model["high"],
+           "high_part": "model" if model["high"] else "item" if item["high"] else None}
+    ikind = item_type_of(ident)
+    if ikind in SIZED_KINDS:
+        out["item_label"] = "same colour"
+        ours = size_of(ident, ikind)
+        if ours:
+            def at_size(rows, kinds):
+                return sum(k == "item" and size_match(title_sizes(c.get("title"), ikind), ours) is True
+                           for c, k in zip(rows, kinds))
+            out["size"] = {**_supply_part(at_size(sold, s_kind), at_size(active, a_kind), False, False),
+                           "high": False}
+            out["size_label"] = size_label(ident, ikind)
+    return out
 
 
 def supply_lookup(pricing: dict, ident: dict, *, fetch_sold=None, fetch_active=None,
@@ -776,8 +993,13 @@ def supply_line(res: dict) -> str | None:
         return None
     parts = [f"same model {supply_text(sup['model'], sup['days'])}"]
     if sup["item"]["sold"] or sup["item"]["active"]:
-        parts.append(f"same item {supply_text(sup['item'], sup['days'])}")
-    return ("⚠️ " if sup.get("high") else "") + "Supply: " + " · ".join(parts)
+        parts.append(f"{sup.get('item_label') or 'same item'} {supply_text(sup['item'], sup['days'])}")
+    size = sup.get("size")
+    if size and (size["sold"] or size["active"]):
+        # titles that state our size: a floor, many titles state none
+        parts.append(f"size {sup.get('size_label')}: {size['sold']} sold / {size['active']} active")
+    tail = " · sold counts incomplete" if sup.get("sold_incomplete") else ""
+    return ("⚠️ " if sup.get("high") else "") + "Supply: " + " · ".join(parts) + tail
 
 
 LEVEL_NAMES = {1: "eBay sold, same item", 2: "eBay sold, same model other colour/size",
@@ -818,7 +1040,8 @@ def _median(xs):
 
 def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history: list | None = None,
                  receipt: dict | None = None, exclude_item_id: str | None = None,
-                 details: dict | None = None, supply: dict | None = None) -> dict:
+                 details: dict | None = None, supply: dict | None = None,
+                 box: bool | None = None) -> dict:
     """The evidence ladder (Person B, 2026-11-02). Every level is an ITEM price
     (eBay totals minus the shipping we charge):
       1 eBay sold, same item: 2+ sales -> their median, done.
@@ -837,7 +1060,10 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
     the upper end of levels 2-4 ("no competition, unique"); no demand
     either -> the median stays ("no competition, no demand data").
     High supply (supply_lookup, Person B 2026-11-06): a price from eBay
-    sales goes no higher than the lower quartile of those sales."""
+    sales goes no higher than the lower quartile of those sales.
+    Shoes with box known (box, Person B 2026-11-07): only the sales in our
+    condition (with box, or without / New other) count; none in our condition
+    -> all of them, said in box_note."""
     from pipeline import msrp
     ident = ident or {}
     kind = item_type_of(ident)
@@ -845,6 +1071,17 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
     # Dropship-style sold rows are not evidence of what a buyer pays us.
     judged = [c for c in all_judged if c.get("source") != "sold" or not is_dropship(c, kind)]
     dropped = len(all_judged) - len(judged)
+    box_left_out, box_note = 0, None
+    if kind == "shoes" and box is not None:
+        want = "box" if box else "no_box"
+
+        def sale(c):
+            return c.get("source") == "sold" and c.get("verdict") in ("same_item", "variant") and c.get("total")
+        fits = [c for c in judged if not sale(c) or box_of(c.get("condition")) in (want, None)]
+        if any(sale(c) for c in fits):
+            box_left_out, judged = len(judged) - len(fits), fits
+        elif any(sale(c) for c in judged):
+            box_note = f"no sales {'with' if box else 'without'} box: priced from the others"
     ship = config.EBAY_SHIP_CHARGED
     same_v = ("same_item", "variant") if not exact else ("same_item",)
     same = sorted(c["total"] for c in judged if c.get("source") == "sold"
@@ -904,7 +1141,9 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
         used = [k for k in (3, 4) if k in levels]
     sold_backed = 1 in used or 2 in used
     raw = levels[1]["value"] if 1 in levels else _median([levels[k]["value"] for k in used])
-    competitors = [c for c in all_judged if c.get("source") != "sold" and c.get("verdict") == "same_item"
+    # Our colour in another size (tighten_size) still means the item is not unique (check #17)
+    competitors = [c for c in all_judged if c.get("source") != "sold"
+                   and (c.get("verdict") == "same_item" or c.get("other_size"))
                    and c.get("total") and not is_dropship(with_details(c, details), kind)]
     note, upper = None, False
     if not competitors and used:
@@ -946,22 +1185,34 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
             "sales": len(same), "from_asks": False, "estimated": bool(used) and 1 not in used,
             "sold_median": _median(same), "disagrees": False, "ask_discount": None,
             "dropship_excluded": dropped, "competitors": len(competitors), "competition_note": note,
-            "upper_end": upper}
+            "upper_end": upper, "model_sales": len(variant), "box": box, "box_left_out": box_left_out,
+            "box_note": box_note}
 
 
 def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
              text: str = "", quick: bool = False, history: list | None = None,
              exclude_item_id: str | None = None, details: dict | None = None,
-             supply: dict | None = None) -> dict:
+             supply: dict | None = None, box: bool | None = None,
+             incomplete: str | None = None) -> dict:
     """Price choice, money and verdict from a pricing result. Shared by
     run_check and the backtest (scripts/backtest_check.py), so the backtest
     scores exactly what /check would say. quick: a quick check that found no
     data at all is NO_DATA instead of SKIP. supply (full check,
-    supply_lookup): high supply lowers the verdict one step."""
-    pricing = tighten_same_model(pricing, ident or {})
-    pick = choose_price(pricing, exact, ident, history=history, exclude_item_id=exclude_item_id,
-                        details=details, supply=supply)
+    supply_lookup): high supply lowers the verdict one step. box (shoes):
+    True/False once we know whether ours has the box. incomplete: why some
+    sold searches failed (sold_incomplete)."""
     kind, label = label_for(ident, text)
+    pricing = tighten_size(tighten_same_model(pricing, ident or {}), ident or {}, kind)
+    if kind == "shoes" and box is not None:
+        # the cheapest identical listing in our condition (a no-box ask is no ceiling for a boxed pair)
+        want = "box" if box else "no_box"
+        asks = [c["total"] for c in pricing.get("judged_comps") or []
+                if c.get("source") != "sold" and c.get("verdict") == "same_item" and c.get("total")
+                and not c.get("shipping_imputed") and box_of(c.get("condition")) in (want, None)]
+        if pricing.get("raw_active_floor") is not None or asks:
+            pricing = {**pricing, "raw_active_floor": min(asks, default=None)}
+    pick = choose_price(pricing, exact, ident, history=history, exclude_item_id=exclude_item_id,
+                        details=details, supply=supply, box=box)
     money = economics(pick["price"], ross_price, label) if pick["price"] and ross_price else None
     cheapest = pricing.get("raw_active_floor")
     at_cheapest = at_total(cheapest, ross_price, label) if cheapest and ross_price else None
@@ -973,23 +1224,29 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
                          profit_at_cheapest=at_cheapest["profit"] if at_cheapest else None,
                          low_confidence=pricing.get("claude_confidence") == "low",
                          from_asks=pick["from_asks"], disagrees=pick["disagrees"],
-                         estimated=pick.get("estimated", False), own_sales=3 in (pick.get("used") or []))
+                         estimated=pick.get("estimated", False), own_sales=3 in (pick.get("used") or []),
+                         model_sales=pick.get("model_sales") or 0, incomplete=bool(incomplete))
+        if pick.get("box_note"):
+            why = list(why) + [pick["box_note"]]
         if money is None:
             # No price at all is not evidence against the item (Person B,
             # 2026-11-02: in the backtest 14 of 20 such SKIPs were winners).
             # SKIP is only given when real prices back it.
             v, why = NO_DATA, (["the quick check found no recent sales and no identical listing"] if quick
+                               else [f"sold searches failed ({incomplete}) and no identical listing found: "
+                                     "not enough data for a verdict"] if incomplete
                                else ["no sales and no identical listing found: not enough data for a verdict"])
     if supply and supply.get("high") and v in STEP_DOWN:
         part = supply[supply["high_part"]]
-        what = "same model" if supply["high_part"] == "model" else "same item"
+        what = "same model" if supply["high_part"] == "model" else supply.get("item_label") or "same item"
         v, why = STEP_DOWN[v], [f"high supply: {what} {supply_text(part, supply['days'])}, "
                                 f"one step lower"] + list(why)
     size =bag_size(ident or {}, text) if kind == "bags" else None
     return {"item_type": kind, "label": label, "label_size": size, "verdict": v, "reasons": why, "pick": pick,
             "money": money, "cheapest_total": cheapest, "at_cheapest": at_cheapest,
             "similar": similar_sold(pricing), "offer": best_offer(pick["price"]),
-            "max_buy": max_buy(pick["price"], label), "supply": supply}
+            "max_buy": max_buy(pick["price"], label), "supply": supply,
+            "box_split": box_split(pricing, kind), "size_label": size_label(ident or {}, kind)}
 
 
 def _norm_code(v) -> str:
@@ -1062,7 +1319,9 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
         if k != "total_s":
             timings[k] = v
     raw_verdicts = Counter(c.get("verdict") or "unjudged" for c in pricing.get("judged_comps") or [])
-    pricing = tighten_same_model(pricing, ident)
+    pricing = tighten_size(tighten_same_model(pricing, ident), ident, label_for(ident, text)[0])
+    failed = pricing.get("sold_failed") or []
+    incomplete = sold_incomplete(failed, len(pricing.get("rungs_tried") or []) or None)
     details = {}
     if full:           # listing age, units sold, category of the cheapest identical listings
         t = time.perf_counter()
@@ -1076,12 +1335,15 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
         except Exception:          # advisory: a failed count never loses the check
             supply = None
         timings["supply_s"] = round(time.perf_counter() - t, 2)
-    ev = evaluate(pricing, ident, req.get("ross_price"), bool(req.get("exact", True)), text,
-                  quick=not full, details=details, supply=supply)
-    comps = comp_list(pricing, ev["item_type"], bool(req.get("exact", True)), details)
+        if supply and failed:      # the failed searches' sales are missing from the counts
+            supply = {**supply, "sold_incomplete": True}
+    ev = _scored(pricing, ident, req, details, supply, incomplete)
     timings["total_s"] = round(time.perf_counter() - t0, 2)
     return {"request": dict(req), "photo": bool(photo_path), "identification": ident,
             **ev, "already_have": have, "borrowed": borrowed, "no_search": no_search,
+            "sold_incomplete": incomplete, "sold_failed": failed,
+            # what with_box re-scores from (shoes: "has yours the box?"), no new search
+            "_raw": {"pricing": pricing, "details": details, "supply": supply},
             "typed_ross": typed_ross if typed_ross and not req.get("ross_sku") else None,
             "timings": timings,
             "confidence": pricing.get("claude_confidence"),
@@ -1091,11 +1353,6 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
             "sold_searched": not (not full and not no_search and pricing.get("rungs_tried")
                                   and len(pricing.get("sold_cache_misses") or [])
                                   >= len(pricing.get("rungs_tried") or [])),
-            # every comp used (Details); the first 5 are saved with the check
-            "comp_list": comps, "demand": demand_summary(comps),
-            "comps": [{"source": c["status"], **{k: c.get(k) for k in ("verdict", "title", "total", "url",
-                                                                       "date", "dropship")}}
-                      for c in comps][:5],
             "same_item_active": pricing.get("same_item_active_count"),
             "reference": pricing.get("reference"), "warnings": pricing.get("comp_warning"),
             "judge_model": pricing.get("judge_model"), "escalated": pricing.get("judge_escalated"),
@@ -1103,6 +1360,53 @@ def run_check(req: dict, *, photo_path: str | None = None, pricing_fn=None, iden
             "verdicts": dict(raw_verdicts),
             # judge "variant"s that failed the style code / product name test
             "demoted": sum(c.get("verdict") == OTHER_STYLE for c in pricing.get("judged_comps") or [])}
+
+
+def _scored(pricing: dict, ident: dict, req: dict, details: dict, supply: dict | None,
+            incomplete: str | None) -> dict:
+    """evaluate plus the comp list: what run_check and with_box share."""
+    exact = bool(req.get("exact", True))
+    ev = evaluate(pricing, ident, req.get("ross_price"), exact, req.get("description") or "",
+                  quick=not req.get("full"), details=details, supply=supply, box=req.get("box"),
+                  incomplete=incomplete)
+    comps = comp_list(tighten_size(pricing, ident, ev["item_type"]), ev["item_type"], exact, details)
+    return {**ev, "comp_list": comps, "demand": demand_summary(comps),
+            # every comp used (Details); the first 5 are saved with the check
+            "comps": [{"source": c["status"], **{k: c.get(k) for k in ("verdict", "title", "total", "url",
+                                                                       "date", "dropship")}}
+                      for c in comps][:5]}
+
+
+def with_box(res: dict, box: bool | None) -> dict:
+    """A shoe check re-scored once we know whether ours has the box: the same
+    comps and supply (no new search, no AI call), the price from the sales in
+    our condition."""
+    raw = res.get("_raw") or {}
+    if not raw.get("pricing"):
+        return res
+    req = {**res["request"], "box": box}
+    ev = _scored(raw["pricing"], res["identification"], req, raw.get("details") or {}, raw.get("supply"),
+                 res.get("sold_incomplete"))
+    return {**res, **ev, "request": req}
+
+
+def box_line(res: dict) -> str | None:
+    """Shoes: "📦 Sold: 7 with box ~$75 · 11 no box (New other) ~$52 · has yours the box? Tap below"."""
+    split = res.get("box_split")
+    if res.get("item_type") != "shoes":
+        return None
+    box = (res.get("request") or {}).get("box")
+    yours = "has yours the box? Tap below" if box is None else f"yours: {'with' if box else 'no'} box"
+    if not split:
+        return f"📦 {yours[0].upper()}{yours[1:]}"
+    parts = []
+    for b, name in (("box", "with box"), ("no_box", "no box (New other)")):
+        xs = split["sold"][b]
+        parts.append(f"{len(xs)} {name}" + (f" ~{_whole(_median(xs))}" if xs else ""))
+    asks = split["active"]
+    tail = f" · identical for sale {len(asks['box'])} with box / {len(asks['no_box'])} no box" \
+        if asks["box"] or asks["no_box"] else ""
+    return f"📦 Sold: {' · '.join(parts)}{tail} · {yours}"
 
 
 def owned_saved(have) -> list:
@@ -1123,6 +1427,9 @@ def check_fields(res: dict) -> dict:
                               "sold_median": pick.get("sold_median"), "item_type": res.get("item_type"),
                               "label": res.get("label"), "reasons": res.get("reasons"),
                               "max_buy": res.get("max_buy"), "supply": res.get("supply"),
+                              "sold_incomplete": res.get("sold_incomplete"),
+                              "size": res.get("size_label"), "box": req.get("box"),
+                              "box_split": res.get("box_split"),
                               "comps": res.get("comps") or [],
                               "owned": owned_saved(res.get("already_have")),
                               "warnings": (res.get("warnings") or "")[:500] or None}}
@@ -1233,8 +1540,32 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}{'' if n == 1 else 's'}"
 
 
-def _sales_phrase(n: int) -> str:
-    return "no sales found" if not n else _plural(n, "sale")
+def sales_phrase(n: int, model: int = 0, incomplete: bool = False) -> str:
+    """"no sales found" only when none were found and every sold search ran;
+    "no same-item sales, 18 model sales" when the model sold (check #17)."""
+    if n and model:
+        return f"{_plural(n, 'same-item sale')}, {_plural(model, 'model sale')}"
+    if n:
+        return _plural(n, "sale")
+    if model:
+        return f"no same-item sales, {_plural(model, 'model sale')}"
+    return "no sales in the sold searches that worked" if incomplete else "no sales found"
+
+
+SOLD_FAIL_TEXT = {"out_of_credit": "Apify out of credit", "budget": "Apify spend cap reached",
+                  "rejected": "Apify key rejected"}
+
+
+def sold_incomplete(failed: list | None, total: int | None = None) -> str | None:
+    """Why the sold data is incomplete, for the reply's top line, or None."""
+    if not failed:
+        return None
+    reasons = {f.get("reason") for f in failed}
+    for r in ("out_of_credit", "budget", "rejected"):
+        if r in reasons:
+            return SOLD_FAIL_TEXT[r]
+    n = len(failed)
+    return f"{n} of {total} sold searches failed" if total else f"{_plural(n, 'sold search')} failed"
 
 
 def _listings_phrase(res: dict) -> str:
@@ -1310,7 +1641,9 @@ def ladder_line(pick: dict, res: dict) -> str:
         # a quick check with nothing cached looked at no sales: never "0 sold"
         parts = ["sold not searched"]
     else:
-        parts = [f"{n1} sold same" + (f" {_whole(levels[1]['value'])}" if 1 in levels else "")]
+        size = f" size {res['size_label']}" if res.get("size_label") else ""
+        parts = [f"{n1} sold same{size}" + (f" {_whole(levels[1]['value'])}" if 1 in levels else "")
+                 + (" (searches incomplete)" if res.get("sold_incomplete") else "")]
     if 2 in levels:
         incl = f" (incl. {levels[2]['same_item']} same)" if levels[2].get("same_item") else ""
         parts.append(f"{levels[2]['n']} sold same model{incl} {_whole(levels[2]['value'])}")
@@ -1344,12 +1677,15 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
     if req.get("ross_price") is None:
         why = "Ross price missing"
     else:
-        why = f"{_sales_phrase(sales)}, {_listings_phrase(res)}"
+        why = f"{sales_phrase(sales, pick.get('model_sales') or 0, bool(res.get('sold_incomplete')))}, " \
+              f"{_listings_phrase(res)}"
     est = " (estimated)" if pick.get("estimated") and v != NO_DATA else ""
     from pipeline import owned
     have = res.get("already_have") if isinstance(res.get("already_have"), dict) else None
     # "Do I already have this?" first (already HTML-escaped when html)
-    top = owned.reply_lines(have, html=html)
+    # A failed sold search is not "no sales" (check #17: Apify's 402 on the style-code search)
+    warn = [f"⚠️ Sold data incomplete: {res['sold_incomplete']}"] if res.get("sold_incomplete") else []
+    top = warn + owned.reply_lines(have, html=html)
     if top and prefix:
         top[0] = prefix + top[0]
         prefix = ""
@@ -1376,6 +1712,9 @@ def format_reply(res: dict, *, check_id: int | None = None, prefix: str = "", fo
         lines.append(offer_line(offer))
     match = CERTAINTY.get(res.get("confidence"), "-")
     lines.append("Evidence: " + ladder_line(pick, res) + f" · match {match}")
+    box = box_line(res)
+    if box:
+        lines.append(box)
     sup = supply_line(res)
     if sup:
         lines.append(sup)
@@ -1456,7 +1795,10 @@ def comp_line(c: dict, now: datetime | None = None) -> str:
         age = _age_days(c.get("listed"), now)
         if age is not None:
             bits.append(f"listed {age}d" + (f", {c['units_sold']} sold" if c.get("units_sold") is not None else ""))
-    bits.append(VERDICT_WORDS.get(c.get("verdict"), c.get("verdict") or "-"))
+    bits.append("same colour, other size" if c.get("other_size")
+                else VERDICT_WORDS.get(c.get("verdict"), c.get("verdict") or "-"))
+    if c.get("box"):
+        bits.append("with box" if c["box"] == "box" else "no box")
     if c.get("dropship"):
         bits.append("⚠️ dropship? " + ", ".join(c.get("signals") or [])
                     + (" (left out)" if c.get("status") == "sold" else " (ceiling only)"))
@@ -1468,6 +1810,12 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
     req, money, pick = res["request"], res["money"], res["pick"]
     ross = req.get("ross_price")
     out = [f"Details{f' for check #{check_id}' if check_id else ''}: {_item_name(res)}"]
+    failed = res.get("sold_failed") or []
+    if failed:
+        reasons = sorted({SOLD_FAIL_TEXT.get(f.get("reason"), "error") for f in failed})
+        out.append(f"⚠️ Sold searches failed ({', '.join(reasons)}): "
+                   + "; ".join(str(f.get("query"))[:60] for f in failed)
+                   + ". Their sales are missing: \"no sales\" here is not known. Run Full again later.")
     if isinstance(res.get("already_have"), dict):
         from pipeline import owned
         out += owned.details_lines(res["already_have"])
@@ -1523,7 +1871,9 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
         if pick.get("low_end") is not None:
             out.append(f"  high supply: priced at the lower quartile of the sales, {_usd(pick['low_end'])}")
     if pick.get("competition_note"):
-        out.append(f"Competition: {pick.get('competitors', 0)} identical listing(s) besides dropship-style ones"
+        any_size = " (our colour, any size)" if res.get("size_label") else ""
+        out.append(f"Competition: {pick.get('competitors', 0)} identical listing(s){any_size} besides "
+                   "dropship-style ones"
                    f" → {pick['competition_note']}" + (", priced at the upper end" if pick.get("upper_end") else ""))
     if res.get("cheapest_total"):
         at = res.get("at_cheapest") or {}
@@ -1547,6 +1897,12 @@ def format_details(res: dict, *, check_id: int | None = None, sku: str | None = 
                    f"neither our style code nor our product name")
     if pick.get("dropship_excluded"):
         out.append(f"  {pick['dropship_excluded']} dropship-style sale(s) left out of the price")
+    if res.get("size_label"):
+        out.append(f"  Same item = our style code and size {res['size_label']} (from the titles); "
+                   "other sizes are same model")
+    if pick.get("box_left_out"):
+        out.append(f"  {pick['box_left_out']} sale(s) {'without' if pick.get('box') else 'with'} box left out "
+                   f"(yours {'has the' if pick.get('box') else 'has no'} box)")
     links = search_links(res)
     if links:
         out.append("eBay: " + " · ".join(f"{k} {u}" for k, u in links.items()))

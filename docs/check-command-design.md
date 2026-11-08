@@ -476,6 +476,78 @@ Check #10 replayed (dev, full):
 There are 37 active, not ~20, because the 200-row search finds more
 colours than eBay's first page shows.
 
+### Check #17 fixes: failed searches, shoe sizes, wording, box (Person B, 2026-11-07)
+
+Check #17: Nike Air Max Muse FV1920-004, Metallic Oil Green, women's 9,
+Ross $19.99. BORDERLINE was about right: the colourway has ~110 listings at
+$53-80 with shipping. Four fixes:
+
+1. **A failed sold search is not "no sales".** Apify answered 402 (both
+   accounts out of credit) on the style-code search, and the reply said "no
+   sales found".
+   - `pricing_v2.gather_candidates` now records each failed sold search
+     (`sold_failed`: query and reason). The reasons are `out_of_credit` for
+     402, `budget`, `rejected` for 401/403, and `error`. Intake and
+     repricing drop this field, so their stored pricing is unchanged.
+   - The reply starts with "⚠️ Sold data incomplete: Apify out of credit".
+     The evidence line says "0 sold same (searches incomplete)".
+   - Details lists the failed searches. The supply line ends in "sold
+     counts incomplete".
+   - With no price at all, NO DATA says the searches failed.
+   - The high-supply step stays. Listings for sale are counted in full; only
+     sales can be missing.
+2. **Shoes and sized clothing: the same item is the style code (colour code
+   included) plus the size.** The size is read from titles (`shoe_sizes`,
+   `clothing_sizes`, `size_match`).
+   - "Size 9", "WMNS 9", "W9", "US 9" and "EU 40.5" all count. Sizes 30
+     and up are EU. A men's size counts as the women's size minus 1.5.
+     "Air Max 90" is not a size.
+   - `tighten_size`, run in code after the judge:
+     - A judge "same item" whose title states another size becomes "same
+       model". It is still our colour.
+     - A judge "same model" with our full style code and our size becomes
+       "same item".
+     - A title that states no size keeps the judge's verdict.
+     - The identical-listing count and the cheapest identical listing are
+       counted again.
+   - The judge's prompt is not changed (it is shared with intake).
+   - Supply: the "same item" line becomes **same colour** (any size). The
+     high-supply step stays on that line, because saturation of the colour
+     matters. A **size** count is added for display only, and it never
+     lowers the verdict: "size 9: 0 sold / 3 active". It counts titles that
+     state our size, so it is a floor.
+   - Our colour in other sizes for sale still counts as competition. A shoe
+     is never "no competition, unique" when its colour has 41 listings.
+   - A typed `/check ... size 9 ...` sets the size.
+3. **Wording.** With same-model sales the reply says "no same-item sales,
+   18 model sales", not "no sales found". With both kinds of sales it says
+   "1 same-item sale, 18 model sales". When some sold searches failed and
+   nothing was found: "no sales in the sold searches that worked".
+4. **Shoes: with box or not.**
+   - eBay's "Brand New" / "New with box" is counted apart from "New (Other)" /
+     "New without box".
+   - The reply shows both: "📦 Sold: 11 with box ~$81 · 7 no box (New
+     other) ~$86 · has yours the box? Tap below".
+   - There are two buttons, **With box** and **No box**. A tap re-scores
+     the same comps (`check.with_box`) and edits the reply in place: no
+     search and no AI call. Full / Any reruns keep the answer.
+   - Once known, only the sales in our condition set the price, and the
+     cheapest identical listing is the cheapest one in our condition. When
+     there are no sales in our condition, all sales are used, and the reply
+     says so.
+   - The identification's "missing box" guess from the photo is not used.
+     The answer is asked, because a photo can't tell.
+   - Saved in `comps_summary`: `box`, `box_split`, `size` and
+     `sold_incomplete`.
+
+Replayed on check #17's cached rows (offline: Apify's 402 faked for the
+missing search, the judge replaced by title rules, no spend):
+- "⚠️ Sold data incomplete: Apify out of credit";
+- "BORDERLINE (estimated): no same-item sales, 18 model sales";
+- same colour 4 sold / 41 active (~10 months, high), size 9: 0 sold / 3
+  active;
+- ~$65.99, Max buy ~$31.47; with No box, ~$62.99 from the 7 no-box sales.
+
 ### "Do I already have this?" (Person B, 2026-11-05)
 
 The first line of every reply, before the verdict: `pipeline/owned.py`

@@ -81,6 +81,21 @@ class ApifyBudgetExceeded(RuntimeError):
     """The next uncached Apify call would push estimated spend past the cap."""
 
 
+def sold_failure_reason(e: Exception) -> str:
+    """Why a sold search failed: "out_of_credit" (Apify's 402, check #17),
+    "budget" (our own cap), "rejected" (401/403) or "error". /check shows it
+    so that a failed search never reads as "no sales"."""
+    if isinstance(e, ApifyBudgetExceeded):
+        return "budget"
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    if status is None:          # comps.call: "Apify rejected both ... (HTTP 402)"
+        m = re.search(r"\bHTTP (\d{3})\b", str(e))
+        status = int(m.group(1)) if m else None
+    if status == 402:
+        return "out_of_credit"
+    return "rejected" if status in (401, 403) else "error"
+
+
 # --- spend accounting (process-wide; the backtest reads and caps it) ---------
 
 _lock = threading.Lock()
@@ -690,22 +705,26 @@ def gather_candidates(ident: dict, photo_paths=None, *, sold_max_age_s: float | 
         jobs["active:gtin"] = (fetch_active, (None, gtin), act_kw)
     if photo and image_search:
         jobs["image"] = (fetch_by_image, (photo,), act_kw)
-    raw, cache_misses = {}, []
+    raw, cache_misses, sold_failed = {}, [], []
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         futs = {pool.submit(fn, *args, **kw): name for name, (fn, args, kw) in jobs.items()}
         for f in concurrent.futures.as_completed(futs):
             name = futs[f]
+            query = dict(queries).get(name.split(":", 1)[-1], name)
             try:
                 raw[name] = f.result()
                 if raw[name] is None:       # cache_only and nothing fresh cached
                     raw[name] = []
-                    cache_misses.append(dict(queries).get(name.split(":", 1)[-1], name))
+                    cache_misses.append(query)
             except ApifyBudgetExceeded as e:
                 errors.append(f"{name}: skipped, {e}")
-                skipped.append(dict(queries).get(name.split(":", 1)[-1], name))
+                skipped.append(query)
+                sold_failed.append({"query": query, "reason": "budget"})
                 raw[name] = []
             except Exception as e:      # one dead source must not lose the others
                 errors.append(f"{name}: {type(e).__name__}: {str(e)[:160]}")
+                if name.startswith("sold:"):
+                    sold_failed.append({"query": query, "reason": sold_failure_reason(e)})
                 raw[name] = []
     # Apify use of this run: the sold searches that weren't cached (an estimate,
     # as apify_spend: rows x price per row + a run start each).
@@ -737,7 +756,7 @@ def gather_candidates(ident: dict, photo_paths=None, *, sold_max_age_s: float | 
         c["id"] = f"{p}{counters[p]}"
     return {"candidates": pooled, "dropped": dropped, "errors": errors,
             "queries": [q for _, q in queries], "skipped_queries": skipped,
-            "sold_cache_misses": cache_misses,
+            "sold_cache_misses": cache_misses, "sold_failed": sold_failed,
             "sold_reused": [q for _, q in reused], "sold_reused_for": reused_for, "apify": apify,
             "active_query": aq, "gtin": gtin,
             "photo": photo, "raw_counts": {k: len(v) for k, v in raw.items()}}
@@ -767,6 +786,7 @@ def price_item(item: dict) -> dict:
     # Run diagnostics for /check; a stored item's pricing keeps its usual shape.
     res.pop("timings", None)
     res.pop("sold_cache_misses", None)
+    res.pop("sold_failed", None)
     return res
 
 
@@ -937,6 +957,8 @@ def get_pricing_v2(identification: dict, *, photo_paths=None, receipt=None,
         "thumbnails_used": bool(j and j.get("thumbnails_used")),
         "raw_counts": g["raw_counts"],
         "sold_cache_misses": g.get("sold_cache_misses") or [],
+        # sold searches that failed ({"query", "reason"}): /check's "Sold data incomplete"
+        "sold_failed": g.get("sold_failed") or [],
         "sold_reused": g.get("sold_reused") or [], "sold_reused_for": g.get("sold_reused_for") or [],
         "timings": {**timings, "total_s": round(time.perf_counter() - t_start, 2)},
     }
