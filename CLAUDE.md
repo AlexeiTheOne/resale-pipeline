@@ -102,6 +102,8 @@ change eBay. Use `.env.example` as the template.
 - `scripts/`: deploy, notify and one-off reports.
 - `web/`: the 3D site (Vite). Not wired to real data yet.
 - `docs/`: playbook, pricing design, cleanup plan, business reviews.
+  `docs/todo.md` lists requested features not started yet. Check it before
+  planning new work.
 
 ## Code conventions
 
