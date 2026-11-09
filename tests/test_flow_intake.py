@@ -145,7 +145,10 @@ class Pipeline:
     def _draft(self, ident, pricing):
         self.seen.append(("draft", self._status()))
         return {"title": f"{self.brand} Canvas Tote Bag Navy NWT", "price": 24.99,
-                "description": "A navy canvas tote."}
+                # Meets the quality standard (4-6 sentences), so no redo and
+                # no standard issues: this test is about the flow.
+                "description": ("A navy canvas tote. It has two handles. "
+                                "It closes with a zip. It is new with tags.")}
 
     def _check(self, item):
         self.seen.append(("check", item["status"]))

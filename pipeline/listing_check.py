@@ -246,12 +246,25 @@ def check_and_store(item_id: str) -> dict | None:
     """Check the item's current draft and save the result on the item. Never
     raises; returns the stored result (None only if the item is gone)."""
     try:
-        from db import get_item, update_field
+        from db import get_item, list_items, update_field
+        from pipeline import quality
         item = get_item(item_id)
         if item is None:
             return None
         result = check_listing(item)
-        if result.get("unchecked") != "disabled":
+        # The quality standard's code checks (pipeline/quality.py) share the
+        # review card's Check block. They cost nothing, so they run even when
+        # the AI check is off.
+        try:
+            live = [(i["item_id"], (i.get("listing") or {}).get("title"))
+                    for i in list_items() if i.get("status") == "published"]
+            standard = quality.check(item, live)
+        except Exception as e:
+            print(f"⚠️ quality standard check failed: {type(e).__name__}: {e}")
+            standard = []
+        if standard:
+            result = {**result, "issues": standard + list(result.get("issues") or [])}
+        if result.get("unchecked") != "disabled" or standard:
             update_field(item_id, "listing_check", result)
         return result
     except Exception as e:

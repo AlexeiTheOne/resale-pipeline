@@ -11,6 +11,7 @@ from llm import LazyClient, generate_with_retry, response_text
 from pipeline.category import choose_category, department_of
 from pipeline.description_guard import sanitize_description
 from pipeline.gtin import product_gtin
+from pipeline import quality
 from pipeline.specifics import clean_specifics, fill_mpn_from_style_code, is_shoe_size_aspect
 from pipeline.title import (TITLE_MAX_LEN, TITLE_RULES, enforce_band_for_device,
                             ensure_title_fits, fit_title)
@@ -106,7 +107,7 @@ Rules:
 - item_specifics Brand and Color must be non-null strings.
 - Return raw JSON only, no markdown fences.
 - Size field: write 'One Size' if the item has one universal size.
-  Put dimensions in the description SPECIFICATIONS section only, not in Size field.
+  Put dimensions in the description sentences only, not in the Size field.
 
 Build the item_specifics this way:
 
@@ -131,7 +132,9 @@ Rules for item_specifics:
   do not leave a field blank when the data clearly answers it.
 - Each value is a short filter value (a word or two), never a sentence or a
   comma-joined list. Color/Exterior Color: the one main colour (e.g. "Black");
-  "Multicolor" only when no single colour dominates. Pattern and Style: one
+  "Multicolor" when no single colour dominates, and ALWAYS for a printed item
+  (tattoo, floral, animal, graphic or camouflage print): then Color and
+  Exterior Color are "Multicolor" and the base colour word goes in the title. Pattern and Style: one
   value.
 - Leave an aspect out when the identification does not answer it — a guessed
   value is worse than none. Department only when the identification states it.
@@ -140,25 +143,26 @@ Rules for item_specifics:
 - Never invent condition details — only what the identification/photos report.
 - Never list the same value twice in one aspect.
 
-description: Keep it lightweight and scannable — bullets over paragraphs, no
-marketing fluff. Use this structure:
-- One short opening line summarizing the item (a single sentence, not a paragraph).
+description: ONE paragraph of 4-6 plain sentences, no headings, no bullets, no
+marketing fluff (the store's SHIPPING and RETURNS sections are added after it
+automatically):
+- Sentence 1: what it is, in the words a buyer searches: condition (e.g. "New
+  with tags"), brand, department, the item type and its print or colour.
+- Then the key features (material, closure, straps, hardware, pockets), the
+  dimensions when known (e.g. "It measures about 11 x 9 x 5 inches."), and
+  anything else that ships with it that is visible in the photos (dust bag,
+  box, pouch). Never invent packaging that isn't shown.
 - Do NOT write a "what you see is what you get" line yourself. It is added in bold
-  above the SHIPPING section of every listing automatically, and writing your own
-  only pushes the bold one out (see WYSIWYG_NOTE in config.py).
-- SPECIFICATIONS: short bullet list — brand, color, material, size/dimensions.
-- FEATURES: 3-5 one-line bullets with ✓ (concise, no filler).
-- CONDITION: one short bullet on condition and any flags.
-- INCLUDED: bullet list of exactly what ships.
-- Write section headings as bare ALL-CAPS text ending in a colon, e.g.
-  SPECIFICATIONS: — plain, on their own line.
-- NO MARKDOWN. Never wrap anything in ** or * for emphasis. The renderer treats
-  a leading * as a bullet marker, so a heading written as **SPECIFICATIONS:**
-  is read as a bullet and the heading disappears from the published listing,
-  asterisks and all. Bullets start with -, • or ✓ and nothing else.
-- INCLUDED must describe what is actually in the photos, not just the item
-  itself: if a pouch, retail box, dust bag, tags or adapters are visible in the
-  images, list them. Do not invent packaging that isn't shown."""
+  above the SHIPPING section of every listing automatically (WYSIWYG_NOTE in
+  config.py).
+- NO MARKDOWN: never wrap anything in ** or *.
+
+Bags name ONE bag type (tote, satchel, shoulder bag, hobo, crossbody, sling,
+backpack, clutch, duffel, messenger, bucket bag, belt bag) and use the same one
+in the title, Style, Type and the description. A crossbody strap on a satchel
+or tote is a feature, not a second type. "Bag", "purse" and "handbag" are
+fine alongside it. A style or SKU code goes at the END of the title, if at
+all."""
 
 
 def _choose_category(identification: dict | None, specifics: dict | None = None,
@@ -224,12 +228,16 @@ def _clean_draft_specifics(draft: dict, identification: dict | None) -> None:
 
 
 def _fill_mpn(draft: dict, identification: dict | None) -> None:
-    """The style code goes into MPN as well as Model (pipeline/specifics.py)."""
+    """The style code goes into MPN as well as Model (pipeline/specifics.py),
+    and a printed item's colour is Multicolor (pipeline/quality.py)."""
     specifics = draft.get("item_specifics")
     if isinstance(specifics, dict):
         code = fill_mpn_from_style_code(specifics, identification)
         if code:
             print(f"🏷️ specifics: MPN set from the style code {code}")
+        changed = quality.apply_multicolor(specifics, draft.get("category_id"))
+        if changed:
+            print(f"🎨 specifics: printed item, {', '.join(changed)} = Multicolor")
 
 
 def _aspect_hint_block(category: dict | None) -> str | None:

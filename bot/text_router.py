@@ -341,8 +341,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     db.update_field(item_id, "listing", revised)
     # The correction changed the draft, so the old check no longer describes it.
-    if config.LISTING_CHECK_ENABLED:
-        await asyncio.to_thread(listing_check.check_and_store, item_id)
+    await asyncio.to_thread(listing_check.check_and_store, item_id)
     # Through _show_review, so the revised draft carries its id header and is
     # registered as a reply target like the first one — a haul correction made
     # by replying to it used to land on nothing.
