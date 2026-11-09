@@ -79,6 +79,55 @@ def _is_placeholder(value) -> bool:
     return value is None or str(value).strip().lower() in _PLACEHOLDER
 
 
+# A manufacturer style / part number: one token of letters and digits with at
+# least one digit, e.g. R34D1B53, 87F2LEVB9U, EHH462-42-003. A product name
+# ("The J Marc", "Ava Tote") is not one, and neither is a word-only code
+# (LBPERCY): too easy to confuse with a name, so a person fills those.
+_STYLE_CODE = re.compile(r"^(?=\S*\d)[A-Za-z0-9][A-Za-z0-9\-./]{3,24}$")
+
+
+def _get_ci(d: dict, name: str):
+    return next((v for k, v in (d or {}).items() if k.strip().lower() == name), None)
+
+
+def style_code(specifics: dict | None, identification: dict | None) -> str | None:
+    """The item's style code, from the Model specific, then the identification's
+    style_code, then its model. A value with spaces counts by its first token
+    when that token is a code: "XW09620 970 0IC" is style XW09620 plus colour
+    and size suffixes."""
+    ident = identification or {}
+    for value in (_get_ci(specifics, "model"), ident.get("style_code"), ident.get("model")):
+        if isinstance(value, list):
+            value = value[0] if len(value) == 1 else None
+        if _is_placeholder(value) or not isinstance(value, (str, int)):
+            continue
+        text = str(value).strip()
+        if _STYLE_CODE.match(text):
+            return text
+        first = text.split()[0]
+        if first != text and _STYLE_CODE.match(first):
+            return first
+    return None
+
+
+def fill_mpn_from_style_code(specifics: dict, identification: dict | None) -> str | None:
+    """Put the style code in MPN when MPN is empty or "Does not apply", in place.
+    Model is left as it is. Returns the code written, else None.
+
+    The draft model files the tag's style code under Model and leaves MPN null,
+    so eBay got "Does not apply" and showed "MPN: Not provided" on 60 of 72 bag
+    listings (eBay listing quality report, 2026-11-06), while 53 of them had
+    the code under Model."""
+    key = next((k for k in specifics if k.strip().lower() == "mpn"), "MPN")
+    current = specifics.get(key)
+    if not _is_placeholder(current) and str(current).strip().lower() != "does not apply":
+        return None
+    code = style_code(specifics, identification)
+    if code:
+        specifics[key] = code
+    return code
+
+
 def _identification_text(identification: dict | None) -> str:
     ident = identification or {}
     return json.dumps({k: v for k, v in ident.items()
