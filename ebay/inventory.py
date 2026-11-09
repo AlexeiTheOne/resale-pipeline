@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import html
 import json
@@ -470,6 +471,14 @@ def update_inventory_aspects(sku: str, set_aspects: dict | None = None,
 
     Returns the aspects sent. Same full-replace PUT and the same image repair
     as update_inventory_title — see _write_inventory_product."""
+    edit = _aspects_editor(sku, set_aspects, remove)
+    return _write_inventory_product(sku, edit, known_images)["aspects"]
+
+
+def _aspects_editor(sku: str, set_aspects: dict | None, remove):
+    """Validate an aspect change and return the function that applies it to a
+    product block (update_inventory_aspects' rules). Raises before anything is
+    read or written: a bad GTIN, a name both set and removed, an empty value."""
     wanted = {}
     for name, value in (set_aspects or {}).items():
         values = _normalize_aspect_values(value)
@@ -519,7 +528,72 @@ def update_inventory_aspects(sku: str, set_aspects: dict | None = None,
             if brand:
                 product["brand"] = brand
 
-    return _write_inventory_product(sku, edit, known_images)["aspects"]
+    return edit
+
+
+# The product fields a revise can change (title, aspects and the identifier
+# fields aspects are mirrored onto). revise_inventory_product saves them so a
+# revise that fails half-way can put them back.
+_REVISABLE_PRODUCT_FIELDS = ("title", "aspects", "upc", "ean", "isbn", "mpn", "brand")
+
+
+def read_listing_content(sku: str, offer_id: str) -> dict:
+    """What a buyer sees now, read from eBay (no writes): the title and aspects
+    on the inventory item, and the offer's description HTML."""
+    product = (_request("GET", f"/sell/inventory/v1/inventory_item/{sku}").json()
+               .get("product") or {})
+    offer = _request("GET", f"/sell/inventory/v1/offer/{offer_id}").json()
+    return {"title": product.get("title") or "",
+            "aspects": {k: list(v) for k, v in (product.get("aspects") or {}).items()},
+            "description_html": offer.get("listingDescription") or ""}
+
+
+def revise_inventory_product(sku: str, *, title: str | None = None,
+                             set_aspects: dict | None = None, remove=(),
+                             known_images: int | None = None,
+                             saved: dict | None = None) -> dict:
+    """Change the title and/or item specifics of a live listing in ONE inventory
+    PUT, so the two can't land half-done. Same validation as
+    update_inventory_title and update_inventory_aspects, checked before any
+    request. Returns the product block sent.
+
+    `saved`, if given, is filled with the revisable fields as they were BEFORE
+    the edit, ready for restore_inventory_product. It is filled before the PUT,
+    so it is there even when the PUT raises: eBay can save the record and still
+    refuse to revise the listing (see update_inventory_aspects)."""
+    checked = _checked_title(title) if title is not None else None
+    aspect_edit = _aspects_editor(sku, set_aspects, remove) if (set_aspects or remove) else None
+    if checked is None and aspect_edit is None:
+        raise ValueError("revise_inventory_product: nothing to change")
+
+    def edit(product: dict) -> None:
+        if saved is not None:
+            saved.clear()
+            saved.update({k: copy.deepcopy(product.get(k)) for k in _REVISABLE_PRODUCT_FIELDS})
+        if checked is not None:
+            product["title"] = checked
+        if aspect_edit is not None:
+            aspect_edit(product)
+
+    return _write_inventory_product(sku, edit, known_images)
+
+
+def restore_inventory_product(sku: str, saved: dict, known_images: int | None = None) -> dict:
+    """Put back the fields revise_inventory_product saved, leaving the rest of
+    the item (photos, condition, quantity) as it is now."""
+    def edit(product: dict) -> None:
+        for k, v in saved.items():
+            if v is None:
+                product.pop(k, None)
+            else:
+                product[k] = copy.deepcopy(v)
+
+    return _write_inventory_product(sku, edit, known_images)
+
+
+def description_html(text: str) -> str:
+    """The HTML the bot publishes for a stored plain-text description."""
+    return _html_description(text)
 
 
 def _write_inventory_product(sku: str, edit, known_images: int | None = None) -> dict:
