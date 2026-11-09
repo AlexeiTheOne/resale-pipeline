@@ -16,7 +16,7 @@ import config
 import db
 from bot import flow, formatting, state, text_router, util
 from ebay import inventory, negotiation
-from pipeline import offers, reprice
+from pipeline import offers, reprice, sync
 
 
 # Upper bound on a hand-typed /setqty. Ross stock is near-always single units and
@@ -353,6 +353,9 @@ async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     db.update_field(item_id, "pricing", pricing)
 
     offer_id = (item.get("ebay") or {}).get("offer_id")
+    if offer_id and item["status"] in ("ebay_draft", "published") and sync.detached(item):
+        await util._safe_reply(update.message, _detached_msg(item, f"Saved ${price} locally"))
+        return
     if offer_id and item["status"] in ("ebay_draft", "published"):
         try:
             await asyncio.to_thread(inventory.update_offer_price, offer_id, price)
@@ -367,6 +370,15 @@ async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await util._safe_reply(update.message, f"💲 Price set to ${price} for {item_id[:8]} (updated the {where}).")
     else:
         await util._safe_reply(update.message, f"💲 Price set to ${price} for {item_id[:8]}.")
+
+
+def _detached_msg(item: dict, saved: str) -> str:
+    """Reply for an item relisted in Seller Hub: its offer points at the ended
+    original, so pushing through it would change nothing on the live listing."""
+    lid = (item.get("ebay") or {}).get("listing_id")
+    return (f"✂️ {saved}, but NOT on eBay: {item['item_id'][:8]} was relisted in Seller Hub "
+            f"(live listing {lid}), and the bot's price and quantity changes can't reach it. "
+            "Change it in Seller Hub; the next /sync reads it back.")
 
 
 async def setqty_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -413,6 +425,10 @@ async def setqty_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await util._safe_reply(update.message,
             f"{item_id[:8]} isn't on eBay yet (status '{item['status']}') — it needs an eBay "
             "offer first. Approve/activate it, then set the quantity.")
+        return
+
+    if sync.detached(item):
+        await util._safe_reply(update.message, _detached_msg(item, "Nothing changed"))
         return
 
     try:
@@ -804,6 +820,9 @@ async def reprice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     db.update_field(item_id, "pricing", pricing)
 
     offer_id = (item.get("ebay") or {}).get("offer_id")
+    if offer_id and sync.detached(item):
+        await util._safe_reply(query.message, _detached_msg(item, f"Saved ${price} locally"))
+        return
     if offer_id:
         try:
             await asyncio.to_thread(inventory.update_offer_price, offer_id, price)

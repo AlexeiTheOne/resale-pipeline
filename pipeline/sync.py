@@ -30,6 +30,25 @@ def full_refunds(sales: list[dict] | None) -> list[dict]:
     return out
 
 
+def detached(item: dict) -> bool:
+    """True when the item's eBay offer no longer drives its live listing: it was
+    relisted in Seller Hub, so the offer still points at the ended original.
+    Price and quantity pushed through the offer then never reach eBay. Set by
+    /sync (run_sync's live-listing pass)."""
+    return bool((item.get("ebay") or {}).get("relisted_in_seller_hub"))
+
+
+def offer_is_stale(offer: dict, item: dict) -> bool:
+    """The offer belongs to a different listing than the one we have stored.
+
+    After a Seller Hub relist the live-listing pass stores the NEW listing id,
+    while the offer still names the ended original. Its price, quantity and
+    status then describe a dead listing."""
+    offer_lid = str((offer.get("listing") or {}).get("listingId") or "")
+    stored_lid = str((item.get("ebay") or {}).get("listing_id") or "")
+    return bool(offer_lid and stored_lid and offer_lid != stored_lid)
+
+
 def sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
     """Pull one item's live eBay state (price, quantity, listing status) and write
     any changes into the local DB. Runs in a worker thread (blocking eBay call).
@@ -47,10 +66,17 @@ def sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
 
     changes = []
 
+    # A Seller Hub relist leaves the offer on the ended original. Its price,
+    # quantity and ENDED status are then about a dead listing. Copying them in
+    # zeroed the quantity on every run, and the live-listing pass put it back:
+    # the same items showed as "Updated" on every /sync. The live-listing pass
+    # owns price and quantity for these instead.
+    stale = offer_is_stale(offer, item)
+
     # Price: eBay is the source of truth for a manual Seller-Hub edit.
     ebay_price = (offer.get("pricingSummary") or {}).get("price") or {}
     ebay_price_val = ebay_price.get("value")
-    if ebay_price_val is not None:
+    if ebay_price_val is not None and not stale:
         new_price = round(float(ebay_price_val), 2)
         old_price = (item.get("listing") or {}).get("price")
         if old_price is None or round(float(old_price), 2) != new_price:
@@ -72,7 +98,7 @@ def sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
     # copying it in and then zeroing it below flipped the same items 0→1→0 and
     # reported them on every daily sync.
     ebay_qty = offer.get("availableQuantity")
-    if ebay_qty is not None and listing_status != "ENDED":
+    if ebay_qty is not None and listing_status != "ENDED" and not stale:
         old_qty = ebay.get("quantity", 1)
         if int(old_qty) != int(ebay_qty):
             ebay["quantity"] = int(ebay_qty)
@@ -173,7 +199,7 @@ def sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
     # records. Zero it, or the report keeps counting merchandise that isn't for
     # sale — a listing ended after selling one unit was still projecting its
     # remaining units as inventory.
-    if listing_status == "ENDED" and (ebay.get("quantity") or 0) != 0:
+    if listing_status == "ENDED" and not stale and (ebay.get("quantity") or 0) != 0:
         ebay["quantity"] = 0
         db.update_field(item_id, "ebay", ebay)
         changes.append("ended on eBay → qty 0")
@@ -205,7 +231,8 @@ def sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
             "full_refunds": [{"order_id": r["order_id"], "refund": round(r.get("refund") or 0, 2)}
                              for r in refunded],
             "likely_sold": likely_sold, "ended_unsold": ended_unsold,
-            "listing_status": listing_status}
+            "listing_status": listing_status,
+            "offer_listing_id": str(listing_info.get("listingId") or "") or None}
 
 
 def adopt_listing(row: dict) -> str:
@@ -295,6 +322,7 @@ async def run_sync_locked(days: int, on_progress=None,
     updated, auto_sold, sold_flags, errors, ended_flags = [], [], [], [], []
     new_sales = []   # (item, new_sale) — for the scheduled brief
     refund_flags = []  # (item, [{"order_id", "refund"}]) — refunded in full, returned?
+    offer_lids = {}    # item_id -> listing id its offer points at
     for item in items:
         try:
             result = await asyncio.to_thread(sync_one, item, sold_map)
@@ -303,6 +331,8 @@ async def run_sync_locked(days: int, on_progress=None,
             on_error(f"sync ({item['item_id'][:8]})", e)
             errors.append(f"{item['item_id'][:8]}: {type(e).__name__}: {str(e)[:120]}")
             continue
+        if result.get("offer_listing_id"):
+            offer_lids[item["item_id"]] = result["offer_listing_id"]
         if result.get("new_sale"):
             new_sales.append((item, result["new_sale"]))
         if result["auto_sold"]:
@@ -323,6 +353,7 @@ async def run_sync_locked(days: int, on_progress=None,
     # which leaves the stored one pointing at a dead listing (and the price check
     # reading traffic for the wrong thing).
     adopted, relinked, live_mismatch, discover_err = [], [], [], None
+    detached_rows, newly_detached = [], []   # relisted in Seller Hub
     relisted_live = []   # were 'sold' locally but still have stock live on eBay
     back_live: set[str] = set()   # their item ids
     live_item_ids: set[str] = set()
@@ -351,11 +382,28 @@ async def run_sync_locked(days: int, on_progress=None,
                 item = by_listing_id.get(str(row["listing_id"]))
             if item is not None:
                 ebay_data = dict(item.get("ebay") or {})
+                # Relisted in Seller Hub: the offer still points at the ended
+                # original, so the bot's price and quantity pushes go to a dead
+                # listing. Flag it (the price and quantity commands read the flag),
+                # and clear it if the offer is live again (e.g. republished by the
+                # bot).
+                offer_lid = offer_lids.get(item["item_id"])
+                is_detached = bool(ebay_data.get("offer_id") and offer_lid
+                                   and offer_lid != str(row["listing_id"]))
+                flag_changed = is_detached != bool(ebay_data.get("relisted_in_seller_hub"))
+                if is_detached:
+                    ebay_data["relisted_in_seller_hub"] = True
+                    title = ((item.get("listing") or {}).get("title") or "(untitled)")[:40]
+                    detached_rows.append(f"{item['item_id'][:8]} {title} (live listing {row['listing_id']})")
+                    if flag_changed:
+                        newly_detached.append(item["item_id"])
+                else:
+                    ebay_data.pop("relisted_in_seller_hub", None)
                 # Price, for the listings sync_one can't reach. It owns this for
-                # anything with an offer_id and has already run by now; this fills
-                # the gap for adopted listings, whose only link to eBay is the row
-                # in hand.
-                if not ebay_data.get("offer_id") and row["price"] is not None:
+                # anything with a working offer and has already run by now; this
+                # fills the gap for adopted listings, whose only link to eBay is the
+                # row in hand, and for detached ones, whose offer is dead.
+                if (not ebay_data.get("offer_id") or is_detached) and row["price"] is not None:
                     new_price = round(float(row["price"]), 2)
                     listing = dict(item.get("listing") or {})
                     old_price = listing.get("price")
@@ -363,7 +411,7 @@ async def run_sync_locked(days: int, on_progress=None,
                         listing["price"] = new_price
                         db.update_field(item["item_id"], "listing", listing)
                         updated.append(f"{item['item_id'][:8]}: price ${old_price}→${new_price} (eBay)")
-                changed = False
+                changed = flag_changed
                 if str(ebay_data.get("listing_id") or "") != str(row["listing_id"]):
                     ebay_data["listing_id"] = row["listing_id"]
                     ebay_data["view_item_url"] = row["view_item_url"]
@@ -423,6 +471,10 @@ async def run_sync_locked(days: int, on_progress=None,
         lines += ["", f"♻️ Sold but still selling ({len(relisted_live)}) — stock left on the "
                   "listing, so these are live inventory again (the recorded sale is kept):"]
         lines += [f"  {x}" for x in relisted_live]
+    if detached_rows:
+        lines += ["", f"✂️ Relisted in Seller Hub ({len(detached_rows)}): price changes from the "
+                  "bot won't reach eBay. Change price or quantity in Seller Hub:"]
+        lines += [f"  {x}" for x in detached_rows]
     if live_mismatch:
         lines += ["", f"❓ Live on eBay but not 'published' here ({len(live_mismatch)}) — "
                   "no stock available, so the status is left alone. /end it if it's gone:"]
@@ -478,6 +530,9 @@ async def run_sync_locked(days: int, on_progress=None,
     for i, r in refund_flags:
         todo.append(f"↩️ Refunded in full: returned? {_refund_line(i, r)}. If it came back, relist it; "
                     "if not, nothing to do.")
+    if newly_detached:
+        todo.append(f"✂️ {len(newly_detached)} relisted in Seller Hub — price changes from the bot "
+                    "won't reach eBay: " + ", ".join(i[:8] for i in newly_detached))
     if live_mismatch:
         todo.append(f"❓ {len(live_mismatch)} live on eBay but not 'published' here — see /sync")
     if adopted:
