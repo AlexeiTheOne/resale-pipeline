@@ -272,6 +272,30 @@ def _things(exclude_check_id=None) -> list[tuple[dict, dict, dict]]:
     return out
 
 
+def ross_hits(skus) -> dict:
+    """What we have under each of these Ross codes, for receipt lines:
+    {sku: {"items": [(ident, hit)], "checks": [(ident, hit)]}}. "items" are
+    items and pieces (an item whose code was generated, not read off a tag,
+    is left out: such a code can't be on a receipt); "checks" are earlier
+    pre-buy checks. Each hit carries match = ROSS, so hit_text() works.
+    Same index as /check (_things), so a receipt line and "already have"
+    agree on what a code is."""
+    import db
+    want = {c for c in map(ross_code, skus or ()) if c}
+    if not want:
+        return {}
+    generated = {it["item_id"] for it in db.list_items() if (it.get("receipt") or {}).get("code_generated")}
+    out = {}
+    for k, ident, hit in _things():
+        if hit["source"] == "item" and hit["id"] in generated:
+            continue
+        for sku in k["ross"] & want:
+            slot = out.setdefault(sku, {"items": [], "checks": []})
+            slot["checks" if hit["source"] == "check" else "items"].append(
+                (ident, {**hit, "match": ROSS, "ident": ident}))
+    return out
+
+
 # --- AI fallback ------------------------------------------------------------------------------
 
 _AI_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["matches"],

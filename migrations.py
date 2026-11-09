@@ -1086,12 +1086,51 @@ def _mssql_ross_code_main(cur) -> None:
     cur.execute("ALTER TABLE dbo.checks ADD ross_sku_main VARCHAR(20) NULL")
 
 
+RLD_SOURCES = ("rules", "ai", "matched_item")
+RLD_GENDERS = ("men", "women", "unisex", "boys", "girls", "kids", "baby")
+
+
+def _mssql_receipt_line_details(cur) -> None:
+    """What a Ross receipt line is, decoded once per unique description
+    (docs/receipt-decoding.md). desc_key = UPPER(LTRIM(RTRIM(Description))),
+    made by SQL only. No FK to ReceiptItems (keyed per text; receipt_pipeline
+    owns the lines and may change them) nor to items (provenance, like checks).
+    source 'matched_item': every line with this text has a SKU of one item.
+    model = the decoder (rules-v1, a Claude model id); product_model = the
+    product's own model or style code."""
+    cur.execute(f"""
+    CREATE TABLE dbo.receipt_line_details (
+        detail_id     INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_receipt_line_details PRIMARY KEY,
+        desc_key      NVARCHAR(500) NOT NULL
+                      CONSTRAINT CK_receipt_line_details_desc_key CHECK (LEN(desc_key) > 0),
+        category      VARCHAR(30)   NULL,
+        item_type     VARCHAR(40)   NULL,
+        gender        VARCHAR(10)   NULL
+                      CONSTRAINT CK_receipt_line_details_gender CHECK (gender IN ({_in(RLD_GENDERS)})),
+        color         VARCHAR(40)   NULL,
+        brand_guess   NVARCHAR(100) NULL,
+        product_model NVARCHAR(100) NULL,
+        confidence    DECIMAL(3,2)  NULL
+                      CONSTRAINT CK_receipt_line_details_confidence CHECK (confidence BETWEEN 0 AND 1),
+        source        VARCHAR(12)   NOT NULL
+                      CONSTRAINT CK_receipt_line_details_source CHECK (source IN ({_in(RLD_SOURCES)})),
+        model         VARCHAR(60)   NULL,
+        item_id       VARCHAR(36)   NULL,
+        decode_raw    NVARCHAR(MAX) NULL
+                      CONSTRAINT CK_receipt_line_details_decode_raw_json CHECK (ISJSON(decode_raw) = 1),
+        decoded_at    DATETIME2(6)  NOT NULL
+                      CONSTRAINT DF_receipt_line_details_decoded_at DEFAULT SYSUTCDATETIME()
+    )""")
+    cur.execute("CREATE UNIQUE INDEX UX_receipt_line_details_desc_key ON dbo.receipt_line_details (desc_key)")
+
+
 # (version, name, function). Append only.
 MSSQL_MIGRATIONS = [
     (1, "resaledb_baseline", _mssql_baseline),
     (2, "receipt_unique_indexes", _mssql_receipt_unique),
     (3, "checks_table", _mssql_checks_table),
     (4, "ross_code_main", _mssql_ross_code_main),
+    (5, "receipt_line_details", _mssql_receipt_line_details),
 ]
 # The production migration copies the receipts into a database at this
 # version: the unique indexes (step 2) come after the receipt cleanup.

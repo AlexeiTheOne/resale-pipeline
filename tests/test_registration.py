@@ -26,7 +26,7 @@ EXPECTED_COMMANDS = {
     "refreshdesc", "photos", "cover", "arrange", "stockphoto", "offers",
     "setprice", "setqty", "sync", "feedback", "activate", "promote",
     "pricecheck", "retry", "photocheck", "health", "usage", "auth", "whoami",
-    "help", "cancel", "check", "shop",
+    "help", "cancel", "check", "shop", "rcpt",
 }
 # pattern -> callback function name
 EXPECTED_CALLBACKS = {

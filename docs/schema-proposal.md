@@ -431,6 +431,27 @@ person decides.
 | fixed_by | VARCHAR(30) |
 | fixed_at | DATETIME2(6) |
 
+**`receipt_line_details`** (migration step 5): what a receipt line is,
+decoded once per unique description (docs/receipt-decoding.md). Read by
+`/rcpt`. No FK: keyed by the description text, which receipt_pipeline owns.
+The item a line paid for is worked out per line from its own SKU when it is
+read, never from this row.
+
+| Column | Type | Notes |
+|---|---|---|
+| detail_id | INT IDENTITY PK | |
+| desc_key | NVARCHAR(500) NOT NULL, UNIQUE | `UPPER(LTRIM(RTRIM(Description)))`, made by SQL only |
+| category / item_type | VARCHAR(30) / VARCHAR(40) | closed lists in `pipeline/receipt_decode.py` |
+| gender | VARCHAR(10) | CHECK men, women, unisex, boys, girls, kids, baby |
+| color | VARCHAR(40) | up to two colours joined by `/` |
+| brand_guess / product_model | NVARCHAR(100) | |
+| confidence | DECIMAL(3,2) | 0–1 |
+| source | VARCHAR(12) NOT NULL | CHECK `rules` / `ai` / `matched_item` |
+| model | VARCHAR(60) | the decoder: `rules-v1` or a Claude model id |
+| item_id | VARCHAR(36) | `matched_item` rows only (no FK) |
+| decode_raw | NVARCHAR(MAX) JSON | the decoder's whole answer, and `prev` when replaced |
+| decoded_at | DATETIME2(6) | |
+
 **`v_receipt_checks`** (view, computed live, never stored): one row per receipt with:
 
 - `items_sum`
@@ -495,6 +516,7 @@ erDiagram
     pieces |o--o{ receipt_matches : "paid by"
     items |o--o{ receipt_matches : "paid by (no piece)"
     stores |o..o{ Receipts : "StoreNumber (no FK)"
+    ReceiptItems }o..o| receipt_line_details : "Description (no FK)"
     offer_plans ||--o{ offer_plan_rows : rows
 
     items {

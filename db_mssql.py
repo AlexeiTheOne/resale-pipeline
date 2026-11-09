@@ -556,6 +556,174 @@ def receipt_lines_for_skus(skus) -> list[dict]:
     return rows
 
 
+# --- receipt line decoding and /rcpt (docs/receipt-decoding.md) --------------------
+# Receipts and ReceiptItems belong to receipt_pipeline: only read here. The one
+# table written is receipt_line_details (migration step 5).
+
+RLD_COLUMNS = ("category", "item_type", "gender", "color", "brand_guess", "product_model", "confidence",
+               "source", "model", "item_id", "decode_raw")
+_LINE_MONEY = ("price", "subtotal", "total", "tax", "lines_sum", "subtotal_gap", "d_confidence", "confidence")
+# Per line: how many prices its SKU has on its receipt (the whole receipt, not
+# just the lines a search returned), the receipt's line count and sum, and
+# whether receipts_cleanup fixed the line by hand.
+_LINE_CONTEXT = """
+    OUTER APPLY (SELECT COUNT(DISTINCT x.Price) AS same_code_prices FROM dbo.ReceiptItems x
+                 WHERE x.ReceiptID = ri.ReceiptID AND x.SKU = ri.SKU) sc
+    OUTER APPLY (SELECT COUNT(*) AS line_count, SUM(x.Price) AS lines_sum FROM dbo.ReceiptItems x
+                 WHERE x.ReceiptID = ri.ReceiptID) rs"""
+_LINE_FIXED = """CAST(CASE WHEN EXISTS (SELECT 1 FROM dbo.receipt_fixes f WHERE f.table_name = 'ReceiptItems'
+                 AND f.row_id = ri.ItemID AND f.column_name <> '*') THEN 1 ELSE 0 END AS BIT) AS fixed"""
+_LINE_COLUMNS = """ri.ItemID AS line_id, ri.ReceiptID AS receipt_id, ri.LineIndex AS line_index, ri.SKU AS sku,
+    ri.Description AS description, UPPER(LTRIM(RTRIM(ri.Description))) AS desc_key, ri.Price AS price,
+    r.ReceiptNumber AS receipt_number, r.ReceiptDate AS receipt_date, r.ReceiptTime AS receipt_time,
+    r.StoreNumber AS store_number, r.StoreCity AS store_city, r.Subtotal AS subtotal, r.Total AS total,
+    r.Tax AS tax, sc.same_code_prices, rs.line_count, rs.lines_sum"""
+
+
+def _has_line_details(cur) -> bool:
+    """Step 5 may not have run yet (a dry run against production before the
+    deploy): then there are no saved decodes."""
+    cur.execute("SELECT OBJECT_ID(N'dbo.receipt_line_details', N'U')")
+    return cur.fetchone()[0] is not None
+
+
+def _receipt_values(rows: list[dict]) -> list[dict]:
+    for r in rows:
+        for k in _LINE_MONEY:
+            if r.get(k) is not None:
+                r[k] = float(r[k])
+        for k in ("receipt_date",):
+            if r.get(k) is not None and hasattr(r[k], "isoformat"):
+                r[k] = r[k].isoformat()[:10]
+        if r.get("receipt_time") is not None:
+            r["receipt_time"] = str(r["receipt_time"])[:8]
+        for k in ("decode_raw", "d_decode_raw"):
+            if isinstance(r.get(k), str):
+                r[k] = json.loads(r[k])
+        if "fixed" in r:
+            r["fixed"] = bool(r["fixed"])
+    return rows
+
+
+def receipt_decode_inputs() -> dict:
+    con = sqlserver.connect()
+    try:
+        cur = con.cursor()
+        cur.execute(f"SELECT {_LINE_COLUMNS}, {_LINE_FIXED} FROM dbo.ReceiptItems ri "
+                    f"JOIN dbo.Receipts r ON r.ReceiptID = ri.ReceiptID {_LINE_CONTEXT} "
+                    "ORDER BY ri.ReceiptID, ri.LineIndex")
+        lines = _receipt_values(_dicts(cur))
+        details = {}
+        has = _has_line_details(cur)
+        if has:
+            cur.execute("SELECT * FROM dbo.receipt_line_details")
+            details = {r["desc_key"]: r for r in _receipt_values(_dicts(cur))}
+        con.commit()
+        return {"lines": lines, "details": details, "has_table": has}
+    finally:
+        con.close()
+
+
+def save_receipt_line_details(rows) -> int:
+    rows = list(rows)
+
+    def go(cur):
+        now = _ts(_now())
+        for r in rows:
+            vals = {c: r.get(c) for c in RLD_COLUMNS}
+            vals["confidence"] = _dec(vals["confidence"], 3, 2)
+            if vals["decode_raw"] is not None:
+                vals["decode_raw"] = json.dumps(vals["decode_raw"], ensure_ascii=False, default=str)
+            vals["decoded_at"] = now
+            _upsert(cur, "receipt_line_details", {"desc_key": r["desc_key"]}, vals)
+        return len(rows)
+    return _write(go) if rows else 0
+
+
+def _like(text: str) -> str:
+    """A LIKE pattern for text, with % _ [ \\ taken literally (ESCAPE '\\')."""
+    return "%" + "".join("\\" + ch if ch in "%_[\\" else ch for ch in text) + "%"
+
+
+def _rcpt_where(kind: str, value, has_details: bool) -> tuple[str, list]:
+    if kind == "sku":
+        return "ri.SKU = ?", [value]
+    if kind == "sku_suffix":
+        return "ri.SKU LIKE ?", ["%" + value]
+    if kind == "receipt_number_part":
+        return "REPLACE(r.ReceiptNumber, '-', '') LIKE ?", [f"%{value}%"]
+    if kind != "words":
+        raise ValueError(f"unknown /rcpt search kind {kind!r}")
+    parts, args = [], []
+    for term in value:
+        if term.get("gender"):
+            parts.append("d.gender = ?" if has_details else "1 = 0")
+            args += [term["gender"]] if has_details else []
+            continue
+        like = _like(term["text"])
+        ors = ["ri.Description LIKE ? ESCAPE '\\'"]
+        args.append(like)
+        if has_details:
+            for col in ("brand_guess", "category", "item_type", "color", "product_model"):
+                ors.append(f"d.{col} LIKE ? ESCAPE '\\'")
+                args.append(like)
+        # what the item behind the line's SKU is (real Ross codes only)
+        ors.append("EXISTS (SELECT 1 FROM dbo.item_tags t JOIN dbo.item_identification i ON i.item_id = t.item_id "
+                   "WHERE (t.ross_code = ri.SKU OR t.ross_code_main = ri.SKU) AND ISNULL(t.code_generated, 0) = 0 "
+                   "AND (i.brand LIKE ? ESCAPE '\\' OR i.item_type LIKE ? ESCAPE '\\' "
+                   "OR i.product_name LIKE ? ESCAPE '\\'))")
+        args += [like, like, like]
+        for code in term.get("codes") or ():
+            c = "".join("\\" + ch if ch in "%_[\\" else ch for ch in code)
+            ors.append("(ri.Description LIKE ? ESCAPE '\\' OR ri.Description LIKE ? ESCAPE '\\' "
+                       "OR ri.Description LIKE ? ESCAPE '\\' OR ri.Description = ?)")
+            args += [f"{c} %", f"% {c} %", f"#{c} %", code]
+        parts.append("(" + " OR ".join(ors) + ")")
+    return " AND ".join(parts) or "1 = 0", args
+
+
+def receipt_lines_search(kind: str, value, limit: int = 10) -> dict:
+    con = sqlserver.connect()
+    try:
+        cur = con.cursor()
+        has = _has_line_details(cur)
+        cur.execute("SELECT StoreNumber, StoreCity, COUNT(*) FROM dbo.Receipts "
+                    "WHERE StoreNumber IS NOT NULL GROUP BY StoreNumber, StoreCity")
+        store_rows = [tuple(r) for r in cur.fetchall()]
+        header = None
+        if kind in ("receipt_id", "receipt_number"):
+            col = "r.ReceiptID" if kind == "receipt_id" else "r.ReceiptNumber"
+            cur.execute(f"""
+                SELECT r.ReceiptID AS receipt_id, r.ReceiptNumber AS receipt_number, r.ReceiptDate AS receipt_date,
+                       r.ReceiptTime AS receipt_time, r.StoreNumber AS store_number, r.StoreCity AS store_city,
+                       r.Subtotal AS subtotal, r.Tax AS tax, r.Total AS total, r.Flags AS flags,
+                       c.line_count, c.subtotal_gap, c.has_returns, c.missing_fields
+                FROM dbo.Receipts r LEFT JOIN dbo.v_receipt_checks c ON c.ReceiptID = r.ReceiptID
+                WHERE {col} = ?""", value)
+            found = _receipt_values(_dicts(cur))
+            if not found:
+                return {"total": 0, "lines": [], "receipt": None, "store_rows": store_rows}
+            header = found[0]
+            where, args, order = "ri.ReceiptID = ?", [header["receipt_id"]], "ri.LineIndex"
+        else:
+            where, args = _rcpt_where(kind, value, has)
+            order = ("CASE WHEN r.ReceiptDate IS NULL THEN 1 ELSE 0 END, r.ReceiptDate DESC, r.ReceiptTime DESC, "
+                     "ri.ReceiptID DESC, ri.LineIndex")
+        cols = ", ".join(f"{'d.' + c if has else 'NULL'} AS d_{c}" for c in RLD_COLUMNS)
+        join = ("LEFT JOIN dbo.receipt_line_details d ON d.desc_key = UPPER(LTRIM(RTRIM(ri.Description)))"
+                if has else "")
+        cur.execute(f"""
+            SELECT TOP (?) COUNT(*) OVER () AS match_count, {_LINE_COLUMNS}, {_LINE_FIXED}, {cols}
+            FROM dbo.ReceiptItems ri JOIN dbo.Receipts r ON r.ReceiptID = ri.ReceiptID {join} {_LINE_CONTEXT}
+            WHERE {where} ORDER BY {order}""", int(limit), *args)
+        lines = _receipt_values(_dicts(cur))
+        con.commit()
+        return {"total": lines[0]["match_count"] if lines else 0, "lines": lines, "receipt": header,
+                "store_rows": store_rows}
+    finally:
+        con.close()
+
+
 def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> None:
     _write(_upsert, "job_runs", {"job": job}, {"last_run_at": _ts(_now()), "status": status, "detail": detail})
 

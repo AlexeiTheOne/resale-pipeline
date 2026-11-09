@@ -49,6 +49,7 @@ async def _sold_alert_loop(app: Application) -> None:
 _JOB_REPRICE = "weekly_reprice"
 _JOB_SYNC = "daily_sync"
 _JOB_FEEDBACK = "daily_feedback"
+_JOB_RECEIPT_DECODE = "daily_receipt_decode"
 
 
 def _previous_slot(now: datetime, hour_utc: int, weekday: int | None = None) -> datetime:
@@ -274,3 +275,30 @@ async def _daily_feedback_loop(app: Application) -> None:
         target = _next_slot(now, config.FEEDBACK_HOUR_UTC)
         await asyncio.sleep((target - now).total_seconds())
         await _run_feedback_job(app)
+
+
+async def _run_receipt_decode_job(app: Application) -> None:
+    """Decode new receipt line descriptions (pipeline/receipt_decode.py).
+    Silent: writes only receipt_line_details; a failure goes to /errors and
+    the job retries at the next start."""
+    from pipeline import receipt_decode
+    try:
+        summary = await asyncio.to_thread(receipt_decode.decode_pending, max_keys=config.RECEIPT_DECODE_MAX_KEYS,
+                                          max_usd=config.RECEIPT_DECODE_MAX_USD)
+    except Exception as e:
+        traceback.print_exc()
+        util._record_error("receipt decode", e)
+        return
+    db.record_job_run(_JOB_RECEIPT_DECODE, detail=f"{summary['saved']} saved, {summary['ai']} by AI, "
+                                                  f"${summary['ai_cost_usd']:.4f}")
+
+
+async def _daily_receipt_decode_loop(app: Application) -> None:
+    """Once a day (RECEIPT_DECODE_HOUR_UTC), catching up at startup."""
+    if _missed_slot(_JOB_RECEIPT_DECODE, datetime.now(timezone.utc), config.RECEIPT_DECODE_HOUR_UTC):
+        await _run_receipt_decode_job(app)
+    while True:
+        now = datetime.now(timezone.utc)
+        target = _next_slot(now, config.RECEIPT_DECODE_HOUR_UTC)
+        await asyncio.sleep((target - now).total_seconds())
+        await _run_receipt_decode_job(app)

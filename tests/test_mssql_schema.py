@@ -142,7 +142,8 @@ def test_every_constraint_is_trusted_and_enabled(cur):
 
 def test_doc_parser_sees_the_whole_design():
     tables, views = parse_doc_tables()
-    assert len(tables) == 36, sorted(tables)  # 34 + schema_version + checks (step 3)
+    # 34 + schema_version + checks (step 3) + receipt_line_details (step 5)
+    assert len(tables) == 37, sorted(tables)
     assert set(views) == {"v_item_sales", "v_item_cost", "v_items", "v_receipt_checks"}
     # Every table's columns are parsed, except the receipt tables, which the doc
     # defines as "same as ReceiptsDB" (checked against RECEIPTSDB below).
@@ -291,11 +292,22 @@ def test_a_sold_item_cannot_be_deleted(cur):
     "INSERT INTO dbo.not_duplicates (a, b) VALUES ('b', 'a')",
     "INSERT INTO dbo.ebay_tokens (id) VALUES (2)",
     "INSERT INTO dbo.item_flags (item_id, kind, flag) VALUES ('i1', 'other', 'x')",
+    "INSERT INTO dbo.receipt_line_details (desc_key, source) VALUES ('EH BLK', 'x')",
+    "INSERT INTO dbo.receipt_line_details (desc_key, source) VALUES ('', 'rules')",
+    "INSERT INTO dbo.receipt_line_details (desc_key, source, gender) VALUES ('EH BLK', 'ai', 'm')",
+    "INSERT INTO dbo.receipt_line_details (desc_key, source, confidence) VALUES ('EH BLK', 'ai', 1.5)",
+    "INSERT INTO dbo.receipt_line_details (desc_key, source, decode_raw) VALUES ('EH BLK', 'ai', 'x')",
 ])
 def test_bad_rows_are_refused(cur, sql):
     _item(cur)
     with pytest.raises(pyodbc.IntegrityError):
         cur.execute(sql)
+
+
+def test_receipt_line_details_one_row_per_description(cur):
+    cur.execute("INSERT INTO dbo.receipt_line_details (desc_key, source) VALUES ('#ASST RUNNING', 'rules')")
+    with pytest.raises(pyodbc.IntegrityError):   # the collation is case-insensitive
+        cur.execute("INSERT INTO dbo.receipt_line_details (desc_key, source) VALUES ('#asst running', 'ai')")
 
 
 def test_piece_codes_must_be_upper_case(cur):

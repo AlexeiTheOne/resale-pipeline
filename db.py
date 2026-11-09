@@ -402,6 +402,53 @@ def receipt_lines_for_skus(skus) -> list[dict]:
     return []
 
 
+# --- receipt line decoding and /rcpt (docs/receipt-decoding.md) -----------------
+# Receipts are only on SQL Server. On SQLite the reads are empty and the one
+# write (receipt_line_details) refuses.
+
+RLD_SOURCES = migrations.RLD_SOURCES
+
+
+def receipt_decode_inputs() -> dict:
+    """Every receipt line, for the decoder: {"lines": [{line_id, receipt_id,
+    line_index, sku, description, desc_key, price, receipt_number,
+    receipt_date, receipt_time, store_number, store_city, subtotal, total,
+    tax, same_code_prices, line_count, lines_sum, fixed}], "details":
+    {desc_key: saved receipt_line_details row}, "has_table": bool}.
+    desc_key = UPPER(LTRIM(RTRIM(Description))), made by SQL. Read only."""
+    if _on_sqlserver():
+        return _sqlserver().receipt_decode_inputs()
+    return {"lines": [], "details": {}, "has_table": False}
+
+
+def save_receipt_line_details(rows) -> int:
+    """Insert or update receipt_line_details rows by desc_key (the only table
+    this writes). Each row: desc_key + category, item_type, gender, color,
+    brand_guess, product_model, confidence, source, model, item_id,
+    decode_raw (a dict). Returns how many."""
+    rows = list(rows)
+    for r in rows:
+        if not str(r.get("desc_key") or "").strip():
+            raise ValueError("receipt_line_details row without a desc_key")
+        if r.get("source") not in RLD_SOURCES:
+            raise ValueError(f"bad receipt_line_details source {r.get('source')!r}")
+    if _on_sqlserver():
+        return _sqlserver().save_receipt_line_details(rows)
+    raise RuntimeError("receipt_line_details is on SQL Server only")
+
+
+def receipt_lines_search(kind: str, value, limit: int = 10) -> dict:
+    """/rcpt: receipt lines, newest first (a whole receipt: in line order).
+    kind: receipt_id | receipt_number | receipt_number_part | sku |
+    sku_suffix | words (value: [{"text", "codes", "gender"}], all must match).
+    Returns {"total", "lines" (line fields + d_<column> of its saved decode),
+    "receipt" (the header, for a whole receipt), "store_rows"
+    [(store, city, n)]}. Read only."""
+    if _on_sqlserver():
+        return _sqlserver().receipt_lines_search(kind, value, limit)
+    return {"total": 0, "lines": [], "receipt": None, "store_rows": []}
+
+
 
 def record_job_run(job: str, status: str = "ok", detail: str | None = None) -> None:
     """Stamp a scheduled job as having just completed. Called after the work,

@@ -389,6 +389,21 @@ CHECK_OWNED_AI = os.getenv("CHECK_OWNED_AI", "1") == "1"
 CHECK_OWNED_AI_MODEL = os.getenv("CHECK_OWNED_AI_MODEL", "")
 CHECK_OWNED_SHOW = int(os.getenv("CHECK_OWNED_SHOW", "3"))
 
+# Receipt line decoding (pipeline/receipt_decode.py, docs/receipt-decoding.md):
+# what each Ross receipt line is, cached per description. The AI decodes the
+# lines rules can't, RECEIPT_DECODE_BATCH per call on the cheap model; one run
+# stops at RECEIPT_DECODE_MAX_USD. The daily top-up (bot/jobs.py) is off until
+# the backfill is approved and applied (RECEIPT_DECODE_JOB=1 turns it on).
+RECEIPT_DECODE_JOB = _env_bool("RECEIPT_DECODE_JOB", False)
+RECEIPT_DECODE_HOUR_UTC = int(os.getenv("RECEIPT_DECODE_HOUR_UTC", "10"))
+RECEIPT_DECODE_MODEL = os.getenv("RECEIPT_DECODE_MODEL", "")      # empty = CLAUDE_CHEAP_MODEL
+RECEIPT_DECODE_BATCH = int(os.getenv("RECEIPT_DECODE_BATCH", "50"))
+RECEIPT_DECODE_MAX_TOKENS = int(os.getenv("RECEIPT_DECODE_MAX_TOKENS", "12000"))
+RECEIPT_DECODE_MAX_USD = float(os.getenv("RECEIPT_DECODE_MAX_USD", "0.25"))
+RECEIPT_DECODE_MAX_KEYS = int(os.getenv("RECEIPT_DECODE_MAX_KEYS", "300"))
+# /rcpt: receipt lines per reply.
+RCPT_MAX_LINES = int(os.getenv("RCPT_MAX_LINES", "10"))
+
 # Smallest NET margin (after eBay fees, ad rate, and shipping) a repricing
 # suggestion may land on — never suggest a cut that sells at a loss.
 REPRICE_MIN_MARGIN_DOLLARS = float(os.getenv("REPRICE_MIN_MARGIN_DOLLARS", "5"))
