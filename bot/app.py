@@ -31,7 +31,7 @@ import config
 import db
 import logging_setup
 from bot import (
-    check_cmds, flow, intake, inventory_cmds, jobs, listing_cmds, ops_cmds, photos_cmds,
+    check_cmds, diagnose_cmds, flow, intake, inventory_cmds, jobs, listing_cmds, ops_cmds, photos_cmds,
     receipt_cmds, revise_cmds, sales_cmds, text_router, util,
 )
 
@@ -309,6 +309,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("setprice", listing_cmds.setprice_command))
     app.add_handler(CommandHandler("setqty", listing_cmds.setqty_command))
     app.add_handler(CommandHandler("revise", revise_cmds.revise_command))
+    app.add_handler(CommandHandler("diagnose", diagnose_cmds.diagnose_command))
     app.add_handler(CallbackQueryHandler(revise_cmds.revise_callback, pattern=r"^rev:"))
     app.add_handler(CommandHandler("sync", sales_cmds.sync_command))
     app.add_handler(CommandHandler("feedback", ops_cmds.feedback_command))

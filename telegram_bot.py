@@ -72,6 +72,9 @@ from bot.check_cmds import (  # noqa: E402,F401  (re-export)
 from bot.receipt_cmds import (  # noqa: E402,F401  (re-export)
     rcpt_command,
 )
+from bot.diagnose_cmds import (  # noqa: E402,F401  (re-export)
+    diagnose_command,
+)
 from bot.revise_cmds import (  # noqa: E402,F401  (re-export)
     revise_callback, revise_command,
 )
