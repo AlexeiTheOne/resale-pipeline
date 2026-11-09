@@ -630,3 +630,14 @@ QUALITY_IMPRESSION_CHECK = _env_bool("QUALITY_IMPRESSION_CHECK", True)
 QUALITY_IMPRESSION_CHECK_DAYS = int(os.getenv("QUALITY_IMPRESSION_CHECK_DAYS", "3"))
 QUALITY_IMPRESSION_CHECK_MAX_DAYS = int(os.getenv("QUALITY_IMPRESSION_CHECK_MAX_DAYS", "10"))
 QUALITY_IMPRESSION_HOUR_UTC = int(os.getenv("QUALITY_IMPRESSION_HOUR_UTC", "15"))
+
+# --- Competitor search (pipeline/competitors.py) --------------------------------
+# A model searched within this many hours is answered from check_evidence.
+COMPETITOR_CACHE_HOURS = float(os.getenv("COMPETITOR_CACHE_HOURS", "24"))
+# Active listings per Browse search, and how many of the best get a getItem
+# call (specifics, photos, returns). 123 listings x (1 + 10) calls is about
+# 1,350, inside Browse's default 5,000 a day.
+COMPETITOR_ACTIVE_LIMIT = int(os.getenv("COMPETITOR_ACTIVE_LIMIT", "50"))
+COMPETITOR_DETAIL_MAX = int(os.getenv("COMPETITOR_DETAIL_MAX", "10"))
+# Sold rows per Apify search (about $0.02 for 30).
+COMPETITOR_SOLD_COUNT = int(os.getenv("COMPETITOR_SOLD_COUNT", "30"))

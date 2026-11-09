@@ -389,6 +389,90 @@ def list_checks(*, user_id: int | None = None, status: str | None = None, sku: s
     return [_check_row(dict(r)) for r in rows]
 
 
+# --- check_evidence: price evidence, also the competitor-search cache ---------
+# docs/check-command-design.md Part 2; pipeline/competitors.py.
+
+EVIDENCE_COLUMNS = ("check_id", "item_id", "model_key", "source", "found_by", "store", "title",
+                    "condition", "price", "shipping", "total", "url", "ebay_id", "category_id",
+                    "photo_count", "returns_accepted", "best_offer", "specifics", "event_date",
+                    "match", "match_by", "query", "fetched_at")
+_EVIDENCE_BOOL = ("returns_accepted", "best_offer")
+_EVIDENCE_MONEY = ("price", "shipping", "total")
+
+
+def _evidence_check(row: dict) -> None:
+    unknown = set(row) - set(EVIDENCE_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown check_evidence column(s): {sorted(unknown)}")
+    if not row.get("model_key") or not row.get("source"):
+        raise ValueError("check_evidence rows need a model_key and a source")
+
+
+def _utc_iso(value) -> str | None:
+    """An ISO time (or datetime) as UTC ISO text; naive means UTC."""
+    if value is None or value == "":
+        return None
+    d = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    d = d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc).isoformat()
+
+
+def _evidence_row(row: dict) -> dict:
+    """One stored row as both backends return it: floats, bools, specifics as
+    a dict, times as UTC ISO text."""
+    out = dict(row)
+    if isinstance(out.get("specifics"), str):
+        out["specifics"] = json.loads(out["specifics"])
+    for k in _EVIDENCE_BOOL:
+        if out.get(k) is not None:
+            out[k] = bool(out[k])
+    for k in _EVIDENCE_MONEY:
+        if out.get(k) is not None:
+            out[k] = float(out[k])
+    return out
+
+
+def add_evidence(rows) -> int:
+    """Save evidence rows (dicts with EVIDENCE_COLUMNS keys; model_key and
+    source required). fetched_at defaults to now. Returns how many."""
+    rows = [{k: v for k, v in r.items() if v is not None} for r in rows]
+    for r in rows:
+        _evidence_check(r)
+    if not rows:
+        return 0
+    if _on_sqlserver():
+        return _sqlserver().add_evidence(rows)
+    now = _now()
+    with _conn() as con:
+        for r in rows:
+            r = dict(r)
+            r.setdefault("fetched_at", now)
+            for k in ("event_date", "fetched_at"):
+                if k in r:
+                    r[k] = _utc_iso(r[k])
+            if "specifics" in r:
+                r["specifics"] = json.dumps(r["specifics"])
+            for k in _EVIDENCE_BOOL:
+                if k in r:
+                    r[k] = int(bool(r[k]))
+            con.execute(f"INSERT INTO check_evidence ({', '.join(r)}) VALUES ({', '.join('?' * len(r))})",
+                        tuple(r.values()))
+    return len(rows)
+
+
+def recent_evidence(model_key: str, source: str, since) -> list[dict]:
+    """Rows for a model and source fetched at or after `since` (ISO time or
+    datetime), oldest first."""
+    since = _utc_iso(since)
+    if _on_sqlserver():
+        return _sqlserver().recent_evidence(model_key, source, since)
+    with _conn() as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("SELECT * FROM check_evidence WHERE model_key = ? AND source = ? "
+                           "AND fetched_at >= ? ORDER BY evidence_id", (model_key, source, since)).fetchall()
+    return [_evidence_row(dict(r)) for r in rows]
+
+
 def receipt_lines_for_skus(skus) -> list[dict]:
     """Ross receipt lines (what we bought) with one of these 12-digit SKUs,
     newest first: line_id, sku, description, price, receipt_date (date),

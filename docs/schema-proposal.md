@@ -452,6 +452,35 @@ read, never from this row.
 | decode_raw | NVARCHAR(MAX) JSON | the decoder's whole answer, and `prev` when replaced |
 | decoded_at | DATETIME2(6) | |
 
+**`check_evidence`** (migration step 6): price evidence, one row per eBay
+listing (sold or for sale), retail offer or own sale. Facts only. Written by
+the competitor search (`pipeline/competitors.py`) and later by /check, intake
+and repricing (docs/check-command-design.md Part 2). It is also their cache:
+rows for a model younger than `COMPETITOR_CACHE_HOURS` are reused. No FK:
+`check_id` and `item_id` are provenance, like `checks.item_id`.
+
+| Column | Type | Notes |
+|---|---|---|
+| evidence_id | INT IDENTITY PK | |
+| check_id / item_id | INT / VARCHAR(36) | either may be null (no FK) |
+| model_key | NVARCHAR(200) NOT NULL | `sold_reuse.model_keys`, else `upc\|…` or brand + words |
+| source | VARCHAR(12) NOT NULL | CHECK `retail` / `ebay_sold` / `ebay_active` / `own_sale` |
+| found_by | VARCHAR(10) | CHECK `upc` / `mpn` / `keywords` / `image`: the rung that matched |
+| store | NVARCHAR(100) | the eBay seller, or the retail store |
+| title / condition | NVARCHAR(300) / NVARCHAR(60) | as shown |
+| price / shipping / total | DECIMAL(10,2) | shipping and total null when unknown |
+| url / ebay_id | NVARCHAR(500) / VARCHAR(40) | |
+| category_id | VARCHAR(20) | from getItem |
+| photo_count | INT | from getItem |
+| returns_accepted / best_offer | BIT | |
+| specifics | NVARCHAR(MAX) JSON | the listing's item specifics, from getItem |
+| event_date | DATETIME2(6) | sale date (sold, own sale) |
+| match / match_by | VARCHAR(10) / VARCHAR(6) | CHECK `same_item` / `same_model` / `other`; `judge` / `code` / `title` |
+| query | NVARCHAR(300) | the search it came from |
+| fetched_at | DATETIME2(6) | |
+
+Indexes: `(model_key, source, fetched_at)`, `(check_id)`, `(item_id)`.
+
 **`v_receipt_checks`** (view, computed live, never stored): one row per receipt with:
 
 - `items_sum`

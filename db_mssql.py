@@ -518,6 +518,34 @@ def update_check(check_id: int, **fields) -> None:
         "WHERE check_id = ?", *row.values(), check_id))
 
 
+def add_evidence(rows: list[dict]) -> int:
+    """db.add_evidence on ResaleDB (rows already checked by db.py)."""
+    def go(cur):
+        for r in rows:
+            r = dict(r)
+            for k in ("event_date", "fetched_at"):
+                if r.get(k) is not None:
+                    r[k] = _ts(db._utc_iso(r[k]))
+            if "specifics" in r:
+                r["specifics"] = json.dumps(r["specifics"])
+            cur.execute(f"INSERT INTO dbo.check_evidence ({', '.join(r)}) "
+                        f"VALUES ({', '.join('?' * len(r))})", *r.values())
+        return len(rows)
+    return _write(go)
+
+
+def recent_evidence(model_key: str, source: str, since: str) -> list[dict]:
+    rows = _query("SELECT * FROM dbo.check_evidence WHERE model_key = ? AND source = ? "
+                  "AND fetched_at >= ? ORDER BY evidence_id", model_key, source, _ts(since))
+    out = []
+    for row in rows:
+        for k in ("event_date", "fetched_at"):
+            if row.get(k) is not None:
+                row[k] = row[k].replace(tzinfo=timezone.utc).isoformat()
+        out.append(db._evidence_row(row))
+    return out
+
+
 def get_check(check_id: int) -> dict | None:
     rows = _query("SELECT * FROM dbo.checks WHERE check_id = ?", check_id)
     return _check_decode(rows[0]) if rows else None

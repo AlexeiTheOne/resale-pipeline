@@ -456,6 +456,11 @@ applies.
   (backup `D:\SQLBackups\ResaleDB-20261109-051223-before-receipt-decode.bak`);
   the daily top-up is on by default (`RECEIPT_DECODE_JOB=0` turns it off).
   `/rcpt` works before that, with raw lines, item links and live rules.
+- ⬜ **Price evidence** (`check_evidence`, step 6, docs/schema-proposal.md
+  and docs/check-command-design.md Part 2): new table only, no FK. The bot
+  runs the step at startup after the deploy (which backs up first). The
+  competitor search (`pipeline/competitors.py`) writes it and reads it as its
+  24-hour cache. /check, intake and repricing start writing it in later PRs.
 - 💤 Dev refresh after step 5: `refresh_dev_from_backup.py` copies every
   table, so ResaleDB_Dev must be at step 5 too (any `import db` with the dev
   `.env` migrates it).
@@ -481,6 +486,12 @@ applies.
 ---
 
 ## Log
+- 2026-11-09: **SQL Server step 6 `check_evidence`** (SQLite step 4; branch
+  `competitor-search`): price evidence, one row per eBay listing, retail offer
+  or own sale; also the competitor search's 24-hour cache. New table only, no
+  FK, nothing else locked. The bot runs the step at startup after the deploy,
+  which backs up first. Older code after a rollback warns "schema 6, code
+  knows 5" and keeps working.
 - 2026-11-08: **SQL Server step 5 `receipt_line_details`** (branch
   `receipt-decoding`): what each receipt line is, one row per unique
   description. New table only, no FK, no lock on the receipt tables. The bot
