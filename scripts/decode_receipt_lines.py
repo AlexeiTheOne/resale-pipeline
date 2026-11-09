@@ -220,6 +220,9 @@ def main(argv=None) -> int:
     ap.add_argument("--from", dest="from_file", help="the JSONL from stage 2")
     ap.add_argument("--max-usd", type=float, default=config.RECEIPT_DECODE_MAX_USD)
     ap.add_argument("--redo-ai", action="store_true", help="decode descriptions that already have an AI row")
+    ap.add_argument("--reuse", help="stage 2: keep the AI rows of an earlier stage-2 JSONL (not paid again)")
+    ap.add_argument("--redo-category", action="append", default=[],
+                    help="with --reuse: decode this category's rows again (repeatable)")
     ap.add_argument("--report-dir", default=str(config.LOG_DIR))
     args = ap.parse_args(argv)
     check_target(args.target, args.production)
@@ -272,8 +275,15 @@ def main(argv=None) -> int:
 
     # --- stage 2: the AI (usage logged to the .env database, not the target)
     pending = p["ai"] + [p["info"][k] for k in validation_keys]
-    print(f"AI: {len(pending)} descriptions ({len(validation_keys)} only for the check), cap ${args.max_usd:.2f}")
+    reused = load_reuse(args.reuse, set(args.redo_category)) if args.reuse else {}
+    pending = [x for x in pending if x["key"] not in reused]
+    print(f"AI: {len(pending)} descriptions ({len(validation_keys)} for the check, {len(reused)} reused), "
+          f"cap ${args.max_usd:.2f}")
     ai_rows, spent = rd.ai_decode_all(pending, max_usd=args.max_usd)
+    ai_rows = {**reused, **ai_rows}
+    if args.reuse:
+        rep += ["", f"Reused {len(reused)} AI rows from `{args.reuse}` (not paid again); decoded again: "
+                    f"{', '.join(args.redo_category) or 'nothing'}."]
     check = validate(ai_rows, p["validate"])
     jsonl = report_dir / f"receipt-decode-{args.target}-{stamp}.jsonl"
     with jsonl.open("w", encoding="utf-8") as f:
@@ -302,6 +312,19 @@ def main(argv=None) -> int:
     print(f"spent ${spent['cost_usd']:.4f}; category {check['category'][2]}%, brand {check['brand'][2]}%, "
           f"type {check['type'][2]}%\nreport: {path}\njsonl:  {jsonl}")
     return 0
+
+
+def load_reuse(path: str, redo: set) -> dict:
+    """{desc_key: row} from an earlier stage-2 JSONL, minus the categories to
+    decode again."""
+    rows = {}
+    with open(path, encoding="utf-8") as f:
+        next(f)  # the run header
+        for line in f:
+            rec = json.loads(line)
+            if rec["row"].get("category") not in redo:
+                rows[rec["desc_key"]] = rec["row"]
+    return rows
 
 
 def apply(args, db, rd, data, hits, p) -> int:

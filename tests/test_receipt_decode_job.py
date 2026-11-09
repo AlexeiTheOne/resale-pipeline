@@ -125,6 +125,26 @@ def test_ai_run_writes_a_file_not_the_db_and_apply_reuses_it(lines, mssql, mssql
     assert (tmp_path / "receipt_decode.jsonl").exists()
 
 
+def test_reuse_keeps_paid_rows_and_redoes_a_category(lines, mssql, mssql_db, tmp_path, monkeypatch):
+    old = tmp_path / "old.jsonl"
+    row = rd.ai_fields({"cat": "bags", "type": "tote", "gender": "none", "color": "", "brand": "", "model": "",
+                        "conf": 0.6}, "m")
+    old.write_text('{"run": "x"}\n' + json.dumps({"desc_key": "ZXQ WIDGET", "row": row}) + "\n", encoding="utf-8")
+    calls = []
+
+    def fake_all(pending, **kw):
+        calls.append([p["key"] for p in pending])
+        return {}, {"cost_usd": 0.0, "calls": 0, "input_tokens": 0, "output_tokens": 0, "model": None,
+                    "stopped": None, "left": 0}
+    monkeypatch.setattr(rd, "ai_decode_all", fake_all)
+    s = _script()
+    assert s.main(["--target", mssql_db, "--ai", "--reuse", str(old), "--report-dir", str(tmp_path)]) == 0
+    assert calls[-1] == []                                   # reused: nothing paid again
+    assert s.main(["--target", mssql_db, "--ai", "--reuse", str(old), "--redo-category", "bags",
+                   "--report-dir", str(tmp_path)]) == 0
+    assert calls[-1] == ["ZXQ WIDGET"]
+
+
 def test_apply_refuses_before_step_5(lines, mssql, mssql_db, tmp_path, monkeypatch):
     import db_mssql
     monkeypatch.setattr(db_mssql, "_has_line_details", lambda cur: False)

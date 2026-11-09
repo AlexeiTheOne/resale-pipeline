@@ -237,6 +237,7 @@ _RULES = [
         r"CHARGED ASSERT", r"HOVR", r"FLEX RUNNER", r"ARUKU", r"GIANNIS", r"LEBR", r"FIELD GENERA\w*",
         r"FREE 2005"), "high"),
     ("shoes", "cleats", _w(r"CLEATS?"), "high"),
+    ("shoes", None, _w(r"SHOES?", r"FOOTWEAR"), "medium"),
     ("clothing", "jeans", r"^TR\b.*\b(RICKY|ROCCO|GENO|JESSE|BOBBY|BILLY|JOEY)\b|\bSN (FLP|NF|AOP)\b", "high"),
     ("bags", None, r"^TOMMY-[A-Z\u0100-\u017f]+ (II|TI)\b", "high"),
     ("shoes", "sandals", _w(r"SANDALS?", r"FLIP FLOPS?"), "medium"),
@@ -519,7 +520,9 @@ HW = Hot Wheels. OCR often reads EH as cH, CH or ER. FLP = flap pocket, SN = str
 Colours: BLK black, WHT white, GRY grey, NVY navy, PNK pink, BRN brown, OLV olive (green), SIL silver.
 
 Answer every line. Use "none" for a type or gender you can't tell, "" for an unknown colour, brand or
-model. cat must be one of the categories; type should fit the category. color: up to two of
+model. cat must be one of the categories; type should fit the category. Give a type only when the
+words show it (BKPK, TOTE, DUFFEL, WALLET, SS = tee, JOGGER): an Ed Hardy line with only colours and a
+print is a bag of type "none", not a tote. Don't guess a type from the brand or the price. color: up to two of
 black, white, grey, navy, blue, red, pink, purple, green, brown, beige, gold, silver, orange, yellow,
 multi, joined by '/', only for clothing, shoes, bags, accessories and jewelry. model: a product model
 or style name if the line shows one (JORDAN MVP 92 -> "MVP 92"), else "". conf: 0 to 1, how sure you
@@ -534,6 +537,7 @@ Examples:
 "01/15/26 20CT GMY" $5.99 -> health, supplement
 "X HW 5PK" $4.99 -> toys, vehicle, Hot Wheels
 "VB QLT BKPK" $34.99 -> bags, backpack, Vera Bradley
+"EH PNK LEOP SKULL" $16.99 -> bags, none, Ed Hardy, pink/multi
 "S/3 GLASS VASE" $12.99 -> home, decor
 "MK 40MM GLD" $59.99 -> jewelry_watches, watch, gold, Michael Kors"""
 
