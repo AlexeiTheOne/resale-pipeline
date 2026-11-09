@@ -264,11 +264,60 @@ def _checks_sku_main(con: sqlite3.Connection) -> None:
     con.execute("ALTER TABLE checks ADD COLUMN ross_sku_main TEXT")
 
 
+# check_evidence (docs/check-command-design.md Part 2, and the competitor
+# search, docs/listing-performance-plan.md 7.1): one row per piece of price
+# evidence, facts only. The allowed values, shared by both backends.
+EVIDENCE_SOURCES = ("retail", "ebay_sold", "ebay_active", "own_sale")
+EVIDENCE_FOUND_BY = ("upc", "mpn", "keywords", "image")
+EVIDENCE_MATCHES = ("same_item", "same_model", "other")
+EVIDENCE_MATCH_BY = ("judge", "code", "title")
+
+
+def _check_evidence(con: sqlite3.Connection) -> None:
+    """Price evidence: eBay sold and active listings, retail offers, our own
+    sales. Shared by /check, intake, repricing and the competitor search; also
+    their cache (rows younger than a day are reused). Not items: check_id and
+    item_id are provenance and may both be null."""
+    con.execute(f"""
+        CREATE TABLE IF NOT EXISTS check_evidence (
+            evidence_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            check_id         INTEGER,
+            item_id          TEXT,
+            model_key        TEXT NOT NULL CHECK (length(model_key) > 0),
+            source           TEXT NOT NULL CHECK (source IN ({_in(EVIDENCE_SOURCES)})),
+            found_by         TEXT CHECK (found_by IN ({_in(EVIDENCE_FOUND_BY)})),
+            store            TEXT,
+            title            TEXT,
+            condition        TEXT,
+            price            REAL,
+            shipping         REAL,
+            total            REAL,
+            url              TEXT,
+            ebay_id          TEXT,
+            category_id      TEXT,
+            photo_count      INTEGER,
+            returns_accepted INTEGER CHECK (returns_accepted IN (0, 1)),
+            best_offer       INTEGER CHECK (best_offer IN (0, 1)),
+            specifics        TEXT CHECK (specifics IS NULL OR json_valid(specifics)),
+            event_date       TEXT,
+            match            TEXT CHECK (match IN ({_in(EVIDENCE_MATCHES)})),
+            match_by         TEXT CHECK (match_by IN ({_in(EVIDENCE_MATCH_BY)})),
+            query            TEXT,
+            fetched_at       TEXT NOT NULL
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_check_evidence_model "
+                "ON check_evidence (model_key, source, fetched_at)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_check_evidence_check ON check_evidence (check_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_check_evidence_item ON check_evidence (item_id)")
+
+
 # (version, name, function). Append only.
 MIGRATIONS = [
     (1, "baseline", _baseline),
     (2, "checks_table", _checks_table),
     (3, "checks_sku_main", _checks_sku_main),
+    (4, "check_evidence", _check_evidence),
 ]
 
 
@@ -1124,6 +1173,48 @@ def _mssql_receipt_line_details(cur) -> None:
     cur.execute("CREATE UNIQUE INDEX UX_receipt_line_details_desc_key ON dbo.receipt_line_details (desc_key)")
 
 
+def _mssql_check_evidence(cur) -> None:
+    """Price evidence (see the SQLite step _check_evidence). No FK to checks or
+    items: provenance, like checks.item_id."""
+    cur.execute(f"""
+    CREATE TABLE dbo.check_evidence (
+        evidence_id      INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_check_evidence PRIMARY KEY,
+        check_id         INT           NULL,
+        item_id          VARCHAR(36)   NULL,
+        model_key        NVARCHAR(200) NOT NULL
+                         CONSTRAINT CK_check_evidence_model_key CHECK (LEN(model_key) > 0),
+        source           VARCHAR(12)   NOT NULL
+                         CONSTRAINT CK_check_evidence_source CHECK (source IN ({_in(EVIDENCE_SOURCES)})),
+        found_by         VARCHAR(10)   NULL
+                         CONSTRAINT CK_check_evidence_found_by CHECK (found_by IN ({_in(EVIDENCE_FOUND_BY)})),
+        store            NVARCHAR(100) NULL,
+        title            NVARCHAR(300) NULL,
+        condition        NVARCHAR(60)  NULL,
+        price            DECIMAL(10,2) NULL,
+        shipping         DECIMAL(10,2) NULL,
+        total            DECIMAL(10,2) NULL,
+        url              NVARCHAR(500) NULL,
+        ebay_id          VARCHAR(40)   NULL,
+        category_id      VARCHAR(20)   NULL,
+        photo_count      INT           NULL,
+        returns_accepted BIT           NULL,
+        best_offer       BIT           NULL,
+        specifics        NVARCHAR(MAX) NULL
+                         CONSTRAINT CK_check_evidence_specifics_json CHECK (ISJSON(specifics) = 1),
+        event_date       DATETIME2(6)  NULL,
+        match            VARCHAR(10)   NULL
+                         CONSTRAINT CK_check_evidence_match CHECK (match IN ({_in(EVIDENCE_MATCHES)})),
+        match_by         VARCHAR(6)    NULL
+                         CONSTRAINT CK_check_evidence_match_by CHECK (match_by IN ({_in(EVIDENCE_MATCH_BY)})),
+        query            NVARCHAR(300) NULL,
+        fetched_at       DATETIME2(6)  NOT NULL
+                         CONSTRAINT DF_check_evidence_fetched_at DEFAULT SYSUTCDATETIME()
+    )""")
+    cur.execute("CREATE INDEX IX_check_evidence_model ON dbo.check_evidence (model_key, source, fetched_at)")
+    cur.execute("CREATE INDEX IX_check_evidence_check ON dbo.check_evidence (check_id)")
+    cur.execute("CREATE INDEX IX_check_evidence_item ON dbo.check_evidence (item_id)")
+
+
 # (version, name, function). Append only.
 MSSQL_MIGRATIONS = [
     (1, "resaledb_baseline", _mssql_baseline),
@@ -1131,6 +1222,7 @@ MSSQL_MIGRATIONS = [
     (3, "checks_table", _mssql_checks_table),
     (4, "ross_code_main", _mssql_ross_code_main),
     (5, "receipt_line_details", _mssql_receipt_line_details),
+    (6, "check_evidence", _mssql_check_evidence),
 ]
 # The production migration copies the receipts into a database at this
 # version: the unique indexes (step 2) come after the receipt cleanup.

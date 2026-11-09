@@ -27,6 +27,7 @@ import io
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -222,6 +223,23 @@ def search_by_image(image_path, *, limit: int = 50, category_ids=None,
 
 
 ITEM_PATH = "/buy/browse/v1/item/get_item_by_legacy_id"
+
+
+def item_detail(item_id: str) -> dict:
+    """What a search result doesn't carry, for one listing (read only, app
+    token): its item specifics, photo count, whether it takes returns, Best
+    Offer, and category. `item_id` is the Browse id from search ("v1|...|0")."""
+    d = _call("GET", "/buy/browse/v1/item/" + quote(str(item_id), safe=""), params={})
+    specifics = {}
+    for a in d.get("localizedAspects") or []:
+        if a.get("name") and a.get("value") not in (None, ""):
+            specifics[a["name"]] = a["value"]
+    photos = (1 if d.get("image") else 0) + len(d.get("additionalImages") or [])
+    returns = (d.get("returnTerms") or {}).get("returnsAccepted")
+    return {"specifics": specifics, "photo_count": photos,
+            "returns_accepted": bool(returns) if returns is not None else None,
+            "best_offer": "BEST_OFFER" in (d.get("buyingOptions") or []),
+            "category_id": str(d["categoryId"]) if d.get("categoryId") else None}
 
 
 def listing_details(legacy_item_id: str) -> dict:
