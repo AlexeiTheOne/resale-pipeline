@@ -11,7 +11,7 @@ from llm import LazyClient, generate_with_retry, response_text
 from pipeline.category import choose_category, department_of
 from pipeline.description_guard import sanitize_description
 from pipeline.gtin import product_gtin
-from pipeline.specifics import clean_specifics, is_shoe_size_aspect
+from pipeline.specifics import clean_specifics, fill_mpn_from_style_code, is_shoe_size_aspect
 from pipeline.title import (TITLE_MAX_LEN, TITLE_RULES, enforce_band_for_device,
                             ensure_title_fits, fit_title)
 
@@ -84,7 +84,7 @@ SCHEMA_INSTRUCTIONS = """Generate an eBay listing as a valid JSON object matchin
     "Size": "One Size if universal fit, otherwise the specific size from tag",
     "Material": "string or null",
     "Condition": "string",
-    "MPN": "manufacturer part number from Google Search or null",
+    "MPN": "manufacturer part / style number: the style code from the tag or identification (style_code/model), the same value as Model when Model is a style code; null only if there is none",
     "UPC": "identification.upc copied exactly, or null (never a number from search or the Ross price tag)"
   },
   "price": 0.0,
@@ -220,6 +220,16 @@ def _clean_draft_specifics(draft: dict, identification: dict | None) -> None:
     for note in notes:
         print(f"🧹 specifics: {note}")
     draft["item_specifics"] = cleaned
+    _fill_mpn(draft, identification)
+
+
+def _fill_mpn(draft: dict, identification: dict | None) -> None:
+    """The style code goes into MPN as well as Model (pipeline/specifics.py)."""
+    specifics = draft.get("item_specifics")
+    if isinstance(specifics, dict):
+        code = fill_mpn_from_style_code(specifics, identification)
+        if code:
+            print(f"🏷️ specifics: MPN set from the style code {code}")
 
 
 def _aspect_hint_block(category: dict | None) -> str | None:
@@ -543,6 +553,7 @@ def revise_draft(current_draft: dict, correction: str,
         revised["category_id"] = current_draft["category_id"]
     if isinstance(revised.get("item_specifics"), dict):
         _clean_gtins(revised["item_specifics"], keep_valid=True)
+        _fill_mpn(revised, identification)
 
     # Same rule as generate_draft: a copy edit must not move the price. Rewording
     # a title should never quietly reprice a live listing — price changes go
