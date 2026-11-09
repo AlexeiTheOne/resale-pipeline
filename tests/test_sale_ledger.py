@@ -160,15 +160,43 @@ def test_a_late_refund_updates_the_recorded_sale_quietly():
     result, writes = _sync_with(item, _OFFER_ENDED, after)
     assert not result["auto_sold"] and result["new_sale"] is None
     assert not [w for w in writes if w[0] == "status"]          # never re-marked
-    (_, _, field, ebay), = [w for w in writes if w[0] == "field"]
-    assert field == "ebay" and abs(ebay["net_proceeds"] - (-7.33)) < CENT
+    fields = [w for w in writes if w[0] == "field"]
+    assert {w[2] for w in fields} == {"ebay"}
+    ebay = fields[-1][3]
+    assert abs(ebay["net_proceeds"] - (-7.33)) < CENT
     assert ebay["refunded"] == 99.98
     assert any("refund" in c for c in result["changes"])
+    # refunded in full: asked once (returned?), remembered so it isn't asked again
+    assert result["full_refunds"] == [{"order_id": "V", "refund": 99.98}]
+    assert ebay["refund_asked"] == ["V"]
 
     # Same data again: nothing to write.
     item["ebay"] = ebay
     result, writes = _sync_with(item, _OFFER_ENDED, after)
     assert writes == [] and result["changes"] == []
+    assert result["full_refunds"] == []
+
+
+def test_partial_refund_or_a_published_item_is_not_asked_about():
+    sold = [_order("V", "2026-08-20T00:00:00.000Z", 89.99, 9.99)]
+    txns = [_sale_txn("V", 16.23), _label("V", 7.33)]
+    partial = orders.sales_by_item(orders=sold, transactions=txns + _refund_set("V", 20.00, 3.0))
+    item = _recorded(orders.sales_by_item(orders=sold, transactions=txns)["S1"])
+    result, _ = _sync_with(item, _OFFER_ENDED, partial)
+    assert result["full_refunds"] == []
+    full = orders.sales_by_item(orders=sold, transactions=txns + _refund_set("V", 99.98, 16.23))
+    relisted = {**_recorded(full["S1"]), "status": "published"}   # it came back and is on sale
+    result, _ = _sync_with(relisted, _OFFER_ENDED, full)
+    assert result["full_refunds"] == []
+
+
+def test_full_refunds_needs_everything_the_buyer_paid():
+    from pipeline import sync
+    recs = [{"order_id": "A", "sale": 89.99, "shipping": 9.99, "refund": 99.98},
+            {"order_id": "B", "sale": 50, "shipping": 0, "refund": 49.99},
+            {"order_id": "C", "sale": 0, "shipping": 0, "refund": 0}]
+    assert [r["order_id"] for r in sync.full_refunds(recs)] == ["A", "B"]
+    assert sync.full_refunds(None) == []
 
 
 def test_no_refresh_when_fees_are_unknown():
