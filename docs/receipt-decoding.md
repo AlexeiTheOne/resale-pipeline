@@ -25,7 +25,7 @@ does (the dry run checks they agree). Blank descriptions get no row.
 | brand_guess, product_model | the product's brand and model/style, when known |
 | confidence | 0–1; `/rcpt` adds "?" below 0.6 |
 | source | `matched_item`, `rules` or `ai` |
-| model | the decoder: `rules-v2` or the Claude model that answered |
+| model | the decoder: `rules-v3` or the Claude model that answered |
 | item_id | the item, for `matched_item` rows only |
 | decode_raw | the decoder's whole answer; `prev` holds an AI decode an item replaced |
 
@@ -47,11 +47,21 @@ does (the dry run checks they agree). Blank descriptions get no row.
    confidence 0.5. When the AI names no brand but a brand code matched, the
    code's brand is kept. About 1,840 descriptions.
 
-**Fashion codes** (`FASHION_CODES`, confirmed by Person B 2026-11-08): a line
-whose first word is SM (Steve Madden), VB (Vera Bradley), EH (Ed Hardy), TR
-(True Religion), BJ (Betsey Johnson), DKNY or Prezzo is always clothing,
-shoes, bags, accessories or jewelry. The rules give it the brand's fallback
-(bags; TR clothing) and a guard after the AI replaces a food, home or beauty
+**Fashion codes** (`FASHION_CODES`, confirmed by Person B 2026-11-08 and
+-09): a line whose first word is SM (Steve Madden), VB (Vera Bradley), EH (Ed
+Hardy), TR (True Religion), BJ (Betsey Johnson), DKNY, Prezzo, UA (Under
+Armour), POLO/RL (Polo Ralph Lauren), KL (Karl Lagerfeld), LB (Luv Betsey),
+NAUT (Nautica) or TB (Ted Baker) is always clothing, shoes, bags, accessories
+or jewelry (fallback: bags for SM, VB, EH, BJ, DKNY, LB; clothing for the rest).
+
+**Brand-only codes:** CK/CKJ (Calvin Klein), MK (Michael Kors), JC (Juicy
+Couture), AK (Anne Klein) set only the brand: they also sell fragrance, gift
+sets and jewelry, so the product words decide. They are never food, health,
+household, toys, tools, electronics, pet or sports; an AI answer in one of
+those becomes `other` at confidence 0.3 (`decode_raw.fixed = "brand_code"`).
+BS, SL, HD, AB and SNF are unknown codes, left to the AI.
+
+For the fashion codes, the rules give the brand's fallback and a guard after the AI replaces a food, home or beauty
 answer with it (confidence 0.5, `decode_raw.fixed = "fashion_code"`). Prezzo
 is a sure rule: bags, duffel, no AI. Two exceptions, because licensed beauty
 is real: a sure beauty/fragrance rule stays (EH MANI SET, EH 150 CT FLOSS,

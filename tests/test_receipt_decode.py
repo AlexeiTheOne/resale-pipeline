@@ -170,7 +170,33 @@ def test_the_ai_cannot_put_a_fashion_code_in_food():
     assert sm["confidence"] == 0.5 and sm["decode_raw"]["fixed"] == "fashion_code"
     assert got["EH PNK SKULL TOTE"]["category"] == "bags"
     assert got["TR EDT SPRAY 3.4"]["category"] == "fragrance"       # the line says it's a fragrance
-    assert got["MK VANILLA RETRO J"]["category"] == "food"          # MK isn't one of the confirmed codes
+    mk = got["MK VANILLA RETRO J"]                                  # brand only: never food, no guessed category
+    assert (mk["category"], mk["brand_guess"], mk["decode_raw"]["fixed"]) == ("other", "Michael Kors", "brand_code")
+    assert mk["confidence"] == 0.3
+
+
+@pytest.mark.parametrize("desc, cat, brand", [
+    ("UA ASST BLK LEGGIN", "clothing", "Under Armour"), ("POLO SLEEP PANT PO", "clothing", "Polo Ralph Lauren"),
+    ("X KL POLO W/ UPDAT", "clothing", "Karl Lagerfeld"), ("LB PINK GINGHAM MI", "bags", "Luv Betsey"),
+    ("NAUT INFANT BLK MO", "clothing", "Nautica"), ("TB ASST CSL ACTIVE", "clothing", "Ted Baker"),
+])
+def test_new_fashion_codes(desc, cat, brand):
+    r = rd.decode_rules(desc)
+    assert (r["category"], r["brand"]) == (cat, brand)
+
+
+def test_brand_only_codes_let_the_words_decide():
+    batch = [{"key": k, "desc": k, "prices": [], "rules": rd.decode_rules(k)}
+             for k in ("JC APRICOT CRUSH C", "AK ST PAV CNTR BLU", "CK TEES ASST", "X CK BOX MONOLOGO")]
+    assert all(b["rules"]["brand"] for b in batch)
+    got = rd.ai_decode(batch, ask=_fake_ask([[
+        _a(1, "fragrance", "body_mist"), _a(2, "jewelry_watches", "earrings"), _a(3, "clothing", "tee"),
+        _a(4, "toys", "game")]], []), meta={})
+    assert got["JC APRICOT CRUSH C"]["category"] == "fragrance"     # the words said body mist: kept
+    assert got["AK ST PAV CNTR BLU"]["category"] == "jewelry_watches"
+    assert got["CK TEES ASST"]["category"] == "clothing"
+    assert got["X CK BOX MONOLOGO"]["category"] == "other"          # toys isn't allowed for a brand code
+    assert rd.decode_rules("MK VANILLA RETRO J")["category"] not in rd.NOT_FOR_BRAND_CODES
 
 
 def test_redo_fashion_drops_only_the_wrong_reused_rows(tmp_path):
