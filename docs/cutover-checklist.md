@@ -450,10 +450,11 @@ applies.
   a time.
 - 💤 Fill `stores` for the 18 store numbers (clean names, city, zip).
 - 💤 Receipt matching (`receipt_matches`): the matcher and its Telegram review.
-- 🔧 **Receipt line decoding** (`receipt_line_details`, step 5,
-  `docs/receipt-decoding.md`): the deploy creates the table. Then
-  `python scripts/decode_receipt_lines.py --target ResaleDB --production --apply --from <approved jsonl>`
-  (it backs up first), then `RECEIPT_DECODE_JOB=1` for the daily top-up.
+- ✅ **Receipt line decoding** (`receipt_line_details`, step 5,
+  `docs/receipt-decoding.md`): step 5 deployed 2026-11-09 (8ac26b1); 2,179
+  decodes saved from `logs/receipt-decode-ResaleDB-20261109-045047.jsonl`
+  (backup `D:\SQLBackups\ResaleDB-20261109-051223-before-receipt-decode.bak`);
+  the daily top-up is on by default (`RECEIPT_DECODE_JOB=0` turns it off).
   `/rcpt` works before that, with raw lines, item links and live rules.
 - 💤 Dev refresh after step 5: `refresh_dev_from_backup.py` copies every
   table, so ResaleDB_Dev must be at step 5 too (any `import db` with the dev

@@ -95,7 +95,8 @@ about 10 new descriptions: well under a cent a month.
 `--redo-category <cat>` and `--redo-fashion` (fashion-code lines that got a
 non-fashion category) decode those again.
 
-Then `RECEIPT_DECODE_JOB=1` turns on the daily top-up (`bot/jobs.py`, at
+Saved on ResaleDB 2026-11-09 (2,179 decodes). The daily top-up is on by default
+(`RECEIPT_DECODE_JOB=0` turns it off; `bot/jobs.py`, at
 `RECEIPT_DECODE_HOUR_UTC`, at most `RECEIPT_DECODE_MAX_KEYS` new descriptions
 and `RECEIPT_DECODE_MAX_USD` a run). It is silent; failures go to `/errors`.
 

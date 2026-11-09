@@ -392,9 +392,10 @@ CHECK_OWNED_SHOW = int(os.getenv("CHECK_OWNED_SHOW", "3"))
 # Receipt line decoding (pipeline/receipt_decode.py, docs/receipt-decoding.md):
 # what each Ross receipt line is, cached per description. The AI decodes the
 # lines rules can't, RECEIPT_DECODE_BATCH per call on the cheap model; one run
-# stops at RECEIPT_DECODE_MAX_USD. The daily top-up (bot/jobs.py) is off until
-# the backfill is approved and applied (RECEIPT_DECODE_JOB=1 turns it on).
-RECEIPT_DECODE_JOB = _env_bool("RECEIPT_DECODE_JOB", False)
+# stops at RECEIPT_DECODE_MAX_USD. The daily top-up (bot/jobs.py) is on: the
+# backfill was approved and saved 2026-11-09. It runs only with JOBS_ENABLED and
+# on SQL Server; RECEIPT_DECODE_JOB=0 turns it off.
+RECEIPT_DECODE_JOB = _env_bool("RECEIPT_DECODE_JOB", True)
 RECEIPT_DECODE_HOUR_UTC = int(os.getenv("RECEIPT_DECODE_HOUR_UTC", "10"))
 RECEIPT_DECODE_MODEL = os.getenv("RECEIPT_DECODE_MODEL", "")      # empty = CLAUDE_CHEAP_MODEL
 RECEIPT_DECODE_BATCH = int(os.getenv("RECEIPT_DECODE_BATCH", "50"))
