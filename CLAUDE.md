@@ -23,7 +23,25 @@ ask: "Should profit include the sales tax we pay?" Yes, obviously.
 
 ## Production: pushing to `main` goes live
 
-The live bot runs on Person B's PC, not on a laptop. Task `EbayBotDeploy` runs
+The live bot runs on Person B's PC. The dev copy is on the same PC, so a
+session in `resale-dev` is already on the production machine: read live logs
+and the live DB directly, with no SSH.
+
+| What | Where | Access |
+|---|---|---|
+| Live bot | `C:\Users\boris\Projects\ebay-list` | read-only |
+| Dev copy (work here) | `C:\Users\boris\Projects\resale-dev` | read-write |
+| Live DB | SQL Server `.\SQLEXPRESS`, database `ResaleDB` | read-only |
+| Dev DB | same server, `ResaleDB_Dev` (refresh: `scripts/refresh_dev_from_backup.py`) | read-write |
+
+`data/ross.db` is a SQLite archive since 2 Nov 2026 (the move to SQL Server).
+Don't use it for tests or as the current state. In `resale-dev` use
+`venv\Scripts\python.exe`: the plain `python` on PATH is 3.11 without pytest.
+`ResaleDB` is normalized (`items`, `ebay_listings`, `sales`, ...). Keys with no
+column of their own go in `*_raw` JSON columns (`dbmap.py`). For a read-only
+look, open pyodbc with `readonly=True` and `ApplicationIntent=ReadOnly`.
+
+Task `EbayBotDeploy` runs
 `scripts/deploy.ps1` every 5 minutes. When `origin/main` has a new commit it:
 
 1. runs the tests in a staging copy
@@ -41,8 +59,8 @@ and `prod-logs` (read live logs and DB, read-only). Both use
 
 So:
 - Push only code that passed the tests locally. A push restarts the live bot.
-- Never commit on the production PC. A dirty or diverged live copy blocks
-  deploys.
+- Never commit in the live copy (`ebay-list`). A dirty or diverged live copy
+  blocks deploys. Commit in `resale-dev` on a branch.
 - A failed commit is not retried. Push a fix, or run `deploy.ps1 -Force`.
 
 ## Hard rules
@@ -50,9 +68,11 @@ So:
 - **Never run the bot with the live token anywhere but production.** One
   token allows one poller, and a second one breaks the live bot.
 - **Secrets never go in git.** `.env` is gitignored. Never print `.env` values.
-  The eBay user token lives in `data/ross.db`.
-- **`data/` is not in git** (DB and photos). Never overwrite or delete
-  `data/ross.db`. Back up with `python backup.py` first.
+  The eBay user token lives in the live DB (`ebay_tokens` in `ResaleDB`).
+  Never read or print it.
+- **Never write to `ResaleDB`** from a dev session. Use `ResaleDB_Dev`.
+- **`data/` is not in git** (photos, and the old SQLite archive). Never
+  overwrite or delete `data/ross.db`.
 - **On the production PC:**
   - Never touch `receipt_pipeline` or its processes.
   - Never kill `python.exe` broadly.
@@ -70,9 +90,10 @@ python telegram_bot.py       # the TEST bot, with the laptop .env
 `.claude/settings.json` runs the tests before every `git commit` Claude makes
 and blocks the commit if they fail (`scripts/precommit_tests.py`).
 
-The laptop `.env` uses a separate test bot token and `JOBS_ENABLED=0` (no
-background jobs). The laptop DB has no eBay user token, so the test bot cannot
-change eBay. Use `.env.example` as the template.
+The dev `.env` uses a separate test bot token, `JOBS_ENABLED=0` (no background
+jobs), `EBAY_WRITES_ENABLED=0`, `DB_BACKEND=sqlserver` and
+`SQL_DATABASE=ResaleDB_Dev`. The dev DB has no eBay user token, so the test bot
+cannot change eBay. Use `.env.example` as the template.
 
 ## Layout
 
