@@ -34,11 +34,15 @@ Women's Bags & Handbags (72 of our listings):
 
 ## 2. Order of work
 
-1. `/revise`: PR #14. Then revise d7432192 (approved text, Type = Handbag).
-2. MPN fix.
-3. `/offers` upgrade.
-4. Free-shipping test.
-5. `/diagnose` with report ingestion.
+1. `/revise`: PR #14, merged once `OWNER_USER_IDS` is in the live `.env`. Then
+   revise d7432192 (approved text, Type = Handbag, no hangtag sentence).
+2. MPN fix: new listings in PR #16. The 53 live listings go through `/revise`
+   afterwards.
+3. `/offers` upgrade. Second offers are on hold (section 4).
+4. Free-shipping test: approved (section 5).
+5. Competitor search, then `/diagnose` with report ingestion (section 7).
+
+Done: PR #13 (shipping charged $9.99) merged 2026-11-09.
 
 The ad-rate list (section 6) is for the owner to decide on; nothing changes
 until then.
@@ -101,12 +105,32 @@ the cooldown ended today.
 | MK Apple Watch band, silver pavé (00c8d805) | 15 | 0 | $100.00 | $90.00 |
 | MK Access band, rose gold pavé (bff24df0) | 13 | 0 | $139.00 | $125.10 |
 
-A second 10% offer repeats one that didn't convert. **Owner's call:** resend at
-10%, or go to 15% where the floor allows. Also worth a look: the Kate Spade
+**Second offers: on hold (owner, 2026-11-09).** Rule: before any second offer,
+pull 90-day sold comps. If they're below our offer price, the fix is a price
+cut, not another offer.
+
+Pulled 2026-11-09 with the bot's Apify sold search (4 searches, about $0.07):
+
+| Listing | Our price (+$9.99) | Nov 2 offer | Sold, last 90 days (item price) | Verdict |
+|---|---|---|---|---|
+| Patricia Nash Ava Rose tote | $149.99 ($159.98) | $134.99 | **1 exact**, new: $86.00 (+$15.75), Oct 11. Nearest other new tooled Nash tote: $85.00. The rest are used, $18–70. | Below offer → **price cut** |
+| MK band silver pavé MKS8006 | $100.00 ($109.99) | $90.00 | **1 exact**, new: $77.99 (+$7.00), Oct 21. New MK Apple Watch bands of any model: 6 sales, $67.50–$94.99, median $78.00. | Below offer → **price cut** |
+| MK Access rose gold pavé MKS8028SET | $139.00 ($148.99) | $125.10 | **No sale** of this set in two searches. Nearest: MK Access silver "bling" band, $80.00 (new, other). | Too little evidence; what there is sits below the offer |
+
+All three point to a price cut, not an offer. The evidence is one exact sale
+for two of them and none for the third, so the size of each cut is the owner's
+call. The house rule is small cuts plus monitoring. Nothing has been changed.
+
+Also worth a look: the Kate Spade
 Apple Watch band (f5ab5777) has 15 watchers and 0 sales and has never been
 offered. eBay may not have listed it as eligible; only the live bot can tell.
 
 ## 5. Free-shipping test
+
+**Approved (owner, 2026-11-09)** as drafted: 18 vs 18, 21 days, judged by CTR,
+sales as a direction only. **The Patricia Nash Ava Rose tote (331dc4a9) is in
+neither group.** It had a sale in the last 31 days, so the 0-sales rule
+already leaves it out. The re-draw on the start day also excludes it by id.
 
 **$9.88:** `EBAY_SHIP_CHARGED` was an old (2026-08-16) measurement of what
 buyers pay for shipping. Buyers paid $9.99 on 82 of 87 orders. PR #13 sets it
@@ -188,28 +212,96 @@ with CTR from 0.07% to 0.25%. A higher rate buys more impressions, which
 aren't their problem. 117347886751 is a Seller Hub relist (155333d1), so check
 that any rate change lands on the live listing.
 
-## 7. `/diagnose` with report ingestion
+## 7. Competitor search and `/diagnose` (owner spec, 2026-11-09)
 
-**Not found:** no `/diagnose` command, no plan for it, and no competitor-search
-module exists in any branch or doc. The nearest existing piece is the weekly
-price check's verdicts (`reprice._diagnose`) and playbook §6. **The owner or
-Person A should send the plan** these were built against, so this doesn't
-guess at it.
+Built after the MPN fix. Thresholds live in `config.py`.
 
-What this report adds, whatever that plan is:
-- **Ingest:** send the xlsx to the bot. It parses every category sheet: per
-  listing (watchers, item age, sales 31d, daily impressions, CTR, conversion,
-  the recommendations) and per category (our numbers, top 10%, bottom 10%).
-  Stored with the report date. This is a new table, so it needs a
-  `migrations.py` step: **Person B's area (DB)**, to agree with them.
-- **Benchmarks:** compare each listing with its category's top and bottom 10%
-  from the same report, not just our store average. Use the report's CTR
-  against the report's benchmarks only. Its definition may differ from the
-  Analytics API CTR the bot computes.
-- **Verdicts:**
-  - `WATCHERS, NO SALES` → send an offer (through `/offers`).
-  - `CATEGORY FIX` → what eBay recommends for that category (free shipping,
-    ad rate, specifics), linked to the action that applies it.
+### 7.1 Shared module: competitor search
+
+Used by `/check`, new listings and `/diagnose`.
+
+- **Match:** UPC first, then MPN, then brand + title keywords. Each result
+  records which method matched.
+- **Active listings** (Browse API): price, shipping, total, title, category,
+  item specifics, photo count, returns, Best Offer. Browse *search* results
+  carry price, shipping, title, category and buying options (Best Offer). They
+  don't carry specifics, photo count or return terms; those need one
+  `getItem` call per listing. So only the best matches get the extra call
+  (`COMPETITOR_DETAIL_MAX`, e.g. 10). `/diagnose all` on 123 listings is then
+  about 1,300 calls, inside Browse's 5,000 a day.
+- **Sold listings** (Apify; not Marketplace Insights): sold price, date, title.
+- **Cache:** a DB table with a timestamp; no re-search within 24 hours.
+  - New table, so a `migrations.py` step on both backends: **Person B's area.**
+  - It overlaps with Person B's planned `check_evidence` table for `/check`
+    (`docs/check-command-design.md` §0000). Agree on **one** table with
+    Person B before building.
+- **Apify budget:** on 2026-11-09 the primary account was at $0.00 and the
+  backup at about $0.73. A sold search costs about $0.02. So: the 24-hour
+  cache, a daily spend cap in config, and `/diagnose all` searches sold
+  listings only for listings whose verdict needs them (PRICE, WATCHERS).
+
+### 7.2 Verdicts
+
+One primary verdict per listing. Each comes with a one-line reason and one
+concrete fix.
+
+| Verdict | When | Fix |
+|---|---|---|
+| NOT ENOUGH DATA | expected views < 3 | Wait; check again later. Says when. |
+| WATCHERS, NO SALES, OFFER ALREADY SENT | watchers, offer sent, no sale | Price is above the market: suggest a price from sold comps. |
+| WATCHERS, NO SALES | watchers, no offer yet, no sale | Send an offer (`/offers`), but only if sold comps are at or above the offer price. Otherwise this becomes PRICE. |
+| PRICE | views or watchers, no sales | Compare with sold comps; suggest a price. |
+| SEARCH CARD | CTR below the category benchmark | Total price vs competitors; flag the thumbnail. |
+| VISIBILITY | impressions below the category benchmark | What competitors have that we lack (specifics, photos, returns, free shipping). |
+| CATEGORY FIX | eBay's report recommendation for the category | Apply it (free shipping, ad rate, specifics). |
+
+Decisions this spec leaves open, decided here (change in config if wrong):
+
+- **Order when several verdicts apply:** top to bottom as in the table. Data
+  first, then the money signals closest to a sale, then clicks, then
+  impressions. CATEGORY FIX comes last because it's account-wide; it's shown
+  as a second line when another verdict is primary.
+- **Expected views** = the listing's impressions in the window × the
+  category's CTR for our store (from the report; 0.38% for bags). Below
+  `DIAGNOSE_MIN_EXPECTED_VIEWS` (3), click-through can't be judged yet.
+- **Too few sold comps:** fewer than 3 in 90 days means PRICE can't suggest a
+  number. It says so and shows what there is, as with MKS8028SET above.
+- **Benchmarks:** the report's top and bottom 10% for the listing's category.
+  For a category the report doesn't cover, fall back to our store average,
+  labelled as such. Compare the report's CTR only with the report's
+  benchmarks; its definition may differ from the Analytics API CTR.
+
+### 7.3 `/diagnose`
+
+- Owner-only, read-only.
+- `/diagnose <listing>`, or `/diagnose all`: ranked worst first, by verdict
+  order, then by impressions (the most exposure wasted).
+- Fixes go through `/revise` (and `/offers`); `/diagnose` changes nothing.
+
+### 7.4 Report ingestion
+
+- Send the eBay listing quality report (xlsx) to the bot. It parses every
+  category sheet: per listing (watchers, item age, sales 31d, daily
+  impressions, CTR, conversion, recommendations) and per category (ours, top
+  10%, bottom 10%). Stored with the report date.
+- Another new table: **Person B's area**, together with 7.1.
+
+### 7.5 New listings
+
+- Run competitor search before the draft. Give Gemini the competitors'
+  keywords, category and specifics.
+- **Never copy competitor titles or descriptions verbatim**, enforced in code
+  as well as the prompt. The draft is refused and redone if its title matches
+  a competitor's, or if its description repeats a run of 8+ words from one.
+- Show our price against sold comps in the confirmation.
+
+### 7.6 First test listings
+
+| Listing | Expected |
+|---|---|
+| 202eb699 Pro Standard Liga MX Club América hoodie (listed Nov 5) | NOT ENOUGH DATA: too new |
+| d7432192 Ed Hardy shoulder bag (after its `/revise`) | to see |
+| 00c8d805 MK band silver pavé MKS8006 | WATCHERS, NO SALES, OFFER ALREADY SENT, with sold comps around $78 |
 
 ## 8. Can't verify from this dev session
 
@@ -232,9 +324,13 @@ unchecked:
   policy. It's requested, and policy reads work (`/health`), but a create
   hasn't been tried.
 
+- Our app's Browse API daily quota. 7.1 assumes eBay's default of 5,000 calls
+  a day; check it on the eBay developer account before `/diagnose all` runs.
+
 ## 9. Open items
 
 - The owner's listing quality list (to be pasted), for the quality standard
   for new listings, minus the UPC check.
-- The `/diagnose` and competitor-search plan (section 7).
-- Second offer to the first targets: 10% again or 15% (section 4).
+- Price cuts for the three offer targets (section 4): the owner sets them.
+- With Person B: one comps cache table vs `check_evidence`, and the report
+  table (sections 7.1, 7.4).
