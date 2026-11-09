@@ -135,6 +135,56 @@ def test_ai_answers_are_normalised():
     assert '| $4.99–$9.99 |' in calls[0]["prompt"]                 # the misread $4998 is left out of the hint
 
 
+@pytest.mark.parametrize("desc, cat, typ, brand, tier", [
+    ("Prezzo sage coated", "bags", "duffel", "Prezzo", "high"),      # sample #28: a sage duffel, no AI
+    ("SM BGIGI CHOCOLATE", "bags", None, "Steve Madden", "low"),     # a colour, not candy
+    ("TR TAN METAL PLAQU", "clothing", None, "True Religion", "low"),
+    ("DKNY MARSHMALLOW R", "bags", None, "DKNY", "low"),
+    ("BJ2 PNK HEART", "bags", None, "Betsey Johnson", "low"),
+    ("VB QLT BKPK", "bags", "backpack", "Vera Bradley", "high"),       # a sure rule still wins
+])
+def test_fashion_codes_are_never_food_or_beauty(desc, cat, typ, brand, tier):
+    r = rd.decode_rules(desc)
+    assert (r["category"], r["item_type"], r["brand"]) == (cat, typ, brand)
+    assert r["tier"] == tier or (tier == "high" and r["tier"] in ("high", "medium"))
+    if desc.startswith("Prezzo"):
+        assert r["color"] == "green"
+
+
+@pytest.mark.parametrize("desc, cat", [
+    ("EH TRAVEL MANI SET", "beauty"), ("EH 150 CT FLOSS P1", "beauty"), ("DKNY BE DELICIOUS", "fragrance"),
+])
+def test_licensed_beauty_with_a_sure_rule_stays(desc, cat):
+    r = rd.decode_rules(desc)
+    assert r["category"] == cat and r["tier"] == "high"
+
+
+def test_the_ai_cannot_put_a_fashion_code_in_food():
+    batch = [{"key": k, "desc": k, "prices": [], "rules": rd.decode_rules(k)}
+             for k in ("SM BGIGI CHOCOLATE", "EH PNK SKULL TOTE", "TR EDT SPRAY 3.4", "MK VANILLA RETRO J")]
+    got = rd.ai_decode(batch, ask=_fake_ask([[
+        _a(1, "food", "candy", color="brown", conf=0.9), _a(2, "bags", "tote"),
+        _a(3, "fragrance", "fragrance"), _a(4, "food", "snack")]], []), meta={})
+    sm = got["SM BGIGI CHOCOLATE"]
+    assert (sm["category"], sm["item_type"], sm["brand_guess"]) == ("bags", None, "Steve Madden")
+    assert sm["confidence"] == 0.5 and sm["decode_raw"]["fixed"] == "fashion_code"
+    assert got["EH PNK SKULL TOTE"]["category"] == "bags"
+    assert got["TR EDT SPRAY 3.4"]["category"] == "fragrance"       # the line says it's a fragrance
+    assert got["MK VANILLA RETRO J"]["category"] == "food"          # MK isn't one of the confirmed codes
+
+
+def test_redo_fashion_drops_only_the_wrong_reused_rows(tmp_path):
+    import json
+    from scripts import decode_receipt_lines as script
+    path = tmp_path / "run.jsonl"
+    rows = {"SM BGIGI CHOCOLATE": "food", "SM BLK SATCHEL": "bags", "CHOC TRUFFLE 7OZ": "food"}
+    lines = [json.dumps({"run": "x"})] + [json.dumps({"desc_key": k, "row": {"category": c}})
+                                          for k, c in rows.items()]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert set(script.load_reuse(str(path), set(), True)) == {"SM BLK SATCHEL", "CHOC TRUFFLE 7OZ"}
+    assert set(script.load_reuse(str(path), set())) == set(rows)
+
+
 def test_ai_batches_retry_missing_lines_once_and_stop_at_the_cap(monkeypatch):
     monkeypatch.setattr(config, "RECEIPT_DECODE_BATCH", 2)
     pending = [{"key": k, "desc": k, "prices": []} for k in "ABCDE"]

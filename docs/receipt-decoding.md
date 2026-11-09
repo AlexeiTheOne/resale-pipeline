@@ -25,7 +25,7 @@ does (the dry run checks they agree). Blank descriptions get no row.
 | brand_guess, product_model | the product's brand and model/style, when known |
 | confidence | 0–1; `/rcpt` adds "?" below 0.6 |
 | source | `matched_item`, `rules` or `ai` |
-| model | the decoder: `rules-v1` or the Claude model that answered |
+| model | the decoder: `rules-v2` or the Claude model that answered |
 | item_id | the item, for `matched_item` rows only |
 | decode_raw | the decoder's whole answer; `prev` holds an AI decode an item replaced |
 
@@ -46,6 +46,18 @@ does (the dry run checks they agree). Blank descriptions get no row.
    it skips are retried once. Two lines merged into one text are capped at
    confidence 0.5. When the AI names no brand but a brand code matched, the
    code's brand is kept. About 1,840 descriptions.
+
+**Fashion codes** (`FASHION_CODES`, confirmed by Person B 2026-11-08): a line
+whose first word is SM (Steve Madden), VB (Vera Bradley), EH (Ed Hardy), TR
+(True Religion), BJ (Betsey Johnson), DKNY or Prezzo is always clothing,
+shoes, bags, accessories or jewelry. The rules give it the brand's fallback
+(bags; TR clothing) and a guard after the AI replaces a food, home or beauty
+answer with it (confidence 0.5, `decode_raw.fixed = "fashion_code"`). Prezzo
+is a sure rule: bags, duffel, no AI. Two exceptions, because licensed beauty
+is real: a sure beauty/fragrance rule stays (EH MANI SET, EH 150 CT FLOSS,
+DKNY BE DELICIOUS), and a fragrance answer stays when the line says EDT, EDP,
+cologne, spray and so on. Before this, the AI read "SM BGIGI CHOCOLATE" (a
+chocolate-brown bag) as candy.
 
 Every run works the item and rules rows out again (free). An item row that
 stops qualifying (a new line with another SKU) goes back to the AI; an AI row
@@ -78,6 +90,10 @@ about 10 new descriptions: well under a cent a month.
 3. After the sample is approved: `... --apply --from <jsonl>`. Needs step 5
    on the target (the deploy runs it), backs the target up, writes only
    `receipt_line_details`.
+
+`--reuse <jsonl>` keeps an earlier run's AI rows (not paid again);
+`--redo-category <cat>` and `--redo-fashion` (fashion-code lines that got a
+non-fashion category) decode those again.
 
 Then `RECEIPT_DECODE_JOB=1` turns on the daily top-up (`bot/jobs.py`, at
 `RECEIPT_DECODE_HOUR_UTC`, at most `RECEIPT_DECODE_MAX_KEYS` new descriptions

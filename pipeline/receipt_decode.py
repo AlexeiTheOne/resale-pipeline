@@ -21,7 +21,7 @@ from collections import Counter
 
 import config
 
-RULES_VERSION = "rules-v1"
+RULES_VERSION = "rules-v2"
 AI_STAGE = "receipt_decode"
 
 # --- vocabularies (closed lists; normalised in code, so no migration to change) ---
@@ -170,11 +170,49 @@ _BRANDS = [  # (regex on the normalised text, brand)
     (r"FISHER[- ]PRICE", "Fisher-Price"), (r"ENERGIZER", "Energizer"), (r"ACDEL|ADELCO", "ACDelco"),
     (r"WORKPRO", "WorkPro"), (r"AIWA", "Aiwa"), (r"VIVITAR", "Vivitar"), (r"WILSON", "Wilson"),
     (r"DOVE", "Dove"), (r"CREMO", "Cremo"), (r"OLD SPICE", "Old Spice"), (r"BODY GLOVE", "Body Glove"),
-    (r"VOX POPULI", "Vox Populi"), (r"FUBU", "FUBU"), (r"PRPS", "PRPS"),
+    (r"VOX POPULI", "Vox Populi"), (r"FUBU", "FUBU"), (r"PRPS", "PRPS"), (r"PREZZO", "Prezzo"),
 ]
 _BRANDS = [(re.compile(rx), b) for rx, b in _BRANDS]
 BAG_BRANDS = {"Ed Hardy", "Vera Bradley", "Luv Betsey", "Betsey Johnson", "Nanette Lepore", "Patricia Nash",
-              "Kipling", "Samsonite", "Tumi", "JanSport", "Steve Madden"}
+              "Kipling", "Samsonite", "Tumi", "JanSport", "Steve Madden", "DKNY", "Prezzo"}
+# Fashion brand codes (confirmed by Person B, 2026-11-08). A line that starts with one is always
+# clothing, shoes, bags, accessories or jewelry (or a fragrance when the line says so), never food
+# or beauty: the AI once read "SM BGIGI CHOCOLATE" (a Steve Madden bag) as candy.
+# first word -> (brand, fallback category, fallback type, sure); sure = a rule, no AI needed.
+FASHION_CODES = {
+    "SM": ("Steve Madden", "bags", None, False), "VB": ("Vera Bradley", "bags", None, False),
+    "EH": ("Ed Hardy", "bags", None, False), "TR": ("True Religion", "clothing", None, False),
+    "BJ": ("Betsey Johnson", "bags", None, False), "DKNY": ("DKNY", "bags", None, False),
+    "PREZZO": ("Prezzo", "bags", "duffel", True),
+}
+_FRAGRANCE_WORDS = re.compile(r"\b(EDT|EDP|EDC|COLOGNE|PERFUME|PARFUM|SPRAY|BODY MIST|FRAG\w*)\b")
+
+
+def fashion_code(u: str) -> tuple | None:
+    """FASHION_CODES entry for a normalised line's first word (BJ2 counts as BJ)."""
+    m = re.match(r"([A-Z]+)\d?\b", u)
+    return FASHION_CODES.get(m.group(1)) if m else None
+
+
+def fashion_ok(row: dict, desc: str) -> bool:
+    """A row's category is allowed for a fashion-code line."""
+    return row.get("category") in WEARABLE or (
+        row.get("category") == "fragrance" and bool(_FRAGRANCE_WORDS.search(normalise(desc)[0])))
+
+
+def fashion_guard(row: dict, rules: dict | None, desc: str) -> dict:
+    """Keep an AI row for a fashion-code line in a wearable category. Changes `row` in place."""
+    fc = (rules or {}).get("fashion")
+    if not fc:
+        return row
+    brand, cat, typ, _sure = fc
+    if not row.get("brand_guess"):
+        row["brand_guess"] = brand
+    if not fashion_ok(row, desc):
+        row.update(category=cat, item_type=typ, color=(rules or {}).get("color"),
+                   confidence=min(row.get("confidence") or 0.5, 0.5))
+        row["decode_raw"] = {**(row.get("decode_raw") or {}), "fixed": "fashion_code"}
+    return row
 # How the register abbreviates a brand: /rcpt finds "ed hardy" as "EH ...".
 BRAND_CODES = {
     "ed hardy": ("EH",), "true religion": ("TR",), "vera bradley": ("VB",), "luv betsey": ("LB", "LUV"),
@@ -448,6 +486,16 @@ def decode_rules(desc: str) -> dict:
     if hit and hit[0] == "clothing" and hit[1] == "jeans" and brand in BAG_BRANDS and \
             not re.search(r"JEANS?|SHORTS?|WASH|WSH", u):
         hit = ("bags", None, "low")
+    fc = fashion_code(u)
+    if fc:
+        out["brand"], out["fashion"] = fc[0], list(fc)
+        if fc[3]:
+            hit = (fc[1], hit[1] if hit and hit[0] == fc[1] and hit[1] else fc[2], "high")
+        # licensed beauty is real (EH MANI SET, EH 150 CT FLOSS, DKNY BE DELICIOUS): a sure beauty or
+        # fragrance rule stays; food, home and anything unsure becomes the brand's fashion category
+        elif not hit or (hit[0] not in WEARABLE and not (hit[0] in ("beauty", "fragrance") and hit[2] == "high")
+                         and not (hit[0] == "fragrance" and _FRAGRANCE_WORDS.search(u))):
+            hit = (fc[1], fc[2], "low")
     if hit:
         out["category"], out["item_type"], out["tier"] = hit
     if out["category"] not in WEARABLE:
@@ -515,7 +563,8 @@ belt), VB = Vera Bradley (QLT = quilted), LB/LUV = Luv Betsey, BJ = Betsey Johns
 (MK 40MM = watch), CK/CKJ = Calvin Klein, KL = Karl Lagerfeld, UA = Under Armour, ADI = adidas,
 RL/POLO = Polo Ralph Lauren, TH/TOMMY = Tommy Hilfiger (TOMMY-<NAME> II = bag), NAUT = Nautica,
 KS = Kate Spade, SM = Steve Madden, TB = Ted Baker, JC = Juicy Couture, TNF = The North Face,
-HW = Hot Wheels. OCR often reads EH as cH, CH or ER. FLP = flap pocket, SN = straight, AOP = all-over print, SS/LS = short/long sleeve,
+HW = Hot Wheels, Prezzo = bags (duffels). A line starting SM, VB, EH, TR, BJ, DKNY or Prezzo is always
+clothing, shoes, bags, accessories or jewelry: "SM BGIGI CHOCOLATE" is a chocolate-brown bag, not candy. OCR often reads EH as cH, CH or ER. FLP = flap pocket, SN = straight, AOP = all-over print, SS/LS = short/long sleeve,
 (GS) = grade school (kids), WMNS = women's.
 Colours: BLK black, WHT white, GRY grey, NVY navy, PNK pink, BRN brown, OLV olive (green), SIL silver.
 
@@ -625,6 +674,7 @@ def ai_decode(batch: list[dict], ask=None, meta: dict | None = None) -> dict:
             # the brand codes are reliable (EH, TR, VB...): keep the rules' brand when the AI gave none
             if not row["brand_guess"] and (b.get("rules") or {}).get("brand"):
                 row["brand_guess"] = b["rules"]["brand"]
+            fashion_guard(row, b.get("rules"), b["desc"])
             found[b["key"]] = row
     return found
 
