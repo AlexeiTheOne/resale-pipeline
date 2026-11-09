@@ -232,9 +232,9 @@ Used by `/check`, new listings and `/diagnose`.
 - **Sold listings** (Apify; not Marketplace Insights): sold price, date, title.
 - **Cache:** a DB table with a timestamp; no re-search within 24 hours.
   - New table, so a `migrations.py` step on both backends: **Person B's area.**
-  - It overlaps with Person B's planned `check_evidence` table for `/check`
-    (`docs/check-command-design.md` §0000). Agree on **one** table with
-    Person B before building.
+  - **Agreed with Person B (2026-11-09): the comps cache shares the
+    `check_evidence` table** planned for `/check`
+    (`docs/check-command-design.md` §0000), rather than a second table.
 - **Apify budget:** on 2026-11-09 the primary account was at $0.00 and the
   backup at about $0.73. A sold search costs about $0.02. So: the 24-hour
   cache, a daily spend cap in config, and `/diagnose all` searches sold
@@ -284,7 +284,7 @@ Decisions this spec leaves open, decided here (change in config if wrong):
   category sheet: per listing (watchers, item age, sales 31d, daily
   impressions, CTR, conversion, recommendations) and per category (ours, top
   10%, bottom 10%). Stored with the report date.
-- Another new table: **Person B's area**, together with 7.1.
+- A new table for the reports: **approved by Person B (2026-11-09).**
 
 ### 7.5 New listings
 
@@ -332,5 +332,5 @@ unchecked:
 - The owner's listing quality list (to be pasted), for the quality standard
   for new listings, minus the UPC check.
 - Price cuts for the three offer targets (section 4): the owner sets them.
-- With Person B: one comps cache table vs `check_evidence`, and the report
-  table (sections 7.1, 7.4).
+- Listing quality standard for new listings: plan shown to the owner
+  2026-11-09, waiting for approval.
