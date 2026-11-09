@@ -303,7 +303,10 @@ EBAY_AD_FEE_PCT = float(os.getenv("EBAY_AD_FEE_PCT", "0.046"))
 # ad spend as account-level charges with no order id; the old account's 2025
 # export puts it at 3.77% of item sales against the 5.0% configured, which if it
 # holds here means the floor is still a little conservative.)
-EBAY_SHIP_CHARGED = float(os.getenv("EBAY_SHIP_CHARGED", "9.88"))
+# EBAY_SHIP_CHARGED re-measured 2026-11-09: buyers paid exactly $9.99 on 82 of
+# 87 orders (per unit: median $9.99, mean $9.97), the shared shipping policy's
+# flat rate. $9.88 was the 2026-08-16 figure from a smaller sample.
+EBAY_SHIP_CHARGED = float(os.getenv("EBAY_SHIP_CHARGED", "9.99"))
 EBAY_SHIP_COST = float(os.getenv("EBAY_SHIP_COST", "7.20"))
 # What to assume an item cost at Ross when no receipt was captured. Items with no
 # receipt used to be costed at ZERO, which reported their entire sale price as

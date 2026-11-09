@@ -113,7 +113,7 @@ active search links.
 | Old feature | Today (`main`) |
 |---|---|
 | Sold comps from Apify | ✅ Same actor, 15 rows × up to 3 queries (brand + style code, `search_query`, brand + product), cached, backup-token failover (`pipeline/comps.py`, `pricing_v2.sold_queries`). |
-| Active comps from Browse, total price, buyer zip | ✅ `ebay/browse.search_active`, plus a **GTIN (UPC) search** and an **image search**, which the old tool lacked. Unknown shipping is imputed at $9.88 and flagged. |
+| Active comps from Browse, total price, buyer zip | ✅ `ebay/browse.search_active`, plus a **GTIN (UPC) search** and an **image search**, which the old tool lacked. Unknown shipping is imputed at `EBAY_SHIP_CHARGED` ($9.99) and flagged. |
 | "Is this the same item?" | ✅ Better: an **LLM judge** (`pricing_v2.judge`, Sonnet at low effort, escalating to Opus when unsure). It sees titles, thumbnails and our photo, and returns same_item / variant / wrong / bundle. The formula counts only same_item comps. |
 | Evidence tiers, dispersion | ✅ `price_from_judged`: solid ≥ 5, thin ≥ 3; dispersion p90/p10 against 4.0. |
 | Own listings left out of comps | ✅ `is_own` (the old tool didn't do this). |

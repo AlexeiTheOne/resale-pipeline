@@ -248,8 +248,8 @@ up in `checks.ross_sku`:
 
 ## 000. Pricing: the evidence ladder (Person B, 2026-11-02). This replaces the price choice in §3 and §0.
 
-Every level is an **item price**: eBay totals minus the $9.88 shipping we
-charge.
+Every level is an **item price**: eBay totals minus the shipping we charge
+(`EBAY_SHIP_CHARGED`, $9.99).
 
 | Level | Evidence | Rule |
 |---|---|---|
@@ -751,7 +751,7 @@ the intake pipeline, so the bot keeps answering.
 | `identify.identify_item` | ✅ | Photo path only. Same as intake: tag detect + vision + research + format (Gemini). |
 | `ross_tag.decode_barcode` / `parse_barcode` | ✅ | The Ross tag barcode = 12-digit Ross code + price in cents. Free, local. |
 | `stages.same_item_keys` / duplicate logic | ✅ | "You already have this" warning. |
-| `profit.py` fee settings | ✅ | `EBAY_FVF_PCT` 0.155, `EBAY_AD_FEE_PCT` 0.046, `EBAY_FIXED_FEE` 0.40, `EBAY_SHIP_CHARGED` 9.88, `EBAY_SHIP_COST` 7.20, `SALES_TAX_RATE` 0.07 (all in `config.py`). |
+| `profit.py` fee settings | ✅ | `EBAY_FVF_PCT` 0.155, `EBAY_AD_FEE_PCT` 0.046, `EBAY_FIXED_FEE` 0.40, `EBAY_SHIP_CHARGED` 9.99, `EBAY_SHIP_COST` 7.20, `SALES_TAX_RATE` 0.07 (all in `config.py`). |
 | **`build_identification(text)`** | 🆕 | Text → identification dict, **no LLM by default**: `search_query` = cleaned text (filler words dropped, as `legacy/comps.py clean_query`), `model` = style code found in the text (`auto_required_tokens` rule: ≥ 3 digits and a letter, not a unit like `128gb`), `upc` = a 12–13 digit number, `brand` = first word if it matches a brand seen in our items, `size` from the text. Open question Q2 for an optional LLM step. |
 | **`profit.check_economics(...)`** | 🆕 pure | §4. Today's `profit.breakeven_price` / `project` need a stored item with a receipt, so a small standalone function with the same settings. |
 | **`verdict(...)`** | 🆕 pure | §5. |
@@ -778,7 +778,7 @@ v2 terms: the judge decides what is identical, not keyword rules.
 
 ```
 P   = suggested item price (default mode) or formula price (exact)
-S   = shipping we charge                      EBAY_SHIP_CHARGED   9.88
+S   = shipping we charge                      EBAY_SHIP_CHARGED   9.99
 T   = P + S                                   (what the buyer pays)
 a   = the listing's ad rate                   EBAY_DEFAULT_AD_RATE_PCT  4%
 fees= T × (EBAY_FVF_PCT + a) + EBAY_FIXED_FEE = T × (0.155 + 0.04) + 0.40   (2026-11-07)
