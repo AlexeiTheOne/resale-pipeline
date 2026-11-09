@@ -19,6 +19,17 @@ def differs(a, b) -> bool:
     return a != b
 
 
+def full_refunds(sales: list[dict] | None) -> list[dict]:
+    """The per-order records whose refund covers everything the buyer paid
+    (item + shipping): a return or a cancellation after payment."""
+    out = []
+    for r in sales or []:
+        paid = (r.get("sale") or 0) + (r.get("shipping") or 0)
+        if r.get("order_id") and paid > 0 and (r.get("refund") or 0) >= paid - 0.01:
+            out.append(r)
+    return out
+
+
 def sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
     """Pull one item's live eBay state (price, quantity, listing status) and write
     any changes into the local DB. Runs in a worker thread (blocking eBay call).
@@ -175,8 +186,24 @@ def sync_one(item: dict, sold_map: dict | None = None) -> dict | None:
     # user to record a sale sends them to invent one that never happened.
     likely_sold = ended and sold_qty > 0
     ended_unsold = ended and sold_qty == 0
+
+    # An order refunded in full leaves the item 'sold' with $0 kept, and only a
+    # person knows whether it came back. Ask once per order (refund_asked holds
+    # the orders already asked about), and only while the item is 'sold': a
+    # returned item that was relisted is 'published' again and needs nothing.
+    refunded = []
+    if item["status"] == "sold" or auto_sold:
+        asked = set(ebay.get("refund_asked") or [])
+        refunded = [r for r in full_refunds(ebay.get("sales")) if r["order_id"] not in asked]
+        if refunded:
+            ebay["refund_asked"] = sorted(asked | {r["order_id"] for r in refunded})
+            db.update_field(item_id, "ebay", ebay)
+            changes.append("refunded in full: " + ", ".join(
+                f"order {r['order_id']} ${round((r.get('refund') or 0), 2)}" for r in refunded))
     return {"item_id": item_id, "changes": changes, "auto_sold": auto_sold,
             "new_sale": new_sale,
+            "full_refunds": [{"order_id": r["order_id"], "refund": round(r.get("refund") or 0, 2)}
+                             for r in refunded],
             "likely_sold": likely_sold, "ended_unsold": ended_unsold,
             "listing_status": listing_status}
 
@@ -267,6 +294,7 @@ async def run_sync_locked(days: int, on_progress=None,
 
     updated, auto_sold, sold_flags, errors, ended_flags = [], [], [], [], []
     new_sales = []   # (item, new_sale) — for the scheduled brief
+    refund_flags = []  # (item, [{"order_id", "refund"}]) — refunded in full, returned?
     for item in items:
         try:
             result = await asyncio.to_thread(sync_one, item, sold_map)
@@ -285,6 +313,8 @@ async def run_sync_locked(days: int, on_progress=None,
             sold_flags.append(result["item_id"])
         if result.get("ended_unsold"):
             ended_flags.append(result["item_id"])
+        if result.get("full_refunds"):
+            refund_flags.append((item, result["full_refunds"]))
 
     # Reconcile against every listing actually live on eBay, not just the ones we
     # already know about. Listings made by hand in Seller Hub never touch the
@@ -294,6 +324,7 @@ async def run_sync_locked(days: int, on_progress=None,
     # reading traffic for the wrong thing).
     adopted, relinked, live_mismatch, discover_err = [], [], [], None
     relisted_live = []   # were 'sold' locally but still have stock live on eBay
+    back_live: set[str] = set()   # their item ids
     live_item_ids: set[str] = set()
     try:
         live = await asyncio.to_thread(listings.get_active_listings)
@@ -363,6 +394,7 @@ async def run_sync_locked(days: int, on_progress=None,
                 if item["status"] != "published":
                     if item["status"] == "sold" and row["quantity"] > 0:
                         db.update_status(item["item_id"], "published")
+                        back_live.add(item["item_id"])
                         relisted_live.append(
                             f"{item['item_id'][:8]} — {row['sold_quantity']} sold, "
                             f"{row['quantity']} still live at ${row['price']} → back to 'published'")
@@ -417,6 +449,13 @@ async def run_sync_locked(days: int, on_progress=None,
         lines += ["", "🛒 Likely sold (ended/out of stock, no order matched) — record with "
                   "/sold <id> <price>:"]
         lines += [f"  {sid[:8]}" for sid in sold_flags]
+    # live on eBay again (relisted): it came back and is on sale, nothing to ask
+    refund_flags = [(i, r) for i, r in refund_flags
+                    if i["item_id"] not in live_item_ids and i["item_id"] not in back_live]
+    if refund_flags:
+        lines += ["", f"↩️ Refunded in full ({len(refund_flags)}): returned? If it came back, relist it "
+                  "(Seller Hub relist; the next /sync puts it back to published). If not, nothing to do:"]
+        lines += [f"  {_refund_line(i, r)}" for i, r in refund_flags]
     if sold_map_err:
         lines += ["", f"⚠️ Couldn't read eBay orders ({sold_map_err})",
                   "   → if this is a scope/403 error, re-run `python -m ebay.auth` to grant "
@@ -436,6 +475,9 @@ async def run_sync_locked(days: int, on_progress=None,
     if sold_flags:
         todo.append(f"🛒 {len(sold_flags)} look sold but no order matched — /sold <id> <price>: "
                     + ", ".join(sid[:8] for sid in sold_flags))
+    for i, r in refund_flags:
+        todo.append(f"↩️ Refunded in full: returned? {_refund_line(i, r)}. If it came back, relist it; "
+                    "if not, nothing to do.")
     if live_mismatch:
         todo.append(f"❓ {len(live_mismatch)} live on eBay but not 'published' here — see /sync")
     if adopted:
@@ -445,3 +487,9 @@ async def run_sync_locked(days: int, on_progress=None,
     if todo:
         brief += ([""] if brief else []) + todo
     return lines, brief
+
+
+def _refund_line(item: dict, refunds: list[dict]) -> str:
+    title = ((item.get("listing") or {}).get("title") or "(untitled)")[:45]
+    orders_txt = ", ".join(f"${r['refund']} on order {r['order_id']}" for r in refunds)
+    return f"{item['item_id'][:8]} {title}: {orders_txt}"
