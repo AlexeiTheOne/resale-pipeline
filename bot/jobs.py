@@ -50,6 +50,7 @@ _JOB_REPRICE = "weekly_reprice"
 _JOB_SYNC = "daily_sync"
 _JOB_FEEDBACK = "daily_feedback"
 _JOB_RECEIPT_DECODE = "daily_receipt_decode"
+_JOB_IMPRESSIONS = "daily_impression_check"
 
 
 def _previous_slot(now: datetime, hour_utc: int, weekday: int | None = None) -> datetime:
@@ -291,6 +292,70 @@ async def _run_receipt_decode_job(app: Application) -> None:
         return
     db.record_job_run(_JOB_RECEIPT_DECODE, detail=f"{summary['saved']} saved, {summary['ai']} by AI, "
                                                   f"${summary['ai_cost_usd']:.4f}")
+
+
+def impression_traffic(items: list[dict], batch: int = 20) -> dict[str, dict]:
+    """Traffic over the listings' whole life (QUALITY_IMPRESSION_CHECK_MAX_DAYS)
+    for the 3-day check, in batches like the weekly check. eBay leaves out
+    listings with no traffic, so one missing from a batch that succeeded is a
+    real zero; a failed batch's listings stay unknown and are tried tomorrow."""
+    from ebay import analytics
+    ids = [str((i.get("ebay") or {}).get("listing_id")) for i in items]
+    out: dict[str, dict] = {}
+    for start in range(0, len(ids), batch):
+        chunk = ids[start:start + batch]
+        try:
+            got = analytics.get_traffic_report(chunk, config.QUALITY_IMPRESSION_CHECK_MAX_DAYS)
+        except Exception as e:
+            util._record_error("impression check (traffic)", e)
+            print(f"impression check: traffic batch failed ({type(e).__name__}); "
+                  f"{len(chunk)} listing(s) left for tomorrow")
+            continue
+        for lid in chunk:
+            out[lid] = got.get(lid) or {"impressions": 0}
+    return out
+
+
+async def _run_impression_check(app: Application) -> None:
+    """New listings with zero impressions after QUALITY_IMPRESSION_CHECK_DAYS:
+    alert the owners (the allowlist if no owner is set). Each listing is
+    checked once; the result is stored as ebay.impressions_check."""
+    from pipeline import quality
+    try:
+        due = quality.due_for_impression_check(await asyncio.to_thread(db.list_items))
+        traffic = await asyncio.to_thread(impression_traffic, due) if due else {}
+    except Exception as e:
+        traceback.print_exc()
+        util._record_error("impression check", e)
+        return
+    lines, results = quality.zero_impression_alerts(due, traffic)
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for item_id, result in results.items():
+        fresh = db.get_item(item_id)   # re-read: /sync may have written since
+        if fresh is None:
+            continue
+        ebay = dict(fresh.get("ebay") or {})
+        ebay["impressions_check"] = {**result, "checked_at": stamp}
+        db.update_field(item_id, "ebay", ebay)
+    if lines:
+        for uid in (config.OWNER_USER_IDS or util.ALLOWED_USER_IDS):
+            try:
+                await util._send_chunked_to(app.bot, uid, lines)
+            except Exception as e:
+                print(f"WARNING: impression alert to {uid} failed: {type(e).__name__}: {e}")
+    zero = sum(1 for r in results.values() if not r["impressions"])
+    db.record_job_run(_JOB_IMPRESSIONS, detail=f"{len(due)} due, {len(results)} checked, {zero} at zero")
+
+
+async def _daily_impression_check_loop(app: Application) -> None:
+    """Once a day (QUALITY_IMPRESSION_HOUR_UTC), catching up at startup."""
+    if _missed_slot(_JOB_IMPRESSIONS, datetime.now(timezone.utc), config.QUALITY_IMPRESSION_HOUR_UTC):
+        await _run_impression_check(app)
+    while True:
+        now = datetime.now(timezone.utc)
+        target = _next_slot(now, config.QUALITY_IMPRESSION_HOUR_UTC)
+        await asyncio.sleep((target - now).total_seconds())
+        await _run_impression_check(app)
 
 
 async def _daily_receipt_decode_loop(app: Application) -> None:

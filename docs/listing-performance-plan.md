@@ -329,8 +329,27 @@ unchecked:
 
 ## 9. Open items
 
-- The owner's listing quality list (to be pasted), for the quality standard
-  for new listings, minus the UPC check.
-- Price cuts for the three offer targets (section 4): the owner sets them.
-- Listing quality standard for new listings: plan shown to the owner
-  2026-11-09, waiting for approval.
+- Price cuts for the three offer targets (section 4): the owner decides,
+  from the profit tables shown 2026-11-09.
+- The buyer-words / style-code title rule (section 10) ships with the
+  competitor search.
+
+## 10. Listing quality standard for new listings (owner, 2026-11-09)
+
+Code checks (`pipeline/quality.py`) after the draft and after every typed
+correction. Their issues join the AI listing check's "Check" block on the
+review card. They warn and never block, like the duplicate warning. Where a
+model can fix the problem, the draft goes back to the copywriter once
+automatically (`stages._meet_standard`).
+
+| Rule | How |
+|---|---|
+| One bag type (Women's and Men's Bags) | Title, Style, Type and description name the same type. Bag, purse and handbag are fine alongside it. **A crossbody strap on a satchel or tote is a feature, not a second type** (owner); "crossbody" is the type only for crossbody-only bags. Type follows eBay's short list: Handbag, Satchel, Backpack, Clutch. |
+| Description | One paragraph of 4–6 sentences, with the dimensions when they're known, then the store's SHIPPING and RETURNS sections. Replaces the SPECIFICATIONS / FEATURES bullet layout. |
+| Printed items | Color and **Exterior Color = Multicolor** (owner), applied to the specifics automatically. The base colour stays in the title. |
+| Similar titles | Warn when a title shares 60% or more of its words with one of our live titles. On the 123 live titles that's 7 pairs, all near-twins. |
+| Impressions at 3 days | A daily job (15:00 UTC) checks listings 3–10 days old once each and alerts the owners on zero total impressions. eBay's traffic data lags 1–2 days, so day 3 covers the first day or two. |
+| Buyer search words first; style code only if searched | The title leads with buyer words and puts a style code at the end. Whether buyers search a code needs the competitor search (≥2 sold comps or ≥3 active competitors using it), so that part ships with section 7.1. |
+
+New listings only. d7432192 gets Exterior Color = Multicolor through the
+owner's own `/revise`.

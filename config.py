@@ -612,3 +612,21 @@ LISTING_CHECK_EFFORT = os.getenv("LISTING_CHECK_EFFORT", "low")
 # review screen, and a check that holds the draft up for minutes isn't worth it.
 LISTING_CHECK_TIMEOUT_S = float(os.getenv("LISTING_CHECK_TIMEOUT_S", "60"))
 LISTING_CHECK_PHOTOS = int(os.getenv("LISTING_CHECK_PHOTOS", "3"))
+
+# --- Listing quality standard (pipeline/quality.py) ----------------------------
+# Owner, 2026-11-09. Code checks next to the listing check above; advisory.
+# Categories where a listing must name one bag type: Women's Bags, Men's Bags.
+QUALITY_BAG_CATEGORIES = os.getenv("QUALITY_BAG_CATEGORIES", "169291,52357")
+QUALITY_DESCRIPTION_SENTENCES = (int(os.getenv("QUALITY_DESCRIPTION_MIN_SENTENCES", "4")),
+                                 int(os.getenv("QUALITY_DESCRIPTION_MAX_SENTENCES", "6")))
+# Share of title words in common with one of our live titles that counts as
+# too similar. 0.6 caught 7 near-twin pairs among 123 live titles (2026-11-09).
+QUALITY_SIMILAR_TITLE = float(os.getenv("QUALITY_SIMILAR_TITLE", "0.6"))
+QUALITY_MESSAGE_MAX = int(os.getenv("QUALITY_MESSAGE_MAX", "160"))
+# Alert on listings with zero impressions this many days after going live
+# (daily job). Older listings are skipped so the first run doesn't flag the
+# whole catalogue. Off with QUALITY_IMPRESSION_CHECK=0.
+QUALITY_IMPRESSION_CHECK = _env_bool("QUALITY_IMPRESSION_CHECK", True)
+QUALITY_IMPRESSION_CHECK_DAYS = int(os.getenv("QUALITY_IMPRESSION_CHECK_DAYS", "3"))
+QUALITY_IMPRESSION_CHECK_MAX_DAYS = int(os.getenv("QUALITY_IMPRESSION_CHECK_MAX_DAYS", "10"))
+QUALITY_IMPRESSION_HOUR_UTC = int(os.getenv("QUALITY_IMPRESSION_HOUR_UTC", "15"))

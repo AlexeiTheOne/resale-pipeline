@@ -196,6 +196,11 @@ async def _post_init(app: Application) -> None:
     else:
         print("Buyer feedback automation disabled (FEEDBACK_ENABLED=0); use /feedback.")
 
+    if config.QUALITY_IMPRESSION_CHECK:
+        _start_loop(app, jobs._daily_impression_check_loop)
+        print(f"Daily new-listing impression check scheduled: hour={config.QUALITY_IMPRESSION_HOUR_UTC} UTC "
+              f"(listings {config.QUALITY_IMPRESSION_CHECK_DAYS}-{config.QUALITY_IMPRESSION_CHECK_MAX_DAYS} days old).")
+
     if config.RECEIPT_DECODE_JOB and config.DB_BACKEND == "sqlserver":
         _start_loop(app, jobs._daily_receipt_decode_loop)
         print(f"Daily receipt line decoding scheduled: hour={config.RECEIPT_DECODE_HOUR_UTC} UTC "

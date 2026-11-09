@@ -15,7 +15,7 @@ import ross_tag
 from config import GEMINI_PHOTO_LIMIT
 # `as draft_mod`: stage_draft has a local named `draft`.
 from pipeline import draft as draft_mod
-from pipeline import listing_check, pricing_v2
+from pipeline import listing_check, pricing_v2, quality
 from pipeline.gtin import product_gtin
 
 
@@ -247,16 +247,35 @@ def stage_price(item_id, notify=lambda _t: None) -> dict:
     return pricing
 
 
+def _meet_standard(item_id: str, draft: dict, identification, notify) -> dict:
+    """Send the draft back to the copywriter once when it breaks a quality rule
+    a model can fix (one bag type, a 4-6 sentence description with dimensions).
+    Whatever is left shows on the review card. A failed redo keeps the draft."""
+    fix = quality.redo_instruction(quality.check({"item_id": item_id, "listing": draft}))
+    if not fix:
+        return draft
+    notify("🧹 Tidying the listing to the quality standard...")
+    print(f"🧹 {item_id[:8]}: redo for the quality standard: {fix[:300]}")
+    try:
+        return draft_mod.revise_draft(draft, fix, identification)
+    except Exception as e:
+        print(f"⚠️ quality redo failed, keeping the first draft: {type(e).__name__}: {e}")
+        return draft
+
+
 def stage_draft(item_id, notify=lambda _t: None) -> dict:
     item = db.get_item(item_id)
     notify("✍️ Writing the listing...")
     t = time.perf_counter()
     draft = draft_mod.generate_draft(item["identification"], item["pricing"])
     print(f"✓ Draft generated in {time.perf_counter() - t:.0f}s")
+    draft = _meet_standard(item_id, draft, item.get("identification"), notify)
     db.update_field(item_id, "listing", draft)
     db.update_status(item_id, "drafted")
     if config.LISTING_CHECK_ENABLED:
         notify("🔎 Checking the listing...")
-        listing_check.check_and_store(item_id)  # advisory; never raises
+    # Advisory; never raises. Runs with the AI check off too: the quality
+    # standard's code checks are part of it (pipeline/quality.py).
+    listing_check.check_and_store(item_id)
     db.update_status(item_id, "review")
     return draft
