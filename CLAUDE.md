@@ -89,6 +89,8 @@ change eBay. Use `.env.example` as the template.
   - `draft.py`, `title.py`, `specifics.py`, `category.py`: listing content.
   - `price.py`, `pricing_v2.py`, `quick_price.py`, `reprice.py`: pricing.
   - `offers.py`, `sync.py`: offers and sales.
+  - `receipt_decode.py`: what each Ross receipt line is (`/rcpt`,
+    `docs/receipt-decoding.md`).
 - `ebay/`: eBay API clients (inventory, listings, orders, browse, marketing,
   negotiation, auth).
 - `db.py`: SQLite (`data/ross.db`).

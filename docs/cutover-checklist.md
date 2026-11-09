@@ -450,6 +450,14 @@ applies.
   a time.
 - 💤 Fill `stores` for the 18 store numbers (clean names, city, zip).
 - 💤 Receipt matching (`receipt_matches`): the matcher and its Telegram review.
+- 🔧 **Receipt line decoding** (`receipt_line_details`, step 5,
+  `docs/receipt-decoding.md`): the deploy creates the table. Then
+  `python scripts/decode_receipt_lines.py --target ResaleDB --production --apply --from <approved jsonl>`
+  (it backs up first), then `RECEIPT_DECODE_JOB=1` for the daily top-up.
+  `/rcpt` works before that, with raw lines, item links and live rules.
+- 💤 Dev refresh after step 5: `refresh_dev_from_backup.py` copies every
+  table, so ResaleDB_Dev must be at step 5 too (any `import db` with the dev
+  `.env` migrates it).
 - 💤 Drop ReceiptsDB after 30 days (final backup first).
 - 💤 **Person B reviews the 26 flagged prices** (lines over $500 with no
   evidence for a fix, listed in the cleanup report). They stay as they are
@@ -465,12 +473,19 @@ applies.
   when convenient: remove the frozen SQLite migration steps from
   `migrations.py`, the SQLite branch of db.py and backup.py, and the
   sqlite_only tests.
-- 💤 `.claude/settings.json`: the pre-commit hook also fires on Bash commands
-  that contain a `for` loop, not only on `git commit`.
+- ✅ `.claude/settings.json`: the pre-commit hook fired on commands it
+  couldn't parse, not only on `git commit`. Fixed 2026-11-08: the hook script
+  checks the command itself.
 
 ---
 
 ## Log
+- 2026-11-08: **SQL Server step 5 `receipt_line_details`** (branch
+  `receipt-decoding`): what each receipt line is, one row per unique
+  description. New table only, no FK, no lock on the receipt tables. The bot
+  runs the step at startup after the deploy (which backs up first). Older
+  code after a rollback warns "schema 5, code knows 4" and keeps working.
+  The planned `check_evidence` table must take step 6.
 - 2026-11-05: **SQL Server step 4 `ross_code_main`**:
   - Adds `item_tags.ross_code_main` and `pieces.ross_code_main` (CHAR(12),
     indexed) and `checks.ross_sku_main`. SQLite gets step 3, the checks

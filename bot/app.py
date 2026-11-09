@@ -32,7 +32,7 @@ import db
 import logging_setup
 from bot import (
     check_cmds, flow, intake, inventory_cmds, jobs, listing_cmds, ops_cmds, photos_cmds,
-    sales_cmds, text_router, util,
+    receipt_cmds, sales_cmds, text_router, util,
 )
 
 def configure() -> None:
@@ -196,6 +196,11 @@ async def _post_init(app: Application) -> None:
     else:
         print("Buyer feedback automation disabled (FEEDBACK_ENABLED=0); use /feedback.")
 
+    if config.RECEIPT_DECODE_JOB and config.DB_BACKEND == "sqlserver":
+        _start_loop(app, jobs._daily_receipt_decode_loop)
+        print(f"Daily receipt line decoding scheduled: hour={config.RECEIPT_DECODE_HOUR_UTC} UTC "
+              f"(cap ${config.RECEIPT_DECODE_MAX_USD:.2f} a run).")
+
 
 async def _post_shutdown(app: Application) -> None:
     """Cancel the background loops started by _post_init."""
@@ -285,6 +290,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("scoreboard", sales_cmds.scoreboard_command))
     app.add_handler(CommandHandler("listing", listing_cmds.listing_command))
     app.add_handler(CommandHandler("receipt", sales_cmds.receipt_command))
+    app.add_handler(CommandHandler("rcpt", receipt_cmds.rcpt_command))
     app.add_handler(CommandHandler("addphotos", intake.addphotos_command))
     app.add_handler(CommandHandler("delete", listing_cmds.delete_command))
     app.add_handler(CommandHandler("notdup", listing_cmds.notdup_command))
