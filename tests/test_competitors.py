@@ -86,8 +86,28 @@ def test_mpn_rung_keeps_only_titles_with_the_code(monkeypatch):
     f = Fakes(monkeypatch, by_query={"Michael Kors MKS8006": [_b(1, "Michael Kors MKS-8006 band"),
                                                               _b(2, "Michael Kors MKS8010 band")]})
     out = competitors.search(IDENT, specifics=SPECS, sold=False)
-    assert f.calls == [("gtin", "796483538993"), ("q", "Michael Kors MKS8006")]
+    assert f.calls[:2] == [("gtin", "796483538993"), ("q", "Michael Kors MKS8006")]
     assert out["found_by"]["active"] == "mpn" and [r["ebay_id"] for r in out["active"]] == ["1"]
+
+
+def test_the_ladder_climbs_until_enough_and_tags_each_row(monkeypatch):
+    """One UPC match is not enough: the MPN and keyword rungs add the
+    identical listings that left the UPC out. Duplicates count once."""
+    f = Fakes(monkeypatch, by_gtin=[_b(1, "Michael Kors MKS8006 band")],
+              by_query={"Michael Kors MKS8006": [_b(1, "Michael Kors MKS8006 band"),
+                                                 _b(2, "Michael Kors MKS8006 silver")],
+                        "Michael Kors MKS8006 Apple Watch band": [_b(3, "MK pave band"), _b(4, "MK band"),
+                                                                  _b(5, "MK band 2"), _b(6, "MK band 3")]})
+    out = competitors.search(IDENT, specifics=SPECS, sold=False)
+    assert [(r["ebay_id"], r["found_by"]) for r in out["active"]] == [
+        ("1", "upc"), ("2", "mpn"), ("3", "keywords"), ("4", "keywords"), ("5", "keywords"), ("6", "keywords")]
+    assert len(f.calls) == 3
+
+
+def test_the_ladder_stops_once_there_are_enough(monkeypatch):
+    f = Fakes(monkeypatch, by_gtin=[_b(n, f"Michael Kors MKS8006 band {n}") for n in range(1, 7)])
+    competitors.search(IDENT, specifics=SPECS, sold=False)
+    assert f.calls == [("gtin", "796483538993")]
 
 
 def test_keywords_rung_last(monkeypatch):

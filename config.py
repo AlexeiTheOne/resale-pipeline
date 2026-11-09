@@ -639,5 +639,8 @@ COMPETITOR_CACHE_HOURS = float(os.getenv("COMPETITOR_CACHE_HOURS", "24"))
 # 1,350, inside Browse's default 5,000 a day.
 COMPETITOR_ACTIVE_LIMIT = int(os.getenv("COMPETITOR_ACTIVE_LIMIT", "50"))
 COMPETITOR_DETAIL_MAX = int(os.getenv("COMPETITOR_DETAIL_MAX", "10"))
+# Keep climbing the match ladder (UPC, MPN, keywords) until this many active
+# listings are found.
+COMPETITOR_MIN_ACTIVE = int(os.getenv("COMPETITOR_MIN_ACTIVE", "5"))
 # Sold rows per Apify search (about $0.02 for 30).
 COMPETITOR_SOLD_COUNT = int(os.getenv("COMPETITOR_SOLD_COUNT", "30"))

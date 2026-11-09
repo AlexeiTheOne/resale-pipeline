@@ -2,7 +2,9 @@
 (docs/listing-performance-plan.md 7.1). Shared by /check, new listings and
 /diagnose.
 
-Match ladder, best first, and every row records which one found it:
+Match ladder, best first, and every row records which rung found it. Active
+listings climb it until COMPETITOR_MIN_ACTIVE are found (Browse is free);
+sold listings stop at the first rung that finds any (Apify costs money):
   1. UPC     Browse GTIN search: eBay matches the identifier sellers filled in.
   2. MPN     brand + style code, kept only when the title carries the code.
   3. keywords brand + the item's words (its search query or title).
@@ -77,22 +79,30 @@ def _search(query=None, gtin=None) -> list[dict]:
     return browse.search_active(query, gtin=gtin, limit=config.COMPETITOR_ACTIVE_LIMIT)
 
 
-def find_active(k: dict) -> tuple[list[dict], str | None, str | None]:
-    """(Browse rows, found_by, query) from the first rung that finds anything."""
+def find_active(k: dict) -> list[dict]:
+    """Browse rows, best rung first, each tagged with _found_by and _query.
+    Browse is free, so the ladder keeps climbing until COMPETITOR_MIN_ACTIVE
+    listings are found: one UPC match would otherwise hide every identical
+    listing whose seller left the UPC out."""
+    rungs = []
     if k.get("upc"):
-        rows = _search(gtin=k["upc"])
-        if rows:
-            return rows, "upc", f"gtin:{k['upc']}"
+        rungs.append(("upc", f"gtin:{k['upc']}", lambda: _search(gtin=k["upc"])))
     if k.get("mpn") and k.get("brand"):
         q = f"{k['brand']} {k['mpn']}"
-        rows = [r for r in _search(q) if _has_code(r.get("title"), k["mpn"])]
-        if rows:
-            return rows, "mpn", q
+        rungs.append(("mpn", q, lambda q=q: [r for r in _search(q) if _has_code(r.get("title"), k["mpn"])]))
     if k.get("keywords"):
-        rows = _search(k["keywords"])
-        if rows:
-            return rows, "keywords", k["keywords"]
-    return [], None, None
+        rungs.append(("keywords", k["keywords"], lambda: _search(k["keywords"])))
+    out, seen = [], set()
+    for found_by, query, run in rungs:
+        for r in run():
+            key = r.get("item_id") or r.get("item_web_url")
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({**r, "_found_by": found_by, "_query": query})
+        if len(out) >= config.COMPETITOR_MIN_ACTIVE:
+            break
+    return out
 
 
 def find_sold(k: dict) -> tuple[list[dict], str | None, str | None]:
@@ -116,7 +126,7 @@ def _own():
     return config.OWN_SELLER_USERNAMES, ids, titles
 
 
-def _active_rows(browse_rows, found_by, query, base) -> list[dict]:
+def _active_rows(browse_rows, base) -> list[dict]:
     own = _own()
     out = []
     for s in browse_rows:
@@ -124,7 +134,7 @@ def _active_rows(browse_rows, found_by, query, base) -> list[dict]:
         if c is None or pricing_v2.is_own(c, *own):
             continue
         ship = s.get("shipping_cost")   # the listing's own figure; None = unknown
-        out.append({**base, "source": "ebay_active", "found_by": found_by, "query": query,
+        out.append({**base, "source": "ebay_active", "found_by": s["_found_by"], "query": s["_query"],
                     "store": c["seller"], "title": c["title"], "condition": c["condition"] or None,
                     "price": c["item_price"], "shipping": ship,
                     "total": round(c["item_price"] + ship, 2) if ship is not None else None,
@@ -194,8 +204,7 @@ def search(ident: dict | None, *, specifics: dict | None = None, title: str | No
     if cached:
         out["active"], out["cached"]["active"] = cached, True
     else:
-        rows, by, q = find_active(k)
-        out["active"] = _active_rows(rows, by, q, base)
+        out["active"] = _active_rows(find_active(k), base)
         _add_details(out["active"])
         _save(out["active"])
     out["found_by"]["active"] = next((r.get("found_by") for r in out["active"]), None)
