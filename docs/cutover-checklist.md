@@ -225,8 +225,10 @@ Status: ✅ done · ⬜ to do at cutover · 🔧 not built yet (blocks cutover) 
 ## 2. Cutover day (in this order)
 
 One window for both the bot and the receipt bot (Q1). Pick a quiet time. Production is `C:\Users\boris\Projects\ebay-list`. The
-restart script ends **every** `telegram_bot.py` on this PC, a dev bot
-included.
+restart script stops only the production bot, never a dev bot in
+`resale-dev` (since 2026-11-08). From a normal window Windows refuses to
+stop the S4U bot and the script says "could not stop … access denied"
+(exit 1); `-DryRun` shows what it would stop.
 
 1. ⬜ **Stop deploys:** `Disable-ScheduledTask EbayBotDeploy`.
 2. ⬜ **Stop the bot.** Wait until `logs\busy.json` is gone (idle), then:
@@ -432,8 +434,9 @@ applies.
   - ✅ The pytest leftovers are fixed: PR #2 (ffded45) gives every run
     its own temp and cache folder under `%TEMP%\ebay-deploy-pytest`.
   - Still open: a manual `deploy.ps1 -Force` can't restart the bot. The
-    bot runs under the S4U `EbayBot` task, and its command line is
-    hidden from a normal login, so `restart_ebay_bot.ps1` stops nothing.
+    bot runs under the S4U `EbayBot` task, and a normal login may not
+    stop it: `restart_ebay_bot.ps1` finds it (heartbeat PID) but Windows
+    answers "access denied", so it exits 1 (measured 2026-11-08).
     The health check then times out and the deploy rolls back with a
     false "BOT DID NOT COME BACK UP" (2026-11-03 17:05).
   - Until that's fixed, deploy through the task (section 1).
