@@ -72,6 +72,9 @@ from bot.check_cmds import (  # noqa: E402,F401  (re-export)
 from bot.receipt_cmds import (  # noqa: E402,F401  (re-export)
     rcpt_command,
 )
+from bot.revise_cmds import (  # noqa: E402,F401  (re-export)
+    revise_callback, revise_command,
+)
 from bot.photos_cmds import (  # noqa: E402,F401  (re-export)
     _resync_photos, _send_photo_index, photos_command, _apply_photo_order, _photo_args,
     cover_command, arrange_command, stockphoto_command, photocheck_command,

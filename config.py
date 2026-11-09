@@ -457,6 +457,12 @@ DB_BACKEND = (os.getenv("DB_BACKEND") or "sqlite").strip().lower()
 # are refused with a log line before anything is sent (ebay/guard.py).
 EBAY_WRITES_ENABLED = _env_bool("EBAY_WRITES_ENABLED", True)
 
+# Telegram user ids allowed to use owner-only commands (/revise), comma
+# separated. A subset of TELEGRAM_ALLOWED_USER_IDS. Empty = nobody: those
+# commands refuse until it is set.
+OWNER_USER_IDS = {int(t) for t in os.getenv("OWNER_USER_IDS", "").replace(";", ",").split(",")
+                  if t.strip().isdigit()}
+
 # Automatic /sync. Until this existed, /sync was manual-only and nothing else
 # wrote sold orders into the DB, so every money figure (/profit, /report, COGS)
 # silently understated whenever a sync was overdue — on 2026-09-03 the DB was
