@@ -106,14 +106,24 @@ class FakePhotoSize:
     height: int = 64
 
 
+@dataclass
+class FakeDocument:
+    file_id: str
+    file_name: str = "file.bin"
+    file_size: int = 0
+    mime_type: str = "application/octet-stream"
+    file_unique_id: str = ""
+
+
 class FakeMessage:
     """A message either from the user (built by a make_*_update) or sent by the
     bot (returned from reply_*/send_*). Bot-side calls go to `transcript`."""
 
     def __init__(self, transcript: Transcript, *, text=None, photo=None, caption=None,
                  media_group_id=None, message_id=None, chat=None, from_user=None,
-                 reply_to_message=None, reply_markup=None):
+                 reply_to_message=None, reply_markup=None, document=None):
         self.transcript = transcript
+        self.document = document
         self.text = text
         self.photo = list(photo or [])
         self.caption = caption
@@ -376,6 +386,21 @@ def make_photo_update(image: bytes | None = None, *, user_id: int = DEFAULT_USER
     msg = FakeMessage(ctx.transcript, photo=sizes, caption=caption,
                       media_group_id=media_group_id, chat=chat, from_user=user,
                       message_id=message_id)
+    return FakeUpdate(user=user, chat=chat, message=msg), ctx
+
+
+def make_document_update(data: bytes, file_name: str, *, user_id: int = DEFAULT_USER_ID,
+                         chat_id: int | None = None, context: FakeContext | None = None,
+                         caption: str | None = None, mime_type: str = "application/octet-stream"):
+    """A file sent as a document. get_file().download_* returns `data`.
+    Returns (update, context)."""
+    ctx = _ctx(context)
+    user, chat = FakeUser(id=user_id), FakeChat(id=chat_id or user_id)
+    file_id = f"file_{_next_id()}"
+    ctx.bot.add_file(file_id, data)
+    doc = FakeDocument(file_id=file_id, file_name=file_name, file_size=len(data), mime_type=mime_type,
+                       file_unique_id=file_id)
+    msg = FakeMessage(ctx.transcript, document=doc, caption=caption, chat=chat, from_user=user)
     return FakeUpdate(user=user, chat=chat, message=msg), ctx
 
 

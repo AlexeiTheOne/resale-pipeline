@@ -46,6 +46,7 @@ EXPECTED_MESSAGE_HANDLERS = {
     "photo_check": ("photo", "caption"),   # /check caption, before photo_handler
     "price_text": ("text", "command"),     # a typed Ross price, before text_handler
     "photo_handler": ("photo",),
+    "report_document": ("document", "xlsx"),  # eBay's listing quality report
     "text_handler": ("text", "command", "inverted"),
 }
 # (handler class, callback name, group)

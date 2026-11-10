@@ -284,7 +284,27 @@ Decisions this spec leaves open, decided here (change in config if wrong):
   category sheet: per listing (watchers, item age, sales 31d, daily
   impressions, CTR, conversion, recommendations) and per category (ours, top
   10%, bottom 10%). Stored with the report date.
-- A new table for the reports: **approved by Person B (2026-11-09).**
+- A new table for the reports: **approved by Person B (2026-11-09).** Built
+  as two (migration step 7: `quality_report_sections` and
+  `quality_report_listings`), because a category row and a listing row have
+  different columns. Same report sent again: its rows are replaced.
+- **Built (2026-11-10):** the owner sends the xlsx to the bot
+  (`bot/report_cmds.py`, `pipeline/quality_report.py`). `/diagnose` uses the
+  newest report while it is at most `QUALITY_REPORT_MAX_AGE_DAYS` (30) old:
+  - expected views use the report's CTR for the listing's category;
+  - SEARCH CARD and VISIBILITY compare the listing's report row with the
+    report's figures: under half of our category figure, or under eBay's
+    bottom 10%. Analytics numbers are never compared with report numbers;
+  - a listing newer than the report gets its category from the listings that
+    are in it (same eBay category id), and store averages for clicks;
+  - **CATEGORY FIX:** eBay's recommendation for the category, when it applies
+    to the listing (no free shipping; ad rate under eBay's; fewer recommended
+    specifics than eBay's minimum). Primary only when nothing else applies;
+    otherwise an extra line. `/diagnose all` groups them, one line per
+    category with a count, instead of repeating them on every listing.
+  - Checked against the 11/06 report and live ResaleDB (read-only): 109 of
+    111 report listings match live items (2 sold since), 4 newer ones match by
+    category, 9 are in categories the report doesn't cover.
 
 ### 7.5 New listings
 

@@ -461,6 +461,11 @@ applies.
   runs the step at startup after the deploy (which backs up first). The
   competitor search (`pipeline/competitors.py`) writes it and reads it as its
   24-hour cache. /check, intake and repricing start writing it in later PRs.
+- ⬜ **eBay listing quality report** (`quality_report_sections` and
+  `quality_report_listings`, step 7, docs/schema-proposal.md): new tables
+  only, no FK. The bot runs the step at startup after the deploy (which
+  backs up first). Filled when the owner sends the report's xlsx to the bot;
+  `/diagnose` reads the newest.
 - 💤 Dev refresh after step 5: `refresh_dev_from_backup.py` copies every
   table, so ResaleDB_Dev must be at step 5 too (any `import db` with the dev
   `.env` migrates it).
@@ -486,6 +491,12 @@ applies.
 ---
 
 ## Log
+- 2026-11-10: **SQL Server step 7 `quality_report`** (SQLite step 5; branch
+  `report-ingest`): `quality_report_sections` and `quality_report_listings`,
+  eBay's listing quality report by report date. New tables only, no FK,
+  nothing else locked. The bot runs the step at startup after the deploy,
+  which backs up first. Older code after a rollback warns "schema 7, code
+  knows 6" and keeps working.
 - 2026-11-09: **SQL Server step 6 `check_evidence`** (SQLite step 4; branch
   `competitor-search`): price evidence, one row per eBay listing, retail offer
   or own sale; also the competitor search's 24-hour cache. New table only, no

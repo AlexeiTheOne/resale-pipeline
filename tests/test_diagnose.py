@@ -203,9 +203,139 @@ def test_all_lists_problems_worst_first(monkeypatch):
     fake = [{**_m(item_id="aaaa1111-x", watchers=15, offered=True), "verdict": "WATCHERS_OFFER_SENT",
              "reason": "r1", "fix": "f1", "benchmark": BENCH},
             {**_m(item_id="bbbb2222-x"), "verdict": "OK", "reason": "-", "fix": "-", "benchmark": BENCH}]
-    monkeypatch.setattr(diagnose, "diagnose", lambda ids: fake)
+    monkeypatch.setattr(diagnose, "diagnose", lambda ids, info=None: fake)
     update, ctx = tg_fakes.make_text_update("/diagnose all", user_id=OWNER)
     tg_fakes.run(diagnose_cmds.diagnose_command, update, ctx)
     text = "\n".join(tg_fakes.sent_texts(ctx))
     assert "2 live listings" in text and "WATCHERS, NO SALES, OFFER SENT 1" in text and "OK 1" in text
     assert "aaaa1111" in text and "bbbb2222" not in text and "→ f1" in text
+
+
+# --- eBay's listing quality report ----------------------------------------------------------
+
+SECTION = {"section": "Women's Bags & Handbags", "impressions_per_day": 163.0, "ctr": 0.0038,
+           "top_ctr": 0.0389, "bottom_ctr": 0.0013, "top_impressions_per_day": 499.0,
+           "bottom_impressions_per_day": 2.0,
+           "recommendations": [{"stage": "impressions", "text": "Add free shipping to 81% of your listings",
+                                "kind": "free_shipping", "target": None, "ours": 0.0, "top": 0.81,
+                                "bottom": 0.61}]}
+
+
+def _row(item_id, lid, **kw):
+    base = {"section": SECTION["section"], "item_id": item_id, "ebay_item_id": lid, "impressions_per_day": 150.0,
+            "ctr": 0.004, "free_shipping": False, "ad_rate": 0.04, "watchers": 0, "sales_31d": 0}
+    base.update(kw)
+    return base
+
+
+def _report(rows, date="2026-11-06T14:38:00+00:00", sections=(SECTION,)):
+    return {"report_date": date, "sections": list(sections), "listings": list(rows)}
+
+
+def test_report_context_matches_by_item_then_by_category():
+    live = [_item(1, cat="169291"), _item(2, cat="169291"), _item(3, cat="11111")]
+    ctx = diagnose.report_context(live, _report([_row("item1-x", "999")]))
+    assert ctx["item1-x"]["listing"]["ebay_item_id"] == "999" and ctx["item1-x"]["label"] == "eBay report 11/06"
+    # Newer than the report, same category: the section, without a row of its own.
+    assert ctx["item2-x"]["listing"] is None and ctx["item2-x"]["section"]["section"] == SECTION["section"]
+    assert "item3-x" not in ctx
+    # The eBay listing id works when the Custom label is missing.
+    ctx = diagnose.report_context(live, _report([_row(None, "L3")]))
+    assert ctx["item3-x"]["listing"]["ebay_item_id"] == "L3"
+
+
+def test_a_stale_or_missing_report_falls_back_to_store_averages(monkeypatch):
+    monkeypatch.setattr(config, "QUALITY_REPORT_MAX_AGE_DAYS", 30)
+    assert diagnose.usable_report(None, NOW)[0] is None
+    report, note = diagnose.usable_report(_report([]), NOW)
+    assert report and note == "Benchmarks: eBay report 11/06 (3 days old)."
+    report, note = diagnose.usable_report(_report([], date="2026-09-01T00:00:00+00:00"), NOW)
+    assert report is None and "store averages" in note and "69 days old" in note
+
+
+def test_report_numbers_against_report_benchmarks():
+    ctx = {"section": SECTION, "listing": _row("x", "1"), "label": "eBay report 11/06"}
+    fixes = [{"fix": "free shipping"}]
+    # The Analytics CTR is low against the store average, but the report row is fine: no SEARCH CARD.
+    assert diagnose.verdict(_m(views=5, ctr=5 / 3000), BENCH, ctx, fixes) == "CATEGORY_FIX"
+    assert diagnose.verdict(_m(views=5, ctr=5 / 3000), BENCH, ctx) == "OK"
+    low_ctr = {**ctx, "listing": _row("x", "1", ctr=0.0012)}            # under the bottom 10% (0.13%)
+    assert diagnose.verdict(_m(), BENCH, low_ctr) == "SEARCH_CARD"
+    half = {**ctx, "listing": _row("x", "1", ctr=0.0018)}               # under half of our 0.38%
+    assert diagnose.verdict(_m(), BENCH, half) == "SEARCH_CARD"
+    dim = {**ctx, "listing": _row("x", "1", impressions_per_day=60.0)}  # under half of our 163/day
+    assert diagnose.verdict(_m(), BENCH, dim) == "VISIBILITY"
+    # Expected views use the report's CTR for the section: 700 x 0.38% = 2.7.
+    assert diagnose.verdict(_m(impressions=700, views=2), BENCH, ctx) == "NOT_ENOUGH_DATA"
+    # Watchers and price still come first.
+    assert diagnose.verdict(_m(watchers=3), BENCH, low_ctr, fixes) == "WATCHERS"
+
+
+def test_report_reasons_name_the_section_and_ebays_benchmarks():
+    ctx = {"section": SECTION, "listing": _row("x", "1", ctr=0.0012, impressions_per_day=60.0),
+           "label": "eBay report 11/06"}
+    bench = diagnose.report_bench(ctx)
+    _, reason, fix = diagnose.explain("SEARCH_CARD", _m(), bench, ITEM, None, ctx)
+    assert reason == ("CTR 0.12% (eBay report 11/06, 31 days) vs 0.38% for our Women's Bags & Handbags "
+                      "listings (eBay: top 10% 3.89%, bottom 10% 0.13%).")
+    assert "don't cut the price" in fix
+    _, reason, _ = diagnose.explain("VISIBILITY", _m(), bench, ITEM, None, ctx)
+    assert reason.startswith("60 impressions/day (eBay report 11/06) vs 163 for our Women's Bags")
+    fixes = diagnose.category_fixes(ctx, ITEM)
+    code, reason, fix = diagnose.explain("CATEGORY_FIX", _m(), bench, ITEM, None, ctx, fixes)
+    assert reason == "eBay's report recommends this for Women's Bags & Handbags."
+    assert fix.startswith("eBay: free shipping for this category (81% of the top listings offer it)")
+
+
+def test_free_shipping_listings_get_no_shipping_fix():
+    ctx = {"section": SECTION, "listing": _row("x", "1", free_shipping=True), "label": "eBay report 11/06"}
+    assert diagnose.category_fixes(ctx, ITEM) == []
+
+
+def test_run_with_a_stored_report(monkeypatch):
+    items = [_item(1, cat="169291"), _item(2, cat="169291"), _item(3, cat="169291")]
+    rows = [_row("item1-x", "L1", ctr=0.0010), _row("item2-x", "L2")]          # item3 is newer
+    monkeypatch.setattr(db, "latest_quality_report", lambda: _report(rows))
+    traffic = {f"L{n}": {"impressions": 3000, "views": 12} for n in (1, 2, 3)}
+    info = {}
+    monkeypatch.setattr(db, "list_items", lambda: items)
+    monkeypatch.setattr(db, "offers_sent_since", lambda since: set())
+    monkeypatch.setattr(analytics, "get_traffic_report", lambda ids, days: traffic)
+    monkeypatch.setattr(analytics, "get_watch_count", lambda lid: 0)
+    results = diagnose.diagnose(now=NOW, search=lambda *a, **k: None, info=info)
+    by = {r["item_id"]: r for r in results}
+    assert info["benchmarks"] == "Benchmarks: eBay report 11/06 (3 days old)."
+    assert by["item1-x"]["verdict"] == "SEARCH_CARD" and by["item1-x"]["benchmark"]["source"] == "eBay report 11/06"
+    assert by["item1-x"]["also"][0].startswith("eBay: free shipping")
+    assert by["item2-x"]["verdict"] == "CATEGORY_FIX" and by["item2-x"]["also"] == []
+    # Newer than the report: store averages for clicks, the section's fix still applies.
+    assert by["item3-x"]["verdict"] == "CATEGORY_FIX" and by["item3-x"]["benchmark"]["source"] == "store average"
+    detail = "\n".join(diagnose.format_detail(by["item1-x"]))
+    assert "eBay report 11/06 (31 days): 150 impressions/day, CTR 0.10%, 0 sales, 0 watchers." in detail
+    assert "Women's Bags & Handbags (eBay report 11/06): our listings 163 impressions/day, CTR 0.38%" in detail
+    assert "\U0001f9ed eBay: free shipping" in detail
+    summary = diagnose.category_summary(results)
+    assert summary == ["  Women's Bags & Handbags, 3 listings: Add free shipping to 81% of your listings → "
+                       "decide through the free-shipping test (plan §5)."]
+
+
+def test_all_groups_category_fixes_instead_of_listing_them(monkeypatch):
+    monkeypatch.setattr(config, "OWNER_USER_IDS", {OWNER})
+    fix = {"section": "Pillowcases", "kind": "ad_rate", "text": "Consider increasing promoted listings ad rate to 7%",
+           "fix": "eBay: ad rate 7%"}
+    fake = [{**_m(item_id="aaaa1111-x"), "verdict": "SEARCH_CARD", "reason": "r1", "fix": "f1",
+             "benchmark": BENCH, "also": ["eBay: ad rate 7%"], "category_fixes": [fix]},
+            {**_m(item_id="bbbb2222-x"), "verdict": "CATEGORY_FIX", "reason": "r2", "fix": "eBay: ad rate 7%",
+             "benchmark": BENCH, "also": [], "category_fixes": [fix]}]
+
+    def fake_diagnose(ids, info=None):
+        info["benchmarks"] = "Benchmarks: eBay report 11/06 (3 days old)."
+        return fake
+    monkeypatch.setattr(diagnose, "diagnose", fake_diagnose)
+    update, ctx = tg_fakes.make_text_update("/diagnose all", user_id=OWNER)
+    tg_fakes.run(diagnose_cmds.diagnose_command, update, ctx)
+    text = "\n".join(tg_fakes.sent_texts(ctx))
+    assert "SEARCH CARD 1, CATEGORY FIX 1" in text and "Benchmarks: eBay report 11/06" in text
+    assert "aaaa1111" in text and "bbbb2222" not in text
+    assert "eBay: ad rate 7%" not in text       # not per listing: once, in the grouped block below
+    assert "Pillowcases, 2 listings: Consider increasing promoted listings ad rate to 7% → owner decision" in text

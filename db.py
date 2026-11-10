@@ -473,6 +473,107 @@ def recent_evidence(model_key: str, source: str, since) -> list[dict]:
     return [_evidence_row(dict(r)) for r in rows]
 
 
+# --- eBay listing quality report (pipeline/quality_report.py) ---------------------
+
+QR_SECTION_COLUMNS = (
+    "section", "conditions", "sellers", "gmv_rank", "impressions_per_day", "impressions_rank", "ctr",
+    "ctr_rank", "conversion", "conversion_rank", "top_impressions_per_day", "bottom_impressions_per_day",
+    "top_ctr", "bottom_ctr", "top_conversion", "bottom_conversion", "recommendations", "benchmarks")
+QR_LISTING_COLUMNS = (
+    "section", "ebay_item_id", "item_id", "title", "price", "shipping_fee", "free_shipping",
+    "impressions_per_day", "ctr", "conversion", "ad_rate", "specifics_filled", "specifics_to_add",
+    "watchers", "age_days", "sales_31d", "raw")
+_QR_JSON = {"recommendations", "benchmarks", "raw"}
+_QR_FLOAT = {"impressions_per_day", "ctr", "conversion", "top_impressions_per_day",
+             "bottom_impressions_per_day", "top_ctr", "bottom_ctr", "top_conversion", "bottom_conversion",
+             "price", "shipping_fee", "ad_rate"}
+
+
+def _qr_rows(report: dict) -> tuple[str, list[dict], list[dict]]:
+    """(report_date as UTC ISO, section rows, listing rows): only the stored
+    columns, JSON columns as text."""
+    date = _utc_iso(report["report_date"])
+    if not date:
+        raise ValueError("a quality report needs its report_date")
+
+    def pick(row, cols):
+        out = {}
+        for c in cols:
+            v = row.get(c)
+            if v is None:
+                continue
+            if c in _QR_JSON:
+                v = json.dumps(v, ensure_ascii=False, default=str)
+            elif c == "free_shipping":
+                v = int(bool(v))
+            out[c] = v
+        return out
+    return (date, [pick(s, QR_SECTION_COLUMNS) for s in report.get("sections") or []],
+            [pick(x, QR_LISTING_COLUMNS) for x in report.get("listings") or []])
+
+
+def _qr_decode(row: dict) -> dict:
+    out = dict(row)
+    for k in _QR_JSON:
+        if isinstance(out.get(k), str):
+            out[k] = json.loads(out[k])
+    for k in _QR_FLOAT:
+        if out.get(k) is not None:
+            out[k] = float(out[k])
+    if out.get("free_shipping") is not None:
+        out["free_shipping"] = bool(out["free_shipping"])
+    for k in ("report_date", "ingested_at"):
+        if out.get(k) is not None:
+            out[k] = _utc_iso(out[k])
+    return out
+
+
+def save_quality_report(report: dict) -> dict:
+    """Store a parsed report (pipeline/quality_report.parse). The same report
+    sent again replaces its own rows, in one transaction. Returns
+    {"sections": n, "listings": n, "replaced": bool}."""
+    date, sections, listings = _qr_rows(report)
+    if _on_sqlserver():
+        return _sqlserver().save_quality_report(date, sections, listings)
+    now = _now()
+    with _conn() as con:
+        replaced = con.execute("SELECT COUNT(*) FROM quality_report_sections WHERE report_date = ?",
+                               (date,)).fetchone()[0] > 0
+        con.execute("DELETE FROM quality_report_sections WHERE report_date = ?", (date,))
+        con.execute("DELETE FROM quality_report_listings WHERE report_date = ?", (date,))
+        for table, rows in (("quality_report_sections", sections), ("quality_report_listings", listings)):
+            for r in rows:
+                r = {"report_date": date, **r, "ingested_at": now}
+                con.execute(f"INSERT INTO {table} ({', '.join(r)}) VALUES ({', '.join('?' * len(r))})",
+                            tuple(r.values()))
+    return {"sections": len(sections), "listings": len(listings), "replaced": replaced}
+
+
+def latest_quality_report() -> dict | None:
+    """The newest stored report: {"report_date": UTC ISO, "sections":
+    [...], "listings": [...]}, or None when none was sent yet."""
+    if _on_sqlserver():
+        got = _sqlserver().latest_quality_report()
+    else:
+        with _conn() as con:
+            con.row_factory = sqlite3.Row
+            date = con.execute("SELECT MAX(report_date) FROM quality_report_sections").fetchone()[0]
+            if not date:
+                return None
+            got = {"report_date": date,
+                   "sections": [dict(r) for r in con.execute(
+                       "SELECT * FROM quality_report_sections WHERE report_date = ? ORDER BY section_row_id",
+                       (date,))],
+                   "listings": [dict(r) for r in con.execute(
+                       "SELECT * FROM quality_report_listings WHERE report_date = ? ORDER BY listing_row_id",
+                       (date,))]}
+    if not got:
+        return None
+    return {"report_date": _utc_iso(got["report_date"]),
+            "sections": [_qr_decode(r) for r in got["sections"]],
+            "listings": [_qr_decode(r) for r in got["listings"]]}
+
+
 def receipt_lines_for_skus(skus) -> list[dict]:
     """Ross receipt lines (what we bought) with one of these 12-digit SKUs,
     newest first: line_id, sku, description, price, receipt_date (date),

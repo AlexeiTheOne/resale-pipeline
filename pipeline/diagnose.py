@@ -13,14 +13,23 @@ Verdicts, in priority order (the first that applies is primary):
                        competitors, and the thumbnail
   VISIBILITY           impressions well below the category: what competitors
                        have that we lack
+  CATEGORY_FIX         eBay's report recommends something for the category
+                       that this listing lacks (free shipping, ad rate,
+                       specifics). Account-wide, so it's last; when another
+                       verdict is primary it's shown as an extra line.
   OK                   nothing to fix
 
-Benchmarks are our own per-category averages until eBay's listing quality
-report is ingested (next PR), and are labelled as such. Rules carried over
-from the weekly check (pipeline/reprice.py): missing traffic or watcher data
-is "unknown", never zero, and a low click-through is never answered with a
-price cut.
+Benchmarks: eBay's listing quality report (sent to the bot as the xlsx,
+pipeline/quality_report.py) while it is at most QUALITY_REPORT_MAX_AGE_DAYS
+old. The report's CTR and impressions are compared only with the report's
+own figures (its definitions may differ from the Analytics API's), so
+SEARCH CARD and VISIBILITY use the listing's report row. A listing newer
+than the report, or with no report, falls back to our own per-category
+averages, labelled "store average". Rules carried over from the weekly
+check (pipeline/reprice.py): missing traffic or watcher data is "unknown",
+never zero, and a low click-through is never answered with a price cut.
 """
+import collections
 import statistics
 from datetime import datetime, timedelta, timezone
 
@@ -28,14 +37,15 @@ import config
 import db
 import profit
 from ebay import analytics
-from pipeline import competitors
+from pipeline import competitors, quality_report
 
-ORDER = ("NOT_ENOUGH_DATA", "WATCHERS_OFFER_SENT", "WATCHERS", "PRICE", "SEARCH_CARD", "VISIBILITY", "OK")
+ORDER = ("NOT_ENOUGH_DATA", "WATCHERS_OFFER_SENT", "WATCHERS", "PRICE", "SEARCH_CARD", "VISIBILITY",
+         "CATEGORY_FIX", "OK")
 LABEL = {"NOT_ENOUGH_DATA": "NOT ENOUGH DATA", "WATCHERS_OFFER_SENT": "WATCHERS, NO SALES, OFFER SENT",
          "WATCHERS": "WATCHERS, NO SALES", "PRICE": "PRICE", "SEARCH_CARD": "SEARCH CARD",
-         "VISIBILITY": "VISIBILITY", "OK": "OK"}
+         "VISIBILITY": "VISIBILITY", "CATEGORY_FIX": "CATEGORY FIX", "OK": "OK"}
 ICON = {"NOT_ENOUGH_DATA": "⏳", "WATCHERS_OFFER_SENT": "💸", "WATCHERS": "👀", "PRICE": "🏷️",
-        "SEARCH_CARD": "🖼️", "VISIBILITY": "🔦", "OK": "✅"}
+        "SEARCH_CARD": "🖼️", "VISIBILITY": "🔦", "CATEGORY_FIX": "🧭", "OK": "✅"}
 
 
 # --- metrics -------------------------------------------------------------------
@@ -107,13 +117,106 @@ def benchmarks(all_metrics: list[dict]) -> dict[str, dict]:
     return out
 
 
+# --- eBay's listing quality report -----------------------------------------------------
+
+def usable_report(report: dict | None, now: datetime) -> tuple[dict | None, str]:
+    """(report or None, a one-line note on which benchmarks this run uses)."""
+    if not report:
+        return None, "Benchmarks: store averages (no eBay listing quality report yet; send the xlsx to the bot)."
+    date = _when(report["report_date"])
+    age = (now - date).days if date else None
+    label = f"eBay report {date:%m/%d}" if date else "eBay report"
+    if age is None or age > config.QUALITY_REPORT_MAX_AGE_DAYS:
+        return None, (f"Benchmarks: store averages ({label} is {age} days old; send a newer one).")
+    return report, f"Benchmarks: {label} ({age} days old)."
+
+
+def report_context(live: list[dict], report: dict | None) -> dict[str, dict]:
+    """{item_id: {"section", "listing" (the report's row or None), "label"}}.
+    A listing in the report gets its own row. A newer listing gets its
+    category's section from the listings that are in it (by category_id)."""
+    if not report:
+        return {}
+    date = _when(report["report_date"])
+    label = f"eBay report {date:%m/%d}" if date else "eBay report"
+    sections = {s["section"]: s for s in report["sections"]}
+    by_item = {r["item_id"]: r for r in report["listings"] if r.get("item_id")}
+    by_listing = {str(r["ebay_item_id"]): r for r in report["listings"]}
+    out, votes = {}, collections.defaultdict(collections.Counter)
+    for item in live:
+        row = by_item.get(item["item_id"]) or by_listing.get(str((item.get("ebay") or {}).get("listing_id")))
+        if row and row["section"] in sections:
+            out[item["item_id"]] = {"section": sections[row["section"]], "listing": row, "label": label}
+            cat = str((item.get("listing") or {}).get("category_id") or "")
+            if cat:
+                votes[cat][row["section"]] += 1
+    for item in live:
+        if item["item_id"] in out:
+            continue
+        cat = str((item.get("listing") or {}).get("category_id") or "")
+        if votes.get(cat):
+            out[item["item_id"]] = {"section": sections[votes[cat].most_common(1)[0][0]], "listing": None,
+                                    "label": label}
+    return out
+
+
+def report_bench(ctx: dict) -> dict:
+    """The benchmark dict /diagnose shows, from a report section."""
+    s = ctx["section"]
+    return {"impressions_per_day": s.get("impressions_per_day"), "ctr": s.get("ctr"),
+            "top_ctr": s.get("top_ctr"), "bottom_ctr": s.get("bottom_ctr"),
+            "top_impressions_per_day": s.get("top_impressions_per_day"),
+            "bottom_impressions_per_day": s.get("bottom_impressions_per_day"),
+            "section": s["section"], "source": ctx["label"]}
+
+
+def category_fixes(ctx: dict | None, item: dict) -> list[dict]:
+    """eBay's recommendations for the listing's section that apply to it:
+    [{"section", "kind", "text" (eBay's words), "fix" (our one line)}]."""
+    if not ctx:
+        return []
+    return [{"section": ctx["section"]["section"], "kind": rec.get("kind"), "text": rec.get("text"),
+             "fix": quality_report.fix_text(rec, ctx["listing"], item["item_id"])}
+            for rec in ctx["section"].get("recommendations") or []
+            if quality_report.applies(rec, ctx["listing"], item)]
+
+
+_HOW = {"free_shipping": "decide through the free-shipping test (plan §5)",
+        "ad_rate": "owner decision (plan §6)",
+        "specifics": "/diagnose <id> lists the missing ones; add them with /revise"}
+
+
+def category_summary(results: list[dict]) -> list[str]:
+    """/diagnose all: eBay's category recommendations once per section, with
+    how many listings each applies to (not repeated on every listing)."""
+    groups: dict[tuple, int] = collections.Counter()
+    for r in results:
+        for f in r.get("category_fixes") or []:
+            groups[(f["section"], f["kind"], f["text"])] += 1
+    lines = []
+    for (section, kind, text), n in sorted(groups.items(), key=lambda g: -g[1]):
+        how = _HOW.get(kind)
+        lines.append(f"  {section}, {n} listing{'s' if n != 1 else ''}: {text}" + (f" → {how}." if how else "."))
+    return lines
+
+
+def _below(value, ours, bottom) -> bool:
+    """Under LOW_FACTOR x our category figure, or under eBay's bottom 10%."""
+    if value is None:
+        return False
+    return bool((ours and value < ours * config.DIAGNOSE_LOW_FACTOR) or (bottom and value < bottom))
+
+
 # --- verdict -----------------------------------------------------------------------
 
-def verdict(m: dict, bench: dict | None) -> str:
-    """The primary verdict code from the numbers alone (comps come after)."""
+def verdict(m: dict, bench: dict | None, ctx: dict | None = None, fixes=()) -> str:
+    """The primary verdict code from the numbers alone (comps come after).
+    `ctx` is the listing's report context (report_context), `fixes` its
+    applicable category recommendations."""
     if not m["traffic_known"]:
         return "NOT_ENOUGH_DATA"
-    ctr_ref = (bench or {}).get("ctr") or config.DIAGNOSE_FALLBACK_CTR
+    section = (ctx or {}).get("section") or {}
+    ctr_ref = section.get("ctr") or (bench or {}).get("ctr") or config.DIAGNOSE_FALLBACK_CTR
     if m["impressions"] * ctr_ref < config.DIAGNOSE_MIN_EXPECTED_VIEWS:
         return "NOT_ENOUGH_DATA"
     no_sales = m["sales"] == 0
@@ -121,11 +224,22 @@ def verdict(m: dict, bench: dict | None) -> str:
         return "WATCHERS_OFFER_SENT" if m["offered"] else "WATCHERS"
     if no_sales and m["views"] >= config.DIAGNOSE_MIN_VIEWS_FOR_PRICE:
         return "PRICE"
-    if bench and bench.get("ctr") and m["ctr"] is not None \
-            and m["ctr"] < bench["ctr"] * config.DIAGNOSE_LOW_FACTOR:
-        return "SEARCH_CARD"
-    if bench and m["impressions_per_day"] < bench["impressions_per_day"] * config.DIAGNOSE_LOW_FACTOR:
-        return "VISIBILITY"
+    row = (ctx or {}).get("listing")
+    if row:
+        # The report's own numbers against the report's benchmarks.
+        if _below(row.get("ctr"), section.get("ctr"), section.get("bottom_ctr")):
+            return "SEARCH_CARD"
+        if _below(row.get("impressions_per_day"), section.get("impressions_per_day"),
+                  section.get("bottom_impressions_per_day")):
+            return "VISIBILITY"
+    else:
+        if bench and bench.get("ctr") and m["ctr"] is not None \
+                and m["ctr"] < bench["ctr"] * config.DIAGNOSE_LOW_FACTOR:
+            return "SEARCH_CARD"
+        if bench and m["impressions_per_day"] < bench["impressions_per_day"] * config.DIAGNOSE_LOW_FACTOR:
+            return "VISIBILITY"
+    if fixes:
+        return "CATEGORY_FIX"
     return "OK"
 
 
@@ -148,11 +262,17 @@ def _suggested_price(item: dict, s: dict) -> tuple[float, float | None]:
     return (max(price, _charm(floor + 1)) if floor else price), floor
 
 
-def explain(code: str, m: dict, bench: dict | None, item: dict, comps: dict | None) -> tuple[str, str, str]:
+def explain(code: str, m: dict, bench: dict | None, item: dict, comps: dict | None,
+            ctx: dict | None = None, fixes=()) -> tuple[str, str, str]:
     """(verdict, reason, fix), one line each. WATCHERS becomes PRICE when the
     sold comps sit below the offer price: then the fix is a price, not an offer."""
     b = bench or {}
     src = b.get("source", "store average")
+    row = (ctx or {}).get("listing")
+    section = (ctx or {}).get("section") or {}
+    if code == "CATEGORY_FIX":
+        return (code, f"eBay's report recommends this for {section.get('section', 'the category')}.",
+                fixes[0]["fix"] if fixes else "See eBay's listing quality report.")
     if code == "NOT_ENOUGH_DATA":
         if not m["traffic_known"]:
             return code, "eBay's traffic couldn't be read.", "Run /diagnose again later."
@@ -192,15 +312,32 @@ def explain(code: str, m: dict, bench: dict | None, item: dict, comps: dict | No
                   if r.get("total") and r.get("found_by") in ("upc", "mpn")]
         vs = (f" Our total ${ours:.2f} vs same-item competitors' median ${statistics.median(totals):.2f}."
               if totals else "")
-        return (code, f"CTR {m['ctr']:.2%} vs {b['ctr']:.2%} {src} for the category.{vs}",
-                "Check the first photo and the title start; don't cut the price for this.")
+        if row:
+            why = (f"CTR {row['ctr']:.2%} ({ctx['label']}, 31 days) vs {section['ctr']:.2%} for our "
+                   f"{section['section']} listings" + _top_bottom(section, "ctr", "{:.2%}") + ".")
+        else:
+            why = f"CTR {m['ctr']:.2%} vs {b['ctr']:.2%} {src} for the category."
+        return (code, why + vs, "Check the first photo and the title start; don't cut the price for this.")
     if code == "VISIBILITY":
         gaps = competitor_gaps(item, comps) if comps else []
-        return (code, f"{m['impressions_per_day']:.0f} impressions/day vs {b['impressions_per_day']:.0f} "
-                f"{src} for the category.",
+        if row:
+            why = (f"{row['impressions_per_day']:.0f} impressions/day ({ctx['label']}) vs "
+                   f"{section['impressions_per_day']:.0f} for our {section['section']} listings"
+                   + _top_bottom(section, "impressions_per_day", "{:.0f}") + ".")
+        else:
+            why = (f"{m['impressions_per_day']:.0f} impressions/day vs {b['impressions_per_day']:.0f} "
+                   f"{src} for the category.")
+        return (code, why,
                 ("Competitors have what we lack: " + "; ".join(gaps) + ".") if gaps else
                 "Check the category, item specifics and title keywords.")
     return code, "Nothing stands out.", "No action."
+
+
+def _top_bottom(section: dict, metric: str, fmt: str) -> str:
+    top, bottom = section.get(f"top_{metric}"), section.get(f"bottom_{metric}")
+    parts = ([f"top 10% {fmt.format(top)}"] if top is not None else []) + \
+            ([f"bottom 10% {fmt.format(bottom)}"] if bottom is not None else [])
+    return f" (eBay: {', '.join(parts)})" if parts else ""
 
 
 def competitor_gaps(item: dict, comps: dict) -> list[str]:
@@ -231,15 +368,20 @@ def _live(items: list[dict]) -> list[dict]:
 
 
 def diagnose(item_ids: list[str] | None = None, *, now: datetime | None = None,
-             search=competitors.search) -> list[dict]:
+             search=competitors.search, info: dict | None = None) -> list[dict]:
     """Verdicts for the given live items (all live items when None), worst
     first. Benchmarks always come from every live listing. Blocking (eBay and
     Apify calls); run in a thread. At most DIAGNOSE_SOLD_MAX sold searches a
-    run (Apify costs money); the rest say their comps were skipped."""
+    run (Apify costs money); the rest say their comps were skipped. `info`,
+    if given, gets "benchmarks": a line saying which benchmarks were used."""
     now = now or datetime.now(timezone.utc)
     days = config.DIAGNOSE_DAYS
     live = _live(db.list_items())
     targets = live if item_ids is None else [i for i in live if i["item_id"] in set(item_ids)]
+    report, note = usable_report(db.latest_quality_report(), now)
+    if info is not None:
+        info["benchmarks"] = note
+    contexts = report_context(live, report)
     traffic = traffic_for(live, days)
     offered = db.offers_sent_since((now - timedelta(days=days)).isoformat())
     watch_cache: dict[str, int | None] = {}
@@ -258,10 +400,13 @@ def diagnose(item_ids: list[str] | None = None, *, now: datetime | None = None,
     for item in targets:
         lid = str(item["ebay"]["listing_id"])
         m = metrics(item, traffic.get(lid), watchers(lid), lid in offered, now, days)
-        b = bench.get(m["category_id"])
-        code = verdict(m, b)
+        ctx = contexts.get(item["item_id"])
+        fixes = category_fixes(ctx, item)
+        # A listing in the report is judged on the report's numbers.
+        b = report_bench(ctx) if ctx and ctx["listing"] else bench.get(m["category_id"])
+        code = verdict(m, bench.get(m["category_id"]), ctx, fixes)
         comps = None
-        if code not in ("NOT_ENOUGH_DATA", "OK"):
+        if code not in ("NOT_ENOUGH_DATA", "CATEGORY_FIX", "OK"):
             need_sold = code in ("WATCHERS_OFFER_SENT", "WATCHERS", "PRICE") and sold_budget > 0
             sold_budget -= need_sold
             listing = item.get("listing") or {}
@@ -272,16 +417,20 @@ def diagnose(item_ids: list[str] | None = None, *, now: datetime | None = None,
                 print(f"diagnose: competitor search failed for {item['item_id'][:8]}: {type(e).__name__}")
             if comps is not None and code in ("WATCHERS_OFFER_SENT", "WATCHERS", "PRICE") and not need_sold:
                 comps = {**comps, "sold_skipped": True}
-        code, reason, fix = explain(code, m, b, item, comps)
-        results.append({**m, "verdict": code, "reason": reason, "fix": fix,
-                        "benchmark": b, "comps_found": bool(comps and (comps["active"] or comps["sold"]))})
+        code, reason, fix = explain(code, m, b, item, comps, ctx, fixes)
+        also = [f["fix"] for f in (fixes if code != "CATEGORY_FIX" else fixes[1:])]
+        results.append({**m, "verdict": code, "reason": reason, "fix": fix, "also": also,
+                        "category_fixes": fixes,
+                        "benchmark": b, "report": (ctx or {}).get("listing"),
+                        "comps_found": bool(comps and (comps["active"] or comps["sold"]))})
     results.sort(key=lambda r: (ORDER.index(r["verdict"]), -(r["impressions"] or 0)))
     return results
 
 
-def format_line(r: dict) -> str:
+def format_line(r: dict, also: bool = True) -> str:
     return (f"{ICON[r['verdict']]} {LABEL[r['verdict']]} · {r['item_id'][:8]} {r['title'][:45]}\n"
-            f"   {r['reason']}\n   → {r['fix']}")
+            f"   {r['reason']}\n   → {r['fix']}"
+            + ("".join(f"\n   {ICON['CATEGORY_FIX']} {a}" for a in r.get("also") or []) if also else ""))
 
 
 def format_detail(r: dict) -> list[str]:
@@ -293,9 +442,25 @@ def format_detail(r: dict) -> list[str]:
              f" ({(r['impressions_per_day'] or 0):.0f}/day), {r['views'] if r['views'] is not None else '?'} views,"
              f" CTR {ctr}; watchers {r['watchers'] if r['watchers'] is not None else 'unknown'};"
              f" sales {r['sales']}; offer sent: {'yes' if r['offered'] else 'no'}."]
-    if b:
+    rep = r.get("report")
+    if rep:
+        lines.append(f"{b.get('source', 'eBay report')} (31 days): "
+                     f"{rep['impressions_per_day'] or 0:.0f} impressions/day, CTR "
+                     + (f"{rep['ctr']:.2%}" if rep.get("ctr") is not None else "n/a")
+                     + f", {rep.get('sales_31d') or 0} sales, {rep.get('watchers') if rep.get('watchers') is not None else '?'}"
+                     " watchers.")
+    if b and b.get("section"):
+        lines.append(f"{b['section']} ({b['source']}): our listings {b['impressions_per_day']:.0f} "
+                     f"impressions/day, CTR {b['ctr']:.2%}"
+                     + (f"; top 10% {b['top_impressions_per_day']:.0f}/day, {b['top_ctr']:.2%}"
+                        if b.get("top_ctr") is not None and b.get("top_impressions_per_day") is not None else "")
+                     + (f"; bottom 10% {b['bottom_impressions_per_day']:.0f}/day, {b['bottom_ctr']:.2%}"
+                        if b.get("bottom_ctr") is not None and b.get("bottom_impressions_per_day") is not None
+                        else "") + ".")
+    elif b:
         lines.append(f"Category ({b.get('source')}, {b.get('n')} listings): "
                      f"{b['impressions_per_day']:.0f} impressions/day"
                      + (f", CTR {b['ctr']:.2%}" if b.get("ctr") else "") + ".")
     lines += ["", f"Why: {r['reason']}", f"Fix: {r['fix']}"]
+    lines += [f"{ICON['CATEGORY_FIX']} {a}" for a in r.get("also") or []]
     return lines

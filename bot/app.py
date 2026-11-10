@@ -32,7 +32,7 @@ import db
 import logging_setup
 from bot import (
     check_cmds, diagnose_cmds, flow, intake, inventory_cmds, jobs, listing_cmds, ops_cmds, photos_cmds,
-    receipt_cmds, revise_cmds, sales_cmds, text_router, util,
+    receipt_cmds, report_cmds, revise_cmds, sales_cmds, text_router, util,
 )
 
 def configure() -> None:
@@ -262,6 +262,8 @@ def register_handlers(app: Application) -> None:
     app.add_handler(MessageHandler(filters.PHOTO & filters.CaptionRegex(r"^/check(@\w+)?(\s|$)"),
                                    check_cmds.photo_check))
     app.add_handler(MessageHandler(filters.PHOTO, intake.photo_handler))
+    # eBay's listing quality report, sent as the xlsx (owner only; /diagnose reads it).
+    app.add_handler(MessageHandler(filters.Document.FileExtension("xlsx"), report_cmds.report_document))
     # A bare number while a check waits for its Ross price (before text_router).
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & check_cmds.AWAITING_PRICE,
                                    check_cmds.price_text))

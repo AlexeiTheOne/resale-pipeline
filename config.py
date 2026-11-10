@@ -669,3 +669,9 @@ DIAGNOSE_OFFER_PCT = float(os.getenv("DIAGNOSE_OFFER_PCT", "10"))
 DIAGNOSE_SOLD_MAX = int(os.getenv("DIAGNOSE_SOLD_MAX", "15"))
 # Listings /diagnose all shows (worst first); the rest are counted.
 DIAGNOSE_SHOW_MAX = int(os.getenv("DIAGNOSE_SHOW_MAX", "30"))
+# eBay's listing quality report (sent to the bot as the xlsx): /diagnose uses
+# the newest one for benchmarks while it is at most this many days old (it
+# covers the 31 days before its date). Older: store averages, and it says so.
+QUALITY_REPORT_MAX_AGE_DAYS = int(os.getenv("QUALITY_REPORT_MAX_AGE_DAYS", "30"))
+# Largest report file the bot accepts (the Nov 2026 one was about 0.2 MB).
+QUALITY_REPORT_MAX_BYTES = int(os.getenv("QUALITY_REPORT_MAX_BYTES", str(10 * 1024 * 1024)))
