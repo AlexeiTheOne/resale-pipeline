@@ -647,3 +647,25 @@ COMPETITOR_DETAIL_MAX = int(os.getenv("COMPETITOR_DETAIL_MAX", "10"))
 COMPETITOR_MIN_ACTIVE = int(os.getenv("COMPETITOR_MIN_ACTIVE", "5"))
 # Sold rows per Apify search (about $0.02 for 30).
 COMPETITOR_SOLD_COUNT = int(os.getenv("COMPETITOR_SOLD_COUNT", "30"))
+
+# --- /diagnose (pipeline/diagnose.py) -------------------------------------------
+# Traffic window, in days (shorter for younger listings).
+DIAGNOSE_DAYS = int(os.getenv("DIAGNOSE_DAYS", "30"))
+# Too little to judge: impressions x the category's CTR below this many views.
+DIAGNOSE_MIN_EXPECTED_VIEWS = float(os.getenv("DIAGNOSE_MIN_EXPECTED_VIEWS", "3"))
+# CTR used for expected views when a category has no traffic of its own:
+# our Women's Bags CTR in eBay's 2026-11-06 report.
+DIAGNOSE_FALLBACK_CTR = float(os.getenv("DIAGNOSE_FALLBACK_CTR", "0.0038"))
+# Views with no sale before price is the question (the weekly check's figure).
+DIAGNOSE_MIN_VIEWS_FOR_PRICE = int(os.getenv("DIAGNOSE_MIN_VIEWS_FOR_PRICE", str(REPRICE_MIN_VIEWS_FOR_SIGNAL)))
+# Below this share of the category's CTR or impressions/day: SEARCH CARD or
+# VISIBILITY.
+DIAGNOSE_LOW_FACTOR = float(os.getenv("DIAGNOSE_LOW_FACTOR", "0.5"))
+# Fewer sold comps than this in 90 days: no suggested price.
+DIAGNOSE_MIN_SOLD_COMPS = int(os.getenv("DIAGNOSE_MIN_SOLD_COMPS", "3"))
+# The watcher offer /diagnose checks against sold comps (percent off).
+DIAGNOSE_OFFER_PCT = float(os.getenv("DIAGNOSE_OFFER_PCT", "10"))
+# Sold (Apify) searches per /diagnose run; the rest say their comps were skipped.
+DIAGNOSE_SOLD_MAX = int(os.getenv("DIAGNOSE_SOLD_MAX", "15"))
+# Listings /diagnose all shows (worst first); the rest are counted.
+DIAGNOSE_SHOW_MAX = int(os.getenv("DIAGNOSE_SHOW_MAX", "30"))

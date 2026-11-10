@@ -371,6 +371,8 @@ HELP_SECTIONS = [
     ]),
     ("Selling", [
         ("/setprice [id] <price>", "Set the price (35 -> $34.99); pushes to eBay if it already has an offer"),
+        ("/diagnose <id> | all", "Owner only: why a live listing isn't selling, and the one fix to try "
+                                 "(read-only; worst first with all)"),
         ("/revise <id>", "Owner only: change a live listing's title, specifics and description "
                          "in place. Shows before/after; nothing is sent until you tap Apply"),
         ("/setqty [id] <n>", "Set the quantity on eBay (once the item has an offer); default is 1"),
