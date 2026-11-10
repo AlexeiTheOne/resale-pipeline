@@ -481,6 +481,54 @@ rows for a model younger than `COMPETITOR_CACHE_HOURS` are reused. No FK:
 
 Indexes: `(model_key, source, fetched_at)`, `(check_id)`, `(item_id)`.
 
+**`quality_report_sections`** (migration step 7): eBay's listing quality
+report (the xlsx the owner sends to the bot, `pipeline/quality_report.py`),
+one row per report category ("section"): our figures, the top and bottom
+10%, our ranks and eBay's recommendations. Keyed by the report's own date; a
+report sent again replaces its rows. `/diagnose` reads the newest.
+Approved by Person B (2026-11-09).
+
+| Column | Type | Notes |
+|---|---|---|
+| section_row_id | INT IDENTITY PK | |
+| report_date | DATETIME2(6) NOT NULL | "Report generated", as UTC; UNIQUE with section |
+| section | NVARCHAR(100) NOT NULL | the category as eBay names it, e.g. `Women's Bags & Handbags` |
+| conditions | NVARCHAR(200) | e.g. `Listings condition: New, Price range: $35 - $11,405` |
+| sellers / gmv_rank | INT / INT | sellers in the section; our sales (GMV) rank |
+| impressions_per_day / impressions_rank | DECIMAL(12,2) / INT | ours |
+| ctr / ctr_rank | DECIMAL(9,6) / INT | ours (0.0038 = 0.38%) |
+| conversion / conversion_rank | DECIMAL(9,6) / INT | ours |
+| top_impressions_per_day / bottom_impressions_per_day | DECIMAL(12,2) | top and bottom 10% |
+| top_ctr / bottom_ctr | DECIMAL(9,6) | |
+| top_conversion / bottom_conversion | DECIMAL(9,6) | can be over 1 (eBay's figure) |
+| recommendations | NVARCHAR(MAX) JSON | `[{stage, text, kind, target, ours, top, bottom}]` |
+| benchmarks | NVARCHAR(MAX) JSON | "More benchmarks": `{stage: {ours, top, bottom: {column: value}}}` |
+| ingested_at | DATETIME2(6) | |
+
+**`quality_report_listings`** (migration step 7): the same report's
+listing rows, one per live listing in it. `item_id` is the report's Custom
+label (our item id); no FK, provenance like `check_evidence.item_id`.
+
+| Column | Type | Notes |
+|---|---|---|
+| listing_row_id | INT IDENTITY PK | |
+| report_date | DATETIME2(6) NOT NULL | UNIQUE with ebay_item_id |
+| section | NVARCHAR(100) NOT NULL | its `quality_report_sections.section` |
+| ebay_item_id | VARCHAR(20) NOT NULL | |
+| item_id | VARCHAR(36) | Custom label (no FK) |
+| title | NVARCHAR(300) | |
+| price / shipping_fee | DECIMAL(10,2) | |
+| free_shipping | BIT | |
+| impressions_per_day | DECIMAL(12,2) | 31 days |
+| ctr / conversion | DECIMAL(9,6) | eBay's "No clicks" / "No sales" stored as 0 |
+| ad_rate | DECIMAL(6,4) | promoted listings rate (0.04 = 4%) |
+| specifics_filled / specifics_to_add | INT / NVARCHAR(500) | eBay's recommended item specifics |
+| watchers / age_days / sales_31d | INT | |
+| raw | NVARCHAR(MAX) JSON | every column of the row, by eBay's header |
+| ingested_at | DATETIME2(6) | |
+
+Index: `quality_report_listings (item_id)`.
+
 **`v_receipt_checks`** (view, computed live, never stored): one row per receipt with:
 
 - `items_sum`

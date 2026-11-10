@@ -546,6 +546,37 @@ def recent_evidence(model_key: str, source: str, since: str) -> list[dict]:
     return out
 
 
+def save_quality_report(date: str, sections: list[dict], listings: list[dict]) -> dict:
+    """db.save_quality_report on ResaleDB (rows already shaped by db.py)."""
+    when = _ts(date)
+
+    def go(cur):
+        cur.execute("SELECT COUNT(*) FROM dbo.quality_report_sections WHERE report_date = ?", when)
+        replaced = cur.fetchone()[0] > 0
+        cur.execute("DELETE FROM dbo.quality_report_sections WHERE report_date = ?", when)
+        cur.execute("DELETE FROM dbo.quality_report_listings WHERE report_date = ?", when)
+        for table, rows in (("quality_report_sections", sections), ("quality_report_listings", listings)):
+            for r in rows:
+                r = {"report_date": when, **r}
+                cur.execute(f"INSERT INTO dbo.{table} ({', '.join(r)}) "
+                            f"VALUES ({', '.join('?' * len(r))})", *r.values())
+        return {"sections": len(sections), "listings": len(listings), "replaced": replaced}
+    return _write(go)
+
+
+def latest_quality_report() -> dict | None:
+    rows = _query("SELECT MAX(report_date) AS d FROM dbo.quality_report_sections")
+    date = rows[0]["d"] if rows else None
+    if date is None:
+        return None
+    iso = date.replace(tzinfo=timezone.utc).isoformat()
+    return {"report_date": iso,
+            "sections": _query("SELECT * FROM dbo.quality_report_sections WHERE report_date = ? "
+                               "ORDER BY section_row_id", date),
+            "listings": _query("SELECT * FROM dbo.quality_report_listings WHERE report_date = ? "
+                               "ORDER BY listing_row_id", date)}
+
+
 def get_check(check_id: int) -> dict | None:
     rows = _query("SELECT * FROM dbo.checks WHERE check_id = ?", check_id)
     return _check_decode(rows[0]) if rows else None

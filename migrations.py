@@ -312,12 +312,75 @@ def _check_evidence(con: sqlite3.Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_check_evidence_item ON check_evidence (item_id)")
 
 
+# eBay's listing quality report (docs/listing-performance-plan.md 7.4): the
+# xlsx the owner sends to the bot, one row per report category and one per
+# listing, keyed by the report's own date. /diagnose reads the latest.
+def _quality_report(con: sqlite3.Connection) -> None:
+    """The report's category figures (ours, top and bottom 10%, ranks, eBay's
+    recommendations) and its per-listing rows. A report sent again replaces
+    its own rows (same report_date)."""
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS quality_report_sections (
+            section_row_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_date                TEXT NOT NULL,
+            section                    TEXT NOT NULL CHECK (length(section) > 0),
+            conditions                 TEXT,
+            sellers                    INTEGER,
+            gmv_rank                   INTEGER,
+            impressions_per_day        REAL,
+            impressions_rank           INTEGER,
+            ctr                        REAL,
+            ctr_rank                   INTEGER,
+            conversion                 REAL,
+            conversion_rank            INTEGER,
+            top_impressions_per_day    REAL,
+            bottom_impressions_per_day REAL,
+            top_ctr                    REAL,
+            bottom_ctr                 REAL,
+            top_conversion             REAL,
+            bottom_conversion          REAL,
+            recommendations            TEXT CHECK (recommendations IS NULL OR json_valid(recommendations)),
+            benchmarks                 TEXT CHECK (benchmarks IS NULL OR json_valid(benchmarks)),
+            ingested_at                TEXT NOT NULL,
+            UNIQUE (report_date, section)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS quality_report_listings (
+            listing_row_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_date         TEXT NOT NULL,
+            section             TEXT NOT NULL,
+            ebay_item_id        TEXT NOT NULL CHECK (length(ebay_item_id) > 0),
+            item_id             TEXT,
+            title               TEXT,
+            price               REAL,
+            shipping_fee        REAL,
+            free_shipping       INTEGER CHECK (free_shipping IN (0, 1)),
+            impressions_per_day REAL,
+            ctr                 REAL,
+            conversion          REAL,
+            ad_rate             REAL,
+            specifics_filled    INTEGER,
+            specifics_to_add    TEXT,
+            watchers            INTEGER,
+            age_days            INTEGER,
+            sales_31d           INTEGER,
+            raw                 TEXT CHECK (raw IS NULL OR json_valid(raw)),
+            ingested_at         TEXT NOT NULL,
+            UNIQUE (report_date, ebay_item_id)
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_quality_report_listings_item "
+                "ON quality_report_listings (item_id)")
+
+
 # (version, name, function). Append only.
 MIGRATIONS = [
     (1, "baseline", _baseline),
     (2, "checks_table", _checks_table),
     (3, "checks_sku_main", _checks_sku_main),
     (4, "check_evidence", _check_evidence),
+    (5, "quality_report", _quality_report),
 ]
 
 
@@ -1215,6 +1278,70 @@ def _mssql_check_evidence(cur) -> None:
     cur.execute("CREATE INDEX IX_check_evidence_item ON dbo.check_evidence (item_id)")
 
 
+def _mssql_quality_report(cur) -> None:
+    """eBay's listing quality report (see the SQLite step _quality_report).
+    New tables only, no FK: item_id is the report's Custom label (our item
+    id), provenance like check_evidence.item_id."""
+    cur.execute("""
+    CREATE TABLE dbo.quality_report_sections (
+        section_row_id             INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_quality_report_sections PRIMARY KEY,
+        report_date                DATETIME2(6)  NOT NULL,
+        section                    NVARCHAR(100) NOT NULL
+                                   CONSTRAINT CK_quality_report_sections_section CHECK (LEN(section) > 0),
+        conditions                 NVARCHAR(200) NULL,
+        sellers                    INT           NULL,
+        gmv_rank                   INT           NULL,
+        impressions_per_day        DECIMAL(12,2) NULL,
+        impressions_rank           INT           NULL,
+        ctr                        DECIMAL(9,6)  NULL,
+        ctr_rank                   INT           NULL,
+        conversion                 DECIMAL(9,6)  NULL,
+        conversion_rank            INT           NULL,
+        top_impressions_per_day    DECIMAL(12,2) NULL,
+        bottom_impressions_per_day DECIMAL(12,2) NULL,
+        top_ctr                    DECIMAL(9,6)  NULL,
+        bottom_ctr                 DECIMAL(9,6)  NULL,
+        top_conversion             DECIMAL(9,6)  NULL,
+        bottom_conversion          DECIMAL(9,6)  NULL,
+        recommendations            NVARCHAR(MAX) NULL
+                                   CONSTRAINT CK_quality_report_sections_recommendations_json
+                                   CHECK (ISJSON(recommendations) = 1),
+        benchmarks                 NVARCHAR(MAX) NULL
+                                   CONSTRAINT CK_quality_report_sections_benchmarks_json CHECK (ISJSON(benchmarks) = 1),
+        ingested_at                DATETIME2(6)  NOT NULL
+                                   CONSTRAINT DF_quality_report_sections_ingested_at DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT UQ_quality_report_sections UNIQUE (report_date, section)
+    )""")
+    cur.execute("""
+    CREATE TABLE dbo.quality_report_listings (
+        listing_row_id      INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_quality_report_listings PRIMARY KEY,
+        report_date         DATETIME2(6)  NOT NULL,
+        section             NVARCHAR(100) NOT NULL,
+        ebay_item_id        VARCHAR(20)   NOT NULL
+                            CONSTRAINT CK_quality_report_listings_ebay_item_id CHECK (LEN(ebay_item_id) > 0),
+        item_id             VARCHAR(36)   NULL,
+        title               NVARCHAR(300) NULL,
+        price               DECIMAL(10,2) NULL,
+        shipping_fee        DECIMAL(10,2) NULL,
+        free_shipping       BIT           NULL,
+        impressions_per_day DECIMAL(12,2) NULL,
+        ctr                 DECIMAL(9,6)  NULL,
+        conversion          DECIMAL(9,6)  NULL,
+        ad_rate             DECIMAL(6,4)  NULL,
+        specifics_filled    INT           NULL,
+        specifics_to_add    NVARCHAR(500) NULL,
+        watchers            INT           NULL,
+        age_days            INT           NULL,
+        sales_31d           INT           NULL,
+        raw                 NVARCHAR(MAX) NULL
+                            CONSTRAINT CK_quality_report_listings_raw_json CHECK (ISJSON(raw) = 1),
+        ingested_at         DATETIME2(6)  NOT NULL
+                            CONSTRAINT DF_quality_report_listings_ingested_at DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT UQ_quality_report_listings UNIQUE (report_date, ebay_item_id)
+    )""")
+    cur.execute("CREATE INDEX IX_quality_report_listings_item ON dbo.quality_report_listings (item_id)")
+
+
 # (version, name, function). Append only.
 MSSQL_MIGRATIONS = [
     (1, "resaledb_baseline", _mssql_baseline),
@@ -1223,6 +1350,7 @@ MSSQL_MIGRATIONS = [
     (4, "ross_code_main", _mssql_ross_code_main),
     (5, "receipt_line_details", _mssql_receipt_line_details),
     (6, "check_evidence", _mssql_check_evidence),
+    (7, "quality_report", _mssql_quality_report),
 ]
 # The production migration copies the receipts into a database at this
 # version: the unique indexes (step 2) come after the receipt cleanup.
