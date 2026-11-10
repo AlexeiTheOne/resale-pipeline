@@ -41,8 +41,15 @@ def inv(monkeypatch, tmp_path):
 
 async def _settle(_update, _ctx):
     """inventory_cmds starts plain asyncio tasks (drain() only sees the
-    application's), so give the album countdown and the read time to finish."""
-    await asyncio.sleep(0.2)
+    application's), so wait for those tasks to finish. A fixed sleep was too
+    short when the machine was busy (deploy staging, 2026-11-10)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 10
+    while loop.time() < deadline:
+        await asyncio.sleep(0.02)
+        if not [t for t in asyncio.all_tasks()
+                if t is not asyncio.current_task() and not t.done()]:
+            return
 
 
 def _send(ups, ctx):
