@@ -166,7 +166,7 @@ def test_only_the_owner_can_revise(monkeypatch):
 def test_one_listing_at_a_time(monkeypatch):
     world = FakeWorld(monkeypatch)
     ctx = _preview(f"/revise {ITEM_ID[:8]} other1\ntitle: X")
-    assert any("One listing at a time" in t for t in tg_fakes.sent_texts(ctx))
+    assert any("One listing per block" in t for t in tg_fakes.sent_texts(ctx))
     assert world.events == []
 
 

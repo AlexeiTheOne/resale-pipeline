@@ -465,6 +465,9 @@ EBAY_WRITES_ENABLED = _env_bool("EBAY_WRITES_ENABLED", True)
 # commands refuse until it is set.
 OWNER_USER_IDS = {int(t) for t in os.getenv("OWNER_USER_IDS", "").replace(";", ",").split(",")
                   if t.strip().isdigit()}
+# Listings one /revise may change (one preview, one Apply). Single-listing
+# revises were verified first (d7432192, 2026-11-09).
+REVISE_MAX_LISTINGS = int(os.getenv("REVISE_MAX_LISTINGS", "10"))
 
 # Automatic /sync. Until this existed, /sync was manual-only and nothing else
 # wrote sold orders into the DB, so every money figure (/profit, /report, COGS)

@@ -51,7 +51,10 @@ USAGE = ("Usage, all in one message:\n"
          "Pattern: -   (removes it)\n"
          "description:\n"
          "New description text, to the end of the message.\n\n"
-         "Every line is optional except the first. One listing at a time.")
+         "Every line is optional except the first.\n\n"
+         "Several listings: separate them with a line of ---, each block starting with its id:\n"
+         "/revise c646d6f0\ntitle: ...\n---\n5fdc486f\ntitle: ...\nExterior Color: Multicolor\n"
+         "One preview for all, one Apply.")
 
 
 class ReviseError(ValueError):
@@ -100,6 +103,43 @@ def parse(text: str) -> tuple[list[str], dict]:
         else:
             change["set"][name] = value
     return args, change
+
+
+_SEPARATOR = re.compile(r"^\s*-{3,}\s*$")
+
+
+def split_blocks(text: str) -> list[tuple[list[str], dict]]:
+    """One (args, change) per listing. A message without --- lines is one
+    listing, exactly as parse() reads it. With them, each block after the
+    first starts with its id on its own line; the first block's id is on the
+    /revise line (or, if not, on the block's first line)."""
+    lines = (text or "").splitlines()
+    if not any(_SEPARATOR.match(ln) for ln in lines[1:]):
+        return [parse(text)]
+    head = lines[0].split()[1:] if lines else []
+    blocks, current = [], []
+    for ln in lines[1:]:
+        if _SEPARATOR.match(ln):
+            blocks.append(current)
+            current = []
+        else:
+            current.append(ln)
+    blocks.append(current)
+    out = []
+    for n, block in enumerate(blocks):
+        body = list(block)
+        if n == 0 and head:
+            ids = head
+        else:
+            while body and not body[0].strip():
+                body.pop(0)
+            if not body:
+                raise ReviseError(f"Listing {n + 1} is empty.")
+            ids = body.pop(0).split()
+        if len(ids) != 1 or ":" in ids[0]:
+            raise ReviseError(f"Listing {n + 1} must start with one id on its own line.")
+        out.append(parse("/revise " + ids[0] + "\n" + "\n".join(body)))
+    return out
 
 
 def _multi_aspects(category_id: str | None) -> set[str]:
@@ -386,6 +426,11 @@ def _expire_old() -> None:
         state.revise.pop(token, None)
 
 
+def _no_change(change: dict) -> bool:
+    return (change["title"] is None and not change["set"] and not change["remove"]
+            and change["description"] is None)
+
+
 async def revise_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not is_owner(update.effective_user):
@@ -394,40 +439,78 @@ async def revise_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                   " No owner is set: add OWNER_USER_IDS to .env and restart."))
         return
     try:
-        args, change = parse(message.text or "")
+        blocks = split_blocks(message.text or "")
     except ReviseError as e:
         await util._safe_reply(message, f"⚠️ {e}\n\n{USAGE}")
         return
-    if len(args) != 1:
-        await util._safe_reply(message, "One listing at a time: /revise <id> on the first line.\n\n" + USAGE)
+    if len(blocks) > config.REVISE_MAX_LISTINGS:
+        await util._safe_reply(message, f"⚠️ {len(blocks)} listings; one /revise takes up to "
+                                        f"{config.REVISE_MAX_LISTINGS}. Nothing changed.")
         return
-    if change["title"] is None and not change["set"] and not change["remove"] and change["description"] is None:
+    if len(blocks) == 1 and len(blocks[0][0]) != 1:
+        await util._safe_reply(message, "One listing per block: /revise <id> on the first line.\n\n" + USAGE)
+        return
+    if any(_no_change(change) for _, change in blocks):
         await util._safe_reply(message, USAGE)
         return
-    item_id, err = util._resolve_item_id(update.effective_user.id, args)
-    if err:
-        await util._safe_reply(message, f"⚠️ {err}")
-        return
-    try:
-        plan = await asyncio.to_thread(build_plan, item_id, change)
-    except ReviseError as e:
-        await util._safe_reply(message, f"⚠️ {e}")
-        return
-    except Exception as e:
-        util._record_error(f"revise preview ({item_id[:8]})", e)
-        await util._safe_reply(message, f"❌ Couldn't read the listing from eBay: "
-                                        f"{type(e).__name__}: {str(e)[:200]}. Nothing changed.")
+
+    item_ids, errors = [], []
+    for args, _ in blocks:
+        item_id, err = util._resolve_item_id(update.effective_user.id, args)
+        if err:
+            errors.append(f"{args[0]}: {err}")
+        elif item_id in item_ids:
+            errors.append(f"{item_id[:8]} is given twice.")
+        item_ids.append(item_id)
+    plans = []
+    if not errors:
+        for item_id, (_, change) in zip(item_ids, blocks):
+            try:
+                plans.append(await asyncio.to_thread(build_plan, item_id, change))
+            except ReviseError as e:
+                errors.append(f"{item_id[:8]}: {e}")
+            except Exception as e:
+                util._record_error(f"revise preview ({item_id[:8]})", e)
+                errors.append(f"{item_id[:8]}: couldn't read the listing from eBay "
+                              f"({type(e).__name__}: {str(e)[:150]})")
+    if errors:
+        # All or nothing at preview time: a partial preview is easy to Apply by mistake.
+        await util._send_chunked(message, ["⚠️ Nothing changed:"] + [f"  {e}" for e in errors])
         return
 
     _expire_old()
     token = secrets.token_hex(4)
-    state.revise[token] = {"user": update.effective_user.id, "ts": time.time(), "plan": plan}
-    await util._send_chunked(message, preview_lines(plan))
+    state.revise[token] = {"user": update.effective_user.id, "ts": time.time(), "plans": plans}
+    if len(plans) == 1:
+        lines = preview_lines(plans[0])
+        ask = f"Apply these changes to eBay listing {plans[0]['listing_id']}? Nothing has been sent yet."
+        apply_label = "✅ Apply to eBay"
+    else:
+        lines = [f"✏️ Revise {len(plans)} listings. Nothing sent yet.", ""]
+        for n, plan in enumerate(plans, 1):
+            lines += [f"── {n} of {len(plans)} ──"] + preview_lines(plan)[1:] + [""]
+        ask = (f"Apply all {len(plans)} to eBay? Each is sent to eBay first, then saved in the DB. "
+               "Nothing has been sent yet.")
+        apply_label = f"✅ Apply all {len(plans)} to eBay"
+    await util._send_chunked(message, lines)
     markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Apply to eBay", callback_data=f"rev:apply:{token}"),
+        InlineKeyboardButton(apply_label, callback_data=f"rev:apply:{token}"),
         InlineKeyboardButton("✖ Cancel", callback_data=f"rev:cancel:{token}")]])
-    await util._safe_reply(message, f"Apply these changes to eBay listing {plan['listing_id']}? "
-                                    "Nothing has been sent yet.", reply_markup=markup)
+    await util._safe_reply(message, ask, reply_markup=markup)
+
+
+async def _apply_one(plan: dict) -> dict:
+    item_id = plan["item_id"]
+    if not util._claim("revise", item_id):
+        return {"ok": False, "lines": [f"⚠️ {item_id[:8]} is already being revised. Not changed."]}
+    try:
+        return await asyncio.to_thread(apply_plan, plan)
+    except Exception as e:
+        util._record_error(f"revise ({item_id[:8]})", e)
+        return {"ok": False, "lines": [f"❌ {item_id[:8]}: revise failed: {type(e).__name__}: "
+                                       f"{str(e)[:200]}. Check the listing before trying again; see /errors."]}
+    finally:
+        util._release("revise", item_id)
 
 
 async def revise_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -460,19 +543,15 @@ async def revise_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                                               "Run /revise again. Nothing changed.")
         return
 
-    plan = pending["plan"]
-    item_id = plan["item_id"]
-    if not util._claim("revise", item_id):
-        await util._safe_reply(query.message, f"{item_id[:8]} is already being revised. Nothing changed.")
-        return
-    try:
-        await util._safe_reply(query.message, f"✍️ Sending the changes for {item_id[:8]} to eBay...")
-        try:
-            result = await asyncio.to_thread(apply_plan, plan)
-        except Exception as e:
-            util._record_error(f"revise ({item_id[:8]})", e)
-            result = {"ok": False, "lines": [f"❌ Revise failed: {type(e).__name__}: {str(e)[:200]}. "
-                                             "Check the listing before trying again; see /errors."]}
-        await util._send_chunked(query.message, result["lines"])
-    finally:
-        util._release("revise", item_id)
+    plans = pending["plans"]
+    await util._safe_reply(query.message, "✍️ Sending the changes for "
+                                          f"{', '.join(p['item_id'][:8] for p in plans)} to eBay...")
+    # One at a time, each eBay first and then the DB. A failure stops only its
+    # own listing: the others are independent and were previewed.
+    results = [await _apply_one(plan) for plan in plans]
+    lines = [line for r in results for line in r["lines"]]
+    if len(plans) > 1:
+        ok = sum(r["ok"] for r in results)
+        lines.append(f"Done: {ok} of {len(plans)} revised."
+                     + ("" if ok == len(plans) else " The others are as described above."))
+    await util._send_chunked(query.message, lines)
