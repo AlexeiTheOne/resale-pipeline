@@ -9,8 +9,12 @@ taxonomy, search) still work.
 The checks sit at the lowest layer of each ebay/ module (every non-GET REST
 request and every Trading call not on the read list), so a new caller cannot
 miss them. The setting is read on each call, so tests can flip it.
-One POST is a read and isn't guarded: the Recommendation API's find
-(ebay/recommendation.py), which only returns suggested ad rates.
+
+One REST POST is a read: the Recommendation API's find
+(ebay/recommendation.py), which only returns suggested ad rates. It still goes
+through require_rest_write, and is let through by its exact path in
+REST_READ_POSTS. Any other POST, a PUT or a DELETE to that path, or a path
+that merely starts with it, is a write.
 """
 import logging
 
@@ -23,6 +27,13 @@ TRADING_READS = frozenset({
     "GetItem",
     "GetMyeBaySelling",
     "GetItemsAwaitingFeedback",
+})
+
+
+# REST POSTs that only read, by exact path (no query string). Keep this to
+# the one endpoint; tests/test_ebay_writes_guard.py pins the set.
+REST_READ_POSTS = frozenset({
+    "/sell/recommendation/v1/find",
 })
 
 
@@ -45,9 +56,12 @@ def require_writes(action: str) -> None:
 
 
 def require_rest_write(method: str, path: str) -> None:
-    """Guard a REST call: anything but GET counts as a write."""
-    if method.upper() != "GET":
-        require_writes(f"{method.upper()} {path}")
+    """Guard a REST call: anything but GET counts as a write, except a POST
+    to a path in REST_READ_POSTS (exact match)."""
+    method = method.upper()
+    if method == "GET" or (method == "POST" and path in REST_READ_POSTS):
+        return
+    require_writes(f"{method} {path}")
 
 
 def require_trading_write(call_name: str) -> None:
