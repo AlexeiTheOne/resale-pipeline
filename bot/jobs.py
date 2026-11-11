@@ -51,6 +51,7 @@ _JOB_SYNC = "daily_sync"
 _JOB_FEEDBACK = "daily_feedback"
 _JOB_RECEIPT_DECODE = "daily_receipt_decode"
 _JOB_IMPRESSIONS = "daily_impression_check"
+_JOB_REPORT_REMINDER = "quality_report_reminder"
 
 
 def _previous_slot(now: datetime, hour_utc: int, weekday: int | None = None) -> datetime:
@@ -158,6 +159,7 @@ async def _run_sync_job(app: Application, *, catch_up: bool = False) -> None:
         return
     db.record_job_run(_JOB_SYNC, detail=f"{len(lines)} report line(s)")
     await _send_budget_warning(app)
+    await _send_report_reminder(app)
 
     # Bookkeeping (price/qty corrections, status fixes) happens silently; the
     # phone only hears about new sales and things that need a decision.
@@ -191,6 +193,37 @@ async def _send_budget_warning(app: Application) -> None:
             await app.bot.send_message(chat_id=uid, text=text)
         except Exception as e:
             print(f"WARNING: budget warning to {uid} failed: {type(e).__name__}: {e}")
+
+
+async def _send_report_reminder(app: Application, now: datetime | None = None) -> None:
+    """About once a month: ask the owners for a fresh eBay listing quality
+    report (pipeline/quality_report.reminder_text decides). Rides on the daily
+    sync like the budget warning; stamped in job_runs so a restart doesn't
+    repeat it."""
+    from pipeline import quality_report
+    now = now or datetime.now(timezone.utc)
+    try:
+        report = await asyncio.to_thread(db.latest_quality_report)
+        last = db.last_job_run(_JOB_REPORT_REMINDER)
+    except Exception as e:
+        print(f"WARNING: report reminder check failed: {type(e).__name__}: {e}")
+        return
+    date = datetime.fromisoformat(report["report_date"]) if report else None
+    if date and date.tzinfo is None:
+        date = date.replace(tzinfo=timezone.utc)
+    text = quality_report.reminder_text(date, last, now, config.QUALITY_REPORT_REMIND_DAYS,
+                                        config.QUALITY_REPORT_MAX_AGE_DAYS)
+    if not text:
+        return
+    sent = False
+    for uid in (config.OWNER_USER_IDS or util.ALLOWED_USER_IDS):
+        try:
+            await app.bot.send_message(chat_id=uid, text=text)
+            sent = True
+        except Exception as e:
+            print(f"WARNING: report reminder to {uid} failed: {type(e).__name__}: {e}")
+    if sent:
+        db.record_job_run(_JOB_REPORT_REMINDER, detail=text[:200])
 
 
 async def _daily_sync_loop(app: Application) -> None:

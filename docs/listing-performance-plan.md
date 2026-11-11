@@ -305,6 +305,27 @@ Decisions this spec leaves open, decided here (change in config if wrong):
   - Checked against the 11/06 report and live ResaleDB (read-only): 109 of
     111 report listings match live items (2 sold since), 4 newer ones match by
     category, 9 are in categories the report doesn't cover.
+- **No eBay API gives the report** (checked 2026-11-10): the category
+  benchmarks (rank, top/bottom 10%) and the free-shipping advice exist only in
+  the xlsx. The bot asks for a fresh one about once a month (the daily sync
+  sends it when the newest report is at least `QUALITY_REPORT_REMIND_DAYS`,
+  28, old, at most once per 28 days).
+- **Between reports (owner-approved 2026-11-10), from eBay's APIs:**
+  - **Conversion:** the traffic report's `TRANSACTION` / views, shown in
+    `/diagnose <id>` with the store average. Not a verdict: about one sale per
+    listing per month is too few to judge. If eBay refuses the metric, the
+    bot stops asking for it, and the weekly check is unaffected.
+  - **Recommended specifics (Taxonomy):** required + recommended aspects for
+    the listing's category against what it has. Fewer than
+    `DIAGNOSE_MIN_RECOMMENDED_SPECIFICS` (8, eBay's own minimum in the report)
+    is a CATEGORY FIX naming the missing ones. Every listing; the report's own
+    specifics line wins where it has one. On 118 live listings: 7 flagged.
+  - **Suggested ad rate (Recommendation API, `findListingRecommendations`):**
+    only for listings the report doesn't cover (a report section without an
+    ad-rate line means eBay finds ours fine). Shown when it is at least
+    `DIAGNOSE_AD_RATE_GAP_PCT` (1 point) above the listing's own rate, read
+    from our Promoted Listings campaign (4% default if that read fails). eBay
+    calls it a guide, not the best rate, so it stays an owner decision (§6).
 
 ### 7.5 New listings
 

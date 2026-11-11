@@ -119,6 +119,31 @@ def marketing_status() -> str:
     return "OK (no campaign yet — created on first /promote)"
 
 
+def ad_rates() -> dict[str, float]:
+    """The ad rate (a fraction: 0.04) of every ad in our campaign, keyed by
+    eBay listing id and by SKU. Read-only; {} when there is no campaign."""
+    campaign_id = _find_campaign_id()
+    if not campaign_id:
+        return {}
+    out: dict[str, float] = {}
+    offset = 0
+    while True:
+        body = _request("GET", f"/sell/marketing/v1/ad_campaign/{campaign_id}/ad",
+                        params={"limit": 500, "offset": offset}).json()
+        ads = body.get("ads") or []
+        for ad in ads:
+            try:
+                rate = float(ad.get("bidPercentage")) / 100
+            except (TypeError, ValueError):
+                continue
+            for key in (ad.get("listingId"), ad.get("inventoryReferenceId")):
+                if key:
+                    out[str(key)] = rate
+        offset += len(ads)
+        if not ads or not body.get("next") or offset >= int(body.get("total") or 0):
+            return out
+
+
 def promote_listing(sku: str, bid_percentage) -> dict:
     """Promote the listing behind `sku` at the given ad rate (a percentage).
 
