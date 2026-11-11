@@ -449,6 +449,10 @@ SQL_TRUST_SERVER_CERT = _env_bool("SQL_TRUST_SERVER_CERT", True)
 # service account can write (doc 7.1, e.g. D:\SQLBackups). Unset = the
 # instance's own Backup folder, which a normal user may not be able to read.
 SQL_BACKUP_DIR = os.getenv("SQL_BACKUP_DIR") or None
+# After a reboot the bot can start before SQL Server is up. At startup it
+# retries the connection for this many seconds, with a log line, before giving
+# up (sqlserver.wait_for_server, called from telegram_bot.py).
+SQL_STARTUP_WAIT_SECONDS = int(os.getenv("SQL_STARTUP_WAIT_SECONDS", "120"))
 # Where db.py reads from: "sqlite" (data/ross.db, the default and what
 # production runs until cutover) or "sqlserver" (SQL_DATABASE, through
 # db_mssql.py: the same functions, reads and writes).

@@ -9,6 +9,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+if __name__ == "__main__":
+    # After a reboot the bot can start before SQL Server. db (imported below)
+    # connects at import, so wait for the server first instead of crashing
+    # every 15 s in the restart loop. Not on import (the tests import this file).
+    import config
+    if config.DB_BACKEND == "sqlserver":
+        import sqlserver
+        sqlserver.wait_for_server()
+
 from telegram.ext import (  # noqa: E402,F401  (re-export for tests)
     CallbackQueryHandler, CommandHandler, MessageHandler, TypeHandler,
 )
