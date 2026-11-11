@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 import config
-from ebay import feedback, guard, inventory, listings, marketing, negotiation
+from ebay import feedback, guard, inventory, listings, marketing, negotiation, recommendation
 
 
 class _Resp:
@@ -37,7 +37,7 @@ def sent(monkeypatch):
         monkeypatch.setattr(httpx, name, _record(name.upper()))
     monkeypatch.setattr(httpx, "request", _record("REQUEST"))
     # No token lookup: these tests must not depend on the DB.
-    for mod in (inventory, listings, marketing, negotiation):
+    for mod in (inventory, listings, marketing, negotiation, recommendation):
         monkeypatch.setattr(mod, "get_access_token", lambda: "fake-token")
     return calls
 
@@ -105,3 +105,44 @@ def test_default_is_on_so_production_is_unchanged(monkeypatch):
     assert config._env_bool("EBAY_WRITES_ENABLED", True) is True
     monkeypatch.setenv("EBAY_WRITES_ENABLED", "0")
     assert config._env_bool("EBAY_WRITES_ENABLED", True) is False
+
+
+# --- the one REST POST that reads -------------------------------------------------
+
+def test_the_read_only_post_list_is_exactly_the_recommendation_find():
+    # Adding a path here lets a POST through with writes off: it needs a reason
+    # in ebay/guard.py and a change to this test.
+    assert guard.REST_READ_POSTS == frozenset({"/sell/recommendation/v1/find"})
+
+
+def test_recommendation_find_still_runs_with_writes_off(sent, writes_off):
+    assert recommendation.suggested_ad_rates(["L1"]) == {}
+    assert sent == [("POST", "https://api.ebay.com/sell/recommendation/v1/find")]
+
+
+@pytest.mark.parametrize("method, path", [
+    ("POST", "/sell/recommendation/v1/find/"),                       # not the exact path
+    ("POST", "/sell/recommendation/v1/find?filter=x"),               # query strings aren't stripped
+    ("POST", "/sell/recommendation/v1/find/../../marketing/v1/ad_campaign"),
+    ("POST", "/sell/recommendation/v1/findx"),
+    ("POST", "/sell/recommendation/v2/find"),
+    ("POST", "/SELL/RECOMMENDATION/V1/FIND"),
+    ("PUT", "/sell/recommendation/v1/find"),                         # same path, other method
+    ("DELETE", "/sell/recommendation/v1/find"),
+    ("PATCH", "/sell/recommendation/v1/find"),
+    ("POST", "/sell/marketing/v1/ad_campaign"),
+    ("POST", "/sell/marketing/v1/ad_campaign/C1/bulk_update_ads_bid_by_inventory_reference"),
+    ("POST", "/sell/inventory/v1/offer/O1/publish"),
+    ("POST", "/sell/inventory/v1/offer"),
+    ("POST", "/sell/negotiation/v1/send_offer_to_interested_buyers"),
+])
+def test_every_other_post_is_still_a_write(method, path, writes_off):
+    with pytest.raises(guard.EbayWritesDisabled):
+        guard.require_rest_write(method, path)
+
+
+def test_the_allowed_post_is_let_through_and_lowercase_methods_too(writes_off):
+    guard.require_rest_write("POST", "/sell/recommendation/v1/find")
+    guard.require_rest_write("post", "/sell/recommendation/v1/find")
+    with pytest.raises(guard.EbayWritesDisabled):
+        guard.require_rest_write("put", "/sell/recommendation/v1/find")
