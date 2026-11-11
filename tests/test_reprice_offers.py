@@ -88,7 +88,8 @@ def test_traffic_report_reads_total_impressions_by_key():
     assert "TOTAL_IMPRESSION_TOTAL" in asked["metric"]
     assert "LISTING_IMPRESSION_TOTAL" in asked["metric"]
     assert out["117"] == {"impressions": 11549, "organic_impressions": 226, "views": 8,
-                          "search_views": 4, "ctr": 0.02}
+                          "search_views": 4, "ctr": 0.02,
+                          "transactions": None}   # eBay didn't return TRANSACTION: unknown
 
 
 def test_traffic_report_without_total_raises_so_the_batch_is_no_data():

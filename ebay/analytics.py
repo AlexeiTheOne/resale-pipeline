@@ -62,13 +62,20 @@ TRAFFIC_METRICS = (
     "LISTING_VIEWS_SOURCE_SEARCH_RESULTS_PAGE",   # views that came from search
     "CLICK_THROUGH_RATE",
 )
+# Asked for too, for /diagnose's conversion (sales / views). Not confirmed on
+# a live response yet, so a 400 with them is retried once without them and
+# they are dropped for the rest of the process: the old metrics must keep
+# working for the weekly check whatever eBay thinks of these.
+OPTIONAL_METRICS = ("TRANSACTION",)
+_optional_ok = True
 
 
 def get_traffic_report(listing_ids: list[str], days: int = 7) -> dict[str, dict]:
     """Impressions/views per listing over the trailing `days`. Returns
     {listing_id: {"impressions": int (TOTAL, promoted included),
     "organic_impressions": int (search + store), "views": int (all sources),
-    "search_views": int, "ctr": float (eBay's own field, not used for verdicts)}}.
+    "search_views": int, "ctr": float (eBay's own field, not used for verdicts),
+    "transactions": int or None (None: eBay didn't give the metric)}}.
     A listing eBay has no traffic to report for is simply omitted.
 
     Raises if the response has records but no TOTAL_IMPRESSION_TOTAL column: a
@@ -86,10 +93,12 @@ def get_traffic_report(listing_ids: list[str], days: int = 7) -> dict[str, dict]
         f"listing_ids:{{{'|'.join(listing_ids)}}},"
         f"date_range:[{start.strftime('%Y%m%d')}..{end.strftime('%Y%m%d')}]"
     )
+    global _optional_ok
+    with_optional = _optional_ok
     params = {
         "dimension": "LISTING",
         "filter": filter_str,
-        "metric": ",".join(TRAFFIC_METRICS),
+        "metric": ",".join(TRAFFIC_METRICS + (OPTIONAL_METRICS if with_optional else ())),
     }
     # eBay rate-limits this endpoint, and a weekly run makes one call per listing —
     # at ~110 listings the tail of the run reliably 429s (4 items lost their whole
@@ -109,6 +118,11 @@ def get_traffic_report(listing_ids: list[str], days: int = 7) -> dict[str, dict]
             break
         if attempt < 2:
             time.sleep(2 + attempt * 2)   # 2s, 4s
+    if r.status_code == 400 and with_optional:
+        print(f"analytics: traffic_report refused {OPTIONAL_METRICS} ({r.text[:200]}); "
+              "asking without them from now on")
+        _optional_ok = False
+        return get_traffic_report(listing_ids, days)
     if r.status_code >= 400:
         raise RuntimeError(f"eBay Analytics API traffic_report failed [{r.status_code}]: {r.text}")
 
@@ -142,6 +156,8 @@ def get_traffic_report(listing_ids: list[str], days: int = 7) -> dict[str, dict]
             "views": int(float(_num(values, "LISTING_VIEWS_TOTAL"))),
             "search_views": int(float(_num(values, "LISTING_VIEWS_SOURCE_SEARCH_RESULTS_PAGE"))),
             "ctr": float(_num(values, "CLICK_THROUGH_RATE")),
+            "transactions": (int(float(_num(values, "TRANSACTION")))
+                             if "TRANSACTION" in metric_keys else None),
         }
     return out
 

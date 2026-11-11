@@ -4,16 +4,28 @@ are faked. The MK MKS8006 band (15 watchers, an offer sent Nov 2, no sale,
 sold comps around $78) is the main case."""
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 import config
 import db
 import profit
 from bot import diagnose_cmds
-from ebay import analytics
+from ebay import analytics, marketing, recommendation, taxonomy
 from pipeline import diagnose
 from tests import tg_fakes
 
 NOW = datetime(2026, 11, 9, 20, tzinfo=timezone.utc)
 OWNER = tg_fakes.DEFAULT_USER_ID
+
+
+@pytest.fixture(autouse=True)
+def no_between_report_apis(monkeypatch):
+    """The Taxonomy / Recommendation / Marketing checks are tested in
+    test_diagnose_between_reports.py; here they find nothing."""
+    monkeypatch.setattr(taxonomy, "category_aspects", lambda cat: [])
+    monkeypatch.setattr(taxonomy, "category_name", lambda cat: None)
+    monkeypatch.setattr(recommendation, "suggested_ad_rates", lambda ids: {})
+    monkeypatch.setattr(marketing, "ad_rates", lambda: {})
 
 
 def _m(**kw):

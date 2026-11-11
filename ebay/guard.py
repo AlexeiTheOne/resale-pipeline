@@ -9,6 +9,8 @@ taxonomy, search) still work.
 The checks sit at the lowest layer of each ebay/ module (every non-GET REST
 request and every Trading call not on the read list), so a new caller cannot
 miss them. The setting is read on each call, so tests can flip it.
+One POST is a read and isn't guarded: the Recommendation API's find
+(ebay/recommendation.py), which only returns suggested ad rates.
 """
 import logging
 

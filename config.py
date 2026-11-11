@@ -669,9 +669,20 @@ DIAGNOSE_OFFER_PCT = float(os.getenv("DIAGNOSE_OFFER_PCT", "10"))
 DIAGNOSE_SOLD_MAX = int(os.getenv("DIAGNOSE_SOLD_MAX", "15"))
 # Listings /diagnose all shows (worst first); the rest are counted.
 DIAGNOSE_SHOW_MAX = int(os.getenv("DIAGNOSE_SHOW_MAX", "30"))
+# Between reports: fewer of eBay's recommended item specifics (Taxonomy) than
+# this is a CATEGORY FIX. 8 is what eBay's report asks for (Athletic Shoes,
+# 11/06/2026); a category with fewer recommended needs all of them.
+DIAGNOSE_MIN_RECOMMENDED_SPECIFICS = int(os.getenv("DIAGNOSE_MIN_RECOMMENDED_SPECIFICS", "8"))
+# eBay's suggested ad rate is shown only when it is at least this many points
+# above the listing's own (a 4.3% suggestion against our 4% is noise).
+DIAGNOSE_AD_RATE_GAP_PCT = float(os.getenv("DIAGNOSE_AD_RATE_GAP_PCT", "1"))
 # eBay's listing quality report (sent to the bot as the xlsx): /diagnose uses
 # the newest one for benchmarks while it is at most this many days old (it
 # covers the 31 days before its date). Older: store averages, and it says so.
 QUALITY_REPORT_MAX_AGE_DAYS = int(os.getenv("QUALITY_REPORT_MAX_AGE_DAYS", "30"))
 # Largest report file the bot accepts (the Nov 2026 one was about 0.2 MB).
 QUALITY_REPORT_MAX_BYTES = int(os.getenv("QUALITY_REPORT_MAX_BYTES", str(10 * 1024 * 1024)))
+# Monthly Telegram reminder to send a fresh report: when the newest is at
+# least this many days old (or there is none), at most once per this many
+# days. Below MAX_AGE_DAYS so a new one can arrive before the old one expires.
+QUALITY_REPORT_REMIND_DAYS = int(os.getenv("QUALITY_REPORT_REMIND_DAYS", "28"))

@@ -233,6 +233,29 @@ def parse(path) -> dict:
     return {"report_date": date, "sections": sections, "listings": unique}
 
 
+# --- the monthly reminder ---------------------------------------------------------
+
+def reminder_text(report_date: datetime | None, last_sent: datetime | None, now: datetime,
+                  remind_days: int, max_age_days: int) -> str | None:
+    """The Telegram reminder to send a fresh report, or None. Due when the
+    newest report is at least `remind_days` old (or there is none) and no
+    reminder went out in the last `remind_days`."""
+    if last_sent and now - last_sent < timedelta(days=remind_days):
+        return None
+    age = (now - report_date).days if report_date else None
+    if age is not None and age < remind_days:
+        return None
+    if age is None:
+        state = "There is no report yet, so /diagnose uses store averages."
+    elif age > max_age_days:
+        state = f"The last one is from {report_date:%m/%d} ({age} days old); /diagnose stopped using it."
+    else:
+        state = (f"The last one is from {report_date:%m/%d} ({age} days old); /diagnose stops using it "
+                 f"after {max_age_days} days.")
+    return ("📊 Time to upload a fresh listing quality report: Seller Hub → Performance → Listing quality "
+            "report → download the xlsx and send it here. " + state)
+
+
 # --- applying it to a listing ----------------------------------------------------
 
 def applies(rec: dict, listing: dict | None, item: dict | None = None) -> bool:

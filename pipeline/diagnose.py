@@ -17,6 +17,10 @@ Verdicts, in priority order (the first that applies is primary):
                        that this listing lacks (free shipping, ad rate,
                        specifics). Account-wide, so it's last; when another
                        verdict is primary it's shown as an extra line.
+                       Between reports two checks from eBay's APIs add to
+                       it: recommended specifics from Taxonomy (every
+                       listing), and eBay's suggested ad rate (Recommendation
+                       API) for a listing the report doesn't cover.
   OK                   nothing to fix
 
 Benchmarks: eBay's listing quality report (sent to the bot as the xlsx,
@@ -28,6 +32,9 @@ than the report, or with no report, falls back to our own per-category
 averages, labelled "store average". Rules carried over from the weekly
 check (pipeline/reprice.py): missing traffic or watcher data is "unknown",
 never zero, and a low click-through is never answered with a price cut.
+
+Conversion (sales / views, from the traffic report's TRANSACTION) is shown,
+not judged: at about one sale a listing a month it is too noisy for a verdict.
 """
 import collections
 import statistics
@@ -36,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 import config
 import db
 import profit
-from ebay import analytics
+from ebay import analytics, marketing, recommendation, taxonomy
 from pipeline import competitors, quality_report
 
 ORDER = ("NOT_ENOUGH_DATA", "WATCHERS_OFFER_SENT", "WATCHERS", "PRICE", "SEARCH_CARD", "VISIBILITY",
@@ -92,11 +99,13 @@ def metrics(item: dict, traffic: dict | None, watchers: int | None, offered: boo
          "category_id": str((item.get("listing") or {}).get("category_id") or ""),
          "days": round(window, 1), "watchers": watchers, "offered": offered, "sales": sales,
          "traffic_known": traffic is not None, "impressions": None, "views": None,
-         "impressions_per_day": None, "ctr": None}
+         "impressions_per_day": None, "ctr": None, "transactions": None, "conversion": None}
     if traffic is not None:
         imp, views = int(traffic.get("impressions") or 0), int(traffic.get("views") or 0)
+        tx = traffic.get("transactions")
         m.update(impressions=imp, views=views, impressions_per_day=imp / window,
-                 ctr=(views / imp) if imp else None)
+                 ctr=(views / imp) if imp else None, transactions=tx,
+                 conversion=(tx / views) if tx is not None and views else None)
     return m
 
 
@@ -111,8 +120,11 @@ def benchmarks(all_metrics: list[dict]) -> dict[str, dict]:
     out = {}
     for cat, ms in by.items():
         imp = sum(m["impressions"] for m in ms)
+        conv = [m for m in ms if m.get("transactions") is not None]
+        conv_views = sum(m["views"] for m in conv)
         out[cat] = {"impressions_per_day": statistics.mean(m["impressions_per_day"] for m in ms),
                     "ctr": (sum(m["views"] for m in ms) / imp) if imp else None,
+                    "conversion": (sum(m["transactions"] for m in conv) / conv_views) if conv_views else None,
                     "n": len(ms), "source": "store average"}
     return out
 
@@ -164,6 +176,7 @@ def report_bench(ctx: dict) -> dict:
     """The benchmark dict /diagnose shows, from a report section."""
     s = ctx["section"]
     return {"impressions_per_day": s.get("impressions_per_day"), "ctr": s.get("ctr"),
+            "conversion": s.get("conversion"),
             "top_ctr": s.get("top_ctr"), "bottom_ctr": s.get("bottom_ctr"),
             "top_impressions_per_day": s.get("top_impressions_per_day"),
             "bottom_impressions_per_day": s.get("bottom_impressions_per_day"),
@@ -176,9 +189,107 @@ def category_fixes(ctx: dict | None, item: dict) -> list[dict]:
     if not ctx:
         return []
     return [{"section": ctx["section"]["section"], "kind": rec.get("kind"), "text": rec.get("text"),
-             "fix": quality_report.fix_text(rec, ctx["listing"], item["item_id"])}
+             "source": "report", "fix": quality_report.fix_text(rec, ctx["listing"], item["item_id"])}
             for rec in ctx["section"].get("recommendations") or []
             if quality_report.applies(rec, ctx["listing"], item)]
+
+
+# --- between reports: eBay's APIs ---------------------------------------------------
+
+def _filled(v) -> bool:
+    if isinstance(v, (list, tuple, set)):
+        return any(_filled(x) for x in v)
+    return v is not None and str(v).strip() not in ("", "Does not apply")
+
+
+def specifics_check(item: dict) -> dict | None:
+    """The listing's category's required + recommended item specifics (eBay
+    Taxonomy, cached 30 days) against what the listing has:
+    {"recommended": n, "filled": k, "missing": [names]}. None if unknown."""
+    listing = item.get("listing") or {}
+    cat = str(listing.get("category_id") or "")
+    if not cat:
+        return None
+    try:
+        aspects = taxonomy.category_aspects(cat)
+    except Exception as e:
+        print(f"diagnose: aspects for {cat} failed ({type(e).__name__})")
+        return None
+    names = []
+    for a in aspects or []:
+        c = a.get("aspectConstraint") or {}
+        name = a.get("localizedAspectName")
+        if name and (c.get("aspectRequired") or c.get("aspectUsage") == "RECOMMENDED"):
+            names.append(name)
+    if not names:
+        return None
+    have = {str(k).strip().lower() for k, v in (listing.get("item_specifics") or {}).items() if _filled(v)}
+    missing = [n for n in names if n.strip().lower() not in have]
+    return {"recommended": len(names), "filled": len(names) - len(missing), "missing": missing}
+
+
+def specifics_fix(check: dict | None, item_id: str, section: str) -> dict | None:
+    """A fix when fewer than DIAGNOSE_MIN_RECOMMENDED_SPECIFICS (eBay's report
+    asks for 8) of eBay's recommended specifics are filled."""
+    if not check:
+        return None
+    target = min(config.DIAGNOSE_MIN_RECOMMENDED_SPECIFICS, check["recommended"])
+    if check["filled"] >= target:
+        return None
+    shown = check["missing"][:6]
+    more = len(check["missing"]) - len(shown)
+    return {"section": section, "kind": "specifics", "source": "taxonomy",
+            "text": f"Fill at least {target} of eBay's recommended item specifics",
+            "fix": (f"eBay Taxonomy: {check['filled']} of {check['recommended']} recommended item specifics "
+                    f"filled; missing: {', '.join(shown)}" + (f" and {more} more" if more > 0 else "")
+                    + f". /revise {item_id[:8]} with the ones that apply.")}
+
+
+def ad_rate_fix(suggested: dict | None, current: float | None, section: str) -> dict | None:
+    """eBay's suggested ad rate (Recommendation API) when it is at least
+    DIAGNOSE_AD_RATE_GAP_PCT points above the listing's own rate."""
+    if not suggested:
+        return None
+    now = current if current is not None else config.EBAY_DEFAULT_AD_RATE_PCT / 100
+    rate = suggested["rate"]
+    if rate < now + config.DIAGNOSE_AD_RATE_GAP_PCT / 100 - 1e-9:
+        return None
+    basis = "for this listing" if suggested.get("basis") == "ITEM" else "trending in the category"
+    return {"section": section, "kind": "ad_rate", "source": "recommendation",
+            "text": "eBay suggests a higher ad rate",
+            "fix": (f"eBay suggests ad rate {rate:.1%} ({basis}); this listing: {now:.1%}"
+                    + (" (our default)" if current is None else "")
+                    + ". A guide, not the best rate: owner decision (plan §6).")}
+
+
+def _section_name(ctx: dict | None, item: dict, names: dict) -> str:
+    if ctx:
+        return ctx["section"]["section"]
+    cat = str((item.get("listing") or {}).get("category_id") or "")
+    if cat not in names:
+        try:
+            names[cat] = taxonomy.category_name(cat) if cat else None
+        except Exception:
+            names[cat] = None
+    return names[cat] or (f"category {cat}" if cat else "no category")
+
+
+def api_fixes(item: dict, ctx: dict | None, have: set, suggested: dict | None, current: float | None,
+              names: dict) -> list[dict]:
+    """The between-report checks for one listing. `have`: kinds the report
+    already gave it (the report's own recommendation wins). The ad rate is a
+    fallback: only for a listing the report doesn't cover at all, because a
+    report section without an ad-rate line means eBay finds ours fine."""
+    section = _section_name(ctx, item, names)
+    out = []
+    if "specifics" not in have:
+        out.append(specifics_fix(specifics_check(item), item["item_id"], section))
+    if ctx is None and "ad_rate" not in have:
+        out.append(ad_rate_fix(suggested, current, section))
+    return [f for f in out if f]
+
+
+_WHO = {"taxonomy": "eBay's recommended item specifics", "recommendation": "eBay's suggested ad rate"}
 
 
 _HOW = {"free_shipping": "decide through the free-shipping test (plan §5)",
@@ -271,8 +382,12 @@ def explain(code: str, m: dict, bench: dict | None, item: dict, comps: dict | No
     row = (ctx or {}).get("listing")
     section = (ctx or {}).get("section") or {}
     if code == "CATEGORY_FIX":
-        return (code, f"eBay's report recommends this for {section.get('section', 'the category')}.",
-                fixes[0]["fix"] if fixes else "See eBay's listing quality report.")
+        first = fixes[0] if fixes else {}
+        where = first.get("section") or section.get("section", "the category")
+        if first.get("source") in _WHO:
+            return code, f"{_WHO[first['source']]} for {where}.", first["fix"]
+        return (code, f"eBay's report recommends this for {where}.",
+                first.get("fix") or "See eBay's listing quality report.")
     if code == "NOT_ENOUGH_DATA":
         if not m["traffic_known"]:
             return code, "eBay's traffic couldn't be read.", "Run /diagnose again later."
@@ -383,6 +498,20 @@ def diagnose(item_ids: list[str] | None = None, *, now: datetime | None = None,
         info["benchmarks"] = note
     contexts = report_context(live, report)
     traffic = traffic_for(live, days)
+    # eBay's suggested ad rate, only for listings the report doesn't cover.
+    uncovered = [str(i["ebay"]["listing_id"]) for i in targets if i["item_id"] not in contexts]
+    suggested, rates = {}, {}
+    if uncovered:
+        try:
+            suggested = recommendation.suggested_ad_rates(uncovered)
+        except Exception as e:
+            print(f"diagnose: suggested ad rates failed ({type(e).__name__})")
+        if suggested:
+            try:
+                rates = marketing.ad_rates()
+            except Exception as e:
+                print(f"diagnose: our ad rates failed ({type(e).__name__}); using the default")
+    names: dict = {}
     offered = db.offers_sent_since((now - timedelta(days=days)).isoformat())
     watch_cache: dict[str, int | None] = {}
 
@@ -402,6 +531,9 @@ def diagnose(item_ids: list[str] | None = None, *, now: datetime | None = None,
         m = metrics(item, traffic.get(lid), watchers(lid), lid in offered, now, days)
         ctx = contexts.get(item["item_id"])
         fixes = category_fixes(ctx, item)
+        sku = (item.get("ebay") or {}).get("sku")
+        current = rates.get(lid, rates.get(str(sku)) if sku else None)
+        fixes += api_fixes(item, ctx, {f["kind"] for f in fixes}, suggested.get(lid), current, names)
         # A listing in the report is judged on the report's numbers.
         b = report_bench(ctx) if ctx and ctx["listing"] else bench.get(m["category_id"])
         code = verdict(m, bench.get(m["category_id"]), ctx, fixes)
@@ -440,18 +572,23 @@ def format_detail(r: dict) -> list[str]:
              r["title"], "",
              f"Last {r['days']:g} days: {r['impressions'] if r['impressions'] is not None else '?'} impressions"
              f" ({(r['impressions_per_day'] or 0):.0f}/day), {r['views'] if r['views'] is not None else '?'} views,"
-             f" CTR {ctr}; watchers {r['watchers'] if r['watchers'] is not None else 'unknown'};"
+             f" CTR {ctr}"
+             + (f", conversion {r['conversion']:.1%} ({r['transactions']} sales)" if r.get("conversion") is not None
+                else "")
+             + f"; watchers {r['watchers'] if r['watchers'] is not None else 'unknown'};"
              f" sales {r['sales']}; offer sent: {'yes' if r['offered'] else 'no'}."]
     rep = r.get("report")
     if rep:
         lines.append(f"{b.get('source', 'eBay report')} (31 days): "
                      f"{rep['impressions_per_day'] or 0:.0f} impressions/day, CTR "
                      + (f"{rep['ctr']:.2%}" if rep.get("ctr") is not None else "n/a")
+                     + (f", conversion {rep['conversion']:.1%}" if rep.get("conversion") is not None else "")
                      + f", {rep.get('sales_31d') or 0} sales, {rep.get('watchers') if rep.get('watchers') is not None else '?'}"
                      " watchers.")
     if b and b.get("section"):
         lines.append(f"{b['section']} ({b['source']}): our listings {b['impressions_per_day']:.0f} "
                      f"impressions/day, CTR {b['ctr']:.2%}"
+                     + (f", conversion {b['conversion']:.1%}" if b.get("conversion") is not None else "")
                      + (f"; top 10% {b['top_impressions_per_day']:.0f}/day, {b['top_ctr']:.2%}"
                         if b.get("top_ctr") is not None and b.get("top_impressions_per_day") is not None else "")
                      + (f"; bottom 10% {b['bottom_impressions_per_day']:.0f}/day, {b['bottom_ctr']:.2%}"
@@ -460,7 +597,8 @@ def format_detail(r: dict) -> list[str]:
     elif b:
         lines.append(f"Category ({b.get('source')}, {b.get('n')} listings): "
                      f"{b['impressions_per_day']:.0f} impressions/day"
-                     + (f", CTR {b['ctr']:.2%}" if b.get("ctr") else "") + ".")
+                     + (f", CTR {b['ctr']:.2%}" if b.get("ctr") else "")
+                     + (f", conversion {b['conversion']:.1%}" if b.get("conversion") is not None else "") + ".")
     lines += ["", f"Why: {r['reason']}", f"Fix: {r['fix']}"]
     lines += [f"{ICON['CATEGORY_FIX']} {a}" for a in r.get("also") or []]
     return lines
