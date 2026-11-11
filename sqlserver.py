@@ -12,6 +12,7 @@ migration script unlocks them (they hold the real eBay token).
 """
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 import pyodbc
@@ -85,6 +86,42 @@ def connect(database: str | None = None, *, autocommit: bool = False,
     """A connection to `database` (default config.SQL_DATABASE). Close it when
     done; `with connect() as con:` commits or rolls back but does not close."""
     return pyodbc.connect(conn_str(database), autocommit=autocommit, timeout=timeout)
+
+
+def wait_for_server(max_wait: float | None = None, interval: float = 5, *,
+                    database: str | None = None, log=print,
+                    sleep=time.sleep, clock=time.monotonic) -> float:
+    """Block until `database` (default config.SQL_DATABASE) accepts a
+    connection, retrying every `interval` s for up to `max_wait` s (default
+    config.SQL_STARTUP_WAIT_SECONDS). For startup after a reboot, when SQL
+    Server may still be starting. Returns the seconds waited. Raises
+    RuntimeError, chained to the last connection error, if it never answers.
+    Log lines are plain ASCII: they go to service.out.log before logging is
+    set up."""
+    max_wait = config.SQL_STARTUP_WAIT_SECONDS if max_wait is None else max_wait
+    target = f"{config.SQL_SERVER} ({database or config.SQL_DATABASE})"
+    start = clock()
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            connect(database, timeout=max(1, int(interval))).close()
+        except pyodbc.Error as e:
+            waited = clock() - start
+            if waited >= max_wait:
+                log(f"{datetime.now():%Y-%m-%d %H:%M:%S} SQL Server {target} still not reachable "
+                    f"after {waited:.0f} s ({attempts} tries); giving up.")
+                raise RuntimeError(f"SQL Server {target} not reachable after {waited:.0f} s") from e
+            if attempts == 1:
+                log(f"{datetime.now():%Y-%m-%d %H:%M:%S} Waiting for SQL Server {target}: not "
+                    f"reachable yet, retrying every {interval:g} s for up to {max_wait:g} s.")
+            sleep(interval)
+            continue
+        waited = clock() - start
+        if attempts > 1:
+            log(f"{datetime.now():%Y-%m-%d %H:%M:%S} SQL Server {target} is up after "
+                f"{waited:.0f} s ({attempts} tries).")
+        return waited
 
 
 def server_available(timeout: int = 3) -> bool:
