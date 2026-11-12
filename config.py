@@ -140,14 +140,18 @@ EBAY_PROMOTED_CAMPAIGN_NAME = os.getenv("EBAY_PROMOTED_CAMPAIGN_NAME", "ross-aut
 # listing is promoted at this floor rate by default; bump an individual one with
 # /promote <id> <pct>. Set to 0 to disable auto-promotion. eBay accepts 2–100%.
 EBAY_DEFAULT_AD_RATE_PCT = float(os.getenv("EBAY_DEFAULT_AD_RATE_PCT", "4"))
-# Best Offer on every new listing. The auto-decline floor is the HIGHER of
-# BEST_OFFER_MIN_PCT of the list price and the break-even
-# (profit.breakeven_price), each rounded UP to a whole dollar; there is no
-# auto-accept. Break-even alone let $15-$25 offers on $30-$50 bags through
-# (44-50% of price, Oct 2026), while every offer that became a sale was 83-88%.
-# No floor when it would reach the list price (that declines every offer).
-# Set BEST_OFFER_ENABLED=0 to publish without Best Offer.
-BEST_OFFER_MIN_PCT = float(os.getenv("BEST_OFFER_MIN_PCT", "75"))   # owner picked 75, 2026-10-28
+# Best Offer on every new listing, and its thresholds are rewritten whenever
+# the bot sets a price (ebay.inventory.best_offer_terms). Auto-accept at
+# BEST_OFFER_AUTO_ACCEPT_PCT of the price, auto-decline at
+# BEST_OFFER_AUTO_DECLINE_PCT, each rounded UP to .99 and never below the
+# break-even (profit.breakeven_price). Owner, 2026-11-12: 95 / 85, replacing
+# the 28 Oct 75% floor with no auto-accept. A price change that left the old
+# floor in place failed on eBay (errorId 25016: the auto-decline can't be at
+# or above the price). Every offer that became a sale in Oct 2026 was 83-88%.
+# A threshold is left off when it would reach the price (or the decline would
+# reach the accept). Set BEST_OFFER_ENABLED=0 to publish without Best Offer.
+BEST_OFFER_AUTO_ACCEPT_PCT = float(os.getenv("BEST_OFFER_AUTO_ACCEPT_PCT", "95"))
+BEST_OFFER_AUTO_DECLINE_PCT = float(os.getenv("BEST_OFFER_AUTO_DECLINE_PCT", "85"))
 BEST_OFFER_ENABLED = os.getenv("BEST_OFFER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
 EBAY_MERCHANT_LOCATION_KEY = "ross-resale-warehouse"
 EBAY_SHIP_FROM_ADDRESS = {
