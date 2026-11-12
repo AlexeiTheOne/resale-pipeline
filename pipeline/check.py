@@ -190,14 +190,15 @@ def _dimensions(ident: dict) -> list[float]:
     return out
 
 
-def bag_size(ident: dict, text: str = "") -> str:
+def bag_size(ident: dict, text: str = "", default: str | None = "large") -> str | None:
     """"small" or "large" for the shipping label. The name first: a sling,
     crossbody, mini or wallet is small unless it is also a tote/weekender/
     backpack ("mini" wins: a mini backpack is small); a tote, weekender or
     duffel is large. A soft sling folds into a poly mailer whatever its
     length (check #5: a 21" Vans sling). Only a name that says neither
     ("handbag", "shoulder bag") goes by the measured sides: none over
-    CHECK_SMALL_BAG_MAX_IN = small. Unknown: large, the safe side for profit."""
+    CHECK_SMALL_BAG_MAX_IN = small. Unknown: `default` (large, the safe side
+    for profit; None when matching old store sales by size)."""
     hay = " ".join(str(ident.get(k) or "") for k in ("item_type", "product_name", "search_query"))
     words = set(re.findall(r"[a-z]+", f"{hay} {text}".lower()))
     words |= {w[:-1] for w in words if w.endswith("s")}
@@ -207,7 +208,9 @@ def bag_size(ident: dict, text: str = "") -> str:
     if large:
         return "large"
     dims = _dimensions(ident)
-    return "small" if dims and max(dims) <= config.CHECK_SMALL_BAG_MAX_IN else "large"
+    if not dims:
+        return default
+    return "small" if max(dims) <= config.CHECK_SMALL_BAG_MAX_IN else "large"
 
 
 def label_for(ident: dict, text: str = "") -> tuple[str, float]:
@@ -1041,13 +1044,17 @@ def _median(xs):
 def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history: list | None = None,
                  receipt: dict | None = None, exclude_item_id: str | None = None,
                  details: dict | None = None, supply: dict | None = None,
-                 box: bool | None = None) -> dict:
+                 box: bool | None = None, old_store_rows: list | None = None) -> dict:
     """The evidence ladder (Person B, 2026-11-02). Every level is an ITEM price
     (eBay totals minus the shipping we charge):
       1 eBay sold, same item: 2+ sales -> their median, done.
       2 eBay sold, same model other colour/size (the judge's variants), 1+,
         plus a single same-item sale.
-      3 our own sales, same brand + type (median sold price).
+      3 our own sales, same brand + type (median sold price). Fewer than
+        CHECK_OLD_STORE_MIN_SALES of them -> the old store's sales of the
+        last CHECK_OLD_STORE_YEARS years (pipeline/old_store.match: brand +
+        type + bag size, brand + type, or the parent brand of a sub-line),
+        shown as "old store" (old_store_rows: None = read from the DB).
       4 MSRP x brand ratio (our sold/MSRP; type bucket when the brand has
         too few sales; never the all-sales fallback).
       5 eBay asking prices x CHECK_ASK_DISCOUNT: a ceiling, never the price.
@@ -1108,12 +1115,31 @@ def choose_price(pricing: dict, exact: bool, ident: dict | None = None, history:
     bk, tb = msrp.brand_key(ident.get("brand")), msrp.type_bucket(ident.get("item_type"))
     mine = [h for h in history if bk and h["brand"] == bk and h["bucket"] == tb
             and not (exclude_item_id and h["item_id"].startswith(exclude_item_id))]
+    ours = None
     if mine:
         days = [h["days"] for h in mine if h.get("days") is not None]
-        levels[3] = {"value": _median([h["sold"] for h in mine]), "n": len(mine),
-                     "days": _median(days), "brand": ident.get("brand"), "bucket": tb,
-                     "detail": f"median of {len(mine)} of our {bk} {tb} sale(s)"
-                               + (f", median {_median(days):.0f} days to sell" if days else "")}
+        ours = {"value": _median([h["sold"] for h in mine]), "n": len(mine),
+                "days": _median(days), "brand": ident.get("brand"), "bucket": tb,
+                "detail": f"median of {len(mine)} of our {bk} {tb} sale(s)"
+                          + (f", median {_median(days):.0f} days to sell" if days else "")}
+    old = None
+    if bk and len(mine) < config.CHECK_OLD_STORE_MIN_SALES and config.CHECK_OLD_STORE_YEARS > 0:
+        from pipeline import old_store
+        if old_store_rows is None:
+            try:
+                old_store_rows = old_store.recent_rows()
+            except Exception:
+                old_store_rows = []
+        size = bag_size(ident, default=None) if tb == "bag" else None
+        old = old_store.match(ident.get("brand"), tb, size, old_store_rows)
+    if old:
+        what = f"{old['size']} {tb}" if old.get("size") else tb
+        levels[3] = {**old, "days": None, "source": "old_store", "ours": ours,
+                     "detail": f"median of {old['n']} old store {old['brand']} {what} sale(s) since "
+                               f"{old['since']} ({old['match']})"
+                               + (f"; ours: {ours['detail']}" if ours else "")}
+    elif ours:
+        levels[3] = ours
     try:
         est = msrp.store_estimate(ident, receipt, exclude_item_id=exclude_item_id, history=history)
     except Exception:
@@ -1193,7 +1219,7 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
              text: str = "", quick: bool = False, history: list | None = None,
              exclude_item_id: str | None = None, details: dict | None = None,
              supply: dict | None = None, box: bool | None = None,
-             incomplete: str | None = None) -> dict:
+             incomplete: str | None = None, old_store_rows: list | None = None) -> dict:
     """Price choice, money and verdict from a pricing result. Shared by
     run_check and the backtest (scripts/backtest_check.py), so the backtest
     scores exactly what /check would say. quick: a quick check that found no
@@ -1212,7 +1238,7 @@ def evaluate(pricing: dict, ident: dict, ross_price: float | None, exact: bool,
         if pricing.get("raw_active_floor") is not None or asks:
             pricing = {**pricing, "raw_active_floor": min(asks, default=None)}
     pick = choose_price(pricing, exact, ident, history=history, exclude_item_id=exclude_item_id,
-                        details=details, supply=supply, box=box)
+                        details=details, supply=supply, box=box, old_store_rows=old_store_rows)
     money = economics(pick["price"], ross_price, label) if pick["price"] and ross_price else None
     cheapest = pricing.get("raw_active_floor")
     at_cheapest = at_total(cheapest, ross_price, label) if cheapest and ross_price else None
@@ -1650,8 +1676,17 @@ def ladder_line(pick: dict, res: dict) -> str:
     if 3 in levels:
         l3 = levels[3]
         kind = {"bag": "bags", "watch": "watches", "other": "items"}.get(l3.get("bucket"), f"{l3.get('bucket')}s")
-        days = f" ({l3['days']:.0f}d)" if l3.get("days") is not None else ""
-        parts.append(f"our {l3.get('brand') or ''} {kind} ~{_whole(l3['value'])}{days}".replace("  ", " "))
+        if l3.get("source") == "old_store":
+            mine = l3.get("ours")
+            if mine:
+                parts.append(f"our {mine.get('brand') or ''} {kind} ~{_whole(mine['value'])} ({mine['n']})"
+                             .replace("  ", " "))
+            size = f"{l3['size']} " if l3.get("size") else ""
+            parts.append(f"old store {l3.get('brand') or ''} {size}{kind} ~{_whole(l3['value'])} ({l3['n']})"
+                         .replace("  ", " "))
+        else:
+            days = f" ({l3['days']:.0f}d)" if l3.get("days") is not None else ""
+            parts.append(f"our {l3.get('brand') or ''} {kind} ~{_whole(l3['value'])}{days}".replace("  ", " "))
     if 4 in levels:
         r = levels[4].get("ratio")
         other = " (other brands)" if levels[4].get("level") == "type" else ""

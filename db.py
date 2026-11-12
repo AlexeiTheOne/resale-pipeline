@@ -574,6 +574,61 @@ def latest_quality_report() -> dict | None:
             "listings": [_qr_decode(r) for r in got["listings"]]}
 
 
+# --- the old eBay store's sales (pipeline/old_store.py) ---------------------------
+
+OLD_STORE_COLUMNS = (
+    "source", "source_tab", "source_row", "period_start", "period_end", "year_inferred",
+    "title", "ebay_item_id", "quantity", "item_sales", "unit_price", "shipping_per_unit",
+    "label_per_unit", "fees_per_unit", "net_per_unit", "price_paid", "cost_per_unit",
+    "best_offer_units", "seller_offer_units", "status", "note",
+    "brand", "parent_brand", "item_type", "bag_size", "msrp", "msrp_from")
+_OS_FLOAT = {"item_sales", "unit_price", "shipping_per_unit", "label_per_unit", "fees_per_unit",
+             "net_per_unit", "price_paid", "cost_per_unit", "msrp"}
+
+
+def replace_old_store_sales(rows: list[dict]) -> dict:
+    """Replace every old_store row with `rows` (dicts keyed by
+    OLD_STORE_COLUMNS), in one transaction. Returns {"rows": n, "replaced": n}."""
+    rows = [{c: r.get(c) for c in OLD_STORE_COLUMNS} for r in rows]
+    if _on_sqlserver():
+        return _sqlserver().replace_old_store_sales(rows)
+    now = _now()
+    with _conn() as con:
+        replaced = con.execute("SELECT COUNT(*) FROM old_store_sales").fetchone()[0]
+        con.execute("DELETE FROM old_store_sales")
+        cols = (*OLD_STORE_COLUMNS, "imported_at")
+        con.executemany(f"INSERT INTO old_store_sales ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                        [(*r.values(), now) for r in rows])
+    return {"rows": len(rows), "replaced": replaced}
+
+
+def old_store_sales(since: str | None = None) -> list[dict]:
+    """Old store rows whose period ends on or after `since` (ISO date; None =
+    all), oldest first. Dates as ISO strings, money as floats. Read only."""
+    if _on_sqlserver():
+        got = _sqlserver().old_store_sales(since)
+    else:
+        with _conn() as con:
+            con.row_factory = sqlite3.Row
+            sql = "SELECT * FROM old_store_sales"
+            got = [dict(r) for r in (con.execute(sql + " WHERE period_end >= ? ORDER BY period_start, row_id",
+                                                 (since,)) if since
+                                     else con.execute(sql + " ORDER BY period_start, row_id"))]
+    out = []
+    for r in got:
+        r = dict(r)
+        for k in ("period_start", "period_end"):
+            if r.get(k) is not None and not isinstance(r[k], str):
+                r[k] = r[k].isoformat()
+        for k in _OS_FLOAT:
+            if r.get(k) is not None:
+                r[k] = float(r[k])
+        r["year_inferred"] = bool(r.get("year_inferred"))
+        r.pop("imported_at", None)
+        out.append(r)
+    return out
+
+
 def receipt_lines_for_skus(skus) -> list[dict]:
     """Ross receipt lines (what we bought) with one of these 12-digit SKUs,
     newest first: line_id, sku, description, price, receipt_date (date),

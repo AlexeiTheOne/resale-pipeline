@@ -577,6 +577,28 @@ def latest_quality_report() -> dict | None:
                                "ORDER BY listing_row_id", date)}
 
 
+def replace_old_store_sales(rows: list[dict]) -> dict:
+    """db.replace_old_store_sales on ResaleDB (rows already shaped by db.py)."""
+    def go(cur):
+        cur.execute("SELECT COUNT(*) FROM dbo.old_store_sales")
+        replaced = cur.fetchone()[0]
+        cur.execute("DELETE FROM dbo.old_store_sales")
+        if rows:
+            cols = list(rows[0])
+            cur.executemany(f"INSERT INTO dbo.old_store_sales ({', '.join(cols)}) "
+                            f"VALUES ({', '.join('?' * len(cols))})",
+                            [tuple(r[c] for c in cols) for r in rows])
+        return {"rows": len(rows), "replaced": replaced}
+    return _write(go)
+
+
+def old_store_sales(since: str | None) -> list[dict]:
+    if since:
+        return _query("SELECT * FROM dbo.old_store_sales WHERE period_end >= ? "
+                      "ORDER BY period_start, row_id", since)
+    return _query("SELECT * FROM dbo.old_store_sales ORDER BY period_start, row_id")
+
+
 def get_check(check_id: int) -> dict | None:
     rows = _query("SELECT * FROM dbo.checks WHERE check_id = ?", check_id)
     return _check_decode(rows[0]) if rows else None

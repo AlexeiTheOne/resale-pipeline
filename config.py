@@ -337,6 +337,14 @@ CHECK_MIN_PROFIT_AT_CHEAPEST = float(os.getenv("CHECK_MIN_PROFIT_AT_CHEAPEST", "
 # items: sold price / asking price, mean 0.98 (84% sold at the full ask).
 # Revisit with pilot outcomes from the checks table.
 CHECK_ASK_DISCOUNT = float(os.getenv("CHECK_ASK_DISCOUNT", "0.98"))
+# The old eBay store's sales (pipeline/old_store.py) in /check level 3: used
+# when the current store has fewer than CHECK_OLD_STORE_MIN_SALES sales of the
+# brand + type, counting only periods that ended in the last
+# CHECK_OLD_STORE_YEARS years (older prices have moved). 0 years = off.
+CHECK_OLD_STORE_YEARS = float(os.getenv("CHECK_OLD_STORE_YEARS", "3"))
+CHECK_OLD_STORE_MIN_SALES = int(os.getenv("CHECK_OLD_STORE_MIN_SALES", "3"))
+# Largest old store CSV the bot accepts (the real one is about 0.4 MB).
+OLD_STORE_MAX_BYTES = int(os.getenv("OLD_STORE_MAX_BYTES", str(5 * 1024 * 1024)))
 # /check's eBay fees (Person B, 2026-11-07): EBAY_FVF_PCT x (item + shipping)
 # + EBAY_FIXED_FEE per order + the listing's ad rate (EBAY_DEFAULT_AD_RATE_PCT)
 # x (item + shipping). Fitted on our 85 orders: fees 15.5% + $0.40, ads ~4%,

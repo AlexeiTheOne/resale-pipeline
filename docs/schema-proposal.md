@@ -529,6 +529,49 @@ label (our item id); no FK, provenance like `check_evidence.item_id`.
 
 Index: `quality_report_listings (item_id)`.
 
+**`old_store_sales`** (migration step 8): the old eBay store's sales, 2021
+to Aug 2026, from its workbook (`scripts/import_old_store.py`), one row per
+sold listing per period tab. Brand, parent brand, type and bag size come
+from one AI pass over the titles. The owner sends the CSV to the bot, which
+backs up the DB and replaces every row (`pipeline/old_store.py`); the data
+never goes into git (the repo is public). `/check` uses it as "old store" in
+level 3. No buyer data and no first names: the workbook's name columns are
+never read. Requested 2026-11-11.
+
+| Column | Type | Notes |
+|---|---|---|
+| row_id | INT IDENTITY PK | |
+| source | VARCHAR(12) NOT NULL | always `old_store` (CHECK) |
+| source_tab | NVARCHAR(100) NOT NULL | the workbook tab; UNIQUE with source_row |
+| source_row | INT NOT NULL | row number in that tab |
+| period_start | DATE NOT NULL | the tab's period |
+| period_end | DATE NOT NULL | /check counts periods ending in the last 3 years |
+| year_inferred | BIT NOT NULL | the tab name had no year: it came from the tab order |
+| title | NVARCHAR(300) NOT NULL | the listing title |
+| ebay_item_id | VARCHAR(20) | 2021 tabs only |
+| quantity | INT NOT NULL | units sold in the period (> 0) |
+| item_sales | DECIMAL(10,2) NOT NULL | item price × quantity, before shipping and tax |
+| unit_price | DECIMAL(10,2) NOT NULL | item_sales / quantity |
+| shipping_per_unit | DECIMAL(10,2) | shipping the buyer paid |
+| label_per_unit | DECIMAL(10,2) | label cost |
+| fees_per_unit | DECIMAL(10,2) | eBay selling costs other than the label |
+| net_per_unit | DECIMAL(10,2) | eBay's net sales |
+| price_paid | DECIMAL(10,2) | the old store's "Price 1" (purchase price per unit) |
+| cost_per_unit | DECIMAL(10,2) | price_paid × 1.07 (our tax) |
+| best_offer_units | INT | from 2023 tabs |
+| seller_offer_units | INT | from 2023 tabs |
+| status | VARCHAR(10) NOT NULL | `ok` or `to_check` (the typed Cost doesn't match Price 1) |
+| note | NVARCHAR(200) | why to check |
+| brand | NVARCHAR(100) | sub-lines keep their name (`Luv Betsey`) |
+| parent_brand | NVARCHAR(100) | a sub-line's main brand (`Betsey Johnson`), else NULL |
+| item_type | VARCHAR(20) | bag, backpack, wallet, luggage, watch_band, … |
+| bag_size | VARCHAR(5) | `large` / `small` (bags, backpacks, wallets, luggage) |
+| msrp | DECIMAL(10,2) | from the title ("MSRP $99", a bare "$175") |
+| msrp_from | VARCHAR(12) | `title_msrp` or `title_price` |
+| imported_at | DATETIME2(6) | |
+
+Index: `old_store_sales (period_end)`.
+
 **`v_receipt_checks`** (view, computed live, never stored): one row per receipt with:
 
 - `items_sum`
