@@ -91,11 +91,11 @@ FULL = _base(
              "category_id": "169291", "condition_id": "1000", "stock_image_url": None,
              "item_specifics": {"Brand": "DKNY", "Features": ["Zip", "Pocket"], "Vintage": None,
                                 "MPN": "R84"}},
-    ebay={"sku": "5a58e7ac-3e19-4496-80ee-ef7b63bae489", "listing_id": "117", "offer_id": "191",
+    ebay={"sku": "0a0b0c0d-1111-4222-8333-444455556666", "listing_id": "117", "offer_id": "191",
           "quantity": 0, "published_at": "2026-06-22T02:32:12.000Z", "reselected_from": None,
           "image_urls": ["https://i/1", "https://i/2"], "source": "external", **_sales()},
-    receipt={"code": "400271128951", "barcode": "400271128951000449", "reduced_price": 23.0,
-             "original_price": None, "peeled": False, "source": "barcode", "raw_text": "ROSS\n23.00",
+    receipt={"code": "400999888771", "barcode": "400999888771000449", "reduced_price": 21.0,
+             "original_price": None, "peeled": False, "source": "barcode", "raw_text": "ROSS\n21.00",
              "photo": "data/inbox/x/tag.jpg"},
     photo_layout={"manual": True},
     listing_check={"issues": [{"severity": "warn", "field": "title", "message": "long"}],
@@ -133,7 +133,7 @@ def test_columns_get_the_values_sql_needs():
     assert ident["retail_price"] == Decimal("118.00")      # int still queryable
     assert ident["identification_raw"]["retail_price"] == 118
     assert out["item_listing"][0]["list_price"] == Decimal("69.99")
-    assert out["item_tags"][0]["ross_price"] == Decimal("23.00")
+    assert out["item_tags"][0]["ross_price"] == Decimal("21.00")
     assert out["ebay_listings"][0]["published_at"] == datetime(2026, 6, 22, 2, 32, 12)
     assert {r["order_id"] for r in out["sales"]} == {"25-1", "25-2"}
     # Sale totals are rebuilt from the sales rows, not stored.
@@ -202,7 +202,7 @@ def test_to_db(value, kind, expect):
 
 def test_piece_roundtrip():
     piece = {"code": "G3-07", "box": "G3", "item_id": None, "status": "home", "photo": "data/pieces/g.jpg",
-             "info": {"brand": "DKNY", "ross_code": "400271128951", "brand_visible": True, "msrp": 59},
+             "info": {"brand": "DKNY", "ross_code": "400999888771", "brand_visible": True, "msrp": 59},
              "value": 30.0, "cost": 12, "created_at": "2026-10-01T12:00:00+00:00",
              "updated_at": "2026-10-01T12:00:00+00:00", "sold_at": None, "order_id": None}
     row = {k: v for k, v in dbmap.split_piece(piece).items() if v is not None}

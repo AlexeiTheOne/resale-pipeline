@@ -263,8 +263,8 @@ def _codes(line, receipt=None, **kw):
     ({"description": "MASTERCARD Auth. No. 0823208", "price": 1.0, "sku": "806000000000"}, "not_item"),
     ({"description": "SOUL WiRELESS HEA", "price": 0.99, "sku": "460283077681"}, "sku"),
     ({"description": "**Begin Return***", "price": 4.99}, "return"),
-    ({"description": "CLUB AMERICA NAVY", "price": 9.99, "same_code_prices": 2}, "several_prices"),
-    ({"description": "CLUB AMERICA NAVY", "price": 9.99, "fixed": True}, "fixed"),
+    ({"description": "SAMPLE HOODIE NAVY", "price": 9.99, "same_code_prices": 2}, "several_prices"),
+    ({"description": "SAMPLE HOODIE NAVY", "price": 9.99, "fixed": True}, "fixed"),
 ])
 def test_each_misread_flag(line, code):
     assert code in _codes(line)
@@ -299,13 +299,13 @@ def test_describe_and_cities():
                         "gender": "women", "confidence": 0.5}) == "Ed Hardy · bags: belt bag · women's · pink?"
     assert rd.describe(None) == ""
     assert rd.clean_city("Press For Less Doral") == "Doral" and rd.clean_city("Dress For Less ") is None
-    assert rd.store_cities([("2710", "Dress For Less Miami", 5), ("2710", "Ress For Less Mimi", 1),
-                            ("0443", None, 2)]) == {"2710": "Miami"}
+    assert rd.store_cities([("9901", "Dress For Less Springfield", 5), ("9901", "Ress For Less Sprngfeld", 1),
+                            ("9904", None, 2)]) == {"9901": "Springfield"}
 
 
 # --- SQL Server ------------------------------------------------------------------------------------
 
-def _receipt(cur, number, date, lines, store="2710", city="Dress For Less Miami", subtotal=None):
+def _receipt(cur, number, date, lines, store="9901", city="Dress For Less Springfield", subtotal=None):
     cur.execute("INSERT INTO dbo.Receipts (ReceiptNumber, ReceiptDate, StoreCity, Subtotal) "
                 "OUTPUT INSERTED.ReceiptID VALUES (?, ?, ?, ?)", number, date, city, subtotal)
     rid = cur.fetchone()[0]
@@ -318,26 +318,26 @@ def _receipt(cur, number, date, lines, store="2710", city="Dress For Less Miami"
 def test_inputs_save_and_reread_on_sqlserver(mssql, monkeypatch):
     monkeypatch.setattr(config, "DB_BACKEND", "sqlserver")
     cur = mssql.cursor()
-    rid = _receipt(cur, "2710-03-5447-6292-3", "2026-10-19",
-                   [("400300371436", " club america navy ", 16.99), ("400300371436", "CLUB AMERICA NAVY", 9.99),
+    rid = _receipt(cur, "9901-03-1234-5678-3", "2026-10-19",
+                   [("400123456785", " sample hoodie navy ", 18.49), ("400123456785", "SAMPLE HOODIE NAVY", 9.99),
                     ("400300000001", None, 4.99)])
     mssql.commit()
     data = db.receipt_decode_inputs()
     assert data["has_table"] and data["details"] == {}
     keys = [ln["desc_key"] for ln in data["lines"]]
-    assert keys == ["CLUB AMERICA NAVY", "CLUB AMERICA NAVY", None]       # made by SQL: trimmed, upper
+    assert keys == ["SAMPLE HOODIE NAVY", "SAMPLE HOODIE NAVY", None]       # made by SQL: trimmed, upper
     first = data["lines"][0]
     assert first["same_code_prices"] == 2 and first["line_count"] == 3 and first["receipt_id"] == rid
-    assert first["receipt_date"] == "2026-10-19" and first["price"] == 16.99
-    row = {"desc_key": "CLUB AMERICA NAVY", "category": "clothing", "item_type": "jersey", "gender": None,
+    assert first["receipt_date"] == "2026-10-19" and first["price"] == 18.49
+    row = {"desc_key": "SAMPLE HOODIE NAVY", "category": "clothing", "item_type": "jersey", "gender": None,
            "color": "navy", "brand_guess": None, "product_model": None, "confidence": 0.85, "source": "ai",
            "model": "claude-haiku-5-5", "item_id": None, "decode_raw": {"cat": "clothing"}}
     assert db.save_receipt_line_details([row]) == 1
-    assert db.save_receipt_line_details([{**row, "desc_key": "club america navy", "item_type": "hoodie"}]) == 1
+    assert db.save_receipt_line_details([{**row, "desc_key": "sample hoodie navy", "item_type": "hoodie"}]) == 1
     saved = db.receipt_decode_inputs()["details"]
-    assert list(saved) == ["CLUB AMERICA NAVY"]                            # updated, not a second row
-    assert saved["CLUB AMERICA NAVY"]["item_type"] == "hoodie" and saved["CLUB AMERICA NAVY"]["confidence"] == 0.85
-    assert saved["CLUB AMERICA NAVY"]["decode_raw"] == {"cat": "clothing"}
+    assert list(saved) == ["SAMPLE HOODIE NAVY"]                            # updated, not a second row
+    assert saved["SAMPLE HOODIE NAVY"]["item_type"] == "hoodie" and saved["SAMPLE HOODIE NAVY"]["confidence"] == 0.85
+    assert saved["SAMPLE HOODIE NAVY"]["decode_raw"] == {"cat": "clothing"}
 
 
 def test_the_save_writes_only_receipt_line_details(monkeypatch):

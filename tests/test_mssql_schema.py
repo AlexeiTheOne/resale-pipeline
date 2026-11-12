@@ -235,9 +235,9 @@ def test_receipt_bot_sql_works_unchanged(mssql, cur):
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                "0443-08-1090-6304-0", "Dress For Less", "Miami", "33186", "sale",
-                "10/31/26", "1:41:39 PM", "81.93", "5.73", "87.66", 1.0, "", "20261101_135147_414181")
-    cur.execute("SELECT ReceiptID FROM Receipts WHERE ReceiptNumber=?", "0443-08-1090-6304-0")
+                "9904-08-1111-2222-0", "Dress For Less", "Springfield", "00000", "sale",
+                "10/31/26", "1:41:39 PM", "61.20", "4.28", "65.48", 1.0, "", "20261101_135147_414181")
+    cur.execute("SELECT ReceiptID FROM Receipts WHERE ReceiptNumber=?", "9904-08-1111-2222-0")
     receipt_id = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM ReceiptItems WHERE ReceiptID=?", receipt_id)
     assert cur.fetchone()[0] == 0
@@ -245,12 +245,12 @@ def test_receipt_bot_sql_works_unchanged(mssql, cur):
                         INSERT INTO ReceiptItems
                         (ReceiptID, LineIndex, SKU, Description, Price)
                         VALUES (?, ?, ?, ?, ?)
-                    """, [(receipt_id, 1, "400307072241", "AV mushroom split", "81.93")])
+                    """, [(receipt_id, 1, "400222333444", "Sample item", "61.20")])
     mssql.commit()
     cur.execute("SELECT ReceiptDate, StoreNumber, CreatedAt FROM Receipts WHERE ReceiptID = ?", receipt_id)
     date, store, created = cur.fetchone()
     assert str(date) == "2026-10-31"  # month first, not day first
-    assert store == "0443"
+    assert store == "9904"
     assert abs(datetime.now(timezone.utc).replace(tzinfo=None) - created) < timedelta(minutes=5)  # UTC
 
 

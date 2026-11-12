@@ -37,10 +37,10 @@ def v1(mssql_db):
         cur = con.cursor()
         cur.execute("SET IDENTITY_INSERT dbo.Receipts ON")
         cur.execute("""INSERT INTO dbo.Receipts (ReceiptID, ReceiptNumber, Subtotal, RawFileID, SourceFile) VALUES
-            (178, '2211-10-2851-5337-1', 23.50, NULL, NULL),
-            (183, '2211-10-2851-5337-1', 23.50, NULL, NULL),
-            (195, '0433-01-6531-6002-2', 8.39, NULL, NULL),
-            (196, '0433-01-0000-0000-1', NULL, NULL, NULL),
+            (178, '9902-10-1111-2222-1', 23.50, NULL, NULL),
+            (183, '9902-10-1111-2222-1', 23.50, NULL, NULL),
+            (195, '9903-01-3333-4444-2', 8.39, NULL, NULL),
+            (196, '9903-01-0000-0000-1', NULL, NULL, NULL),
             (200, '0001-01-0000-0000-1', 20.00, NULL, NULL),
             (201, '0001-01-0000-0000-2', NULL, NULL, 'f201'),
             (202, '0001-01-0000-0000-3', 50.00, 'f202', NULL),
@@ -63,8 +63,8 @@ def v1(mssql_db):
             (27, 195, 5, '806002004330', 'Auth. No.', 128.24),
             (30, 196, 1, '400000000010', 'first', 1.00),
             (31, 196, 1, '400000000011', 'different', 2.00),
-            (40, 200, 1, '400305783026', 'CARS 3PC', 1499.00),
-            (41, 200, 2, '400305783027', 'socks', 5.01),
+            (40, 200, 1, '400111222026', 'CARS 3PC', 1499.00),
+            (41, 200, 2, '400111222027', 'socks', 5.01),
             (50, 201, 1, '400299700351', 'EH red/orange', 749.00),
             (60, 202, 1, '400285742662', 'x nike', 998.00),
             (70, 203, 1, '400285742663', 'huge', 60000.00)""")
@@ -163,7 +163,7 @@ def test_unique_indexes_wait_for_the_cleanup(v1, raw_dir, tmp_path):
         assert migrations.migrate_mssql(con)[0] == 2      # the unique indexes, then any later steps
         # the receipt bot's double submit now hits the index (it replies "already saved")
         with pytest.raises(pyodbc.IntegrityError) as e:
-            con.execute("INSERT INTO dbo.Receipts (ReceiptNumber) VALUES ('0433-01-6531-6002-2')")
+            con.execute("INSERT INTO dbo.Receipts (ReceiptNumber) VALUES ('9903-01-3333-4444-2')")
         assert "2601" in str(e.value)
         con.rollback()
         with pytest.raises(pyodbc.IntegrityError):

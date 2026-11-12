@@ -73,6 +73,9 @@ So:
 - **Never write to `ResaleDB`** from a dev session. Use `ResaleDB_Dev`.
 - **`data/` is not in git** (photos, and the old SQLite archive). Never
   overwrite or delete `data/ross.db`.
+- **The repo is public: no real business data in tests or docs.** Never
+  put real costs, sales, order numbers, receipt numbers or buyer data in
+  them. Use made-up values, even when a test copies a real bug's shape.
 - **On the production PC:**
   - Never touch `receipt_pipeline` or its processes.
   - Never kill `python.exe` broadly.

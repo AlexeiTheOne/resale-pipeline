@@ -63,26 +63,26 @@ def test_script_columns_and_types_match_the_table():
 # --- parsing the workbook by the sums ------------------------------------------------
 
 def test_a_normal_row():
-    r = ["NWT Vera Bradley Tote", 3, 155.61, 134.97, 0, 9.67, 10.97, 35.93, 0, 0, 23.74, 6.22, 0, 5.97,
-         110.01, 51.87, 0, 10, 35.1, 74.91]
+    r = ["Brand A Tote", 2, 119.18, 99.98, 0, 7.2, 12.0, 24.0, 0, 0, 16.4, 4.1, 0, 3.5,
+         87.98, 43.99, 0, 12, 28.08, 59.9]
     s = script.solve_row(r)
-    assert (s["quantity"], s["item_sales"], s["shipping"], s["costs"], s["net"]) == (3, 134.97, 10.97, 35.93, 110.01)
+    assert (s["quantity"], s["item_sales"], s["shipping"], s["costs"], s["net"]) == (2, 99.98, 12.0, 24.0, 87.98)
 
 
 def test_a_row_with_a_repeated_quantity_and_one_tax_column():
     """November 10 - December 15: the data sits one column right of the header."""
-    r = ["Michel Germain Deauville Bleu", 5, 5, 215.2, 174.95, 15.3, 24.95, 65.05, 30, 6.46, 28.59, 134.85,
-         43.04, 5, 0, 0, 12, 70.2]
+    r = ["Brand B Cologne", 4, 4, 172.12, 139.96, 12.2, 19.96, 52.0, 24, 5.2, 22.8, 107.92,
+         34.99, 4, 0, 0, 11, 51.48]
     s = script.solve_row(r)
-    assert (s["quantity"], s["item_sales"], s["shipping"], s["net"], s["n_idx"]) == (5, 174.95, 24.95, 134.85, 11)
+    assert (s["quantity"], s["item_sales"], s["shipping"], s["net"], s["n_idx"]) == (4, 139.96, 19.96, 107.92, 11)
 
 
 def test_a_row_with_empty_columns_before_the_tax_and_an_ebay_id():
-    assert script.solve_row(["Heelys", 6, 220.4, 154.82, None, None, None, 10.64, 54.94, 68.46, 29.94,
-                             37.9, 141.3])["shipping"] == 54.94
-    s = script.solve_row(["Herschel Wallet", 383945351194, 2, 51.96, 47.98, 0, 3.98, 0, 13.83, 0, 0, 7.12,
-                          0, 0, 0, 6.71, 34.15])
-    assert s["ebay_item_id"] == "383945351194" and s["costs"] == 13.83 and s["net"] == 34.15
+    assert script.solve_row(["Brand C Sneakers", 5, 184.0, 129.95, None, None, None, 9.1, 44.95, 57.5, 25.0,
+                             32.5, 117.4])["shipping"] == 44.95
+    s = script.solve_row(["Brand D Wallet", 300000000001, 2, 43.18, 39.98, 0, 3.2, 0, 11.5, 0, 0, 6.1,
+                          0, 0, 0, 5.4, 28.48])
+    assert s["ebay_item_id"] == "300000000001" and s["costs"] == 11.5 and s["net"] == 28.48
 
 
 def test_rows_that_dont_add_up_or_arent_sales():
@@ -128,16 +128,16 @@ def test_parse_skips_tabs_totals_zero_sales_and_summary_repeats(tmp_path):
         ["NWT Juicy Couture Weekender MSRP $118", 2, 109.98, 89.98, 5, 15, 38.0, 20.14, 17.86, 66.98, 54.99,
          15, 35.1],
         ["Refunded thing", 1, 0, 0, 0, 0, 3, 0, 3, -3, 0, 5, 5.85],
-        [None, None, None, None, None, None, None, None, None, None, None, 910.26, 602.62],
+        [None, None, None, None, None, None, None, None, None, None, None, 812.4, 540.1],
     ])
-    _sheet(wb, "23 july - 27 aug", HEADER, [["Vans Backpack", 1, 46.2, 34.99, 3.22, 7.99, 13.28, 6.1, 7.18,
-                                             29.7, 46.2, 15, 17.55]])
-    _sheet(wb, "Sales statistics", HEADER, [["Vans Backpack", 1, 46.2, 34.99, 3.22, 7.99, 13.28, 6.1, 7.18,
-                                             29.7, 46.2, 15, 17.55]])
+    _sheet(wb, "23 july - 27 aug", HEADER, [["Brand E Backpack", 1, 40.38, 29.99, 2.4, 7.99, 11.0, 5.0, 6.0,
+                                             26.98, 40.38, 12, 14.04]])
+    _sheet(wb, "Sales statistics", HEADER, [["Brand E Backpack", 1, 40.38, 29.99, 2.4, 7.99, 11.0, 5.0, 6.0,
+                                             26.98, 40.38, 12, 14.04]])
     path = tmp_path / "wb.xlsx"
     wb.save(path)
     rows, rejected = script.parse(path)
-    assert [r["title"] for r in rows] == ["Vans Backpack", "NWT Juicy Couture Weekender MSRP $118"]
+    assert [r["title"] for r in rows] == ["Brand E Backpack", "NWT Juicy Couture Weekender MSRP $118"]
     juicy = rows[1]
     assert (juicy["quantity"], juicy["unit_price"], juicy["shipping_per_unit"], juicy["label_per_unit"],
             juicy["price_paid"], juicy["period_end"]) == (2, 44.99, 7.5, 8.93, 15, "2026-08-31")
@@ -263,11 +263,12 @@ def test_sub_lines_stay_apart_and_fall_back_to_the_parent_under_three_sales():
 
 
 def test_one_bulk_listing_is_not_three_sales():
-    """Luv Betsey on dev: one listing of 3 at $26 was its only large bag sale in
-    3 years; the Betsey Johnson family answers instead."""
-    rows = [shaped("Luv Betsey", 26, units=3, parent="Betsey Johnson")] +         [shaped("Betsey Johnson", p) for p in (49.99, 59.99, 49.99)]
+    """A sub-line whose only large bag sale is one listing of 3 units at a
+    clearance price: the parent brand's family answers instead."""
+    rows = [shaped("Luv Betsey", 28, units=3, parent="Betsey Johnson")] + \
+        [shaped("Betsey Johnson", p) for p in (50, 60, 50)]
     m = old_store.match("Luv Betsey", "bag", "large", rows)
-    assert (m["brand"], m["n"], m["value"], m["match"]) == ("Betsey Johnson", 6, 38.0,
+    assert (m["brand"], m["n"], m["value"], m["match"]) == ("Betsey Johnson", 6, 39.0,
                                                             "parent brand + type + size")
 
 
