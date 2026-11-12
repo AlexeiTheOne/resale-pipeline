@@ -82,7 +82,7 @@ def lines(mssql, monkeypatch):
     monkeypatch.setattr(config, "DB_BACKEND", "sqlserver")
     cur = mssql.cursor()
     cur.execute("INSERT INTO dbo.Receipts (ReceiptNumber, ReceiptDate) OUTPUT INSERTED.ReceiptID "
-                "VALUES ('2710-03-5447-6292-3', '2026-10-19')")
+                "VALUES ('9901-03-1234-5678-3', '2026-10-19')")
     rid = cur.fetchone()[0]
     for i, (sku, desc) in enumerate([("400100000001", "#ASST RUN/COURT"), ("400100000002", "ZXQ WIDGET")], 1):
         cur.execute("INSERT INTO dbo.ReceiptItems (ReceiptID, LineIndex, SKU, Description, Price) "

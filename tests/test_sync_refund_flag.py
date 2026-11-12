@@ -1,5 +1,5 @@
 """/sync asks about an order refunded in full ("returned?") instead of leaving
-the item silently 'sold' with $0 kept (the Versus Versace watch, c1872c91).
+the item silently 'sold' with $0 kept (a watch).
 No eBay or Telegram calls: sync_one and the eBay reads are faked."""
 import asyncio
 
@@ -7,11 +7,11 @@ import db
 from ebay import listings, orders
 from pipeline import sync
 
-_VERSACE = {"item_id": "c1872c91-aaaa", "status": "sold", "listing": {"title": "Versus Versace Tokyo Watch"},
+_VERSACE = {"item_id": "aaaa1111-aaaa", "status": "sold", "listing": {"title": "Brand F Watch"},
             "ebay": {"offer_id": "o1"}}
-_NASH = {"item_id": "331dc4a9-bbbb", "status": "sold", "listing": {"title": "Patricia Nash Ava"},
+_NASH = {"item_id": "bbbb2222-bbbb", "status": "sold", "listing": {"title": "Brand G Tote"},
          "ebay": {"offer_id": "o2"}}
-_REFUND = [{"order_id": "15-15080-62452", "refund": 99.98}]
+_REFUND = [{"order_id": "11-11111-11111", "refund": 79.98}]
 
 
 def _run(monkeypatch, items, live=()):
@@ -33,8 +33,8 @@ def test_a_full_refund_is_asked_about_in_the_brief(monkeypatch):
     lines, brief = _run(monkeypatch, [_VERSACE])
     ask = [b for b in brief if b.startswith("↩️")]
     assert len(ask) == 1
-    assert "returned?" in ask[0] and "c1872c91" in ask[0] and "$99.98" in ask[0]
-    assert "15-15080-62452" in ask[0] and "Versus Versace" in ask[0]
+    assert "returned?" in ask[0] and "aaaa1111" in ask[0] and "$79.98" in ask[0]
+    assert "11-11111-11111" in ask[0] and "Brand F" in ask[0]
     assert any("Refunded in full (1)" in line for line in lines)
 
 

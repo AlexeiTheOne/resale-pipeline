@@ -205,7 +205,7 @@ def _line(n, receipt, date, paid, desc="EH Pink aop fish f"):
 def test_receipt_lines_are_one_reply_line_per_product():
     # check #4's Ross code: a receipt listing it at two prices is a misread
     lines = [_line(5, "R3", "2026-09-19", 7.99), _line(4, "R2", "2026-09-14", 7.99),
-             _line(3, "R2", "2026-09-14", 4.99), _line(2, "R1", "2026-08-11", 15.99),
+             _line(3, "R2", "2026-09-14", 4.99), _line(2, "R1", "2026-08-11", 14.49),
              _line(1, "R1", "2026-08-11", 0.99)]
     s = owned.receipts_summary(lines)
     assert (s["receipts"], s["lines"], s["misread"], s["low"], s["high"]) == (3, 5, 2, 7.99, 7.99)
@@ -262,7 +262,7 @@ def test_what_it_is():
 
 def test_first_line_says_what_the_matched_item_is():
     hits = [_hit(ident={**ED_HARDY, "title": "Ed Hardy Love Kills Slowly Weekender"}, match=owned.ROSS),
-            _line(1, "R1", "2026-08-11", 15.99)]
+            _line(1, "R1", "2026-08-11", 14.49)]
     head = owned.reply_lines({"hits": hits})[0]
     assert head == ('🔁 Already have: Ed Hardy "Love Kills Slowly" Tattoo Print Weekender Duffel Bag · '
                     "bag: weekender duffel · pink multicolor — 1 listed, 1 receipt")
@@ -272,13 +272,13 @@ def test_first_line_says_what_the_matched_item_is():
 
 
 def test_borrow_for_a_typed_code_takes_our_item():
-    hit = {"source": "item", "id": "da8b1b25", "match": owned.ROSS,
+    hit = {"source": "item", "id": "e0d1a2b3", "match": owned.ROSS,
            "ident": {**ED_HARDY, "title": "Ed Hardy Love Kills Slowly Weekender Duffel Bag Pink"}}
     typed = {"product_name": ROSS, "search_query": ROSS, "upc": ROSS}
     got, info = owned.borrow_identification(typed, hit)
     assert got["search_query"] == "Ed Hardy Love Kills Slowly Weekender Duffel Bag Pink"
     assert (got["brand"], got["model"], got["upc"]) == ("Ed Hardy", "EHH230-26-PNA", "796483413276")
-    assert info == {"source": "item", "id": "da8b1b25", "match": owned.ROSS, "query": got["search_query"]}
+    assert info == {"source": "item", "id": "e0d1a2b3", "match": owned.ROSS, "query": got["search_query"]}
     # a photo's own identification is kept; only the gaps are filled
     photo = {"brand": "Ed Hardy", "product_name": "Tattoo duffel", "search_query": "ed hardy duffel"}
     got, _ = owned.borrow_identification(photo, hit)
@@ -291,9 +291,9 @@ def test_borrow_for_a_typed_code_takes_our_item():
 def test_run_check_searches_our_item_never_the_ross_code():
     from pipeline import check
     _item("published", ED_HARDY, listing={"title": "Ed Hardy Love Kills Slowly Weekender Duffel Bag Pink"},
-          receipt={"code": ROSS, "reduced_price": 15.99})
+          receipt={"code": ROSS, "reduced_price": 14.49})
     seen = []
-    res = check.run_check(check.parse_request(f"/check {ROSS} 15.99"),
+    res = check.run_check(check.parse_request(f"/check {ROSS} 14.49"),
                           pricing_fn=lambda ident, **kw: seen.append(ident) or {"judged_comps": [], "timings": {}})
     [ident] = seen
     assert ident["search_query"] == "Ed Hardy Love Kills Slowly Weekender Duffel Bag Pink"

@@ -102,7 +102,7 @@ def _receipts_source(name):
             SKU VARCHAR(20), Description NVARCHAR(500), Price DECIMAL(10,2))""")
         con.execute("SET IDENTITY_INSERT dbo.Receipts ON")
         con.execute("INSERT INTO dbo.Receipts (ReceiptID, ReceiptNumber, ReceiptDate, Subtotal, Tax, Total, "
-                    "CreatedAt, Flags) VALUES (7, '2211-10-2851-5337-1', '2026-01-20', 30.00, 2.10, 32.10, "
+                    "CreatedAt, Flags) VALUES (7, '9902-10-1111-2222-1', '2026-01-20', 30.00, 2.10, 32.10, "
                     "'2026-01-21 00:08:45.997', 'contains_returns'), "
                     "(12, '0457-01-0001-0002-3', NULL, NULL, NULL, NULL, '2026-07-04 13:00:00', NULL), "
                     "(13, NULL, NULL, NULL, NULL, NULL, '2025-11-02 01:30:00', NULL)")

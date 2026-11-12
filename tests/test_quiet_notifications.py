@@ -38,13 +38,13 @@ def _sync_with(item, offer, sold_map):
         inventory.get_offer, db.update_field, db.update_status = saved
 
 
-_SALE = {"sale_price": 49.99, "shipping_collected": 0, "ebay_fees": 8.38,
-         "shipping_label_cost": 0, "net_proceeds": 41.61, "order_id": "A",
+_SALE = {"sale_price": 49.99, "shipping_collected": 0, "ebay_fees": 9.87,
+         "shipping_label_cost": 0, "net_proceeds": 40.12, "order_id": "A",
          "order_ids": ["A"], "units": 1, "sold_at": "2026-10-01", "fees_known": True}
 
 
 def test_recorded_sale_on_a_live_listing_is_not_re_marked_sold():
-    item = {"item_id": "ac7b7ee7" + "x" * 28, "status": "published",
+    item = {"item_id": "abcd1234" + "x" * 28, "status": "published",
             "listing": {"price": 49.99},
             "ebay": {"offer_id": "o", "quantity": 1, "order_ids": ["A"]}}
     offer = {"pricingSummary": {"price": {"value": "49.99"}}, "availableQuantity": 1,
@@ -60,7 +60,7 @@ def test_a_new_order_is_still_recorded():
     offer = {"pricingSummary": {"price": {"value": "49.99"}}, "availableQuantity": 0,
              "listing": {"listingStatus": "ACTIVE"}}
     result, writes = _sync_with(item, offer, {item["item_id"]: _SALE})
-    assert result["auto_sold"] and result["new_sale"]["net"] == 41.61
+    assert result["auto_sold"] and result["new_sale"]["net"] == 40.12
     assert ("status", item["item_id"], "sold") in writes
 
 

@@ -15,24 +15,24 @@ TODAY = date(2026, 11, 8)
 # --- parsing ----------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("text, kind, value", [
-    ("#7341", "receipt_id", 7341),
+    ("#9001", "receipt_id", 9001),
     ("# 23", "receipt_id", 23),
-    ("2710-03-5447-6292-3", "receipt_number", "2710-03-5447-6292-3"),
-    ("271003544762923", "receipt_number", "2710-03-5447-6292-3"),
-    ("2710-03-5447", "receipt_number_part", "2710035447"),
-    ("6292-3", "receipt_number_part", "62923"),
-    ("71436", "sku_suffix", "71436"),
-    ("…371436", "sku_suffix", "371436"),
-    ("SKU 400300371436", "sku", "400300371436"),
-    ("400300371436", "sku", "400300371436"),
-    ("400300371436001999", "sku", "400300371436"),       # the 18-digit tag barcode
+    ("9901-03-1234-5678-3", "receipt_number", "9901-03-1234-5678-3"),
+    ("990103123456783", "receipt_number", "9901-03-1234-5678-3"),
+    ("9901-03-1234", "receipt_number_part", "9901031234"),
+    ("5678-3", "receipt_number_part", "56783"),
+    ("56785", "sku_suffix", "56785"),
+    ("…456785", "sku_suffix", "456785"),
+    ("SKU 400123456785", "sku", "400123456785"),
+    ("400123456785", "sku", "400123456785"),
+    ("400123456785001999", "sku", "400123456785"),       # the 18-digit tag barcode
 ])
 def test_parse_codes(text, kind, value):
     assert rc.parse_query(text) == (kind, value)
 
 
-@pytest.mark.parametrize("text", ["", "#", "12", "4003003714360", "x", "a b", "%", "12-3",
-                                  "500300371436001999"])
+@pytest.mark.parametrize("text", ["", "#", "12", "4001234567850", "x", "a b", "%", "12-3",
+                                  "500123456785001999"])
 def test_parse_refuses(text):
     kind, msg = rc.parse_query(text)
     assert kind == "error" and msg
@@ -50,32 +50,32 @@ def test_words_become_terms():
 # --- the reply --------------------------------------------------------------------------------
 
 def _line(**kw):
-    base = {"line_id": 1, "receipt_id": 7341, "line_index": 1, "sku": "400300371436",
-            "description": "CLUB AMERICA NAVY", "desc_key": "CLUB AMERICA NAVY", "price": 16.99,
-            "receipt_number": "2710-03-5447-6292-3", "receipt_date": "2026-10-19", "store_number": "2710",
+    base = {"line_id": 1, "receipt_id": 9001, "line_index": 1, "sku": "400123456785",
+            "description": "SAMPLE HOODIE NAVY", "desc_key": "SAMPLE HOODIE NAVY", "price": 18.49,
+            "receipt_number": "9901-03-1234-5678-3", "receipt_date": "2026-10-19", "store_number": "9901",
             "store_city": None, "subtotal": None, "total": None, "tax": None, "same_code_prices": 1,
-            "line_count": 2, "lines_sum": 26.98, "fixed": False, "d_source": None}
+            "line_count": 2, "lines_sum": 28.48, "fixed": False, "d_source": None}
     base.update(kw)
     return base
 
 
-ITEM = ({"brand": "Pro Standard", "product_name": "Club America Hoodie", "item_type": "Hoodie", "color": "Navy"},
-        {"source": "item", "id": "202eb699-aaaa", "status": "published", "name": "Club America Hoodie",
-         "price": 49.99, "listed_days": 3, "paid": 16.99, "url": "https://www.ebay.com/itm/117506656915",
+ITEM = ({"brand": "Acme", "product_name": "Sample Hoodie", "item_type": "Hoodie", "color": "Navy"},
+        {"source": "item", "id": "f00dcafe-aaaa", "status": "published", "name": "Sample Hoodie",
+         "price": 49.99, "listed_days": 3, "paid": 18.49, "url": "https://www.ebay.com/itm/110000000001",
          "box": None, "sold_at": None, "profit": None, "match": owned.ROSS})
-STORES = [("2710", "Dress For Less Miami", 4)]
+STORES = [("9901", "Dress For Less Springfield", 4)]
 
 
 def test_a_line_with_our_item_and_a_misread():
     res = {"total": 1, "lines": [_line(same_code_prices=2)], "receipt": None, "store_rows": STORES}
-    text = "\n".join(rc.format_reply("sku_suffix", "71436", res, {"400300371436": {"items": [ITEM], "checks": []}},
+    text = "\n".join(rc.format_reply("sku_suffix", "56785", res, {"400123456785": {"items": [ITEM], "checks": []}},
                                      TODAY))
-    assert "1 receipt line for SKU …71436" in text
-    assert "Oct 19 (20 days ago) · Miami (store 2710) · $16.99" in text      # city from the store's receipts
-    assert '"CLUB AMERICA NAVY" · SKU 400300371436 · receipt #7341' in text
-    assert "(our item)" in text and "Pro Standard" in text
+    assert "1 receipt line for SKU …56785" in text
+    assert "Oct 19 (20 days ago) · Springfield (store 9901) · $18.49" in text      # city from the store's receipts
+    assert '"SAMPLE HOODIE NAVY" · SKU 400123456785 · receipt #9001' in text
+    assert "(our item)" in text and "Acme" in text
     assert "⚠️ misread? this receipt lists this code at 2 prices" in text
-    assert "📦 Listed $49.99, 3 days · paid $16.99 · https://www.ebay.com/itm/117506656915" in text
+    assert "📦 Listed $49.99, 3 days · paid $18.49 · https://www.ebay.com/itm/110000000001" in text
     assert "Ross code" not in text
 
 
@@ -105,15 +105,15 @@ def test_live_rules_when_nothing_is_saved():
 
 
 def test_a_whole_receipt():
-    head = {"receipt_id": 7341, "receipt_number": "2710-03-5447-6292-3", "receipt_date": "2026-10-19",
-            "store_number": "2710", "store_city": "Dress For Less Miami", "total": None, "subtotal_gap": -17.5,
+    head = {"receipt_id": 9001, "receipt_number": "9901-03-1234-5678-3", "receipt_date": "2026-10-19",
+            "store_number": "9901", "store_city": "Dress For Less Springfield", "total": None, "subtotal_gap": -17.5,
             "has_returns": True}
-    text = "\n".join(rc.format_reply("receipt_id", 7341, {"total": 1, "lines": [_line()], "receipt": head,
+    text = "\n".join(rc.format_reply("receipt_id", 9001, {"total": 1, "lines": [_line()], "receipt": head,
                                                           "store_rows": []}, {}, TODAY))
-    assert text.startswith("🧾 Receipt #7341 · 2710-03-5447-6292-3 · Oct 19 (20 days ago) · Miami (store 2710)")
+    assert text.startswith("🧾 Receipt #9001 · 9901-03-1234-5678-3 · Oct 19 (20 days ago) · Springfield (store 9901)")
     assert "no total" in text and "differ from the subtotal by $17.50" in text and "has returns" in text
-    assert '1. $16.99 · "CLUB AMERICA NAVY"' in text
-    empty = rc.format_reply("receipt_id", 7341, {"total": 0, "lines": [], "receipt": head, "store_rows": []}, {},
+    assert '1. $18.49 · "SAMPLE HOODIE NAVY"' in text
+    empty = rc.format_reply("receipt_id", 9001, {"total": 0, "lines": [], "receipt": head, "store_rows": []}, {},
                             TODAY)
     assert "No lines were read from this receipt." in empty
     assert rc.format_reply("receipt_id", 9, {"total": 0, "lines": [], "receipt": None}, {}, TODAY) == \
@@ -131,7 +131,7 @@ def _run(text):
 def test_handler_usage_and_sqlite(monkeypatch):
     assert "Usage: /rcpt" in _run("/rcpt")[0]
     monkeypatch.setattr(config, "DB_BACKEND", "sqlite")
-    assert _run("/rcpt 71436")[0] == "Receipts are on SQL Server only."
+    assert _run("/rcpt 56785")[0] == "Receipts are on SQL Server only."
 
 
 def test_handler_reads_and_replies_without_previews(monkeypatch):
@@ -142,10 +142,10 @@ def test_handler_reads_and_replies_without_previews(monkeypatch):
         seen.update(kind=kind, value=value, limit=limit)
         return {"total": 1, "lines": [_line()], "receipt": None, "store_rows": STORES}
     monkeypatch.setattr(db, "receipt_lines_search", search)
-    monkeypatch.setattr(owned, "ross_hits", lambda skus: {"400300371436": {"items": [ITEM], "checks": []}})
+    monkeypatch.setattr(owned, "ross_hits", lambda skus: {"400123456785": {"items": [ITEM], "checks": []}})
     text, ctx = _run("/rcpt ed hardy")
     assert seen["kind"] == "words" and seen["value"][0]["codes"] == ["EH"] and seen["limit"] == config.RCPT_MAX_LINES
-    assert "CLUB AMERICA NAVY" in text
+    assert "SAMPLE HOODIE NAVY" in text
     assert all(c.kwargs.get("disable_web_page_preview") for c in ctx.transcript.of("reply_text"))
 
 
@@ -155,13 +155,13 @@ def test_handler_reports_a_failure(monkeypatch):
     from bot import util
     errors = []
     monkeypatch.setattr(util, "_record_error", lambda where, e: errors.append(where))
-    assert "⚠️ Couldn't read receipts: RuntimeError: boom" in _run("/rcpt 71436")[0]
+    assert "⚠️ Couldn't read receipts: RuntimeError: boom" in _run("/rcpt 56785")[0]
     assert errors == ["rcpt"]
 
 
 # --- the search on SQL Server ------------------------------------------------------------------------
 
-def _receipt(cur, number, date_, lines, city="Dress For Less Miami"):
+def _receipt(cur, number, date_, lines, city="Dress For Less Springfield"):
     cur.execute("INSERT INTO dbo.Receipts (ReceiptNumber, ReceiptDate, StoreCity) OUTPUT INSERTED.ReceiptID "
                 "VALUES (?, ?, ?)", number, date_, city)
     rid = cur.fetchone()[0]
@@ -175,9 +175,9 @@ def _receipt(cur, number, date_, lines, city="Dress For Less Miami"):
 def receipts(mssql, monkeypatch):
     monkeypatch.setattr(config, "DB_BACKEND", "sqlserver")
     cur = mssql.cursor()
-    old = _receipt(cur, "2710-03-5447-6292-3", "2026-10-19",
-                   [("400300371436", "CLUB AMERICA NAVY", 16.99), ("400300371436", "CLUB AMERICA NAVY", 9.99)])
-    new = _receipt(cur, "0443-08-1090-6304-0", "2026-11-01",
+    old = _receipt(cur, "9901-03-1234-5678-3", "2026-10-19",
+                   [("400123456785", "SAMPLE HOODIE NAVY", 18.49), ("400123456785", "SAMPLE HOODIE NAVY", 9.99)])
+    new = _receipt(cur, "9904-08-1111-2222-0", "2026-11-01",
                    [("400200000001", "EH BLK SKULL 50%_OFF", 14.99), ("400200000002", "WMNS RUN SHOE", 24.99),
                     ("400200000003", "MENS RUN SHOE", 22.99)])
     cur.execute("INSERT INTO dbo.receipt_line_details (desc_key, source, gender, category, item_type) "
@@ -192,24 +192,24 @@ def receipts(mssql, monkeypatch):
 
 
 def test_search_by_code_number_and_id(receipts):
-    r = db.receipt_lines_search("sku_suffix", "71436")
-    assert r["total"] == 2 and [ln["price"] for ln in r["lines"]] == [16.99, 9.99]
+    r = db.receipt_lines_search("sku_suffix", "56785")
+    assert r["total"] == 2 and [ln["price"] for ln in r["lines"]] == [18.49, 9.99]
     assert all(ln["same_code_prices"] == 2 for ln in r["lines"])
-    r = db.receipt_lines_search("receipt_number", "2710-03-5447-6292-3")
+    r = db.receipt_lines_search("receipt_number", "9901-03-1234-5678-3")
     assert r["receipt"]["receipt_id"] == receipts["old"] and len(r["lines"]) == 2
     r = db.receipt_lines_search("receipt_id", receipts["new"])
-    assert [ln["line_index"] for ln in r["lines"]] == [1, 2, 3] and r["receipt"]["receipt_number"].startswith("0443")
+    assert [ln["line_index"] for ln in r["lines"]] == [1, 2, 3] and r["receipt"]["receipt_number"].startswith("9904")
     assert db.receipt_lines_search("receipt_id", 999999)["receipt"] is None
-    r = db.receipt_lines_search("receipt_number_part", "62923")
+    r = db.receipt_lines_search("receipt_number_part", "56783")
     assert r["total"] == 2
-    assert ("2710", "Dress For Less Miami", 1) in r["store_rows"]
+    assert ("9901", "Dress For Less Springfield", 1) in r["store_rows"]
 
 
 def test_search_words(receipts):
     def words(*terms):
         return db.receipt_lines_search("words", [{"text": t, "codes": [], "gender": None} for t in terms])
     assert words("run", "shoe")["total"] == 2
-    assert [ln["description"] for ln in words("club")["lines"]] == ["CLUB AMERICA NAVY"] * 2
+    assert [ln["description"] for ln in words("sample")["lines"]] == ["SAMPLE HOODIE NAVY"] * 2
     assert words("duffel")["lines"][0]["sku"] == "400200000001"       # through the item behind the SKU
     assert words("50%")["total"] == 1                                   # % is literal, not a wildcard
     assert words("0%_")["total"] == 1 and words("x_o")["total"] == 0     # so is _

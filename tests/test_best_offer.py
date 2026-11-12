@@ -45,8 +45,8 @@ def test_percentages_round_up_to_99():
 
 
 def test_low_cost_item_uses_the_percentages():
-    # db2380ba-like: $44.99 with a $9.99 cost, break-even ~ $13
-    item = {"receipt": {"reduced_price": 9.99}, "listing": {"price": 44.99}}
+    # A cheap bag: $44.99 with an $8.49 cost, break-even ~ $12
+    item = {"receipt": {"reduced_price": 8.49}, "listing": {"price": 44.99}}
     assert breakeven_price(item) < 38
     assert inv.offer_thresholds(item, 44.99) == (42.99, 38.99)
 
@@ -83,9 +83,9 @@ def test_no_decline_when_breakeven_reaches_the_price():
 
 
 def test_no_floor_when_breakeven_is_under_a_dollar(monkeypatch):
-    # 905ea463, live: a $0.49 receipt puts break-even below zero, and eBay
-    # rejected the resulting $0 floor (errorId 25016).
-    cheap = {"receipt": {"reduced_price": 0.49}, "listing": {"price": 39.99}}
+    # A tiny receipt puts break-even below zero, and eBay rejected the
+    # resulting $0 floor (errorId 25016).
+    cheap = {"receipt": {"reduced_price": 0.39}, "listing": {"price": 39.99}}
     assert breakeven_price(cheap) < 1
     monkeypatch.setattr(inv, "BEST_OFFER_AUTO_ACCEPT_PCT", 0.0)
     monkeypatch.setattr(inv, "BEST_OFFER_AUTO_DECLINE_PCT", 0.0)
