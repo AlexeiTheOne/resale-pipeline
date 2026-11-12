@@ -90,6 +90,9 @@ from bot.report_cmds import (  # noqa: E402,F401  (re-export)
 from bot.old_store_cmds import (  # noqa: E402,F401  (re-export)
     old_store_document,
 )
+from bot.ship_test_cmds import (  # noqa: E402,F401  (re-export)
+    ship_test_callback, ship_test_command,
+)
 from bot.revise_cmds import (  # noqa: E402,F401  (re-export)
     revise_callback, revise_command,
 )

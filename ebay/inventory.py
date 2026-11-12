@@ -385,7 +385,8 @@ _OFFER_UPDATABLE_FIELDS = (
 )
 
 
-def update_offer_price(offer_id: str, price, item: dict | None = None) -> dict:
+def update_offer_price(offer_id: str, price, item: dict | None = None,
+                       fulfillment_policy_id: str | None = None) -> dict:
     """Change an offer's price. eBay's updateOffer is a full PUT replace, so read
     the current offer, swap in the new price, and send the carried-over fields
     back. Works for both an unpublished draft and a live listing (a published
@@ -395,7 +396,10 @@ def update_offer_price(offer_id: str, price, item: dict | None = None) -> dict:
     auto-decline are rewritten for the new price in the same PUT
     (best_offer_terms). Without that, a cut below the old auto-decline fails
     (errorId 25016), and a raise leaves the thresholds at the old price's
-    percentages. An offer with Best Offer off stays off. Returns the body sent."""
+    percentages. An offer with Best Offer off stays off.
+
+    `fulfillment_policy_id` switches the shipping policy in the same PUT (the
+    free-shipping test). Returns the body sent."""
     current = _request("GET", f"/sell/inventory/v1/offer/{offer_id}").json()
     body = {k: current[k] for k in _OFFER_UPDATABLE_FIELDS if current.get(k) is not None}
     body["pricingSummary"] = {"price": {"value": str(price), "currency": EBAY_CURRENCY}}
@@ -403,6 +407,9 @@ def update_offer_price(offer_id: str, price, item: dict | None = None) -> dict:
     if item is not None and (policies.get("bestOfferTerms") or {}).get("bestOfferEnabled"):
         # Replaces bestOfferTerms whole; the policy ids beside it carry over.
         policies["bestOfferTerms"] = best_offer_terms(item, price)
+    if fulfillment_policy_id:
+        policies["fulfillmentPolicyId"] = str(fulfillment_policy_id)
+    if policies:
         body["listingPolicies"] = policies
     _request("PUT", f"/sell/inventory/v1/offer/{offer_id}", json=body)
     return body
@@ -853,6 +860,54 @@ def update_offer_quantity(sku: str, offer_id: str, quantity: int) -> None:
                 f"eBay bulk_update_price_quantity failed for SKU {res.get('sku')} "
                 f"[{status}]: {res.get('errors')}"
             )
+
+
+# Fields of a fulfillment policy that carry over into a copy. The rest of a
+# GET response (the id, warnings) is read-only.
+_FULFILLMENT_COPY_FIELDS = (
+    "marketplaceId", "categoryTypes", "handlingTime", "shipToLocations", "shippingOptions",
+    "globalShipping", "pickupDropOff", "freightShipping", "localPickup", "description",
+)
+
+
+def free_shipping_policy_body(template: dict, name: str) -> dict:
+    """A copy of the fulfillment policy `template` (as eBay returns it) with free
+    domestic shipping on its first service, under `name`. Everything else, such
+    as handling time, ship-to locations and other services, stays the same. The
+    copy is never the account default for new listings."""
+    body = copy.deepcopy({k: template[k] for k in _FULFILLMENT_COPY_FIELDS if k in template})
+    body["name"] = name
+    body["categoryTypes"] = [{"name": c.get("name")} for c in body.get("categoryTypes") or []
+                             if c.get("name")] or [{"name": "ALL_EXCLUDING_MOTORS_VEHICLES"}]
+    domestic = [o for o in body.get("shippingOptions") or [] if o.get("optionType") == "DOMESTIC"]
+    services = (domestic[0].get("shippingServices") or []) if domestic else []
+    if not services:
+        raise RuntimeError("the current shipping policy has no domestic service to make free")
+    first = services[0]
+    first["freeShipping"] = True
+    currency = (first.get("shippingCost") or {}).get("currency") or EBAY_CURRENCY
+    first["shippingCost"] = {"value": "0.00", "currency": currency}
+    if "additionalShippingCost" in first:
+        first["additionalShippingCost"] = {"value": "0.00", "currency": currency}
+    return body
+
+
+def ensure_free_shipping_policy(template_policy_id: str, name: str) -> str:
+    """The id of the free-shipping fulfillment policy called `name`, created as
+    a copy of `template_policy_id` (the policy the listings use now) the first
+    time. Found by name afterwards, so running it twice creates one policy."""
+    resp = _request("GET", "/sell/account/v1/fulfillment_policy",
+                    params={"marketplace_id": EBAY_MARKETPLACE_ID}).json()
+    for p in resp.get("fulfillmentPolicies") or []:
+        if p.get("name") == name:
+            return str(p["fulfillmentPolicyId"])
+    template = _request("GET", f"/sell/account/v1/fulfillment_policy/{template_policy_id}").json()
+    created = _request("POST", "/sell/account/v1/fulfillment_policy",
+                       json=free_shipping_policy_body(template, name)).json()
+    pid = created.get("fulfillmentPolicyId")
+    if not pid:
+        raise RuntimeError(f"eBay created no fulfillment policy id: {str(created)[:200]}")
+    return str(pid)
 
 
 def get_policy_id(policy_type: str) -> str:

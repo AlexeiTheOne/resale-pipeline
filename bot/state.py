@@ -28,6 +28,7 @@ haul_mode = set()   # user_ids whose next photo batch is a multi-item haul to be
 check_running = set()  # user_ids with a /check in progress (one at a time per user)
 checks = {}         # token -> {"req", "photo", "user", "ts", "check_id"}: a /check reply's buttons
 revise = {}         # token -> a /revise preview awaiting Apply/Cancel (see bot/revise_cmds.py)
+ship_test = {}      # token -> a /shiptest preview awaiting Start/Cancel (bot/ship_test_cmds.py)
                     # (Full check, Any/Exact, Bought) for 30 min; the check itself is in the DB
 shop_mode = {}      # user_id -> {"until": epoch, "task"}: /shop is on (every photo is a check)
 shop_batch = {}     # user_id -> {"photos": [bytes], "message", "task", "price"}: an album being collected

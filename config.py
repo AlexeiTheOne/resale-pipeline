@@ -312,6 +312,18 @@ EBAY_AD_FEE_PCT = float(os.getenv("EBAY_AD_FEE_PCT", "0.046"))
 # flat rate. $9.88 was the 2026-08-16 figure from a smaller sample.
 EBAY_SHIP_CHARGED = float(os.getenv("EBAY_SHIP_CHARGED", "9.99"))
 EBAY_SHIP_COST = float(os.getenv("EBAY_SHIP_COST", "7.20"))
+# A listing on free shipping (ebay.free_shipping) charges $0 and pays this label:
+# the measured median for bags, 2026-11-09 (docs/listing-performance-plan.md §5).
+FREE_SHIPPING_LABEL_COST = float(os.getenv("FREE_SHIPPING_LABEL_COST", "8.17"))
+
+# --- Free-shipping test (pipeline/ship_test.py, plan §5, owner go 2026-11-12) ---
+# The test group moves to free shipping with the price raised by
+# SHIP_TEST_PRICE_BUMP; the control group keeps $9.99 shipping. Neither gets
+# repriced or offered for SHIP_TEST_DAYS after the start.
+SHIP_TEST_PRICE_BUMP = float(os.getenv("SHIP_TEST_PRICE_BUMP", "9.00"))
+SHIP_TEST_DAYS = int(os.getenv("SHIP_TEST_DAYS", "21"))
+# The fulfillment policy the bot creates (or finds by this name) for the test.
+FREE_SHIPPING_POLICY_NAME = os.getenv("FREE_SHIPPING_POLICY_NAME", "Free shipping (USPS Ground Advantage)")
 # What to assume an item cost at Ross when no receipt was captured. Items with no
 # receipt used to be costed at ZERO, which reported their entire sale price as
 # profit — one showed a 68% margin purely because its cost was missing. A share of

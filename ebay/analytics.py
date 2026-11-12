@@ -70,8 +70,10 @@ OPTIONAL_METRICS = ("TRANSACTION",)
 _optional_ok = True
 
 
-def get_traffic_report(listing_ids: list[str], days: int = 7) -> dict[str, dict]:
-    """Impressions/views per listing over the trailing `days`. Returns
+def get_traffic_report(listing_ids: list[str], days: int = 7, *,
+                       start: date | None = None, end: date | None = None) -> dict[str, dict]:
+    """Impressions/views per listing over the trailing `days`, or from `start`
+    to `end` (inclusive) when given. Returns
     {listing_id: {"impressions": int (TOTAL, promoted included),
     "organic_impressions": int (search + store), "views": int (all sources),
     "search_views": int, "ctr": float (eBay's own field, not used for verdicts),
@@ -86,8 +88,8 @@ def get_traffic_report(listing_ids: list[str], days: int = 7) -> dict[str, dict]
 
     # eBay's Analytics API wants dates as yyyyMMdd (errorId 50013 otherwise), NOT
     # ISO yyyy-mm-dd — unlike most eBay REST date params.
-    end = date.today()
-    start = end - timedelta(days=days)
+    end = end or date.today()
+    start = start or end - timedelta(days=days)
     filter_str = (
         f"marketplace_ids:{{{EBAY_MARKETPLACE_ID}}},"
         f"listing_ids:{{{'|'.join(listing_ids)}}},"
@@ -122,7 +124,7 @@ def get_traffic_report(listing_ids: list[str], days: int = 7) -> dict[str, dict]
         print(f"analytics: traffic_report refused {OPTIONAL_METRICS} ({r.text[:200]}); "
               "asking without them from now on")
         _optional_ok = False
-        return get_traffic_report(listing_ids, days)
+        return get_traffic_report(listing_ids, days, start=start, end=end)
     if r.status_code >= 400:
         raise RuntimeError(f"eBay Analytics API traffic_report failed [{r.status_code}]: {r.text}")
 
