@@ -255,7 +255,7 @@ Every level is an **item price**: eBay totals minus the shipping we charge
 |---|---|---|
 | 1 | eBay sold, **same item** (the judge's `same_item`) | **2+ sales: their median, done** |
 | 2 | eBay sold, same model in another colour or size (the judge's `variant`) | 1+ counts |
-| 3 | **Our own sales** (ResaleDB), same brand + type bucket | their median |
+| 3 | **Our own sales** (ResaleDB), same brand + type bucket; the **old store's** when we have fewer than 3 | their median |
 | 4 | **MSRP × brand ratio**: median sold/MSRP over our sold items | the type bucket when the brand has fewer than 3 sales; never the all-sales fallback; skipped when the MSRP looks wrong |
 | 5 | eBay **asking prices**: the cheapest identical listing × `CHECK_ASK_DISCOUNT` | **a ceiling only, never the price** |
 
@@ -273,6 +273,18 @@ Every level is an **item price**: eBay totals minus the shipping we charge
   (12d) · MSRP×47% $51 · ask ≤$92 · 1 for sale 146d, 0 sold". Level 3 adds
   our median days to sell. Details lists every level with its numbers.
 - **The backtest** leaves each item's own sale out of levels 3–4.
+- **Old store in level 3** (2026-11-11, `pipeline/old_store.py`): when the
+  current store has fewer than `CHECK_OLD_STORE_MIN_SALES` (3) sales of the
+  brand + type, level 3 is the old eBay store's median instead, from periods
+  that ended in the last `CHECK_OLD_STORE_YEARS` (3) years. Matching, each
+  step needing 3 listings: brand + type + bag size, the parent brand's
+  family + size for a sub-line ("Luv Betsey" -> Betsey Johnson and its
+  lines), brand + type, parent family + type; else brand + type with
+  whatever it has. Sub-lines stay apart from their parent. The median is
+  over units sold; one listing of 3 units is still one listing. The
+  evidence line shows "old store Juicy Couture large bags ~$49 (28)", next
+  to ours when we have 1–2. Old store sales back a SKIP like our own.
+  No days to sell: the workbook has periods, not dates.
 
 ### Comps, demand and dropship listings (part C)
 

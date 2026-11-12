@@ -466,6 +466,11 @@ applies.
   only, no FK. The bot runs the step at startup after the deploy (which
   backs up first). Filled when the owner sends the report's xlsx to the bot;
   `/diagnose` reads the newest.
+- ⬜ **Old store sales** (`old_store_sales`, step 8, docs/schema-proposal.md):
+  new table only, no FK. The bot runs the step at startup after the deploy
+  (which backs up first). Filled when the owner sends
+  `data\import\old_store_sales.csv` to the bot, which backs up again before
+  replacing the rows; `/check` level 3 reads it.
 - 💤 Dev refresh after step 5: `refresh_dev_from_backup.py` copies every
   table, so ResaleDB_Dev must be at step 5 too (any `import db` with the dev
   `.env` migrates it).
@@ -491,6 +496,11 @@ applies.
 ---
 
 ## Log
+- 2026-11-11: **SQL Server step 8 `old_store_sales`** (SQLite step 6; branch
+  `old-store-sales`): the old eBay store's sales, one row per sold listing per
+  period. New table only, no FK, nothing else locked. The bot runs the step at
+  startup after the deploy, which backs up first. Older code after a rollback
+  warns "schema 8, code knows 7" and keeps working.
 - 2026-11-10: **SQL Server step 7 `quality_report`** (SQLite step 5; branch
   `report-ingest`): `quality_report_sections` and `quality_report_listings`,
   eBay's listing quality report by report date. New tables only, no FK,

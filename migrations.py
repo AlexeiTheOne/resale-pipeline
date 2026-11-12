@@ -374,6 +374,48 @@ def _quality_report(con: sqlite3.Connection) -> None:
                 "ON quality_report_listings (item_id)")
 
 
+def _old_store_sales(con: sqlite3.Connection) -> None:
+    """The old eBay store's sales, 2021 to Aug 2026 (scripts/import_old_store.py,
+    loaded by the bot from the CSV: pipeline/old_store.py). One row per sold
+    listing per period tab. /check uses them as "old store" in level 3. No
+    buyer data and no first names: the workbook's name columns are never read."""
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS old_store_sales (
+            row_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            source             TEXT NOT NULL CHECK (source = 'old_store'),
+            source_tab         TEXT NOT NULL,
+            source_row         INTEGER NOT NULL,
+            period_start       TEXT NOT NULL,
+            period_end         TEXT NOT NULL,
+            year_inferred      INTEGER NOT NULL CHECK (year_inferred IN (0, 1)),
+            title              TEXT NOT NULL CHECK (length(title) > 0),
+            ebay_item_id       TEXT,
+            quantity           INTEGER NOT NULL CHECK (quantity > 0),
+            item_sales         REAL NOT NULL,
+            unit_price         REAL NOT NULL,
+            shipping_per_unit  REAL,
+            label_per_unit     REAL,
+            fees_per_unit      REAL,
+            net_per_unit       REAL,
+            price_paid         REAL,
+            cost_per_unit      REAL,
+            best_offer_units   INTEGER,
+            seller_offer_units INTEGER,
+            status             TEXT NOT NULL CHECK (status IN ('ok', 'to_check')),
+            note               TEXT,
+            brand              TEXT,
+            parent_brand       TEXT,
+            item_type          TEXT,
+            bag_size           TEXT CHECK (bag_size IS NULL OR bag_size IN ('large', 'small')),
+            msrp               REAL,
+            msrp_from          TEXT,
+            imported_at        TEXT NOT NULL,
+            UNIQUE (source_tab, source_row)
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_old_store_sales_period ON old_store_sales (period_end)")
+
+
 # (version, name, function). Append only.
 MIGRATIONS = [
     (1, "baseline", _baseline),
@@ -381,6 +423,7 @@ MIGRATIONS = [
     (3, "checks_sku_main", _checks_sku_main),
     (4, "check_evidence", _check_evidence),
     (5, "quality_report", _quality_report),
+    (6, "old_store_sales", _old_store_sales),
 ]
 
 
@@ -1342,6 +1385,51 @@ def _mssql_quality_report(cur) -> None:
     cur.execute("CREATE INDEX IX_quality_report_listings_item ON dbo.quality_report_listings (item_id)")
 
 
+def _mssql_old_store_sales(cur) -> None:
+    """The old eBay store's sales (see the SQLite step _old_store_sales). New
+    table only, no FK."""
+    cur.execute("""
+    CREATE TABLE dbo.old_store_sales (
+        row_id             INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_old_store_sales PRIMARY KEY,
+        source             VARCHAR(12)   NOT NULL
+                           CONSTRAINT CK_old_store_sales_source CHECK (source = 'old_store'),
+        source_tab         NVARCHAR(100) NOT NULL,
+        source_row         INT           NOT NULL,
+        period_start       DATE          NOT NULL,
+        period_end         DATE          NOT NULL,
+        year_inferred      BIT           NOT NULL,
+        title              NVARCHAR(300) NOT NULL
+                           CONSTRAINT CK_old_store_sales_title CHECK (LEN(title) > 0),
+        ebay_item_id       VARCHAR(20)   NULL,
+        quantity           INT           NOT NULL
+                           CONSTRAINT CK_old_store_sales_quantity CHECK (quantity > 0),
+        item_sales         DECIMAL(10,2) NOT NULL,
+        unit_price         DECIMAL(10,2) NOT NULL,
+        shipping_per_unit  DECIMAL(10,2) NULL,
+        label_per_unit     DECIMAL(10,2) NULL,
+        fees_per_unit      DECIMAL(10,2) NULL,
+        net_per_unit       DECIMAL(10,2) NULL,
+        price_paid         DECIMAL(10,2) NULL,
+        cost_per_unit      DECIMAL(10,2) NULL,
+        best_offer_units   INT           NULL,
+        seller_offer_units INT           NULL,
+        status             VARCHAR(10)   NOT NULL
+                           CONSTRAINT CK_old_store_sales_status CHECK (status IN ('ok', 'to_check')),
+        note               NVARCHAR(200) NULL,
+        brand              NVARCHAR(100) NULL,
+        parent_brand       NVARCHAR(100) NULL,
+        item_type          VARCHAR(20)   NULL,
+        bag_size           VARCHAR(5)    NULL
+                           CONSTRAINT CK_old_store_sales_bag_size CHECK (bag_size IN ('large', 'small')),
+        msrp               DECIMAL(10,2) NULL,
+        msrp_from          VARCHAR(12)   NULL,
+        imported_at        DATETIME2(6)  NOT NULL
+                           CONSTRAINT DF_old_store_sales_imported_at DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT UQ_old_store_sales_source_row UNIQUE (source_tab, source_row)
+    )""")
+    cur.execute("CREATE INDEX IX_old_store_sales_period ON dbo.old_store_sales (period_end)")
+
+
 # (version, name, function). Append only.
 MSSQL_MIGRATIONS = [
     (1, "resaledb_baseline", _mssql_baseline),
@@ -1351,6 +1439,7 @@ MSSQL_MIGRATIONS = [
     (5, "receipt_line_details", _mssql_receipt_line_details),
     (6, "check_evidence", _mssql_check_evidence),
     (7, "quality_report", _mssql_quality_report),
+    (8, "old_store_sales", _mssql_old_store_sales),
 ]
 # The production migration copies the receipts into a database at this
 # version: the unique indexes (step 2) come after the receipt cleanup.

@@ -47,6 +47,7 @@ EXPECTED_MESSAGE_HANDLERS = {
     "price_text": ("text", "command"),     # a typed Ross price, before text_handler
     "photo_handler": ("photo",),
     "report_document": ("document", "xlsx"),  # eBay's listing quality report
+    "old_store_document": ("document", "csv"),  # the old store's sales (pipeline/old_store.py)
     "text_handler": ("text", "command", "inverted"),
 }
 # (handler class, callback name, group)
