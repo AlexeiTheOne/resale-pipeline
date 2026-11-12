@@ -21,8 +21,18 @@ the stored sale_price and shipping_collected.
 """
 from config import (
     ASSUMED_COST_RATIO, EBAY_AD_FEE_PCT, EBAY_FIXED_FEE, EBAY_FVF_PCT,
-    EBAY_SHIP_CHARGED, EBAY_SHIP_COST, SALES_TAX_RATE,
+    EBAY_SHIP_CHARGED, EBAY_SHIP_COST, FREE_SHIPPING_LABEL_COST, SALES_TAX_RATE,
 )
+
+
+def shipping(item: dict) -> tuple[float, float]:
+    """(shipping charged, label cost) per unit for this listing. A listing on
+    free shipping (ebay.free_shipping, set by the free-shipping test) charges
+    nothing and pays FREE_SHIPPING_LABEL_COST, the measured bag label; every
+    other listing uses the flat EBAY_SHIP_CHARGED / EBAY_SHIP_COST."""
+    if (item.get("ebay") or {}).get("free_shipping"):
+        return 0.0, FREE_SHIPPING_LABEL_COST
+    return EBAY_SHIP_CHARGED, EBAY_SHIP_COST
 
 
 def _listed_qty(item: dict) -> int:
@@ -130,8 +140,9 @@ def breakeven_price(item: dict, min_margin: float = 0.0) -> float | None:
     denom = 1 - EBAY_FVF_PCT - (EBAY_AD_FEE_PCT or 0)
     if denom <= 0:
         return None
-    numerator = (min_margin + EBAY_FIXED_FEE + float(paid) + EBAY_SHIP_COST
-                 - EBAY_SHIP_CHARGED * (1 - EBAY_FVF_PCT))
+    charged, label = shipping(item)
+    numerator = (min_margin + EBAY_FIXED_FEE + float(paid) + label
+                 - charged * (1 - EBAY_FVF_PCT))
     return numerator / denom
 
 
@@ -184,10 +195,11 @@ def project(item: dict, price: float | None = None, qty: int | None = None) -> d
         ebay_fee = round(float(ebay.get("ebay_fees") or 0), 2)
         ship_cost = round(float(ebay.get("shipping_label_cost") or 0), 2)
     else:
-        ship_charged = EBAY_SHIP_CHARGED * qty
+        charged, label = shipping(item)
+        ship_charged = charged * qty
         # FVF applies to item + shipping charged; the fixed fee is per unit sold.
         ebay_fee = EBAY_FVF_PCT * (revenue + ship_charged) + EBAY_FIXED_FEE * qty
-        ship_cost = EBAY_SHIP_COST * qty
+        ship_cost = label * qty
     # The Promoted Listings fee eBay actually charged on the order(s), when /sync
     # recorded one (ebay/orders.py attributes each ad fee to its order). Rows
     # recorded before that existed have no `ad_fees` and stay on the assumption.

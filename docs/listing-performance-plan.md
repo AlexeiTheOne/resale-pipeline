@@ -127,6 +127,23 @@ offered. eBay may not have listed it as eligible; only the live bot can tell.
 
 ## 5. Free-shipping test
 
+**Built (owner go, 2026-11-12): `/shiptest`, `pipeline/ship_test.py`.**
+- **Groups, redrawn 2026-11-12:**
+  - 0e48e50b sold on 8 Nov, and its control slot went to f0665406.
+  - d60d9e01 was swapped for 53b36c34 because the owner cut its price that day.
+  - Both are the next women's bags by impressions. The test group is unchanged.
+- **Start:** `/shiptest` shows the preview, and its button starts the test:
+  - The bot creates the policy "Free shipping (USPS Ground Advantage)", a copy of the current one with the first domestic service free.
+  - Each test listing then gets the price +$9, the policy and the new Best Offer thresholds in one eBay update. The DB changes only after eBay accepts.
+  - Both groups get `ebay.ship_test` (start, end, price before).
+- **Floors:** `ebay.free_shipping` makes `profit.shipping` charge $0 and use the $8.17 label, so the break-even and Best Offer floors follow.
+- **Freeze (step 6):**
+  - The weekly digest records stats but suggests nothing for the 36 listings, and its header counts them.
+  - `/offers` and the watcher-offer plan skip them.
+  - `/setprice` refuses them without `force`.
+- **Measuring (step 7):** `/shiptest` reads eBay's traffic report for the test days and for the same number of days just before the start, per group. This replaces the daily snapshot: the Analytics API answers any date range, so a snapshot table would only copy it.
+- **Not built yet:** ending the test, which means putting test listings back on $9.99 shipping or keeping free shipping. That decision comes after the 21 days.
+
 **Approved (owner, 2026-11-09)** as drafted: 18 vs 18, 21 days, judged by CTR,
 sales as a direction only. **The Patricia Nash Ava Rose tote (331dc4a9) is in
 neither group.** It had a sale in the last 31 days, so the 0-sales rule

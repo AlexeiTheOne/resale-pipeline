@@ -27,6 +27,7 @@ EXPECTED_COMMANDS = {
     "setprice", "setqty", "sync", "feedback", "activate", "promote",
     "pricecheck", "retry", "photocheck", "health", "usage", "auth", "whoami",
     "help", "cancel", "check", "shop", "rcpt", "revise", "diagnose",
+    "shiptest",
 }
 # pattern -> callback function name
 EXPECTED_CALLBACKS = {
@@ -39,6 +40,7 @@ EXPECTED_CALLBACKS = {
     r"^chk:": "check_callback",
     r"^chkp:": "price_callback",
     r"^rev:": "revise_callback",
+    r"^shipt:": "ship_test_callback",
 }
 # callback name -> substrings that must appear in the lowercased filters repr
 EXPECTED_MESSAGE_HANDLERS = {

@@ -376,6 +376,8 @@ HELP_SECTIONS = [
                                  "(the xlsx) to the bot for its benchmarks"),
         ("/revise <id>", "Owner only: change a live listing's title, specifics and description "
                          "in place. Shows before/after; nothing is sent until you tap Apply"),
+        ("/shiptest", "Owner only: the free-shipping test. Before it starts, a preview with an "
+                      "Apply button; once it runs, CTR and sales per group"),
         ("/setqty [id] <n>", "Set the quantity on eBay (once the item has an offer); default is 1"),
         ("/sync [days]", "Pull live price/quantity + real sold orders from eBay; auto-marks sold items with actual fees"),
         ("/feedback", "Leave positive feedback now for every paid buyer still waiting on it (also runs daily)"),

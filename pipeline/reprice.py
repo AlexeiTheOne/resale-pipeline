@@ -70,7 +70,7 @@ from db import (
 from ebay.analytics import get_traffic_report, get_watch_count
 from ebay.inventory import auto_decline_price
 from ebay.negotiation import MIN_DISCOUNT_PCT, eligible_listing_ids, send_offer
-from pipeline import pricing_v2
+from pipeline import pricing_v2, ship_test
 from profit import breakeven_price
 
 
@@ -444,6 +444,10 @@ def run_weekly_check() -> tuple[list[dict], dict]:
             continue
         if result is not None:
             results.append(result)
+    # Listings in the free-shipping test still get their weekly stats row
+    # (evaluate_item wrote it) but no suggestion, offer or advice until it ends.
+    frozen = {i["item_id"] for i in candidates if ship_test.frozen(i)}
+    results = [r for r in results if r.get("item_id") not in frozen]
     looked_up = [r for r in results if r["verdict"] != "ERROR"]
     health = {
         "traffic_batches": traffic_health["batches"],
@@ -451,6 +455,7 @@ def run_weekly_check() -> tuple[list[dict], dict]:
         "watch_lookups": len(looked_up),
         "watch_failed": sum(1 for r in looked_up if r.get("watchers") is None),
         "pricing_calls": budget.used,
+        "frozen": len(frozen),
         "offers": build_offer_plan(candidates, results),
     }
     return results, health
@@ -575,6 +580,8 @@ def send_planned_offers(plan_id: str) -> dict:
         price = ((item or {}).get("listing") or {}).get("price")
         if item is None:
             out["skipped"].append((row, "item no longer exists"))
+        elif ship_test.frozen(item):
+            out["skipped"].append((row, "in the free-shipping test"))
         elif price is None or round(float(price), 2) != row["price"]:
             out["skipped"].append((row, f"price changed since the digest (now ${price})"))
         elif row["listing_id"] in recent:

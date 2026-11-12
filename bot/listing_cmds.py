@@ -16,7 +16,7 @@ import config
 import db
 from bot import flow, formatting, state, text_router, util
 from ebay import inventory, negotiation
-from pipeline import offers, reprice, sync
+from pipeline import offers, reprice, ship_test, sync
 
 
 # Upper bound on a hand-typed /setqty. Ross stock is near-always single units and
@@ -338,6 +338,12 @@ async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     state.last_item[user_id] = item_id
 
+    if not forced and ship_test.frozen(item):
+        end = ship_test.record(item)["end"]
+        await util._safe_reply(update.message,
+            f"⚠️ {item_id[:8]} is in the free-shipping test until {end}: a price change now "
+            f"confounds it. Add `force` to change it anyway.")
+        return
     if not forced:
         refusal = text_router._floor_refusal(item, price)
         if refusal:
@@ -679,6 +685,9 @@ async def _send_reprice_digest(bot, chat_id, results: list[dict],
     health_line = _reprice_health_line(health)
     if health_line:
         header += f"\n{health_line}"
+    if (health or {}).get("frozen"):
+        header += (f"\n🧪 {health['frozen']} listing(s) in the free-shipping test are left "
+                   "alone until it ends (/shiptest).")
     if (health or {}).get("traffic_failed"):
         header += ("\n⚠️ Incomplete: listings without traffic data were NOT diagnosed "
                    "as invisible — the numbers are missing, not zero."

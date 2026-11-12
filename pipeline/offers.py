@@ -13,6 +13,7 @@ from config import (
 )
 from ebay import analytics, negotiation
 from ebay.negotiation import MIN_DISCOUNT_PCT
+from pipeline import ship_test
 
 
 def items_with_live_stock() -> list[dict]:
@@ -28,6 +29,8 @@ def items_with_live_stock() -> list[dict]:
     Mirrors pipeline/reprice.py's eligibility rule, which had the same bug."""
     out = []
     for item in db.list_items("published") + db.list_items("sold"):
+        if ship_test.frozen(item):
+            continue   # in the free-shipping test: no offers until it ends
         if item["status"] == "published":
             out.append(item)
             continue
