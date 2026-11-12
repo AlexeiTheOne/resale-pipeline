@@ -344,32 +344,54 @@ async def setprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await util._safe_reply(update.message, f"⚠️ {refusal}")
             return
 
-    # Update the stored price on both the listing and the pricing record.
-    listing = dict(item.get("listing") or {})
-    if listing:
-        listing["price"] = price
-        db.update_field(item_id, "listing", listing)
-    pricing = text_router._apply_manual_price(item.get("pricing") or {}, price)
-    db.update_field(item_id, "pricing", pricing)
-
     offer_id = (item.get("ebay") or {}).get("offer_id")
-    if offer_id and item["status"] in ("ebay_draft", "published") and sync.detached(item):
+    on_ebay = bool(offer_id) and item["status"] in ("ebay_draft", "published")
+    if on_ebay and sync.detached(item):
+        _save_price(item, price, text_router._apply_manual_price(item.get("pricing") or {}, price))
         await util._safe_reply(update.message, _detached_msg(item, f"Saved ${price} locally"))
         return
-    if offer_id and item["status"] in ("ebay_draft", "published"):
+    terms = None
+    if on_ebay:
+        # eBay first, with the Best Offer thresholds for the new price in the
+        # same update; the DB only changes once eBay has taken it.
         try:
-            await asyncio.to_thread(inventory.update_offer_price, offer_id, price)
+            body = await asyncio.to_thread(inventory.update_offer_price, offer_id, price, item)
         except Exception as e:
             traceback.print_exc()
             util._record_error(f"setprice ({item_id[:8]})", e)
             await util._safe_reply(update.message,
-                f"💲 Saved ${price} locally, but updating eBay failed: {type(e).__name__}: {str(e)[:200]}\n"
-                "The stored price is updated; use /retry or /addphotos to rebuild the offer.")
+                f"⚠️ eBay refused ${price} for {item_id[:8]}: {type(e).__name__}: {str(e)[:200]}\n"
+                "Nothing changed: the stored price is still the old one.")
             return
+        terms = ((body or {}).get("listingPolicies") or {}).get("bestOfferTerms")
+    _save_price(item, price, text_router._apply_manual_price(item.get("pricing") or {}, price))
+    if on_ebay:
         where = "live listing" if item["status"] == "published" else "eBay draft"
-        await util._safe_reply(update.message, f"💲 Price set to ${price} for {item_id[:8]} (updated the {where}).")
+        await util._safe_reply(update.message,
+            f"💲 Price set to ${price} for {item_id[:8]} (updated the {where}).{_terms_note(terms)}")
     else:
         await util._safe_reply(update.message, f"💲 Price set to ${price} for {item_id[:8]}.")
+
+
+def _save_price(item: dict, price: float, pricing: dict) -> None:
+    """Store a new price on both the listing and the pricing record."""
+    listing = dict(item.get("listing") or {})
+    if listing:
+        listing["price"] = price
+        db.update_field(item["item_id"], "listing", listing)
+    db.update_field(item["item_id"], "pricing", pricing)
+
+
+def _terms_note(terms: dict | None) -> str:
+    """' Best Offer: accept ≥ $X, decline < $Y.' for the thresholds just sent."""
+    if not terms:
+        return ""
+    parts = []
+    if terms.get("autoAcceptPrice"):
+        parts.append(f"auto-accept ≥ ${terms['autoAcceptPrice']['value']}")
+    if terms.get("autoDeclinePrice"):
+        parts.append(f"auto-decline < ${terms['autoDeclinePrice']['value']}")
+    return f"\nBest Offer: {', '.join(parts)}." if parts else ""
 
 
 def _detached_msg(item: dict, saved: str) -> str:
@@ -809,31 +831,31 @@ async def reprice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if price <= 0:
         return
 
-    listing = dict(item.get("listing") or {})
-    if listing:
-        listing["price"] = price
-        db.update_field(item_id, "listing", listing)
     pricing = dict(item.get("pricing") or {})
     pricing["suggested_price"] = price
     pricing["confidence"] = "reprice"
     pricing["price_basis"] = "reprice"
-    db.update_field(item_id, "pricing", pricing)
 
     offer_id = (item.get("ebay") or {}).get("offer_id")
     if offer_id and sync.detached(item):
+        _save_price(item, price, pricing)
         await util._safe_reply(query.message, _detached_msg(item, f"Saved ${price} locally"))
         return
+    terms = None
     if offer_id:
+        # eBay first (Best Offer thresholds in the same update), then the DB.
         try:
-            await asyncio.to_thread(inventory.update_offer_price, offer_id, price)
+            body = await asyncio.to_thread(inventory.update_offer_price, offer_id, price, item)
         except Exception as e:
             traceback.print_exc()
             util._record_error(f"reprice apply ({item_id[:8]})", e)
             await util._safe_reply(query.message,
-                f"⚠️ Saved ${price} locally, but updating eBay failed: {type(e).__name__}: {str(e)[:200]}\n"
-                "Use /setprice to retry pushing it to eBay.")
+                f"⚠️ eBay refused ${price} for {item_id[:8]}: {type(e).__name__}: {str(e)[:200]}\n"
+                "Nothing changed: the stored price is still the old one.")
             return
-    await util._safe_reply(query.message, f"💲 Repriced {item_id[:8]} to ${price}.")
+        terms = ((body or {}).get("listingPolicies") or {}).get("bestOfferTerms")
+    _save_price(item, price, pricing)
+    await util._safe_reply(query.message, f"💲 Repriced {item_id[:8]} to ${price}.{_terms_note(terms)}")
 
 
 async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

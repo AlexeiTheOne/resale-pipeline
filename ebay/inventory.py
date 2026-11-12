@@ -2,7 +2,6 @@ import copy
 import hashlib
 import html
 import json
-import math
 import os
 import re
 import shutil
@@ -16,8 +15,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import httpx
 
 from config import (
+    BEST_OFFER_AUTO_ACCEPT_PCT,
+    BEST_OFFER_AUTO_DECLINE_PCT,
     BEST_OFFER_ENABLED,
-    BEST_OFFER_MIN_PCT,
     EBAY_CURRENCY,
     EBAY_FULFILLMENT_POLICY_ID,
     EBAY_MARKETPLACE_ID,
@@ -385,15 +385,27 @@ _OFFER_UPDATABLE_FIELDS = (
 )
 
 
-def update_offer_price(offer_id: str, price) -> None:
+def update_offer_price(offer_id: str, price, item: dict | None = None) -> dict:
     """Change an offer's price. eBay's updateOffer is a full PUT replace, so read
     the current offer, swap in the new price, and send the carried-over fields
     back. Works for both an unpublished draft and a live listing (a published
-    offer's update takes effect on the live listing immediately)."""
+    offer's update takes effect on the live listing immediately).
+
+    With `item`, and Best Offer on for this offer, its auto-accept and
+    auto-decline are rewritten for the new price in the same PUT
+    (best_offer_terms). Without that, a cut below the old auto-decline fails
+    (errorId 25016), and a raise leaves the thresholds at the old price's
+    percentages. An offer with Best Offer off stays off. Returns the body sent."""
     current = _request("GET", f"/sell/inventory/v1/offer/{offer_id}").json()
     body = {k: current[k] for k in _OFFER_UPDATABLE_FIELDS if current.get(k) is not None}
     body["pricingSummary"] = {"price": {"value": str(price), "currency": EBAY_CURRENCY}}
+    policies = dict(body.get("listingPolicies") or {})
+    if item is not None and (policies.get("bestOfferTerms") or {}).get("bestOfferEnabled"):
+        # Replaces bestOfferTerms whole; the policy ids beside it carry over.
+        policies["bestOfferTerms"] = best_offer_terms(item, price)
+        body["listingPolicies"] = policies
     _request("PUT", f"/sell/inventory/v1/offer/{offer_id}", json=body)
+    return body
 
 
 # Inventory-item fields that carry over when we re-send one to change its title.
@@ -689,38 +701,65 @@ def _update_offer_description(offer_id: str, current: dict, description_html: st
     _request("PUT", f"/sell/inventory/v1/offer/{offer_id}", json=body)
 
 
-def auto_decline_price(item: dict, price) -> int | None:
-    """The Best Offer auto-decline floor for `item` listed at `price`: the
-    higher of BEST_OFFER_MIN_PCT of the price and the break-even, each rounded
-    UP to a whole dollar. So an offer that would sell at a loss is declined,
-    and so is a lowball that would merely break even — at break-even alone a
-    $20 offer on a $44.99 bag reached the seller.
+def up_to_99(value: float) -> float:
+    """The smallest $X.99 at or above `value`: 47.49 -> 47.99, 47.99 -> 47.99,
+    48.00 -> 48.99. Rounding up keeps a threshold at or above what it's built
+    from, so a break-even stays a floor."""
+    cents = round(float(value) * 100)          # float noise: 30.000000001 is 30.00
+    return (cents + (99 - cents % 100) % 100) / 100
 
-    An unknown Ross cost leaves only the percentage floor. None when the floor
-    would be at or above the price (it would decline every offer), or under a
-    dollar (eBay rejects a $0 floor, errorId 25016)."""
+
+def offer_thresholds(item: dict, price) -> tuple[float | None, float | None]:
+    """(auto-accept, auto-decline) for `item` listed at `price`.
+
+    Auto-accept is BEST_OFFER_AUTO_ACCEPT_PCT of the price, auto-decline
+    BEST_OFFER_AUTO_DECLINE_PCT; each rounded up to .99 and raised to the
+    break-even (cost + fees + label) rounded up to .99, so an offer that would
+    sell at a loss is never accepted automatically and always declined. An
+    unknown Ross cost leaves the percentages alone.
+
+    eBay needs decline < accept < price (errorId 25016 otherwise), so:
+      - no accept when it would reach the price;
+      - no accept when the decline reaches it (both pinned at the break-even):
+        the floor matters more, and offers above it still reach the seller;
+      - no decline when it would reach the price (it would decline every
+        offer) or is under $1 (eBay rejects a $0 floor)."""
     if price is None:
-        return None
-    candidates = []
+        return None, None
+    price = round(float(price), 2)
     breakeven = breakeven_price(item)
-    if breakeven is not None:
-        # Round to cents first so float noise (30.000000001) doesn't add a dollar.
-        candidates.append(math.ceil(round(breakeven, 2)))
-    if BEST_OFFER_MIN_PCT > 0:
-        candidates.append(math.ceil(round(float(price) * BEST_OFFER_MIN_PCT / 100, 2)))
-    if not candidates:
-        return None
-    floor = max(candidates)
-    return floor if 1 <= floor < float(price) else None
+    be = up_to_99(breakeven) if breakeven is not None else None
+
+    def at(pct):
+        if pct <= 0:
+            return be
+        v = up_to_99(price * pct / 100)
+        return max(v, be) if be is not None else v
+
+    accept, decline = at(BEST_OFFER_AUTO_ACCEPT_PCT), at(BEST_OFFER_AUTO_DECLINE_PCT)
+    if decline is not None and not 1 <= decline < price:
+        decline = None
+    if BEST_OFFER_AUTO_ACCEPT_PCT <= 0 or accept is None or accept >= price:
+        accept = None
+    if accept is not None and decline is not None and decline >= accept:
+        accept = None
+    return accept, decline
+
+
+def auto_decline_price(item: dict, price) -> float | None:
+    """The Best Offer auto-decline floor for `item` at `price` (offer_thresholds)."""
+    return offer_thresholds(item, price)[1]
 
 
 def best_offer_terms(item: dict, price) -> dict:
-    """listingPolicies.bestOfferTerms for an offer: Best Offer on, auto-decline
-    at auto_decline_price when there is one, and never an auto-accept."""
+    """listingPolicies.bestOfferTerms for an offer: Best Offer on, with the
+    auto-accept and auto-decline from offer_thresholds when there are any."""
     terms = {"bestOfferEnabled": True}
-    floor = auto_decline_price(item, price)
-    if floor is not None:
-        terms["autoDeclinePrice"] = {"value": f"{floor:.2f}", "currency": EBAY_CURRENCY}
+    accept, decline = offer_thresholds(item, price)
+    if accept is not None:
+        terms["autoAcceptPrice"] = {"value": f"{accept:.2f}", "currency": EBAY_CURRENCY}
+    if decline is not None:
+        terms["autoDeclinePrice"] = {"value": f"{decline:.2f}", "currency": EBAY_CURRENCY}
     return terms
 
 

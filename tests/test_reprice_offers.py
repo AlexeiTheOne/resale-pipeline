@@ -331,7 +331,7 @@ def test_offer_never_below_the_auto_decline_floor():
     with _Patch(rp, WATCHER_OFFER_PCT=30.0):
         plan = rp.plan_watcher_offers([item], [_result(item, 4)], {"L1"}, set())
     floor = auto_decline_price(item, 59.99)
-    assert plan and plan[0]["offer_price"] == floor           # 75% of $59.99 -> $45
+    assert plan and plan[0]["offer_price"] == floor           # 85% of $59.99 -> $50.99
     # A floor that leaves under eBay's 5% minimum discount means no offer.
     tight = _offer_item(2, price=20.0, cost=12.0)
     assert rp.plan_watcher_offers([tight], [_result(tight, 4)], {"L2"}, set()) == []

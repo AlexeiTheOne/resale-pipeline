@@ -170,3 +170,57 @@ def test_setqty_on_a_relisted_item_changes_nothing(monkeypatch):
     assert pushed == []
     assert store.rows[ITEM_ID]["ebay"]["quantity"] == 2
     assert any("NOT on eBay" in t for t in tg_fakes.sent_texts(ctx))
+
+
+# --- eBay first, then the DB (bff24df0) ----------------------------------------
+
+def _live(monkeypatch, fail=False):
+    """A normal live item; update_offer_price fakes eBay's answer."""
+    store = _DB(monkeypatch, _item())
+    calls = []
+
+    def push(offer_id, price, item=None):
+        calls.append((offer_id, price, item and item["item_id"]))
+        if fail:
+            raise RuntimeError("eBay API PUT failed [400]: errorId 25016")
+        return {"listingPolicies": {"bestOfferTerms": inventory.best_offer_terms(item, price)}}
+
+    monkeypatch.setattr(inventory, "update_offer_price", push)
+    return store, calls
+
+
+def test_setprice_sends_the_item_so_best_offer_moves_with_the_price(monkeypatch):
+    store, calls = _live(monkeypatch)
+    update, ctx = tg_fakes.make_text_update(f"/setprice {ITEM_ID[:8]} 21.99 force")
+    tg_fakes.run(listing_cmds.setprice_command, update, ctx)
+    assert calls == [("o1", 21.99, ITEM_ID)]
+    assert store.rows[ITEM_ID]["listing"]["price"] == 21.99
+    sent = tg_fakes.sent_texts(ctx)
+    assert any("Best Offer: auto-accept" in t and "auto-decline" in t for t in sent), sent
+
+
+def test_setprice_keeps_the_db_price_when_ebay_refuses(monkeypatch):
+    store, calls = _live(monkeypatch, fail=True)
+    update, ctx = tg_fakes.make_text_update(f"/setprice {ITEM_ID[:8]} 21.99 force")
+    tg_fakes.run(listing_cmds.setprice_command, update, ctx)
+    assert calls and store.writes == []
+    assert store.rows[ITEM_ID]["listing"]["price"] == 24.99
+    assert store.rows[ITEM_ID]["pricing"] == {"suggested_price": 24.99}
+    assert any("Nothing changed" in t for t in tg_fakes.sent_texts(ctx))
+
+
+def test_reprice_apply_keeps_the_db_price_when_ebay_refuses(monkeypatch):
+    store, calls = _live(monkeypatch, fail=True)
+    update, ctx = tg_fakes.make_callback_update(f"reprice:apply:21.99:{ITEM_ID}")
+    tg_fakes.run(listing_cmds.reprice_callback, update, ctx)
+    assert calls == [("o1", 21.99, ITEM_ID)] and store.writes == []
+    assert store.rows[ITEM_ID]["listing"]["price"] == 24.99
+
+
+def test_reprice_apply_saves_after_ebay_takes_it(monkeypatch):
+    store, calls = _live(monkeypatch)
+    update, ctx = tg_fakes.make_callback_update(f"reprice:apply:21.99:{ITEM_ID}")
+    tg_fakes.run(listing_cmds.reprice_callback, update, ctx)
+    assert calls == [("o1", 21.99, ITEM_ID)]
+    assert store.rows[ITEM_ID]["listing"]["price"] == 21.99
+    assert store.rows[ITEM_ID]["pricing"]["price_basis"] == "reprice"

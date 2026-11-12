@@ -25,7 +25,6 @@ the test instead of reaching eBay.
 import asyncio
 import io
 import json
-import math
 import os
 import re
 import sys
@@ -288,12 +287,16 @@ def activate(item_id, ctx):
     return ctx
 
 
-def expected_floor(price, item=None):
-    """auto-decline floor per config: ceil(price * BEST_OFFER_MIN_PCT%) when the
-    Ross cost is unknown (no break-even to compare against)."""
-    pct = inventory.BEST_OFFER_MIN_PCT
-    floor = math.ceil(round(price * pct / 100, 2)) if pct > 0 else None
-    return floor if floor is not None and 1 <= floor < price else None
+def expected_terms(price):
+    """bestOfferTerms per config when the Ross cost is unknown (no break-even):
+    accept at BEST_OFFER_AUTO_ACCEPT_PCT, decline at BEST_OFFER_AUTO_DECLINE_PCT,
+    each rounded up to .99."""
+    accept = inventory.up_to_99(price * inventory.BEST_OFFER_AUTO_ACCEPT_PCT / 100)
+    decline = inventory.up_to_99(price * inventory.BEST_OFFER_AUTO_DECLINE_PCT / 100)
+    assert 1 <= decline < accept < price   # any sane config sits between $1 and the price
+    cur = inventory.EBAY_CURRENCY
+    return {"bestOfferEnabled": True, "autoAcceptPrice": {"value": f"{accept:.2f}", "currency": cur},
+            "autoDeclinePrice": {"value": f"{decline:.2f}", "currency": cur}}
 
 
 # --------------------------------------------------------------------------- #
@@ -336,14 +339,7 @@ def test_approve_creates_one_draft_offer_with_expected_payload_and_nothing_live(
     assert policies["fulfillmentPolicyId"] == "FP-TEST"
     assert policies["returnPolicyId"] == "RP-TEST"
     if inventory.BEST_OFFER_ENABLED:
-        terms = policies["bestOfferTerms"]
-        assert terms["bestOfferEnabled"] is True
-        floor = expected_floor(PRICE)
-        if floor is None:
-            assert "autoDeclinePrice" not in terms
-        else:
-            assert terms["autoDeclinePrice"] == {"value": f"{floor:.2f}",
-                                                 "currency": inventory.EBAY_CURRENCY}
+        assert policies["bestOfferTerms"] == expected_terms(PRICE)
     else:
         assert "bestOfferTerms" not in policies
 
@@ -388,28 +384,25 @@ def test_activate_publishes_once_stores_listing_id_and_shows_link(bot, http):
 # Config-driven payload: best-offer floor, ad rate
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.parametrize("pct", [None, 60.0, 90.0])
-def test_best_offer_floor_follows_config(bot, http, monkeypatch, pct):
+@pytest.mark.parametrize("pcts", [None, (90.0, 60.0), (97.0, 90.0)])
+def test_best_offer_terms_follow_config(bot, http, monkeypatch, pcts):
     monkeypatch.setattr(inventory, "BEST_OFFER_ENABLED", True)
-    if pct is not None:
-        monkeypatch.setattr(inventory, "BEST_OFFER_MIN_PCT", pct)
+    if pcts is not None:
+        monkeypatch.setattr(inventory, "BEST_OFFER_AUTO_ACCEPT_PCT", pcts[0])
+        monkeypatch.setattr(inventory, "BEST_OFFER_AUTO_DECLINE_PCT", pcts[1])
     item_id = seed_review_item()
     approve(item_id)
     terms = http.of("create_offer")[0]["json"]["listingPolicies"]["bestOfferTerms"]
-    floor = expected_floor(PRICE)
-    assert floor is not None  # any sane config floor sits between $1 and the price
-    assert terms == {"bestOfferEnabled": True,
-                     "autoDeclinePrice": {"value": f"{floor:.2f}",
-                                          "currency": inventory.EBAY_CURRENCY}}
+    assert terms == expected_terms(PRICE)
 
 
 def test_best_offer_floor_uses_breakeven_when_it_is_higher(bot, http, monkeypatch):
     monkeypatch.setattr(inventory, "BEST_OFFER_ENABLED", True)
-    monkeypatch.setattr(inventory, "BEST_OFFER_MIN_PCT", 1.0)  # % floor ~ $1
+    monkeypatch.setattr(inventory, "BEST_OFFER_AUTO_DECLINE_PCT", 1.0)  # % floor ~ $1
     item_id = seed_review_item(receipt={"reduced_price": 19.99, "peeled": True})
     approve(item_id)
     terms = http.of("create_offer")[0]["json"]["listingPolicies"]["bestOfferTerms"]
-    be = math.ceil(round(inventory.breakeven_price(get_item(item_id)), 2))
+    be = inventory.up_to_99(inventory.breakeven_price(get_item(item_id)))
     assert terms["autoDeclinePrice"]["value"] == f"{be:.2f}"
 
 
