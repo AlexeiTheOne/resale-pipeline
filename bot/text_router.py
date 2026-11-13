@@ -4,16 +4,14 @@ Moved verbatim out of telegram_bot.py (docs/cleanup-plan.md Phase 2, step 3).
 """
 import asyncio
 import re
-from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
 import config
 import db
-import profit
 from bot import flow, intake, state, util
-from pipeline import draft, listing_check
+from pipeline import draft, listing_check, price_ops
 
 
 # A typed correction that is really a price instruction: "159.99", "price 159.99",
@@ -49,26 +47,8 @@ def _price_from_correction(text: str) -> float | None:
 
 
 def _apply_manual_price(pricing: dict, price: float) -> dict:
-    """Record a human price override without erasing what the machine proposed.
-
-    `machine_price` is written once by pipeline/pricing_v2.py and never touched here;
-    the override goes to suggested_price (what the rest of the pipeline reads)
-    and is also kept as manual_price alongside it. Previously this assignment
-    overwrote suggested_price outright, so every correction destroyed the number
-    it was correcting — 34 of 57 items ended up with price_basis='manual' and no
-    record of how far off the suggestion had been. Keeping both makes that gap
-    measurable instead of invisible."""
-    pricing = dict(pricing)
-    pricing["manual_price"] = price
-    pricing["manual_price_at"] = datetime.now(timezone.utc).isoformat()
-    if pricing.get("machine_price") is None:
-        # Pre-existing items priced before machine_price existed: the current
-        # suggestion is the machine's, so capture it before it's replaced.
-        pricing["machine_price"] = pricing.get("suggested_price")
-    pricing["suggested_price"] = price
-    pricing["confidence"] = "manual"
-    pricing["price_basis"] = "manual"
-    return pricing
+    """A human price override on the pricing record (pipeline/price_ops.manual_pricing)."""
+    return price_ops.manual_pricing(pricing, price)
 
 
 def _charm_price(value: float) -> float:
@@ -356,10 +336,9 @@ def _floor_refusal(item: dict, price: float) -> str | None:
     only one that did. A price typed by hand went straight to eBay, so the one
     route nothing reviews afterwards was also the one with no floor under it.
 
-    Returns None when the cost is unknown: breakeven_price refuses to guess from
-    an estimated cost, and a floor nobody can compute must not become a wall."""
-    floor = profit.breakeven_price(item)
-    if floor is None or price > floor:
+    Returns None when the cost is unknown (pipeline/price_ops.floor_breach)."""
+    floor = price_ops.floor_breach(item, price)
+    if floor is None:
         return None
     return (f"${price:.2f} is at or below the ${floor:.2f} break-even — it would "
             f"sell at a loss after fees, ads and postage.\n"

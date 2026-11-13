@@ -8,8 +8,9 @@ import copy
 
 import config
 import db
-from bot import revise_cmds, state
+from bot import revise_cmds, state, util
 from ebay import inventory, taxonomy
+from pipeline import revise
 from tests import tg_fakes
 
 ITEM_ID = "d7432192-95d6-42bb-b111-6656046ae27e"
@@ -143,12 +144,12 @@ def test_parse_refuses_a_line_it_cant_read_and_duplicates():
 
 
 def test_a_new_description_keeps_the_current_shipping_and_returns_section():
-    out = revise_cmds.with_footer(NEW_BODY, OLD_DESC)
+    out = revise.with_footer(NEW_BODY, OLD_DESC)
     assert out.startswith(NEW_BODY)
     assert "SHIPPING:\nShips within 1 business day" in out and "RETURNS:" in out
     assert "SPECIFICATIONS" not in out
     own = NEW_BODY + "\n\nSHIPPING:\nFree."
-    assert revise_cmds.with_footer(own, OLD_DESC) == own
+    assert revise.with_footer(own, OLD_DESC) == own
 
 
 # --- owner only, single listing -------------------------------------------------------
@@ -234,10 +235,13 @@ def test_refused_title_or_specifics_leave_the_db_alone(monkeypatch):
     world = FakeWorld(monkeypatch)
     ctx = _preview()
     world.fail.add("inventory")
+    monkeypatch.setattr(util, "_recent_errors", type(util._recent_errors)(maxlen=10))
     reply = _tap(ctx)
     assert "db" not in world.writes() and "offer" not in world.writes()
     assert world.row["listing"]["title"] == OLD_TITLE
     assert "refused the title/specifics" in reply and "DB was not changed" in reply
+    # pipeline/revise reports through the bot's recorder, so /errors has it.
+    assert util._recent_errors[0][1] == f"revise title/specifics ({ITEM_ID[:8]})"
 
 
 def test_refused_description_puts_title_and_specifics_back(monkeypatch):

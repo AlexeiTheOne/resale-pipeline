@@ -110,6 +110,12 @@ cannot change eBay. Use `.env.example` as the template.
   - `draft.py`, `title.py`, `specifics.py`, `category.py`: listing content.
   - `price.py`, `pricing_v2.py`, `quick_price.py`, `reprice.py`: pricing.
   - `offers.py`, `sync.py`: offers and sales.
+  - `price_ops.py`: setting a price (checks, then eBay first and the DB
+    last), for `/setprice` and the reprice button.
+  - `revise.py`: plan and apply for `/revise` (title, specifics,
+    description).
+  - Telegram handlers stay thin: shared logic goes in `pipeline/`, so other
+    callers (the planned dashboard) reuse it.
   - `receipt_decode.py`: what each Ross receipt line is (`/rcpt`,
     `docs/receipt-decoding.md`).
 - `ebay/`: eBay API clients (inventory, listings, orders, browse, marketing,
