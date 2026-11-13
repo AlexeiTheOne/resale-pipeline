@@ -114,7 +114,9 @@ if ($MyInvocation.InvocationName -eq '.') { return }   # dot-sourced by a test
 
 Show 'Code'
 $live = (git -C $RepoPath rev-parse --short HEAD 2>$null)
-$remote = (git ls-remote https://github.com/AlexeiTheOne/resale-pipeline.git refs/heads/main 2>$null)
+# Through the live copy's own remote: it uses the read-only deploy key, so this
+# works from any session once the repo is private (no stored HTTPS login).
+$remote = (git -C $RepoPath ls-remote origin refs/heads/main 2>$null)
 $remoteShort = if ($remote) { $remote.Substring(0, 7) } else { 'unknown (no network?)' }
 Write-Output "live copy : $live  $(git -C $RepoPath log -1 --format=%s 2>$null)"
 Write-Output "GitHub    : $remoteShort"
