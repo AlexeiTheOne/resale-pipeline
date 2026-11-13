@@ -15,7 +15,7 @@ below folded in:**
 - a one-time login link from the bot (section 4);
 - sliding sessions, revocation and a sessions list (section 4);
 - crash recovery for actions (section 1);
-- the SQL Server auth change and its restart (section 7, phase 0);
+- the read-only DB login: a Windows user, so no SQL Server restart (section 7, phase 0);
 - the Smart App Control risk for the frontend build (section 6);
 - desktop first, plus a simple phone view (section 3).
 
@@ -99,8 +99,8 @@ caller:
 | Free-shipping test | `pipeline/ship_test.preview / apply / report` | Nothing |
 | Diagnose | `pipeline/diagnose.diagnose` returns rows | Nothing; store the last run's rows (below) |
 | Watcher offers | `pipeline/offers.offer_plan`, `reprice.build_offer_plan / send_planned_offers` | A plan for chosen listings, not only "all watched" |
-| Revise | `build_plan` / `apply_plan` in `bot/revise_cmds.py` | Move to `pipeline/revise.py` (no logic change) |
-| Set price | Inside `setprice_command` (floor, test freeze, relist check, push, save) | New `pipeline/price_ops.preview / apply`. `/setprice` and the reprice button call it |
+| Revise | `pipeline/revise.build_plan / apply_plan` | **Done** (PR #31, 2026-11-12) |
+| Set price | `pipeline/price_ops.needs_force / set_price` | **Done** (PR #31, 2026-11-12). `/setprice`, the reprice button and the price gate call it |
 
 Rule for the codebase: a dashboard action may only call a `pipeline.*`
 function that a Telegram command also calls. The dashboard has no eBay or
@@ -173,9 +173,13 @@ from Telegram.
     enforced by the server, not by code.
   - Phase 2 adds `INSERT/UPDATE` on `actions` alone. Login codes and
     sessions also need `INSERT/UPDATE`, on those two tables only.
-  - SQL Server here accepts Windows logins only (checked 2026-11-12:
-    `IsIntegratedSecurityOnly = 1`). A SQL login needs mixed mode, which
-    takes a SQL Server restart; see phase 0 in section 7.
+  - **It is a Windows login** for a dashboard-only local Windows user
+    (Person B, 2026-11-12). SQL Server here accepts Windows logins only
+    (`IsIntegratedSecurityOnly = 1`), so this needs no auth change, no SQL
+    Server restart and no password in a file. Setup: section 7, phase 0.
+  - `db_datareader` would also cover `ebay_tokens`, so the login gets an
+    explicit `DENY SELECT ON ebay_tokens`. The dashboard never sees the
+    token, even by mistake.
 - **Secrets:** the eBay token and `.env` are never readable through the API.
 
 ## 5. Ready for several accounts later
@@ -254,9 +258,9 @@ Estimates are working days for one developer with Claude, tests included.
 
 | Phase | What | Effort |
 |---|---|---|
-| **0. Skeleton** | API and frontend skeletons (frontend built off the PC), `tailscale serve`, `/login` link and sessions, `/logout_all`, read-only SQL login, scheduled task, deploy step, heartbeat | 2–3 days |
+| **0. Skeleton** | API and frontend skeletons (frontend built off the PC), `tailscale serve`, `/login` link and sessions, `/logout_all`, the dashboard's Windows user and read-only DB login, scheduled task, deploy step, heartbeat | 2–3 days |
 | **1. Read-only** | Listings table (DB data, weekly stats, cost, break-even, Best Offer, test group); overview; free-shipping test page (DB part); receipts and inventory; check history. Then the `actions` queue for **read** actions only (diagnose run, test report from eBay) and the `diagnose_results` table | 5–7 days |
-| **2. Actions** | Refactor setprice and revise into `pipeline/` (section 2); confirmed write actions in the queue; preview and confirm screens; bulk set price, revise and offers; per-row results; audit page | 7–9 days |
+| **2. Actions** | Confirmed write actions in the queue; preview and confirm screens; bulk set price, revise and offers; per-row results; audit page | 7–9 days |
 | **3. Multi-account ready** | `accounts`, `account_id` columns, `account_settings` overlay, Connect eBay per account; the bot's queries take `account_id` | 5–8 days (not planned now) |
 
 The phase 0 estimate grew by a day for the login link and sessions. Phase 2
@@ -264,34 +268,24 @@ includes crash recovery and the Settings page's sessions list.
 
 **Before phase 0:**
 1. **The repo is private.** No dashboard code before that.
-2. **The read-only DB login.** There are two ways, both Person B's call:
+2. **The read-only DB login: a Windows user** (Person B's decision,
+   2026-11-12). No SQL Server restart and no downtime. Steps, done by
+   Person B in an admin PowerShell and SSMS:
+   1. create a local Windows user for the dashboard only (e.g.
+      `resale-dash`): not an administrator, no interactive logon;
+   2. in SQL Server, add a Windows login for it, map it to `ResaleDB` with
+      `db_datareader`, and `DENY SELECT ON ebay_tokens`;
+   3. run the dashboard's scheduled task as that user (Task Scheduler keeps
+      its password; nothing goes in a file);
+   4. folder access: read on the repo, write on its own log and heartbeat
+      files only, and **no read on the bot's `.env`**. The dashboard gets its
+      own small env file with only what it needs (port, owner allowlist,
+      session days), and no Telegram, eBay or AI keys;
+   5. phase 2 adds `INSERT/UPDATE` on `actions`, `dashboard_login_codes` and
+      `dashboard_sessions` for this login, through `migrations.py`.
 
-   | | A. Mixed mode + SQL login (the brief) | B. Windows login for a dashboard user |
-   |---|---|---|
-   | How | Turn on SQL Server and Windows authentication, restart SQL Server, create a SQL login with `db_datareader` | Create a local Windows user (e.g. `resale-dash`), run the dashboard's scheduled task as it, and add a Windows login with `db_datareader` |
-   | Restart | **Yes:** the `MSSQL$SQLEXPRESS` service | No |
-   | Secret | A SQL password in the dashboard's `.env` | None: Windows signs it in |
-   | Exposure | A new password-based login on the server (localhost only, but still one more way in) | None new |
-
-   **Recommendation: B.** It's the same server-enforced read-only access,
-   with no restart and no password to keep. If Person B prefers A, plan it
-   like this:
-   - **Downtime:** about 1–2 minutes of SQL Server restart. The bot can't
-     reach the DB in that time. Telegram commands fail with a DB error, and
-     a background job in flight fails its run and retries next cycle. eBay
-     is unaffected.
-   - **When:** after the evening sync, at a quiet hour, with `logs/busy.json`
-     absent and no deploy running (pause `EbayBotDeploy` for the window).
-   - **Steps:**
-     1. take a backup;
-     2. set mixed mode (SSMS, or the `LoginMode` registry value set to 2);
-     3. restart only `MSSQL$SQLEXPRESS`, never the PC;
-     4. restart the bot via `restart_ebay_bot.ps1` so it reconnects cleanly;
-     5. check the heartbeat;
-     6. re-enable the deploy task.
-   - **Check `receipt_pipeline` first:** it shares the server. Person B
-     confirms it can take the same 1–2 minute gap, since we never touch its
-     processes.
+   Rejected: mixed mode plus a SQL login. It would need a 1–2 minute SQL
+   Server restart and adds a password-based login.
 3. **Optional:** try the frontend build on this PC (section 6).
 
 Phase 1 gives a usable dashboard in about a week and changes nothing on eBay.
@@ -339,6 +333,7 @@ What would have to be added for other sellers, on top of phase 3:
   - the read-only DB login;
   - the deploy step;
   - any phase 3 schema.
-- **Open, for Person B:** login option A or B (section 7). The
-  recommendation is B.
+- **The DB login is a Windows user** with read-only access and no access
+  to `ebay_tokens` (Person B, 2026-11-12; section 7).
+- **The section 2 refactor is merged** (PR #31).
 - **Open, for Person A:** review of the whole doc in its PR.
